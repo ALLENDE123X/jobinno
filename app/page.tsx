@@ -136,7 +136,7 @@ export default function Home() {
             </Button>
             <ThemeToggle />
             <Button size="lg" asChild>
-              <Link href="/auth">Get started</Link>
+              <Link href="/login">Get started</Link>
             </Button>
           </nav>
         </div>
@@ -167,7 +167,7 @@ export default function Home() {
 
                 <div className="flex w-full flex-col gap-3 sm:w-auto sm:flex-row sm:items-center">
                   <Button size="lg" asChild className="h-11 px-6 text-base">
-                    <Link href="/auth">
+                    <Link href="/login">
                       Get started free
                       <ArrowRight className="size-4" />
                     </Link>
@@ -311,7 +311,7 @@ export default function Home() {
                   size="lg"
                   asChild
                 >
-                  <Link href="/auth">{plan.cta}</Link>
+                  <Link href="/login">{plan.cta}</Link>
                 </Button>
               </div>
             ))}
