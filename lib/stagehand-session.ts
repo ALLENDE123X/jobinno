@@ -18,10 +18,26 @@
  *    fix, not cosmetics.
  *
  * Nothing else about the behaviour is different.
+ *
+ * ── JOB-006 ─────────────────────────────────────────────────────────────────
+ * One more cache sits in front of the file backed one below, and it is the one
+ * that matters commercially. The file cache is keyed by page URL, so it can only
+ * help a posting this machine has already opened, and in production every
+ * posting is one nobody has opened. `lib/form-action-cache.ts` keys the same
+ * answers by what the *form* looks like instead, in Postgres, shared by every
+ * run, so a first visit to a new Greenhouse posting already knows where the
+ * email box is.
+ *
+ * The wiring here is three small things: `BrowserSession` can carry an
+ * `actionPlan`, `resolveAction` consults it before anything else and files what
+ * it learns back into it, and `reResolveLive` is the escape hatch a caller uses
+ * when a replayed answer fails the checks it is put through. With no plan
+ * attached every function below behaves exactly as it did before.
  */
 
 import {
   Stagehand,
+  browserbase,
   localBrowser,
   type Page,
   type StagehandBrowser,
@@ -29,6 +45,12 @@ import {
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  planInvalidate,
+  planLookup,
+  planRecord,
+  type ActionPlan,
+} from "@/lib/form-action-cache";
 
 /**
  * Model driving `act`/`extract`/`observe`. Stagehand validates this string
@@ -54,6 +76,17 @@ export type BrowserSession = {
   page: Page;
   /** Log prefix of the flow that opened this session, e.g. `[act-007]`. */
   logTag: string;
+  /**
+   * JOB-006. The replayable plan for the form shape this session has landed on,
+   * once a caller has looked one up and attached it.
+   *
+   * Mutable and optional on purpose. Optional because a session is opened long
+   * before there is a form to fingerprint, and every helper here behaves exactly
+   * as it did before this field existed when it is absent. Mutable because a run
+   * both reads from it and teaches it, and what it learned is written back once
+   * at the end rather than a row at a time.
+   */
+  actionPlan?: ActionPlan | null;
 };
 
 export type OpenBrowserSessionOptions = {
@@ -61,19 +94,169 @@ export type OpenBrowserSessionOptions = {
   logTag: string;
 };
 
+// ───────────────────────────────────
+// Which browser provider this process uses (JOB-005)
+// ───────────────────────────────────
+
 /**
- * Launches a Chrome this run owns outright and attaches Stagehand to it.
+ * What the readers below accept. `process.env` satisfies it, and so does a
+ * plain object literal, which `NodeJS.ProcessEnv` does not: Next.js augments
+ * that interface with a required `NODE_ENV`, so every test fixture would have
+ * to carry a `NODE_ENV` it does not care about to typecheck.
+ */
+export type EnvSource = Readonly<Record<string, string | undefined>>;
+
+export const BROWSERBASE_API_KEY_ENV_VAR = "BROWSERBASE_API_KEY";
+export const BROWSERBASE_PROJECT_ID_ENV_VAR = "BROWSERBASE_PROJECT_ID";
+export const BROWSERBASE_CONCURRENCY_ENV_VAR = "BROWSERBASE_CONCURRENCY";
+
+/**
+ * Sessions this Browserbase project may run at once, when
+ * `BROWSERBASE_CONCURRENCY` does not say otherwise.
+ *
+ * Not a guess. `GET /v1/projects/{id}` on the live Jobinno project reports
+ * `"concurrency": 3`, which is the plan's own cap: ask for a fourth session and
+ * Browserbase refuses it rather than queueing it. The number is therefore a
+ * property of the billing plan, so it lives in an env var and this constant is
+ * only the fallback for an environment that has not set one.
+ */
+export const BROWSERBASE_DEFAULT_CONCURRENCY = 3;
+
+/**
+ * Seconds before Browserbase ends a session on its own, passed on every launch
+ * rather than left at the project default of 300.
+ *
+ * One application is an account check, a form fill of up to a few dozen fields
+ * and a submit, and every step of that waits on both an LLM call and a slow
+ * careers SPA. Five minutes is not reliably enough. A session cut off mid
+ * submit lands the row on `submission_unconfirmed`, which is terminal and never
+ * retried, so a ceiling set too low costs the candidate an application they
+ * cannot recover, while one set too high costs nothing: Browserbase bills the
+ * minutes a session actually uses, and `closeBrowserSession` closes on every
+ * exit path. Twenty minutes is generous for a form that is working and still
+ * bounded for one that is not.
+ */
+export const BROWSERBASE_SESSION_TIMEOUT_S = 20 * 60;
+
+/**
+ * Sessions the local Chromium path may run at once.
+ *
+ * Two, and the reason is memory rather than taste, as
+ * `inngest/job-application-pipeline.ts` records at length: a 5 wide fan out on
+ * an 8 GB machine put the load average at 32 on 8 cores and pushed swap to 5 GB
+ * of 6 GB, at which point Chrome stops answering CDP or dies outright. That is
+ * a property of one developer machine and it has nothing to say about remote
+ * sessions, which is exactly why the two numbers are now separate.
+ */
+export const LOCAL_BROWSER_CONCURRENCY = 2;
+
+/**
+ * Which provider `openBrowserSession` will use, and why.
+ *
+ * `incomplete` is a third state on purpose. One credential set and the other
+ * missing is a typo every time, never a choice, and silently falling back to a
+ * local Chromium there is the worst of the three outcomes: it looks like it
+ * worked, right up until the same code runs somewhere that has no Chrome
+ * installed at all.
+ */
+export type BrowserProviderChoice =
+  | { provider: "browserbase"; apiKey: string; projectId: string }
+  | { provider: "local" }
+  | { provider: "incomplete"; missing: string; present: string };
+
+/** Trimmed value, or undefined when the variable is unset or only whitespace. */
+function readEnv(env: EnvSource, name: string): string | undefined {
+  const raw = env[name]?.trim();
+  return raw === undefined || raw === "" ? undefined : raw;
+}
+
+/**
+ * Reads the provider choice out of the environment. Pure, and takes the env it
+ * reads, so a test can exercise both branches without a browser and without
+ * mutating `process.env` around whatever else is running.
+ *
+ * Additive by design. With neither Browserbase variable set this returns
+ * `local` and the Chromium path behaves exactly as it did before JOB-005, which
+ * is what keeps `npm run fill-form` working on a laptop with no Browserbase
+ * account.
+ */
+export function chooseBrowserProvider(
+  env: EnvSource = process.env
+): BrowserProviderChoice {
+  const apiKey = readEnv(env, BROWSERBASE_API_KEY_ENV_VAR);
+  const projectId = readEnv(env, BROWSERBASE_PROJECT_ID_ENV_VAR);
+
+  if (apiKey !== undefined && projectId !== undefined) {
+    return { provider: "browserbase", apiKey, projectId };
+  }
+  if (apiKey === undefined && projectId === undefined) {
+    return { provider: "local" };
+  }
+  return apiKey === undefined
+    ? {
+        provider: "incomplete",
+        missing: BROWSERBASE_API_KEY_ENV_VAR,
+        present: BROWSERBASE_PROJECT_ID_ENV_VAR,
+      }
+    : {
+        provider: "incomplete",
+        missing: BROWSERBASE_PROJECT_ID_ENV_VAR,
+        present: BROWSERBASE_API_KEY_ENV_VAR,
+      };
+}
+
+/**
+ * How many sessions may run at once under the active provider.
+ *
+ * `inngest/job-application-pipeline.ts` reads this for `applyToJob`'s
+ * `concurrency.limit`, so the fan out width and the launch queue below always
+ * agree about which bottleneck is real: this machine's cores when the browsers
+ * are local, and the Browserbase plan's session cap when they are not.
+ *
+ * Never throws, including on the `incomplete` case. It runs at module load in
+ * the pipeline, and a tuning number is not worth failing an import over. The
+ * run that would have used it fails with a readable reason in
+ * `openBrowserSession` instead.
+ */
+export function browserConcurrencyLimit(env: EnvSource = process.env): number {
+  if (chooseBrowserProvider(env).provider !== "browserbase") {
+    return LOCAL_BROWSER_CONCURRENCY;
+  }
+
+  const configured = readEnv(env, BROWSERBASE_CONCURRENCY_ENV_VAR);
+  if (configured === undefined) return BROWSERBASE_DEFAULT_CONCURRENCY;
+
+  const parsed = Number(configured);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    console.warn(
+      `${BROWSERBASE_CONCURRENCY_ENV_VAR}=${JSON.stringify(configured)} is not a positive ` +
+        `whole number; falling back to ${BROWSERBASE_DEFAULT_CONCURRENCY}`
+    );
+    return BROWSERBASE_DEFAULT_CONCURRENCY;
+  }
+  return parsed;
+}
+
+/**
+ * Launches a browser this run owns outright and attaches Stagehand to it.
+ *
+ * JOB-005 made which browser a property of the environment rather than of this
+ * function: a Browserbase session when both credentials are set, and the local
+ * Chromium below when neither is. Nothing else in the function changed, because
+ * nothing else needed to. Stagehand hands back the same `StagehandBrowser`
+ * either way, so every caller, the observe cache and the teardown path are all
+ * provider blind by construction.
  *
  * Deliberately no shared instance, no keepalive, no pool: a browser nobody else
  * can reach is what makes a hijack-defence layer unnecessary, and it is also
- * what makes `concurrency: { limit: 5 }` in
- * `inngest/job-application-pipeline.ts` safe — five calls are five Chrome
- * processes with five temp profiles.
+ * what makes `applyToJob`'s `concurrency.limit` in
+ * `inngest/job-application-pipeline.ts` safe: N calls are N browsers, with N
+ * temp profiles locally and N isolated remote sessions on Browserbase.
  *
- * `port` and `userDataDir` are deliberately left unset. Stagehand's launcher
- * only picks a random free port and a fresh temp profile when they are absent;
- * pinning either would make concurrent runs collide on the debug port or on
- * Chrome's profile lock.
+ * `port` and `userDataDir` are deliberately left unset on the local path.
+ * Stagehand's launcher only picks a random free port and a fresh temp profile
+ * when they are absent; pinning either would make concurrent runs collide on
+ * the debug port or on Chrome's profile lock.
  */
 /**
  * How many browsers may be *starting* at once. Not how many may be running.
@@ -96,15 +279,37 @@ export type OpenBrowserSessionOptions = {
  * starts keeps `concurrency: { limit: 5 }` in
  * `inngest/job-application-pipeline.ts` meaning what it says, while never
  * putting more than this many launches in flight at once.
+ *
+ * ── JOB-005: the limit is now the active provider's, not a constant ──────────
+ *
+ * Every word above is about a Chrome process starting on this machine, so none
+ * of it applies to a Browserbase session. There `launch()` is one HTTPS call
+ * that creates a session on someone else's fleet, it costs this process no CPU,
+ * and starts do not contend with each other at all.
+ *
+ * The queue is kept rather than skipped for the remote path, for one reason
+ * that is worth being precise about. Browserbase caps concurrent sessions per
+ * project and refuses the one over the line instead of queueing it, so a bound
+ * is still wanted. Set to the plan's cap it is close to a no op underneath
+ * `applyToJob`'s own `concurrency.limit`, which reads the same number. It earns
+ * its place on the entry points that never touch Inngest, `npm run fill-form`
+ * and `npm run submit-application`, where nothing else is counting.
+ *
+ * What it deliberately does not claim to be is an enforcement of that cap. It
+ * gates starts, not runs, and releases as soon as a session is up, so three
+ * live sessions plus a fourth start is still a refusal from Browserbase. The
+ * pipeline's `concurrency.limit` is what actually holds the line.
  */
-const MAX_CONCURRENT_LAUNCHES = 2;
+function maxConcurrentLaunches(): number {
+  return browserConcurrencyLimit();
+}
 
 /** Resolves when a launch slot is free; the returned function gives it back. */
 const launchQueue: Array<() => void> = [];
 let launchesInFlight = 0;
 
 async function acquireLaunchSlot(logTag: string): Promise<() => void> {
-  if (launchesInFlight >= MAX_CONCURRENT_LAUNCHES) {
+  if (launchesInFlight >= maxConcurrentLaunches()) {
     console.log(
       `${logTag} waiting for a browser-launch slot (${launchesInFlight} starting, ` +
         `${launchQueue.length} already queued) — starts are serialised so none of them ` +
@@ -136,15 +341,45 @@ export async function openBrowserSession(
     );
   }
 
+  // Resolved before a slot is taken, so a half configured environment fails
+  // immediately and without ever occupying the queue.
+  const choice = chooseBrowserProvider();
+  if (choice.provider === "incomplete") {
+    throw new Error(
+      `${choice.present} is set but ${choice.missing} is not. Browserbase needs both, and ` +
+        `running a local Chromium instead would hide the mistake rather than report it. ` +
+        `Set both to use remote browsers, or unset both to use the local browser.`
+    );
+  }
+
   // Held across launch *and* `Stagehand.create()`, because the 60s ceiling
   // covers both and init is not the cheap half.
   const releaseLaunchSlot = await acquireLaunchSlot(options.logTag);
-  let browser: Awaited<ReturnType<typeof localBrowser.launch>>;
+  let browser: StagehandBrowser;
   try {
-    browser = await localBrowser.launch({ headless: options.headless });
+    browser =
+      choice.provider === "browserbase"
+        ? await browserbase.launch({
+            apiKey: choice.apiKey,
+            projectId: choice.projectId,
+            // `options.headless` has no remote equivalent and is not silently
+            // mapped to anything: a Browserbase session has no display either
+            // way, and its live view is how a run gets watched.
+            api_timeout: BROWSERBASE_SESSION_TIMEOUT_S,
+          })
+        : await localBrowser.launch({ headless: options.headless });
   } catch (err) {
     releaseLaunchSlot();
     throw err;
+  }
+
+  if (browser.provider === "browserbase") {
+    // The session id is the only handle on the recording and the live view in
+    // the Browserbase dashboard, and there is no way back to it from a log line
+    // that does not carry it.
+    console.log(
+      `${options.logTag} Browserbase session ${browser.sessionId ?? "(id unavailable)"} started`
+    );
   }
 
   try {
@@ -178,6 +413,11 @@ export async function openBrowserSession(
  * `stagehand.close()` releases the SDK's connection to the browser but leaves
  * the Chrome process running — only `browser.close()` kills it.
  *
+ * Both halves matter more on Browserbase than they did locally, not less. A
+ * remote session that is never closed keeps burning billed minutes until the
+ * project timeout ends it, and it holds one of the plan's concurrency slots the
+ * whole time, so the next run waits on a browser nobody is using.
+ *
  * Never throws. This runs in a `finally` next to a real error often enough that
  * letting a teardown failure replace the original diagnosis would be a bad
  * trade every time.
@@ -193,7 +433,8 @@ export async function closeBrowserSession(session: BrowserSession): Promise<void
     await session.browser.close();
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    console.warn(`${session.logTag} closing the local browser failed (ignored): ${reason}`);
+    const what = session.browser.provider === "browserbase" ? "Browserbase" : "local";
+    console.warn(`${session.logTag} closing the ${what} browser failed (ignored): ${reason}`);
   }
 }
 
@@ -294,24 +535,74 @@ async function saveObserveCache(cache: ObserveCache, logTag: string): Promise<vo
   }
 }
 
+/** What a resolve produced, and where it came from. */
+export type ResolvedAction = {
+  action: CachedAction;
+  cacheKey: string;
+  /** True when the per URL file cache answered, so a retry may safely re observe. */
+  cached: boolean;
+  /**
+   * JOB-006. True when the shared per shape plan answered instead of a model.
+   *
+   * Callers use it for one thing: a replayed answer that does not hold up when
+   * it is checked against the DOM, or that fails when acted on, earns exactly
+   * one live observation rather than being treated as a real result. See
+   * `reResolveLive`.
+   */
+  replayed: boolean;
+};
+
 /**
  * The cached half of the observe → act pattern: return a replayable `Action`
  * for `instruction` on this page, observing only on a miss.
  *
  * Throws when nothing matches. Callers that treat an absent control as an
  * ordinary outcome should use `tryResolveAction`.
+ *
+ * JOB-006 put one more cache in front of the two that were already here. The
+ * order is shared plan, then per URL file, then a model, and it goes that way
+ * because it is cheapest first: the plan is the only one that can answer for a
+ * posting this machine has never opened, which in production is every posting.
+ * A plan is only consulted for the instructions its owner marked cacheable, so
+ * click paths reach the model exactly as they always did.
  */
 export async function resolveAction(
   session: BrowserSession,
   url: string,
   instruction: string
-): Promise<{ action: CachedAction; cacheKey: string; cached: boolean }> {
+): Promise<ResolvedAction> {
   const cacheKey = observeCacheKey(url, instruction);
+
+  const planned = planLookup(session.actionPlan, instruction);
+  if (planned.hit) {
+    if (planned.action === null) {
+      console.log(`${session.logTag} form action plan says absent (no model call): ${instruction}`);
+      throw new ControlNotFoundError(instruction, url);
+    }
+    console.log(
+      `${session.logTag} form action plan REPLAY (no model call): ${instruction} → ` +
+        `${planned.action.selector}`
+    );
+    return {
+      // The caller's own constant, never a stored model written description.
+      // `lib/form-action-cache.ts` explains at length why nothing else is
+      // allowed to come out of a table every user's runs read.
+      action: {
+        selector: planned.action.selector,
+        description: instruction,
+        ...(planned.action.method === undefined ? {} : { method: planned.action.method }),
+      },
+      cacheKey,
+      cached: false,
+      replayed: true,
+    };
+  }
+
   const cache = await loadObserveCache();
   const hit = cache[cacheKey];
   if (hit?.selector) {
     console.log(`${session.logTag} observe cache HIT — ${instruction}`);
-    return { action: hit, cacheKey, cached: true };
+    return { action: hit, cacheKey, cached: true, replayed: false };
   }
 
   const { data: candidates } = await session.stagehand.observe(instruction, {
@@ -319,6 +610,9 @@ export async function resolveAction(
   });
   const found = candidates[0];
   if (!found?.selector) {
+    // An absence is worth remembering too. A board with no LinkedIn box costs a
+    // model call to discover that on every single run otherwise.
+    planRecord(session.actionPlan, instruction, null);
     throw new ControlNotFoundError(instruction, url);
   }
 
@@ -329,10 +623,14 @@ export async function resolveAction(
   };
   cache[cacheKey] = action;
   await saveObserveCache(cache, session.logTag);
+  planRecord(session.actionPlan, instruction, {
+    selector: action.selector,
+    ...(action.method === undefined ? {} : { method: action.method }),
+  });
   console.log(
     `${session.logTag} observe cache MISS — cached ${instruction} → ${action.selector}`
   );
-  return { action, cacheKey, cached: false };
+  return { action, cacheKey, cached: false, replayed: false };
 }
 
 /**
@@ -359,13 +657,42 @@ export async function tryResolveAction(
   session: BrowserSession,
   url: string,
   instruction: string
-): Promise<{ action: CachedAction; cacheKey: string; cached: boolean } | null> {
+): Promise<ResolvedAction | null> {
   try {
     return await resolveAction(session, url, instruction);
   } catch (err) {
     if (err instanceof ControlNotFoundError) return null;
     throw err;
   }
+}
+
+/**
+ * JOB-006. Throws away a replayed answer that did not survive checking, and
+ * observes the control live instead.
+ *
+ * This is what keeps the shared cache from ever being able to make a run worse
+ * than it was before the cache existed. A stored selector is a guess made on
+ * some other posting; the caller checks it against the DOM the way it checks
+ * every other observation, and when the check fails this drops the entry from
+ * the plan, drops the per URL copy with it, and pays for one real model call.
+ * The cost of a wrong row is therefore exactly the call it tried to save.
+ *
+ * Returns `null` when the live observation finds nothing either, which is a real
+ * answer and not a failure: the control is genuinely not on this page.
+ */
+export async function reResolveLive(
+  session: BrowserSession,
+  url: string,
+  instruction: string,
+  why: string
+): Promise<ResolvedAction | null> {
+  console.warn(
+    `${session.logTag} replayed action for "${instruction}" did not hold up (${why}); ` +
+      `observing it live once`
+  );
+  planInvalidate(session.actionPlan, instruction);
+  await forgetAction(observeCacheKey(url, instruction), session.logTag);
+  return await tryResolveAction(session, url, instruction);
 }
 
 export async function forgetAction(cacheKey: string, logTag: string): Promise<void> {
@@ -420,7 +747,7 @@ export async function typeInto(
   instruction: string,
   value: string
 ): Promise<CachedAction> {
-  const { action, cacheKey, cached } = await resolveAction(session, url, instruction);
+  const { action, cacheKey, cached, replayed } = await resolveAction(session, url, instruction);
 
   try {
     await session.stagehand.act(
@@ -434,16 +761,20 @@ export async function typeInto(
     );
     return action;
   } catch (err) {
-    if (!cached) throw err;
-    // A cached selector that no longer resolves is the one failure this can
-    // recover from safely: nothing has been submitted, and re-observing a field
-    // and filling it again is idempotent. Deliberately not extended to any
-    // click, where a retry is not idempotent at all.
+    // JOB-006 widened this from `cached` to "not observed live in this call".
+    // A selector replayed from the shared per shape plan is a guess made against
+    // some other posting, so it fails this way more often than a per URL one
+    // does, and it is recoverable for exactly the same reason: nothing has been
+    // submitted, and filling a field twice is idempotent. Still deliberately not
+    // extended to any click, where a retry is not idempotent at all.
+    if (!cached && !replayed) throw err;
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(
       `${session.logTag} cached selector for "${instruction}" no longer works (${reason}); ` +
         `re-observing once`
     );
+    // Both layers, or the same stale answer comes straight back.
+    planInvalidate(session.actionPlan, instruction);
     await forgetAction(cacheKey, session.logTag);
     const fresh = await resolveAction(session, url, instruction);
     await session.stagehand.act(

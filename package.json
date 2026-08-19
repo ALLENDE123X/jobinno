@@ -15,11 +15,13 @@
     "db:migrate": "drizzle-kit migrate",
     "db:storage-bucket": "tsx scripts/setup-storage-bucket.ts",
     "supabase:auth-config": "npx --yes supabase@2.115.0 config push --project-ref efyubrtiptcsrhfakbwc",
+    "bench:form-cache": "tsx scripts/form-action-cache-benchmark.ts",
     "intake": "tsx lib/intake-cli.ts",
     "fill-form": "tsx lib/fill-form-cli.ts",
     "submit-application": "tsx lib/submit-application-cli.ts",
     "gmail-auth": "tsx lib/future-gmail/gmail-auth-cli.ts",
-    "verification-listener": "tsx lib/future-gmail/verification-listener-cli.ts"
+    "verification-listener": "tsx lib/future-gmail/verification-listener-cli.ts",
+    "sync-boards": "tsx lib/board-sync-cli.ts"
   },
   "dependencies": {
     "@browserbasehq/stagehand": "^4.0.1",
@@ -33,7 +35,9 @@
     "googleapis": "^175.0.0",
     "inngest": "^4.18.1",
     "lucide-react": "^1.32.0",
+    "motion": "^13.1.0",
     "next": "15.5.23",
+    "next-themes": "^0.4.6",
     "postgres": "^3.4.9",
     "radix-ui": "^1.6.7",
     "react": "19.1.0",

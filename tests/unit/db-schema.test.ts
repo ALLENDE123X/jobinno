@@ -20,6 +20,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const TABLES = [
   "applications",
   "boards",
+  "cached_form_actions",
   "feedback",
   "jobs",
   "profiles",
@@ -78,6 +79,16 @@ const PROFILE_USER_COLUMNS = [
 const POLICIES: Record<string, string[]> = {
   applications: ["applications_insert_own", "applications_select_own"],
   boards: ["boards_select_all"],
+  /**
+   * JOB-006. Deliberately empty, and checked as empty rather than left out.
+   *
+   * RLS on with no policy is PostgREST refusing anon and authenticated every
+   * verb, which is the whole intent for a table holding selectors: nothing in
+   * the browser has any reason to read one, and anyone who could write one
+   * could aim a real candidate's resume at a control of their choosing. The
+   * pipeline reaches it on the service role key, which bypasses RLS.
+   */
+  cached_form_actions: [],
   feedback: ["feedback_insert_any", "feedback_select_own"],
   jobs: ["jobs_select_all"],
   profiles: ["profiles_select_own", "profiles_update_own"],

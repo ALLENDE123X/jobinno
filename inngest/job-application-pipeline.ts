@@ -4,7 +4,8 @@
  *
  *   1. discoverListings — ONE bulk search per request, runs once.
  *   2. applyToJob       — fans out from that single list. N listings = N
- *                         independent runs, at most 5 in flight (`concurrency`).
+ *                         independent runs, with `concurrency` capping how many
+ *                         are in flight at the active browser provider's limit.
  *                         Each run is its own sequential chain internally
  *                         (account → maybe verify → fill+submit) because those
  *                         are causally dependent; every listing's chain runs in
@@ -92,6 +93,7 @@ import {
   type JobListing,
   type JobSearchPreferences,
 } from "@/lib/search-job-listings";
+import { browserConcurrencyLimit } from "@/lib/stagehand-session";
 import { SubmissionBlockedError, submitApplication } from "@/lib/submit-application";
 
 /** Same app id ACT-006's sender uses. */
@@ -383,7 +385,8 @@ export const discoverListings = inngest.createFunction(
 
     console.log(
       `[act-009] ${dispatch.length} listing(s) for candidate ${candidateId} → ` +
-        `${dispatch.length} concurrent apply-to-job run(s), 5 at a time`
+        `${dispatch.length} concurrent apply-to-job run(s), ` +
+        `${browserConcurrencyLimit()} at a time`
     );
 
     // The fan-out. One event per listing; Inngest starts one run of `applyToJob`
@@ -427,27 +430,42 @@ export const applyToJob = inngest.createFunction(
   {
     id: "apply-to-job",
     triggers: [{ event: jobApplicationRequested }],
-    // Listings in flight = Chrome processes on this machine, which is why
-    // `createBoardAccount` closes its browser on every exit path.
+    // Listings in flight = browsers, which is why `createBoardAccount` closes
+    // its browser on every exit path.
     //
-    // Two, not five, and the reason is memory rather than taste. A 5-wide
-    // fan-out on an 8 GB machine put the load average at 32 on 8 cores and
-    // pushed swap to 5 GB of 6 GB, at which point Chrome does not fail
-    // cleanly — it stops answering CDP ("RPC response timed out: page.title")
-    // or dies outright ("connect ECONNREFUSED"). Four real applications were
-    // lost that way in one run, none of them for any reason to do with the
-    // application itself.
+    // ── Why this was 2, and why it is no longer a literal (JOB-005) ──────────
     //
-    // A headless Chrome on a heavy ATS page is roughly 700 MB, and it shares
-    // this machine with the Inngest processes, Claude Desktop and the user's
-    // own browser. Two fit. Five did not.
+    // The 2 was memory rather than taste. A 5-wide fan-out on an 8 GB machine
+    // put the load average at 32 on 8 cores and pushed swap to 5 GB of 6 GB, at
+    // which point Chrome does not fail cleanly — it stops answering CDP ("RPC
+    // response timed out: page.title") or dies outright ("connect
+    // ECONNREFUSED"). Four real applications were lost that way in one run,
+    // none of them for any reason to do with the application itself. A headless
+    // Chrome on a heavy ATS page is roughly 700 MB, and it shared that machine
+    // with the Inngest processes, Claude Desktop and the user's own browser.
+    // Two fit. Five did not.
     //
-    // This is a property of the host, not of the pipeline: on a 32 GB machine
-    // five would be comfortable and this should go back up. The launch
-    // semaphore in `stagehand-session.ts` solves a different problem —
-    // simultaneous cold starts — and does not help once the browsers are all
-    // resident.
-    concurrency: { limit: 2 },
+    // Every sentence of that is about one 8 GB laptop's RAM. JOB-005 moved the
+    // browsers to Browserbase when its credentials are set, and a remote
+    // session uses none of this machine's memory, so the binding constraint
+    // stops being the host and becomes the Browserbase plan's own cap on
+    // concurrent sessions. `browserConcurrencyLimit()` reports whichever of the
+    // two is actually in force, which is why the number is read rather than
+    // written: the same code has to be correct on the laptop and on the remote
+    // fleet, and the incident above says what happens when it is not.
+    //
+    // Remote, that comes out at 3 today. Not an estimate:
+    // `GET /v1/projects/{id}` on the live Jobinno project answers
+    // `"concurrency": 3`, and asking for a fourth session gets a refusal rather
+    // than a queue slot. `BROWSERBASE_CONCURRENCY` raises it without a code
+    // change on the day the plan does, and it should be revisited against real
+    // usage once there is some: 3 is the ceiling the plan imposes, not
+    // necessarily the width this pipeline wants to run at.
+    //
+    // The launch semaphore in `stagehand-session.ts` reads the same number but
+    // solves a different problem — simultaneous cold starts — and does not help
+    // once the browsers are all resident. This is the limit that holds the line.
+    concurrency: { limit: browserConcurrencyLimit() },
     // Below Inngest's default of 4, because a retry here is not free: each one
     // relaunches a browser against a real employer's site. Two is enough for the
     // failures retrying actually fixes (a flaky navigation, a Supabase blip) and
