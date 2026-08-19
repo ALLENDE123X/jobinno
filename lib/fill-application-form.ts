@@ -2947,20 +2947,6 @@ async function runBrowserFlow(
     let signals = await reachApplicationForm(session, state, verification.signals);
     console.log(`${LOG} application form reached at ${signals.url}`);
 
-    // ── JOB-006: pick up whatever an earlier run learned about this form shape.
-    //
-    // Here and not earlier, because "this form shape" needs the form to be on
-    // screen: before the apply control is clicked the page is a job description
-    // and its shape says nothing about the form behind it. Here and not later,
-    // because every field lookup below this line is a lookup the plan can answer
-    // without a model.
-    //
-    // The read is the same `enumerateFormFields` the ACT-015 pass runs, which is
-    // pure DOM and costs no inference. Running it a second time is a page
-    // evaluate, which is the cheapest thing in this file by orders of magnitude,
-    // and it is worth it to fingerprint the form while it is still untouched.
-    await attachFormActionPlan(supabase, session, signals.url);
-
     // The cover letter needs somewhere to go before anything is typed. Doing
     // this first means a required-but-impossible cover letter blocks the run
     // before it has half-filled a real employer's form.
@@ -2991,6 +2977,25 @@ async function runBrowserFlow(
         );
       }
     }
+
+    // ── JOB-006: pick up whatever an earlier run learned about this form shape.
+    //
+    // Placed at exactly this line, and both halves of that matter.
+    //
+    // Not earlier, because the form has to be the form: before the apply control
+    // is clicked the page is a job description, and the cover letter box above
+    // may not exist until the manual entry control has been pressed. A
+    // fingerprint taken before that click describes a form nobody is about to
+    // fill, and worse, it would let a stored "this form has no cover letter box"
+    // stand against a page that had just grown one.
+    //
+    // Not later, because every field lookup below this line is one the plan can
+    // answer without a model, which is the entire saving.
+    //
+    // The read is the same `enumerateFormFields` the ACT-015 pass runs further
+    // down: pure DOM, no inference. Running it twice costs a page evaluate,
+    // which is the cheapest thing in this file by orders of magnitude.
+    await attachFormActionPlan(supabase, session, signals.url);
 
     const plan = buildFieldPlan(profile, signals, coverLetter);
     fields.push(...(await fillFields(session, signals.url, plan)));
