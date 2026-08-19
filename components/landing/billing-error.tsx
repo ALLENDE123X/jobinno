@@ -16,14 +16,31 @@
  * failure case. The Suspense boundary around this component is required rather
  * than decorative: `useSearchParams` suspends during prerender, and without one
  * Next refuses to build.
+ *
+ * ── The query parameter itself is never rendered ────────────────────────────
+ * What arrives is a code, and the sentence shown comes from the table in
+ * `lib/billing/plans.ts` keyed by that code. This component used to print the
+ * parameter directly, which turned a public marketing page into somewhere
+ * anybody could put a sentence of their choosing, styled as our own alert,
+ * simply by sending somebody a link. React escapes the value so it was never
+ * script injection, but a line such as "your account is suspended, call this
+ * number" reads just as convincingly with no markup in it at all.
+ *
+ * `billingErrorMessageFor` never returns what it was given, so a code that is
+ * not one of ours gets the generic sentence rather than a passthrough.
  */
 
 import { useSearchParams } from "next/navigation";
 
-import { BILLING_ERROR_PARAM } from "@/lib/billing/plans";
+import {
+  BILLING_ERROR_PARAM,
+  billingErrorMessageFor,
+} from "@/lib/billing/plans";
 
 export function BillingError() {
-  const message = useSearchParams().get(BILLING_ERROR_PARAM);
+  const message = billingErrorMessageFor(
+    useSearchParams().get(BILLING_ERROR_PARAM)
+  );
 
   if (!message) return null;
 

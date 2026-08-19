@@ -28,8 +28,66 @@ export const CHECKOUT_PLAN_PARAM = "plan";
  * The query parameter the checkout route sends somebody back to the pricing
  * cards with when a session could not be opened. Read by
  * `components/landing/billing-error.tsx`.
+ *
+ * ── It carries a code, never a message ──────────────────────────────────────
+ * The value is one of `BILLING_ERROR_CODES` and nothing else. It used to be the
+ * message itself, which meant the landing page rendered whatever text was in
+ * the query string into a styled alert, and anybody could hand somebody a link
+ * that put words of their choosing on our marketing page under our own
+ * branding. It also meant a raw Stripe error, which can name a price id or an
+ * account, was printed to whoever pressed the button.
+ *
+ * So the wire format is a short opaque code, the copy lives here next to it,
+ * and anything unrecognised falls back to the generic line below.
  */
 export const BILLING_ERROR_PARAM = "billing_error";
+
+export const BILLING_ERROR_CODES = [
+  "already_subscribed",
+  "unknown_plan",
+  "checkout_failed",
+] as const;
+
+export type BillingErrorCode = (typeof BILLING_ERROR_CODES)[number];
+
+/**
+ * What each code says to a person. Deliberately vague about the cause: the
+ * detail that would help debugging is in the server log, where it does not
+ * double as a way to probe our Stripe configuration from the outside.
+ */
+export const BILLING_ERROR_MESSAGES: Record<BillingErrorCode, string> = {
+  already_subscribed:
+    "Your account is already on a plan that covers this one, so there is nothing to buy.",
+  unknown_plan: "That is not a plan we sell.",
+  checkout_failed:
+    "Something went wrong opening checkout. Please try that again in a moment.",
+};
+
+/** Shown for a code that is not one of ours, rather than the code itself. */
+export const GENERIC_BILLING_ERROR_MESSAGE =
+  "Something went wrong. Please try that again in a moment.";
+
+export function isBillingErrorCode(value: unknown): value is BillingErrorCode {
+  return (
+    typeof value === "string" &&
+    (BILLING_ERROR_CODES as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * The copy for whatever arrived in the query string, or null when nothing did.
+ *
+ * Never returns its argument. A value that is not a code we issued still gets a
+ * message, because a person who somehow reached this state is better served by
+ * a vague sentence than by silence, but it is our sentence and not theirs.
+ */
+export function billingErrorMessageFor(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+
+  return isBillingErrorCode(value)
+    ? BILLING_ERROR_MESSAGES[value]
+    : GENERIC_BILLING_ERROR_MESSAGE;
+}
 
 /**
  * Just enough of an environment to look a variable up in. Narrower than
@@ -102,6 +160,40 @@ export function isPaidPlanSlug(value: unknown): value is PaidPlanSlug {
 /** The plan for a slug, or null when the slug is not one we sell. */
 export function paidPlanFor(value: unknown): PaidPlan | null {
   return isPaidPlanSlug(value) ? PAID_PLANS[value] : null;
+}
+
+/**
+ * How the tiers order against each other, for deciding whether a purchase would
+ * be buying something the person already has.
+ *
+ * The Season Pass outranks Starter on both of the axes that matter: it costs
+ * more up front and it carries 500 applications against 150. Ordering them is
+ * not a claim that one replaces the other, only that somebody holding the pass
+ * pressing "Get Starter" is far more likely to be double buying by accident
+ * than to be deliberately taking a smaller allowance as well.
+ */
+export const PLAN_RANK: Record<PlanSlug, number> = {
+  free: 0,
+  starter: 1,
+  season_pass: 2,
+};
+
+/** Whatever `profiles.plan` held, narrowed to a slug we understand. */
+export function planSlugOf(value: unknown): PlanSlug {
+  return isPaidPlanSlug(value) ? value : "free";
+}
+
+/**
+ * Whether the plan somebody is already on makes buying `wanted` a duplicate.
+ *
+ * True when they hold a paid plan of the same tier or better. Pressing "Get
+ * Starter" twice is the case this exists for: without it the second press opens
+ * a second Checkout Session and Stripe will happily create a second live
+ * subscription against the same card, billing the person $29 a month twice for
+ * one account. Upgrading is still allowed, because that is a real thing to want.
+ */
+export function alreadyCoveredBy(current: PlanSlug, wanted: PaidPlanSlug): boolean {
+  return PLAN_RANK[current] > 0 && PLAN_RANK[current] >= PLAN_RANK[wanted];
 }
 
 /**

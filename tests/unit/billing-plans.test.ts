@@ -12,11 +12,17 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  BILLING_ERROR_CODES,
+  BILLING_ERROR_MESSAGES,
+  GENERIC_BILLING_ERROR_MESSAGE,
   LAPSED_PLAN_CAP,
   PAID_PLANS,
   PAID_PLAN_SLUGS,
+  alreadyCoveredBy,
+  billingErrorMessageFor,
   isPaidPlanSlug,
   paidPlanFor,
+  planSlugOf,
   priceIdFor,
 } from "@/lib/billing/plans";
 import {
@@ -184,5 +190,97 @@ describe("buildCheckoutSessionParams", () => {
 
     expect(params.customer).toBeUndefined();
     expect(params.customer_email).toBe("someone@university.edu");
+  });
+});
+
+// ───────────────────────────────────
+// Not selling somebody what they already have
+// ───────────────────────────────────
+
+/**
+ * The bug this guards: pressing "Get Starter" twice created two live $29 a
+ * month subscriptions against the same card. Stripe has no objection to that,
+ * and the webhook writes the same plan for both, so nothing downstream notices
+ * until the second charge appears on a statement.
+ */
+describe("alreadyCoveredBy", () => {
+  it("refuses to sell the same plan twice", () => {
+    expect(alreadyCoveredBy("starter", "starter")).toBe(true);
+    expect(alreadyCoveredBy("season_pass", "season_pass")).toBe(true);
+  });
+
+  it("refuses to sell a smaller plan to somebody holding a bigger one", () => {
+    expect(alreadyCoveredBy("season_pass", "starter")).toBe(true);
+  });
+
+  it("still lets somebody upgrade", () => {
+    expect(alreadyCoveredBy("starter", "season_pass")).toBe(false);
+  });
+
+  it("sells anything to somebody on the free tier", () => {
+    for (const slug of PAID_PLAN_SLUGS) {
+      expect(alreadyCoveredBy("free", slug)).toBe(false);
+    }
+  });
+});
+
+describe("planSlugOf", () => {
+  it("reads a paid plan back as itself", () => {
+    expect(planSlugOf("starter")).toBe("starter");
+    expect(planSlugOf("season_pass")).toBe("season_pass");
+  });
+
+  it("treats anything it does not recognise as free", () => {
+    // Fail open on the guard rather than closed: a column holding something
+    // unexpected must not lock a person out of buying anything at all.
+    expect(planSlugOf("free")).toBe("free");
+    expect(planSlugOf(null)).toBe("free");
+    expect(planSlugOf(undefined)).toBe("free");
+    expect(planSlugOf("enterprise")).toBe("free");
+  });
+});
+
+// ───────────────────────────────────
+// The billing error parameter
+// ───────────────────────────────────
+
+/**
+ * `?billing_error=` used to be the message itself, rendered straight into a
+ * styled alert on the landing page. Anybody could therefore hand somebody a
+ * jobinno.app link that put a sentence of their choosing on our own marketing
+ * page, wearing our own branding.
+ */
+describe("billingErrorMessageFor", () => {
+  it("has copy for every code it can issue", () => {
+    for (const code of BILLING_ERROR_CODES) {
+      expect(BILLING_ERROR_MESSAGES[code]).toBeTruthy();
+      expect(billingErrorMessageFor(code)).toBe(BILLING_ERROR_MESSAGES[code]);
+    }
+  });
+
+  it("shows nothing at all when the parameter is absent", () => {
+    expect(billingErrorMessageFor(null)).toBeNull();
+    expect(billingErrorMessageFor(undefined)).toBeNull();
+    expect(billingErrorMessageFor("")).toBeNull();
+  });
+
+  it("never renders back what it was handed", () => {
+    const attacks = [
+      "Your account has been suspended. Call 555 0100 to restore it.",
+      "<img src=x onerror=alert(1)>",
+      "checkout_failed_but_not_really",
+      "  already_subscribed  ",
+    ];
+
+    for (const attack of attacks) {
+      const message = billingErrorMessageFor(attack);
+      expect(message).toBe(GENERIC_BILLING_ERROR_MESSAGE);
+      expect(message).not.toContain(attack);
+    }
+  });
+
+  it("refuses a non string without throwing", () => {
+    expect(billingErrorMessageFor(42)).toBeNull();
+    expect(billingErrorMessageFor({ toString: () => "already_subscribed" })).toBeNull();
   });
 });
