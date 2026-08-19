@@ -30,10 +30,12 @@ const USER_ID = "11111111-2222-3333-4444-555555555555";
 const CUSTOMER_ID = "cus_test_123";
 
 /**
- * A secret this file invents, used both to sign and to verify. It is not a real
- * Stripe secret and never reaches a network.
+ * The secret this file signs with and verifies against. Spelled out rather than
+ * random looking on purpose: it is not a Stripe secret, it never reaches a
+ * network, and a reviewer or a secret scanner should be able to tell that at a
+ * glance. Stripe's HMAC does not care what the string is.
  */
-const TEST_SIGNING_SECRET = "whsec_ItsPtIVEuvBl4Fh8U1TdcVpVpTfsyBUt";
+const TEST_SIGNING_SECRET = "whsec_this_is_not_a_real_secret_only_for_tests";
 
 // ───────────────────────────────────
 // Fixtures
@@ -211,7 +213,7 @@ describe("signature verification", () => {
     // every delivery, and this is what that failure looks like.
     const header = stripe.webhooks.generateTestHeaderString({
       payload,
-      secret: "whsec_a_completely_different_endpoint_secret",
+      secret: "whsec_a_different_secret_also_not_real",
     });
 
     await expect(
