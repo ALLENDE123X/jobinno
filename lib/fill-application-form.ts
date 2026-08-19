@@ -130,8 +130,8 @@
  * it**: `corroborate()` still reads only `tag`, `type` and `haystack`, and
  * nothing here clicks anything that submits an application.
  *
- * Targets the **actinno** Supabase project (`oihpglvvzzmjigxrlmfz`), with the
- * same guard shape as every other module here.
+ * Targets Jobinno's own Supabase project, guarded by the shared
+ * `assertSupabaseProject()` check every module here imports.
  */
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";

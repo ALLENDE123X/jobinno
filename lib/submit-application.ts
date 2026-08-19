@@ -61,8 +61,8 @@
  * instruction a model gets from this module that can reach an action
  * (`INSTRUCTIONS.SUBMIT_APPLICATION`) is a compile-time constant.
  *
- * Targets the **actinno** Supabase project (`oihpglvvzzmjigxrlmfz`), with the
- * same guard shape as every other module here.
+ * Targets Jobinno's own Supabase project, guarded by the shared
+ * `assertSupabaseProject()` check every module here imports.
  */
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
