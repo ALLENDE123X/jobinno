@@ -79,6 +79,18 @@ jobs:
       - name: Push database schema
         run: npx drizzle-kit push
 
+      - name: Apply the hand written privilege migration
+        # `drizzle-kit push` diffs `lib/db/schema.ts`, and the Drizzle schema DSL
+        # has no way to say GRANT or REVOKE, so the one hand written migration in
+        # `drizzle/` is invisible to it. Applied here by name, after the push that
+        # creates the table it grants on. A later privilege migration needs its
+        # own line here; there is deliberately no glob, because silently applying
+        # whatever happens to be in the directory is how a migration nobody meant
+        # to run in CI ends up running in CI.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0003_profiles_column_privileges.sql
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -145,6 +157,18 @@ jobs:
 
       - name: Push database schema
         run: npx drizzle-kit push
+
+      - name: Apply the hand written privilege migration
+        # `drizzle-kit push` diffs `lib/db/schema.ts`, and the Drizzle schema DSL
+        # has no way to say GRANT or REVOKE, so the one hand written migration in
+        # `drizzle/` is invisible to it. Applied here by name, after the push that
+        # creates the table it grants on. A later privilege migration needs its
+        # own line here; there is deliberately no glob, because silently applying
+        # whatever happens to be in the directory is how a migration nobody meant
+        # to run in CI ends up running in CI.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0003_profiles_column_privileges.sql
 
       - name: Build
         run: npm run build

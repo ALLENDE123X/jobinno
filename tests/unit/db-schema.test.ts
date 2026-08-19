@@ -35,6 +35,46 @@ const TABLES = [
  */
 const RLS_TABLES = TABLES;
 
+/**
+ * The columns on `profiles` that the browser side must never be able to write,
+ * and the reason `drizzle/0003_profiles_column_privileges.sql` exists. A policy
+ * restricts rows and nothing else, so without a column privilege behind it an
+ * authenticated user can PATCH any column of the row they already own.
+ *
+ * `plan`, `applications_used` and `applications_cap` are billing state, which
+ * JOB-010 will start trusting. `attested_at` is the completion gate on
+ * `/onboarding`, and it is already trusted today.
+ */
+const PROFILE_SYSTEM_COLUMNS = [
+  "applications_cap",
+  "applications_used",
+  "attested_at",
+  "plan",
+] as const;
+
+/**
+ * The other side of the same fence: what a person answers about themselves and
+ * has to stay able to edit. `id` is here because the `with check` on
+ * `profiles_update_own` already pins it to `auth.uid()`, so a grant on it
+ * cannot move a row to another owner.
+ */
+const PROFILE_USER_COLUMNS = [
+  "citizenship_status",
+  "created_at",
+  "current_city",
+  "current_country",
+  "earliest_start",
+  "email",
+  "f1_status",
+  "grad_date",
+  "id",
+  "requires_sponsorship",
+  "target_locations",
+  "updated_at",
+  "willing_to_relocate",
+  "work_authorized_us",
+] as const;
+
 const POLICIES: Record<string, string[]> = {
   applications: ["applications_insert_own", "applications_select_own"],
   boards: ["boards_select_all"],
@@ -100,6 +140,56 @@ suite("database schema", () => {
       where schemaname = 'public' and tablename = 'skip_log'
     `;
     expect(rows.map((row) => row.cmd)).toEqual(["SELECT"]);
+  });
+
+  describe("column privileges on profiles", () => {
+    /** Which columns of `public.profiles` a role may write. */
+    async function updatableBy(grantee: string) {
+      const rows = await sql<{ column_name: string }[]>`
+        select column_name
+        from information_schema.column_privileges
+        where table_schema = 'public'
+          and table_name = 'profiles'
+          and privilege_type = 'UPDATE'
+          and grantee = ${grantee}
+      `;
+      return rows.map((row) => row.column_name).sort();
+    }
+
+    it("gives authenticated exactly the columns a person owns and no others", async () => {
+      // Asserted as an exact set rather than as four absences on purpose. A new
+      // column on this table has to be classified by whoever adds it, and a
+      // test that only checks the four already known about would let the next
+      // `applications_cap` through without a word.
+      expect(await updatableBy("authenticated")).toEqual(
+        [...PROFILE_USER_COLUMNS].sort()
+      );
+    });
+
+    it("gives authenticated no way to write the system controlled columns", async () => {
+      const updatable = new Set(await updatableBy("authenticated"));
+      for (const column of PROFILE_SYSTEM_COLUMNS) {
+        expect(updatable.has(column)).toBe(false);
+      }
+    });
+
+    it("leaves the system controlled columns writable by the service role", async () => {
+      // The attestation stamp in `app/onboarding/actions.ts` goes through this
+      // role, and Stripe's webhook will write `plan` through it later. A revoke
+      // that caught the service role too would be a locked door with the key
+      // thrown away.
+      const updatable = new Set(await updatableBy("service_role"));
+      for (const column of PROFILE_SYSTEM_COLUMNS) {
+        expect(updatable.has(column)).toBe(true);
+      }
+    });
+
+    it("gives anon no way to update profiles at all", async () => {
+      // RLS refuses these already, there being no update policy for `anon`. The
+      // grant is revoked anyway so that the next policy added to this table
+      // cannot hand out column access nobody meant to hand out.
+      expect(await updatableBy("anon")).toEqual([]);
+    });
   });
 
   it("keeps applications immutable from the browser side", async () => {

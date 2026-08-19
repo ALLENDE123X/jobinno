@@ -7,7 +7,7 @@
 -- hand applied statement is invisible to drizzle's own bookkeeping and the
 -- next `generate` then produces a migration that fights the database.
 --
--- Three things the schema needs that a bare `postgres:15` image does not have:
+-- Four things the schema needs that a bare `postgres:15` image does not have:
 --
 --   1. `auth.users`, which `profiles.id` has a foreign key to.
 --   2. The `anon`, `authenticated` and `service_role` roles that every policy
@@ -15,6 +15,12 @@
 --      role is missing.
 --   3. `auth.uid()`, which the policy expressions call. Postgres resolves the
 --      function at CREATE POLICY time, not at query time.
+--   4. The blanket table grants Supabase hands those three roles on everything
+--      it creates in `public`. Without them CI would start from a locked down
+--      database the real project looks nothing like, and the column privilege
+--      assertions in `tests/unit/db-schema.test.ts` would pass for the wrong
+--      reason: they would be testing a database where nobody was ever granted
+--      anything, rather than one where the grant was taken back.
 --
 -- The definitions are the thinnest possible stand ins. They exist so that the
 -- DDL parses and applies, not so that anything can be signed in.
@@ -45,3 +51,18 @@ BEGIN
     END IF;
 END
 $roles$;
+
+-- What Supabase gives its three roles on a table in `public`, reproduced for
+-- the tables `drizzle-kit push` is about to create. Default privileges rather
+-- than `GRANT ON ALL TABLES` because this file runs before the tables exist,
+-- and they attach to whatever the same role creates afterwards, which is what
+-- `push` does.
+--
+-- This is the state the real project is in, table wide UPDATE included, and
+-- reproducing it is the point: migration `0003_profiles_column_privileges`
+-- takes that grant back on `profiles`, and a test cannot tell a revoke apart
+-- from a grant that was never made unless the grant was made first.
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL ON TABLES TO anon, authenticated, service_role;
