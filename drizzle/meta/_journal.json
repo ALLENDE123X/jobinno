@@ -12,8 +12,29 @@
     {
       "idx": 1,
       "version": "7",
-      "when": 1787126261353,
-      "tag": "0001_charming_mister_fear",
+      "when": 1787126147991,
+      "tag": "0001_big_spacker_dave",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787126887029,
+      "tag": "0002_concerned_firebrand",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1787164098535,
+      "tag": "0003_profiles_column_privileges",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1787167270091,
+      "tag": "0004_calm_banshee",
       "breakpoints": true
     }
   ]

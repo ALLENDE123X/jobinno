@@ -1,6 +1,6 @@
 {
-  "id": "87398e6d-cea0-4f6a-85ec-83d4dda21083",
-  "prevId": "7053a2aa-2017-477d-a26b-41de7cfce3ef",
+  "id": "92f759ca-ac79-4454-891b-354d21651d62",
+  "prevId": "12d3219b-c97f-4cde-8312-29642b386f86",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -72,9 +72,9 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
+          "with": {},
           "method": "btree",
-          "with": {}
+          "concurrently": false
         },
         "applications_job_id_idx": {
           "name": "applications_job_id_idx",
@@ -87,37 +87,37 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
+          "with": {},
           "method": "btree",
-          "with": {}
+          "concurrently": false
         }
       },
       "foreignKeys": {
         "applications_user_id_profiles_id_fk": {
           "name": "applications_user_id_profiles_id_fk",
           "tableFrom": "applications",
-          "tableTo": "profiles",
           "columnsFrom": [
             "user_id"
           ],
+          "tableTo": "profiles",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "cascade"
         },
         "applications_job_id_jobs_id_fk": {
           "name": "applications_job_id_jobs_id_fk",
           "tableFrom": "applications",
-          "tableTo": "jobs",
           "columnsFrom": [
             "job_id"
           ],
+          "tableTo": "jobs",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "cascade"
         }
       },
       "compositePrimaryKeys": {},
@@ -194,11 +194,11 @@
       "uniqueConstraints": {
         "boards_ats_board_token_key": {
           "name": "boards_ats_board_token_key",
-          "nullsNotDistinct": false,
           "columns": [
             "ats",
             "board_token"
-          ]
+          ],
+          "nullsNotDistinct": false
         }
       },
       "policies": {
@@ -271,24 +271,24 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
+          "with": {},
           "method": "btree",
-          "with": {}
+          "concurrently": false
         }
       },
       "foreignKeys": {
         "feedback_user_id_profiles_id_fk": {
           "name": "feedback_user_id_profiles_id_fk",
           "tableFrom": "feedback",
-          "tableTo": "profiles",
           "columnsFrom": [
             "user_id"
           ],
+          "tableTo": "profiles",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "set null",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "set null"
         }
       },
       "compositePrimaryKeys": {},
@@ -414,35 +414,35 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
+          "with": {},
           "method": "btree",
-          "with": {}
+          "concurrently": false
         }
       },
       "foreignKeys": {
         "jobs_board_id_boards_id_fk": {
           "name": "jobs_board_id_boards_id_fk",
           "tableFrom": "jobs",
-          "tableTo": "boards",
           "columnsFrom": [
             "board_id"
           ],
+          "tableTo": "boards",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "cascade"
         }
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
         "jobs_ats_external_id_key": {
           "name": "jobs_ats_external_id_key",
-          "nullsNotDistinct": false,
           "columns": [
             "ats",
             "external_id"
-          ]
+          ],
+          "nullsNotDistinct": false
         }
       },
       "policies": {
@@ -560,6 +560,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "attested_at": {
+          "name": "attested_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",
@@ -580,16 +586,16 @@
         "profiles_id_users_id_fk": {
           "name": "profiles_id_users_id_fk",
           "tableFrom": "profiles",
-          "tableTo": "users",
-          "schemaTo": "auth",
           "columnsFrom": [
             "id"
           ],
+          "tableTo": "users",
+          "schemaTo": "auth",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "cascade"
         }
       },
       "compositePrimaryKeys": {},
@@ -680,24 +686,24 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
+          "with": {},
           "method": "btree",
-          "with": {}
+          "concurrently": false
         }
       },
       "foreignKeys": {
         "resumes_user_id_profiles_id_fk": {
           "name": "resumes_user_id_profiles_id_fk",
           "tableFrom": "resumes",
-          "tableTo": "profiles",
           "columnsFrom": [
             "user_id"
           ],
+          "tableTo": "profiles",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "cascade"
         }
       },
       "compositePrimaryKeys": {},
@@ -804,9 +810,9 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
+          "with": {},
           "method": "btree",
-          "with": {}
+          "concurrently": false
         },
         "skip_log_job_id_idx": {
           "name": "skip_log_job_id_idx",
@@ -819,37 +825,37 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
+          "with": {},
           "method": "btree",
-          "with": {}
+          "concurrently": false
         }
       },
       "foreignKeys": {
         "skip_log_application_id_applications_id_fk": {
           "name": "skip_log_application_id_applications_id_fk",
           "tableFrom": "skip_log",
-          "tableTo": "applications",
           "columnsFrom": [
             "application_id"
           ],
+          "tableTo": "applications",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "cascade"
         },
         "skip_log_job_id_jobs_id_fk": {
           "name": "skip_log_job_id_jobs_id_fk",
           "tableFrom": "skip_log",
-          "tableTo": "jobs",
           "columnsFrom": [
             "job_id"
           ],
+          "tableTo": "jobs",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "cascade"
         }
       },
       "compositePrimaryKeys": {},
@@ -906,10 +912,10 @@
     }
   },
   "schemas": {},
+  "views": {},
   "sequences": {},
   "roles": {},
   "policies": {},
-  "views": {},
   "_meta": {
     "columns": {},
     "schemas": {},

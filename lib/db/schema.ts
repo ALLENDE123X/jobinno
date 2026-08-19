@@ -173,9 +173,40 @@ export const profiles = pgTable(
     currentCity: text("current_city"),
     currentCountry: text("current_country"),
     willingToRelocate: boolean("willing_to_relocate"),
+    /**
+     * Added by JOB-007, because the intake form asks for it and there was
+     * nowhere to put the answer. `willing_to_relocate` on its own is a yes or a
+     * no with no destination attached, and "yes, anywhere in the US" and "yes,
+     * but only to New York" are different instructions to a search that has to
+     * decide which listings are worth opening.
+     *
+     * A `text[]` rather than a join table: these are place names a person
+     * typed, not entities anything joins against, and the only question ever
+     * asked of them is whether a listing's location looks like one of them.
+     * Null means the question has not been answered yet, which is a different
+     * state from an empty array meaning nowhere in particular.
+     */
+    targetLocations: text("target_locations").array(),
 
     gradDate: date("grad_date"),
     earliestStart: date("earliest_start"),
+
+    /**
+     * When the person confirmed their intake is accurate and authorized us to
+     * apply on their behalf. Added by JOB-007.
+     *
+     * A column rather than a checkbox the form merely insists on, because the
+     * attestation is what every generated answer stands on. HARD STOP 9 says no
+     * answer may contain a fact the intake does not support, and the reason
+     * that matters is that submitting an application is the applicant asserting
+     * it is all true. If nothing records that they ever asserted it, the
+     * pipeline has no way to check before it submits, and the checkbox was
+     * decoration after all.
+     *
+     * Null means not yet attested, which is the state of any profile row
+     * created at signup and not yet taken through intake.
+     */
+    attestedAt: timestamp("attested_at", { withTimezone: true }),
 
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()

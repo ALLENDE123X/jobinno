@@ -1,6 +1,6 @@
 {
-  "id": "87398e6d-cea0-4f6a-85ec-83d4dda21083",
-  "prevId": "7053a2aa-2017-477d-a26b-41de7cfce3ef",
+  "id": "5686bd06-dbb3-4542-9972-75138014ff17",
+  "prevId": "92f759ca-ac79-4454-891b-354d21651d62",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -215,6 +215,110 @@
       },
       "checkConstraints": {},
       "isRLSEnabled": false
+    },
+    "public.cached_form_actions": {
+      "name": "cached_form_actions",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "ats": {
+          "name": "ats",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "form_fingerprint": {
+          "name": "form_fingerprint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "shape_version": {
+          "name": "shape_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "shape_tokens": {
+          "name": "shape_tokens",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "actions": {
+          "name": "actions",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "replay_hits": {
+          "name": "replay_hits",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "replay_invalidations": {
+          "name": "replay_invalidations",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "cached_form_actions_ats_idx": {
+          "name": "cached_form_actions_ats_idx",
+          "columns": [
+            {
+              "expression": "ats",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "cached_form_actions_ats_fingerprint_key": {
+          "name": "cached_form_actions_ats_fingerprint_key",
+          "nullsNotDistinct": false,
+          "columns": [
+            "ats",
+            "form_fingerprint"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
     },
     "public.feedback": {
       "name": "feedback",
@@ -557,6 +661,12 @@
         "earliest_start": {
           "name": "earliest_start",
           "type": "date",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attested_at": {
+          "name": "attested_at",
+          "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
         },

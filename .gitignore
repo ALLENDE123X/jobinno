@@ -65,3 +65,7 @@ review.md
 CONTEXT.md
 output.txt
 *.log
+
+# Supabase CLI scratch state. `supabase/config.toml` is the tracked artefact;
+# everything the CLI caches next to it is machine local.
+supabase/.temp/

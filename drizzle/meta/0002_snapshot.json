@@ -1,6 +1,6 @@
 {
-  "id": "87398e6d-cea0-4f6a-85ec-83d4dda21083",
-  "prevId": "7053a2aa-2017-477d-a26b-41de7cfce3ef",
+  "id": "12d3219b-c97f-4cde-8312-29642b386f86",
+  "prevId": "87398e6d-cea0-4f6a-85ec-83d4dda21083",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -557,6 +557,12 @@
         "earliest_start": {
           "name": "earliest_start",
           "type": "date",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attested_at": {
+          "name": "attested_at",
+          "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
         },
