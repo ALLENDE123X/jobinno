@@ -218,7 +218,7 @@ export function browserConcurrencyLimit(env: EnvSource = process.env): number {
  * Deliberately no shared instance, no keepalive, no pool: a browser nobody else
  * can reach is what makes a hijack-defence layer unnecessary, and it is also
  * what makes `applyToJob`'s `concurrency.limit` in
- * `inngest/job-application-pipeline.ts` safe — N calls are N browsers, with N
+ * `inngest/job-application-pipeline.ts` safe: N calls are N browsers, with N
  * temp profiles locally and N isolated remote sessions on Browserbase.
  *
  * `port` and `userDataDir` are deliberately left unset on the local path.
