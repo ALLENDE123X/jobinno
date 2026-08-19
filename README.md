@@ -43,8 +43,14 @@ app/                  Next.js App Router pages and routes
 components/           shadcn/ui components
 inngest/              the durable pipeline that runs one application end to end
 lib/                  the application engine, ported from the actinno project
+  auth/               where a magic link is allowed to land
   db/                 Drizzle schema
   future-gmail/       V2 reference code, not wired up (see that folder's README)
+  onboarding/         the intake schema both halves of the form validate against
+  supabase/           the browser, session, and service role clients
+middleware.ts         keeps the Supabase session fresh ahead of every page
+scripts/              one off setup that is not a schema migration
+supabase/config.toml  Supabase Auth settings, pushed rather than clicked
 tests/unit/           Vitest
 tests/e2e/            Playwright
 ```
@@ -69,9 +75,35 @@ npm run test:e2e     # Playwright
 npm run db:generate  # write a migration for the current schema
 npm run db:migrate   # apply pending migrations
 npm run db:push      # push the schema straight to Postgres, no migration file
+
+npm run db:storage-bucket    # create the private resumes bucket, then read it back
+npm run supabase:auth-config # push supabase/config.toml to the project, then diff it
 ```
 
 Schema changes go through `db:generate` and then `db:migrate`, always in that order and always both. `db:push` is for a scratch database only. Applying SQL to a real database by hand leaves drizzle's own bookkeeping table behind, and every migration after that fights the database instead of describing it.
+
+## Signing in
+
+There are no passwords. You enter an email, Supabase sends a link, and
+`app/auth/callback/route.ts` turns that link into a session.
+
+One thing about this is worth knowing before you touch it. The `emailRedirectTo`
+that the sign in call passes reads like an ordinary parameter and is not one:
+Supabase checks it against the project's redirect allowlist, and when it does
+not match it substitutes the project Site URL and reports success anyway.
+Nothing throws and nothing logs. The only symptom is a link in somebody's inbox
+that goes nowhere useful.
+
+So the allowlist is declared in two places that a test keeps in agreement:
+`AUTH_REDIRECT_ALLOWLIST` in `lib/auth/redirect-urls.ts`, which is what the app
+will ask for, and `additional_redirect_urls` in `supabase/config.toml`, which is
+what the project permits. Adding an origin means adding it to both and then
+running `npm run supabase:auth-config`. That command prints a diff against the
+live project and reports that the remote is up to date once it matches, so it
+doubles as the way to check what the project currently allows.
+
+Running the app on any other origin, a second dev server on port 3001 for
+instance, raises an error naming the fix rather than sending a dead link.
 
 ## Where the engine came from
 
@@ -84,7 +116,7 @@ Two pieces of that port are worth knowing about before reading the code:
 
 ## Status
 
-Early. The engine works, the scaffold is up, and the database schema and its row level security policies are live. The dashboard, billing, and the wiring between them are all still ahead.
+Early. The engine works, the scaffold is up, the database schema and its row level security policies are live, and you can now sign in and complete intake. The dashboard, billing, and the wiring between them are all still ahead.
 
 ## A note on style
 

@@ -1,0 +1,59 @@
+project_id = "efyubrtiptcsrhfakbwc"
+
+# Supabase Auth configuration, kept in the repository rather than only in the
+# dashboard.
+#
+# Why this file exists at all: `emailRedirectTo` on `signInWithOtp` is not a
+# free text field. Supabase compares it against the project's redirect
+# allowlist, and when it does not match it silently substitutes `site_url`
+# instead of returning an error. The failure mode is therefore not a broken
+# call, it is a magic link that arrives in a real person's inbox and lands them
+# somewhere that cannot complete a session. A sibling project lost time to
+# exactly that, so the allowlist is declared here where a reviewer can see it,
+# and pushed with `npm run supabase:auth-config`.
+#
+# Every entry below is a URL the app actually asks for. Adding one here is the
+# only thing that makes the matching `emailRedirectTo` work.
+[auth]
+enabled = true
+site_url = "https://jobinno.app"
+additional_redirect_urls = [
+  "http://localhost:3000/auth/callback",
+  "https://jobinno.app/auth/callback",
+]
+
+# Everything from here down restates what the project already has set. It is
+# spelled out rather than left off because `config push` sends the whole auth
+# block, filling anything absent with the CLI's own defaults: leaving a key out
+# does not mean "leave it alone", it means "reset it". The first run of this
+# file, before these lines were added, was about to turn TOTP enrollment off and
+# shorten the email one time code from eight digits to six purely by omission.
+#
+# So when a reviewer reads a value here that nobody asked for, that is why. Keep
+# it matching the project unless a ticket is deliberately changing it.
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+refresh_token_reuse_interval = 10
+
+# Signing up is how a user gets here in the first place, and there are no
+# passwords anywhere in Jobinno, so the only credential is the emailed link.
+enable_signup = true
+enable_anonymous_sign_ins = false
+enable_manual_linking = false
+
+[auth.mfa.totp]
+enroll_enabled = true
+verify_enabled = true
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = true
+secure_password_change = false
+max_frequency = "1m"
+otp_length = 8
+otp_expiry = 3600
+
+[auth.sms]
+enable_signup = false
+enable_confirmations = false

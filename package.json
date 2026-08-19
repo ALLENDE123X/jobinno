@@ -13,6 +13,8 @@
     "db:push": "drizzle-kit push",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
+    "db:storage-bucket": "tsx scripts/setup-storage-bucket.ts",
+    "supabase:auth-config": "npx --yes supabase@2.115.0 config push --project-ref efyubrtiptcsrhfakbwc",
     "intake": "tsx lib/intake-cli.ts",
     "fill-form": "tsx lib/fill-form-cli.ts",
     "submit-application": "tsx lib/submit-application-cli.ts",
@@ -21,6 +23,7 @@
   },
   "dependencies": {
     "@browserbasehq/stagehand": "^4.0.1",
+    "@supabase/ssr": "^0.12.4",
     "@supabase/supabase-js": "^2.112.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
