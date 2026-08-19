@@ -11,16 +11,20 @@
  * numbers are in the initial HTML.
  */
 
+import { Suspense } from "react";
+
 import Link from "next/link";
 import { ArrowRight, Check, Clock, Moon, ShieldCheck } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { DotPattern } from "@/components/ui/dot-pattern";
 import { ApplicationFeed } from "@/components/landing/application-feed";
+import { BillingError } from "@/components/landing/billing-error";
 import { PipelineDiagram } from "@/components/landing/pipeline-diagram";
 import { StatsBand } from "@/components/landing/stats-band";
 import { Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme";
+import { CHECKOUT_PATH, CHECKOUT_PLAN_PARAM } from "@/lib/billing/plans";
 import { cn } from "@/lib/utils";
 
 /**
@@ -29,6 +33,10 @@ import { cn } from "@/lib/utils";
  */
 const PLANS = [
   {
+    // `slug` is what the checkout route is handed. The two paid ones match the
+    // `plan_tier` enum and the catalog in `lib/billing/plans.ts`; `free` is not
+    // sold and has no Stripe price behind it.
+    slug: "free",
     name: "Free",
     price: "$0",
     cadence: "to try it",
@@ -42,6 +50,7 @@ const PLANS = [
     featured: false,
   },
   {
+    slug: "starter",
     name: "Starter",
     price: "$29",
     cadence: "per month",
@@ -56,6 +65,7 @@ const PLANS = [
     featured: true,
   },
   {
+    slug: "season_pass",
     name: "Season Pass",
     price: "$99",
     cadence: "one time",
@@ -267,6 +277,12 @@ export default function Home() {
             </p>
           </div>
 
+          {/* Suspended so that reading the query string here does not make the
+              whole landing page render on demand. See billing-error.tsx. */}
+          <Suspense fallback={null}>
+            <BillingError />
+          </Suspense>
+
           <div className="mt-12 grid gap-6 md:grid-cols-3">
             {PLANS.map((plan) => (
               <div
@@ -310,14 +326,36 @@ export default function Home() {
                   ))}
                 </ul>
 
-                <Button
-                  className="mt-8 h-10 w-full text-sm"
-                  variant={plan.featured ? "default" : "outline"}
-                  size="lg"
-                  asChild
-                >
-                  <Link href="/login">{plan.cta}</Link>
-                </Button>
+                {plan.slug === "free" ? (
+                  <Button
+                    className="mt-8 h-10 w-full text-sm"
+                    variant={plan.featured ? "default" : "outline"}
+                    size="lg"
+                    asChild
+                  >
+                    <Link href="/login">{plan.cta}</Link>
+                  </Button>
+                ) : (
+                  // A plain form post rather than an onClick, so the button
+                  // needs no client JavaScript and this page stays a server
+                  // component. The route checks the session and sends somebody
+                  // who is signed out to sign in first, then back here.
+                  <form action={CHECKOUT_PATH} method="post" className="mt-8">
+                    <input
+                      type="hidden"
+                      name={CHECKOUT_PLAN_PARAM}
+                      value={plan.slug}
+                    />
+                    <Button
+                      type="submit"
+                      className="h-10 w-full text-sm"
+                      variant={plan.featured ? "default" : "outline"}
+                      size="lg"
+                    >
+                      {plan.cta}
+                    </Button>
+                  </form>
+                )}
               </div>
             ))}
           </div>
