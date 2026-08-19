@@ -1,11 +1,12 @@
 /**
  * ACT-003 — candidate intake: resume upload + `candidates` row.
  *
- * Targets the **actinno** Supabase project (`oihpglvvzzmjigxrlmfz`) — see
- * `.env.example`. The `meminno` project (`hlaeqvuyapkvixwaqxcs`) is a separate
- * live product on the same account; `assertActinnoProject()` below exists
- * specifically to make pointing this code at it a hard failure rather than a
- * silent write. The README's "meminno project" line is stale.
+ * Targets the Supabase project named by `EXPECTED_SUPABASE_PROJECT_REF`, see
+ * `.env.example`. JOB-002 moved that from a literal in this file into the
+ * environment, and `assertSupabaseProject()` in `lib/supabase-project-guard.ts`
+ * still makes pointing this code at any other project a hard failure rather
+ * than a silent write. That matters because more than one live product shares
+ * the Supabase account. The README's "meminno project" line is stale.
  *
  * Storage layout: bucket `resumes` (private), object key `{candidateId}.pdf`.
  * `candidates.resume_url` stores the bucket-qualified path
@@ -22,14 +23,9 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 export const RESUMES_BUCKET = "resumes";
-
-/**
- * Project ref this module is allowed to write to. If the actinno project ever
- * moves, change this one constant together with `SUPABASE_URL`.
- */
-const EXPECTED_PROJECT_REF = "oihpglvvzzmjigxrlmfz";
 
 /** Storage's own default cap is 50MB; fail early with a readable message. */
 const MAX_RESUME_BYTES = 25 * 1024 * 1024;
@@ -140,40 +136,16 @@ export type CandidateIntakeResult = {
   };
 };
 
-/**
- * Guards against writing to the wrong Supabase project. Accepts the actinno
- * project ref, or a local/self-hosted Supabase (localhost / 127.0.0.1).
- */
-function assertActinnoProject(rawUrl: string): void {
-  let host: string;
-  try {
-    host = new URL(rawUrl).hostname;
-  } catch {
-    throw new Error(`SUPABASE_URL is not a valid URL: ${rawUrl}`);
-  }
-
-  if (host === "localhost" || host === "127.0.0.1") return;
-
-  const ref = host.split(".")[0];
-  if (ref !== EXPECTED_PROJECT_REF) {
-    throw new Error(
-      `Refusing to run: SUPABASE_URL points at Supabase project "${ref}", ` +
-        `expected the actinno project "${EXPECTED_PROJECT_REF}". ` +
-        `Check .env.local — do not reuse another project's credentials here.`
-    );
-  }
-}
-
 function getSupabaseClient(): SupabaseClient {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) {
     throw new Error(
       "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars are required " +
-        "(actinno project — see .env.example)"
+        "(see .env.example)"
     );
   }
-  assertActinnoProject(url);
+  assertSupabaseProject(url);
 
   // Service-role, server-side only: no session to persist and nothing to
   // refresh. Leaving the defaults on keeps a refresh timer alive and prevents
@@ -423,8 +395,8 @@ export async function intakeCandidate(
  * file's header for why — so something has to turn that id into an
  * `application_email` for `createBoardAccount`, and this module owns the
  * `candidates` table's conventions (the project guard, the private-bucket
- * caveat on `resume_url`). Putting the read anywhere else would mean a sixth
- * copy of `assertActinnoProject`.
+ * caveat on `resume_url`). Putting the read anywhere else would mean a second
+ * guarded Supabase client to keep in step with this one.
  *
  * `resumeUrl` is repeated here with the same caveat it carries on the way in:
  * it is the bucket-qualified path `resumes/{candidateId}.pdf`, not something
@@ -556,7 +528,7 @@ export async function loadCandidate(candidateId: string): Promise<CandidateRecor
  * paste back for every apply. This is the same read keyed on
  * `application_email` instead, and it lives here rather than in the MCP server
  * for the reason given above `loadCandidate` — this module owns the
- * `candidates` table's conventions and the `assertActinnoProject` guard, and a
+ * `candidates` table's conventions and the `assertSupabaseProject` guard, and a
  * second Supabase client elsewhere would be a copy of both.
  *
  * ── Why this can fail on a *successful* query ───────────────────────────────
@@ -729,7 +701,7 @@ async function cleanupOrphanedResume(
 // ── Why a prefix in `resumes` and not its own bucket ───────────────────────
 // `resumes` already exists, is private, and is reachable only by service_role;
 // a second bucket would be a second thing to provision, a second policy to keep
-// in step, and a second name for `assertActinnoProject` to have no opinion
+// in step, and a second name for `assertSupabaseProject` to have no opinion
 // about. `staging/` inside it cannot collide with the real objects, which are
 // `{uuid}.pdf` at the bucket root with no slash in the key, and it means the
 // existing `cleanupOrphanedResume` shape works unchanged.
@@ -1165,8 +1137,8 @@ async function sweepStaleStagedUploads(supabase: SupabaseClient): Promise<number
 // already in `error_message`, written there by the same code that writes every
 // other blocked reason, and this reports what is there. It lives in this module
 // rather than in a new one because this module already owns the Supabase client
-// and `assertActinnoProject`; a separate file would be a fifth copy of that
-// guard, which this repo has said twice that it does not want.
+// and `assertSupabaseProject`; a separate file would be a second guarded
+// client to keep in step, which this repo has said twice it does not want.
 
 export type ApplicationStatusRecord = {
   jobApplicationId: string;

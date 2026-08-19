@@ -185,11 +185,9 @@ import {
   type FormFieldKind,
 } from "@/lib/form-fields";
 import { toApplicationAnswers, type CandidateApplicationAnswers } from "@/lib/candidate-intake";
+import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 const LOG = "[act-007]";
-
-/** Project ref this module is allowed to write to. */
-const EXPECTED_PROJECT_REF = "oihpglvvzzmjigxrlmfz";
 
 // ───────────────────────────────────
 // The instructions — every one a constant
@@ -977,46 +975,16 @@ export type FillApplicationFormResult = {
 // Supabase
 // ───────────────────────────────────
 
-/**
- * Guards against writing to the wrong Supabase project. Same shape as
- * `candidate-intake.ts`'s and `create-board-account.ts`'s — the meminno project
- * (`hlaeqvuyapkvixwaqxcs`) is a separate live product on the same account and
- * must never be written to from here.
- *
- * This is the fourth copy in the repo. It should be lifted into a shared
- * `lib/supabase.ts` together with the other three; that is a change to three
- * modules this ticket has no other reason to touch, so it is flagged rather than
- * done here.
- */
-function assertActinnoProject(rawUrl: string): void {
-  let host: string;
-  try {
-    host = new URL(rawUrl).hostname;
-  } catch {
-    throw new Error(`SUPABASE_URL is not a valid URL: ${rawUrl}`);
-  }
-  if (host === "localhost" || host === "127.0.0.1") return;
-
-  const ref = host.split(".")[0];
-  if (ref !== EXPECTED_PROJECT_REF) {
-    throw new Error(
-      `Refusing to run: SUPABASE_URL points at Supabase project "${ref}", ` +
-        `expected the actinno project "${EXPECTED_PROJECT_REF}". ` +
-        `Check .env.local — do not reuse another project's credentials here.`
-    );
-  }
-}
-
 function getSupabaseClient(): SupabaseClient {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) {
     throw new Error(
       "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars are required " +
-        "(actinno project — see .env.example)"
+        "(see .env.example)"
     );
   }
-  assertActinnoProject(url);
+  assertSupabaseProject(url);
   return createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },
   });

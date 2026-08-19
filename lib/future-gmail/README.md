@@ -26,6 +26,8 @@ The folder is unwired at runtime but not fully isolated at compile time. Two imp
 
 Neither import starts a mailbox poll. Both do pull `googleapis` into the module graph, which costs a second or so of startup.
 
+One thread now runs the other way: `gmail-verification-listener.ts` imports `assertSupabaseProject` from `lib/supabase-project-guard.ts`, which JOB-002 lifted out of the four copies that used to sit inline. It is a check, not a client, and it opens nothing.
+
 ## Rules
 
 * **Do not wire this up without a ticket that explicitly asks for it.** It reads a real person's mailbox. That is a meaningful privacy surface and it needs a deliberate decision, not a passing import.

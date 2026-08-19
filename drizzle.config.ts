@@ -17,4 +17,8 @@ export default defineConfig({
     url: process.env.DATABASE_URL || "",
   },
   schemaFilter: ["public"],
+  // Supabase provisions `anon`, `authenticated` and `service_role` itself, and
+  // the RLS policies in the schema grant to them by name. Without this,
+  // drizzle-kit treats a role it did not create as drift and tries to drop it.
+  entities: { roles: { provider: "supabase" } },
 });

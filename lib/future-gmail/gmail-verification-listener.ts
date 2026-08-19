@@ -65,6 +65,7 @@ import {
   GmailAuthError,
   rethrowAsAuthError,
 } from "@/lib/future-gmail/gmail-client";
+import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 // ───────────────────────────────────
 // Contract with inngest/job-application-pipeline.ts
@@ -598,38 +599,16 @@ export function extractVerification(
 // Supabase (read-only)
 // ───────────────────────────────────
 
-/** Project ref this module is allowed to read from — same guard shape as ACT-003/ACT-005. */
-const EXPECTED_PROJECT_REF = "oihpglvvzzmjigxrlmfz";
-
-function assertActinnoProject(rawUrl: string): void {
-  let host: string;
-  try {
-    host = new URL(rawUrl).hostname;
-  } catch {
-    throw new Error(`SUPABASE_URL is not a valid URL: ${rawUrl}`);
-  }
-  if (host === "localhost" || host === "127.0.0.1") return;
-
-  const ref = host.split(".")[0];
-  if (ref !== EXPECTED_PROJECT_REF) {
-    throw new Error(
-      `Refusing to run: SUPABASE_URL points at Supabase project "${ref}", ` +
-        `expected the actinno project "${EXPECTED_PROJECT_REF}". ` +
-        `Check .env.local — do not reuse another project's credentials here.`
-    );
-  }
-}
-
 export function getSupabaseClient(): SupabaseClient {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) {
     throw new Error(
       "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars are required " +
-        "(actinno project — see .env.example)"
+        "(see .env.example)"
     );
   }
-  assertActinnoProject(url);
+  assertSupabaseProject(url);
 
   return createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },

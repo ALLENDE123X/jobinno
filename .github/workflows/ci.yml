@@ -64,6 +64,12 @@ jobs:
       - name: Build to generate types
         run: npm run build
 
+      - name: Prepare the test database
+        # A bare Postgres image has no `auth.users`, no `auth.uid()` and none of
+        # Supabase's roles, all of which the schema's foreign keys and RLS
+        # policies need before they will apply. See the file's own header.
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/ci-test-db-bootstrap.sql
+
       - name: Push database schema
         run: npx drizzle-kit push
 
@@ -122,6 +128,12 @@ jobs:
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
+
+      - name: Prepare the test database
+        # A bare Postgres image has no `auth.users`, no `auth.uid()` and none of
+        # Supabase's roles, all of which the schema's foreign keys and RLS
+        # policies need before they will apply. See the file's own header.
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/ci-test-db-bootstrap.sql
 
       - name: Push database schema
         run: npx drizzle-kit push

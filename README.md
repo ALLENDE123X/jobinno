@@ -66,8 +66,12 @@ npm run typecheck    # tsc --noEmit
 npm run lint
 npm test             # Vitest
 npm run test:e2e     # Playwright
-npm run db:push      # push the Drizzle schema to Postgres
+npm run db:generate  # write a migration for the current schema
+npm run db:migrate   # apply pending migrations
+npm run db:push      # push the schema straight to Postgres, no migration file
 ```
+
+Schema changes go through `db:generate` and then `db:migrate`, always in that order and always both. `db:push` is for a scratch database only. Applying SQL to a real database by hand leaves drizzle's own bookkeeping table behind, and every migration after that fights the database instead of describing it.
 
 ## Where the engine came from
 
@@ -80,7 +84,7 @@ Two pieces of that port are worth knowing about before reading the code:
 
 ## Status
 
-Early. The engine works and the scaffold is up. The dashboard, the schema, billing, and the wiring between them are all still ahead.
+Early. The engine works, the scaffold is up, and the database schema and its row level security policies are live. The dashboard, billing, and the wiring between them are all still ahead.
 
 ## A note on style
 
