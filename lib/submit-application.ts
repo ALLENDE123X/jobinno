@@ -95,11 +95,9 @@ import { applyFieldValue, enumerateFormFields, type EnumeratedField } from "@/li
 // time-bounded search that ends in its code extractor.
 import { allowedSenderDomains, waitForMailboxCode } from "@/lib/future-gmail/gmail-verification-listener";
 import { createGmailClient } from "@/lib/future-gmail/gmail-client";
+import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 const LOG = "[act-008]";
-
-/** Project ref this module is allowed to write to. */
-const EXPECTED_PROJECT_REF = "oihpglvvzzmjigxrlmfz";
 
 // ───────────────────────────────────
 // The instructions — every one a constant
@@ -417,48 +415,16 @@ export class SubmissionBlockedError extends Error {
 // Supabase
 // ───────────────────────────────────
 
-/**
- * Guards against writing to the wrong Supabase project. Same shape as
- * `candidate-intake.ts`'s, `create-board-account.ts`'s, `fill-application-form.ts`'s
- * and `gmail-verification-listener.ts`'s — the meminno project
- * (`hlaeqvuyapkvixwaqxcs`) is a separate live product on the same account and
- * must never be written to from here.
- *
- * This is the fifth copy, which is four more than anyone wants. It stays
- * duplicated for the reason `create-board-account.ts`'s header gives: lifting it
- * into a shared `lib/supabase.ts` means editing four modules this ticket has no
- * other reason to touch, and this ticket in particular is a bad one to widen.
- * The case for doing it in a dedicated cleanup is now overwhelming.
- */
-function assertActinnoProject(rawUrl: string): void {
-  let host: string;
-  try {
-    host = new URL(rawUrl).hostname;
-  } catch {
-    throw new Error(`SUPABASE_URL is not a valid URL: ${rawUrl}`);
-  }
-  if (host === "localhost" || host === "127.0.0.1") return;
-
-  const ref = host.split(".")[0];
-  if (ref !== EXPECTED_PROJECT_REF) {
-    throw new Error(
-      `Refusing to run: SUPABASE_URL points at Supabase project "${ref}", ` +
-        `expected the actinno project "${EXPECTED_PROJECT_REF}". ` +
-        `Check .env.local — do not reuse another project's credentials here.`
-    );
-  }
-}
-
 function getSupabaseClient(): SupabaseClient {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) {
     throw new Error(
       "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars are required " +
-        "(actinno project — see .env.example)"
+        "(see .env.example)"
     );
   }
-  assertActinnoProject(url);
+  assertSupabaseProject(url);
   return createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },
   });

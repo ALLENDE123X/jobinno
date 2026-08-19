@@ -1,15 +1,487 @@
 /**
- * Drizzle schema, intentionally empty at JOB-001.
+ * Jobinno's Postgres schema (JOB-002).
  *
- * The scaffold needs a schema module for `drizzle.config.ts` to point at and
- * for `drizzle-kit push` to run against in CI, but the tables themselves are a
- * later ticket's call, not this one's. actinno's Supabase project has two
- * tables, `candidates` and `job_applications`, and the ported modules in `lib/`
- * read and write them through `@supabase/supabase-js` directly rather than
- * through Drizzle. Reconciling those two access paths, and deciding which
- * tables Jobinno actually wants, is the schema ticket's job.
+ * Everything here lives in Supabase's `public` schema and is reached two ways:
+ * the Next.js app talks to it through PostgREST with a user's JWT, and the
+ * pipeline in `lib/` talks to it with the service role key. Those two callers
+ * have very different powers, and the row level security policies at the bottom
+ * of each table are what keeps that difference safe. The service role bypasses
+ * RLS entirely, so every policy below is written for the browser side only.
  *
- * Until then this file exports nothing and `drizzle-kit push` is a no-op.
+ * The ported modules in `lib/` still read actinno's `candidates` and
+ * `job_applications` tables through `@supabase/supabase-js` rather than through
+ * Drizzle. Pointing them at these tables is deliberately not this ticket: it
+ * rewrites live query code in four modules and deserves its own review.
+ *
+ * ── Why `profiles` and not `users` ──────────────────────────────────────────
+ * Supabase Auth owns `auth.users`. A second table called `users` in `public`
+ * means every query, view and policy in the codebase has to say which one it
+ * means, and the day one of them does not is the day a query silently reads the
+ * wrong table. `profiles` keyed by the same uuid costs nothing and removes the
+ * ambiguity for good.
+ *
+ * ── Why the checks are checks and not enums ─────────────────────────────────
+ * Three columns get a real Postgres enum (`plan`, `citizenship_status`,
+ * `f1_status`) because their values are a closed set that changes only with a
+ * product decision. `skip_log.reason` and `feedback.category` get CHECK
+ * constraints built from the exported arrays instead, because widening a CHECK
+ * is a one line migration while removing a value from a Postgres enum is not.
+ * `boards.ats` and `jobs.ats` get neither: supporting a new ATS platform is a
+ * routine addition and should not need a migration to land.
+ *
+ * ── Why `applications.status` is free text ──────────────────────────────────
+ * The status vocabulary already exists, in `lib/application-status.ts`, and
+ * CLAUDE.md is explicit that nothing may add a second competing enum. Its own
+ * docstring says the column is free text with a `discovered` default and that
+ * the values are a convention rather than a constraint. That property is worth
+ * keeping: a status column that rejects a value a running pipeline wants to
+ * write fails in the worst possible place, halfway through a real application.
  */
 
-export {};
+import { sql } from "drizzle-orm";
+import {
+  boolean,
+  check,
+  date,
+  index,
+  integer,
+  jsonb,
+  pgEnum,
+  pgPolicy,
+  pgTable,
+  text,
+  timestamp,
+  unique,
+  uuid,
+} from "drizzle-orm/pg-core";
+import {
+  anonRole,
+  authUid,
+  authUsers,
+  authenticatedRole,
+} from "drizzle-orm/supabase";
+
+// ───────────────────────────────────
+// Vocabularies
+// ───────────────────────────────────
+
+/** Billing tiers. `applications_cap` is what actually gates a run. */
+export const planEnum = pgEnum("plan_tier", ["free", "starter", "season_pass"]);
+
+/**
+ * Work authorization, as an application form asks it. Kept coarse on purpose:
+ * these are the only distinctions the answer generator needs, and every extra
+ * one is another piece of immigration status stored about a real person.
+ */
+export const citizenshipStatusEnum = pgEnum("citizenship_status", [
+  "us_citizen",
+  "permanent_resident",
+  "f1",
+  "h1b",
+  "other",
+]);
+
+/** Only meaningful when `citizenship_status` is `f1`; null otherwise. */
+export const f1StatusEnum = pgEnum("f1_status", ["opt", "cpt", "none"]);
+
+/**
+ * Why a listing was abandoned. The pipeline writes one of these and nothing
+ * else, so the set is closed and enforced.
+ *
+ * `unanswerable_required` is the one that matters most: a required question the
+ * intake data cannot honestly answer. HARD STOP 9 says the run stops and the
+ * question is surfaced rather than guessed at, and this is the row that records
+ * that it happened.
+ */
+export const SKIP_REASONS = [
+  "unanswerable_required",
+  "verification_required",
+  "captcha",
+  "dom_changed",
+  "timeout",
+  "submit_failed",
+] as const;
+export type SkipReason = (typeof SKIP_REASONS)[number];
+
+/** What a piece of feedback is about. */
+export const FEEDBACK_CATEGORIES = ["bug", "feature", "other"] as const;
+export type FeedbackCategory = (typeof FEEDBACK_CATEGORIES)[number];
+
+/**
+ * The ATS platforms V1 targets, per CLAUDE.md. Not a database constraint, see
+ * the header. Validate against this in application code.
+ */
+export const ATS_PLATFORMS = [
+  "greenhouse",
+  "lever",
+  "ashby",
+  "workable",
+  "bamboohr",
+  "breezy",
+  "jazzhr",
+  "recruitee",
+  "teamtailor",
+  "smartrecruiters",
+] as const;
+export type AtsPlatform = (typeof ATS_PLATFORMS)[number];
+
+/**
+ * `"col" in ('a', 'b')` as raw SQL. The values come from the frozen arrays
+ * above and never from user input, so there is nothing here to inject.
+ */
+function inList(column: string, values: readonly string[]) {
+  const literals = values.map((value) => `'${value}'`).join(", ");
+  return sql.raw(`"${column}" in (${literals})`);
+}
+
+// ───────────────────────────────────
+// profiles
+// ───────────────────────────────────
+
+/**
+ * One row per signed up person, keyed by `auth.users.id`. Deleting the auth
+ * user cascades here, and from here to resumes and applications, which is the
+ * whole account deletion story in one constraint.
+ *
+ * Note what is not here: race, gender, veteran status and disability status.
+ * HARD STOP 10 says those are answered "decline to self identify" on every form
+ * and never stored, so there is deliberately nowhere to store them.
+ */
+export const profiles = pgTable(
+  "profiles",
+  {
+    id: uuid("id")
+      .primaryKey()
+      .references(() => authUsers.id, { onDelete: "cascade" }),
+    email: text("email").notNull(),
+
+    plan: planEnum("plan").notNull().default("free"),
+    applicationsUsed: integer("applications_used").notNull().default(0),
+    /**
+     * Zero by default, and deliberately so. An unset cap has to mean "cannot
+     * apply yet" rather than "apply without limit": the failure of a wrong
+     * default here is billable work done for free, on someone else's job board.
+     * Whatever provisions the plan sets the real number.
+     */
+    applicationsCap: integer("applications_cap").notNull().default(0),
+
+    citizenshipStatus: citizenshipStatusEnum("citizenship_status"),
+    f1Status: f1StatusEnum("f1_status"),
+    workAuthorizedUs: boolean("work_authorized_us"),
+    requiresSponsorship: boolean("requires_sponsorship"),
+
+    currentCity: text("current_city"),
+    currentCountry: text("current_country"),
+    willingToRelocate: boolean("willing_to_relocate"),
+
+    gradDate: date("grad_date"),
+    earliestStart: date("earliest_start"),
+
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    pgPolicy("profiles_select_own", {
+      for: "select",
+      to: authenticatedRole,
+      using: sql`${authUid} = ${table.id}`,
+    }),
+    /**
+     * No insert policy: the row is created for a new signup by the service
+     * role, so a client cannot mint a profile for an id it does not own.
+     *
+     * `with check` repeats the `using` expression because without it a user
+     * could update their own row into someone else's id.
+     */
+    pgPolicy("profiles_update_own", {
+      for: "update",
+      to: authenticatedRole,
+      using: sql`${authUid} = ${table.id}`,
+      withCheck: sql`${authUid} = ${table.id}`,
+    }),
+  ]
+);
+
+// ───────────────────────────────────
+// resumes
+// ───────────────────────────────────
+
+/**
+ * A resume is a private Storage object; this row is the pointer to it plus
+ * whatever the parser made of it. `storage_path` is a bucket qualified path and
+ * not a fetchable URL, matching the convention `lib/candidate-intake.ts`
+ * already uses for `candidates.resume_url`.
+ */
+export const resumes = pgTable(
+  "resumes",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => profiles.id, { onDelete: "cascade" }),
+    storagePath: text("storage_path").notNull(),
+    /** A LinkedIn profile export, when the user gave one. Same private bucket. */
+    linkedinPdfPath: text("linkedin_pdf_path"),
+    /** Whatever `lib/resume-parser.ts` extracted. Null until it has run. */
+    parsed: jsonb("parsed"),
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("resumes_user_id_idx").on(table.userId),
+    pgPolicy("resumes_select_own", {
+      for: "select",
+      to: authenticatedRole,
+      using: sql`${authUid} = ${table.userId}`,
+    }),
+    pgPolicy("resumes_insert_own", {
+      for: "insert",
+      to: authenticatedRole,
+      withCheck: sql`${authUid} = ${table.userId}`,
+    }),
+  ]
+);
+
+// ───────────────────────────────────
+// boards and jobs
+// ───────────────────────────────────
+
+/**
+ * A company's job board on one ATS. `board_token` is whatever that ATS calls
+ * the tenant in its own API: the Greenhouse board token, the Lever site name,
+ * the Ashby org slug. Unique per platform, because the same string can name
+ * different companies on two different ATS platforms.
+ *
+ * Not user scoped and carries no personal data, so it is world readable. RLS is
+ * still enabled with a select only policy, because a Supabase table with RLS
+ * off is fully writable by anyone holding the anon key.
+ */
+export const boards = pgTable(
+  "boards",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    ats: text("ats").notNull(),
+    company: text("company").notNull(),
+    boardToken: text("board_token").notNull(),
+    active: boolean("active").notNull().default(true),
+    lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
+  },
+  (table) => [
+    unique("boards_ats_board_token_key").on(table.ats, table.boardToken),
+    pgPolicy("boards_select_all", {
+      for: "select",
+      to: [anonRole, authenticatedRole],
+      using: sql`true`,
+    }),
+  ]
+);
+
+/**
+ * One listing. `raw` keeps the ATS payload the row was built from, because the
+ * fields we parse out today are not the fields a later ticket will want, and
+ * refetching a listing that has since closed is not possible.
+ *
+ * `is_intern` and `is_new_grad` are the filter the whole product turns on. They
+ * are stored rather than derived at query time so that the classification a run
+ * actually used stays visible after the heuristic behind it changes.
+ */
+export const jobs = pgTable(
+  "jobs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    boardId: uuid("board_id")
+      .notNull()
+      .references(() => boards.id, { onDelete: "cascade" }),
+    /** Denormalized from `boards.ats` so the unique key below can stand alone. */
+    ats: text("ats").notNull(),
+    /** The listing's id in the ATS, not ours. */
+    externalId: text("external_id").notNull(),
+    title: text("title").notNull(),
+    location: text("location"),
+    url: text("url").notNull(),
+    description: text("description"),
+    postedAt: timestamp("posted_at", { withTimezone: true }),
+    isIntern: boolean("is_intern").notNull().default(false),
+    isNewGrad: boolean("is_new_grad").notNull().default(false),
+    raw: jsonb("raw"),
+  },
+  (table) => [
+    unique("jobs_ats_external_id_key").on(table.ats, table.externalId),
+    index("jobs_board_id_idx").on(table.boardId),
+    pgPolicy("jobs_select_all", {
+      for: "select",
+      to: [anonRole, authenticatedRole],
+      using: sql`true`,
+    }),
+  ]
+);
+
+// ───────────────────────────────────
+// applications
+// ───────────────────────────────────
+
+/**
+ * One person's run against one listing. `status` uses the vocabulary in
+ * `lib/application-status.ts`; see the header for why it is text.
+ *
+ * There is no update policy. `submitted` is terminal and can never be undone,
+ * and `submission_unconfirmed` must never be retried, so the browser side gets
+ * no way to move a status at all. Only the pipeline, on the service role key,
+ * writes to this column.
+ */
+export const applications = pgTable(
+  "applications",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => profiles.id, { onDelete: "cascade" }),
+    jobId: uuid("job_id")
+      .notNull()
+      .references(() => jobs.id, { onDelete: "cascade" }),
+    status: text("status").notNull().default("discovered"),
+    submittedAt: timestamp("submitted_at", { withTimezone: true }),
+    /** What the board showed back: a reference number, or its wording. */
+    confirmationText: text("confirmation_text"),
+    /** Where the board sent the browser after submit, when it sent it anywhere. */
+    redirectUrl: text("redirect_url"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("applications_user_id_idx").on(table.userId),
+    index("applications_job_id_idx").on(table.jobId),
+    pgPolicy("applications_select_own", {
+      for: "select",
+      to: authenticatedRole,
+      using: sql`${authUid} = ${table.userId}`,
+    }),
+    pgPolicy("applications_insert_own", {
+      for: "insert",
+      to: authenticatedRole,
+      withCheck: sql`${authUid} = ${table.userId}`,
+    }),
+  ]
+);
+
+// ───────────────────────────────────
+// skip_log
+// ───────────────────────────────────
+
+/**
+ * Why a listing was abandoned, in enough detail to fix the cause. The field
+ * columns describe the specific control that stopped the run, which is what
+ * turns "it failed on Workable again" into a reproducible bug.
+ *
+ * `application_id` is nullable because a listing can be skipped before there is
+ * an application row to hang the skip off. Those rows are invisible to every
+ * end user by design, see the policy below.
+ *
+ * Nobody but the pipeline writes here, so there is no insert, update or delete
+ * policy. With RLS enabled and no such policy, PostgREST refuses those verbs
+ * outright for anon and authenticated; the service role key bypasses RLS and is
+ * unaffected.
+ */
+export const skipLog = pgTable(
+  "skip_log",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    applicationId: uuid("application_id").references(() => applications.id, {
+      onDelete: "cascade",
+    }),
+    jobId: uuid("job_id")
+      .notNull()
+      .references(() => jobs.id, { onDelete: "cascade" }),
+    ats: text("ats").notNull(),
+    reason: text("reason").notNull(),
+    /** The label as it appeared on the page, verbatim. */
+    fieldLabel: text("field_label"),
+    /** The control type, from `lib/form-fields.ts`'s vocabulary. */
+    fieldKind: text("field_kind"),
+    required: boolean("required"),
+    /** Anything else worth keeping. Never a screenshot and never resume text. */
+    rawContext: jsonb("raw_context"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check("skip_log_reason_check", inList("reason", SKIP_REASONS)),
+    index("skip_log_application_id_idx").on(table.applicationId),
+    index("skip_log_job_id_idx").on(table.jobId),
+    /**
+     * Readable by whoever owns the application it belongs to. Written as a
+     * subquery rather than a denormalized `user_id` so that ownership has
+     * exactly one definition, on `applications`, and cannot drift.
+     *
+     * The cost is that a skip with no application row is readable by nobody but
+     * the service role. That is the honest answer for now: such a row has no
+     * owner recorded anywhere, and inferring one would be a guess.
+     */
+    pgPolicy("skip_log_select_via_own_application", {
+      for: "select",
+      to: authenticatedRole,
+      using: sql`exists (
+        select 1
+        from public.applications a
+        where a.id = skip_log.application_id
+          and a.user_id = ${authUid}
+      )`,
+    }),
+  ]
+);
+
+// ───────────────────────────────────
+// feedback
+// ───────────────────────────────────
+
+/**
+ * Product feedback. `user_id` is nullable because the most useful feedback
+ * often comes from someone who bounced off the landing page before signing up.
+ *
+ * Anyone may insert, including anonymous. Nobody may read anyone else's, and an
+ * anonymous row is readable only by the service role, because there is nobody
+ * to prove ownership to.
+ */
+export const feedback = pgTable(
+  "feedback",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id").references(() => profiles.id, {
+      onDelete: "set null",
+    }),
+    category: text("category").notNull(),
+    body: text("body").notNull(),
+    /** `page_url`, `user_agent`, client timestamp. Nothing a form was filled with. */
+    context: jsonb("context"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check("feedback_category_check", inList("category", FEEDBACK_CATEGORIES)),
+    index("feedback_user_id_idx").on(table.userId),
+    /**
+     * A signed in submitter may only stamp their own id on it. An anonymous
+     * submitter may only leave it null. Neither can attribute feedback to
+     * somebody else.
+     */
+    pgPolicy("feedback_insert_any", {
+      for: "insert",
+      to: [anonRole, authenticatedRole],
+      withCheck: sql`${table.userId} is null or ${authUid} = ${table.userId}`,
+    }),
+    pgPolicy("feedback_select_own", {
+      for: "select",
+      to: authenticatedRole,
+      using: sql`${authUid} = ${table.userId}`,
+    }),
+  ]
+);

@@ -25,6 +25,12 @@ jobs:
           --health-retries 5
 
     env:
+      # A GitHub runner gives Node a 2GB heap by default, and type checking this
+      # project needs more than that: `googleapis`, which the Gmail modules pull
+      # in, ships enormous type definitions and costs about 1.8GB on its own.
+      # The runner has 16GB, so this is headroom rather than a real ceiling.
+      NODE_OPTIONS: --max-old-space-size=6144
+
       # Throwaway service container, not a real database. Nothing destructive
       # should run against a real DATABASE_URL without an explicit opt in gate.
       DATABASE_URL: postgres://test:test@localhost:5432/jobinno_test
@@ -64,6 +70,12 @@ jobs:
       - name: Build to generate types
         run: npm run build
 
+      - name: Prepare the test database
+        # A bare Postgres image has no `auth.users`, no `auth.uid()` and none of
+        # Supabase's roles, all of which the schema's foreign keys and RLS
+        # policies need before they will apply. See the file's own header.
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/ci-test-db-bootstrap.sql
+
       - name: Push database schema
         run: npx drizzle-kit push
 
@@ -101,6 +113,8 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
+      # See the note on the same variable in the `test` job above.
+      NODE_OPTIONS: --max-old-space-size=6144
       DATABASE_URL: postgres://test:test@localhost:5432/jobinno_test
       NEXT_PUBLIC_SUPABASE_URL: http://localhost:54321
       NEXT_PUBLIC_SUPABASE_ANON_KEY: test-anon-key
@@ -122,6 +136,12 @@ jobs:
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
+
+      - name: Prepare the test database
+        # A bare Postgres image has no `auth.users`, no `auth.uid()` and none of
+        # Supabase's roles, all of which the schema's foreign keys and RLS
+        # policies need before they will apply. See the file's own header.
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/ci-test-db-bootstrap.sql
 
       - name: Push database schema
         run: npx drizzle-kit push
