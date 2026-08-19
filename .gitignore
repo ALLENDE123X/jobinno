@@ -57,7 +57,7 @@ lib/.stagehand-observe-cache.json
 /blob-report/
 /playwright/.cache/
 
-# Debugging artefacts. See HARD STOP 2 in CLAUDE.md — these are the file names
+# Debugging artefacts. See HARD STOP 2 in CLAUDE.md: these are the file names
 # that have actually been committed by accident before.
 ci_log*.txt
 pr_body.md

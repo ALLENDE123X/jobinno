@@ -73,7 +73,7 @@ import { loadCandidate } from "@/lib/candidate-intake";
 // status vocabulary now lives in a module of its own, and `createBoardAccount`
 // resolves to a placeholder that throws (see `lib/account-creation-placeholder.ts`
 // for why the step is still here at all). The `create-account` step below is
-// otherwise untouched — a later ticket owns removing it and rewiring the chain.
+// otherwise untouched. A later ticket owns removing it and rewiring the chain.
 import { APPLICATION_STATUS, type ApplicationStatus } from "@/lib/application-status";
 import { createBoardAccount } from "@/lib/account-creation-placeholder";
 import { FormFillBlockedError, type VerificationInput } from "@/lib/fill-application-form";

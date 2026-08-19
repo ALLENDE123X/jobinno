@@ -1,15 +1,15 @@
 /**
- * `job_applications.status` — the whole pipeline's status vocabulary.
+ * `job_applications.status`: the whole pipeline's status vocabulary.
  *
  * ── Provenance (JOB-001) ────────────────────────────────────────────────────
  * Lifted verbatim from actinno's `lib/create-board-account.ts`, which is the
  * one module in that repo Jobinno deliberately did NOT port: automated account
  * creation on an employer's board is a V2 question, not a V1 one.
  *
- * The enum could not stay there, because it was never really account-creation
- * code. Four ported modules read it — `fill-application-form.ts`,
+ * The enum could not stay there, because it was never really account creation
+ * code. Four ported modules read it: `fill-application-form.ts`,
  * `submit-application.ts`, `future-gmail/gmail-verification-listener.ts` and
- * `inngest/job-application-pipeline.ts` — and its own docstring below already
+ * `inngest/job-application-pipeline.ts`, and its own docstring below already
  * admits it had "outgrown" its host file. So it moves to a module whose only
  * job is to hold it, and the four importers point here instead. The values and
  * their comments are unchanged; only the import path moved.
@@ -18,8 +18,8 @@
  * values describe a flow Jobinno does not run yet. They are kept rather than
  * pruned because `gmail-verification-listener.ts` and the pipeline still
  * reference them, and because a status column that quietly loses values is how
- * historical rows stop meaning anything. The ticket that removes the
- * account-creation step owns deciding their fate.
+ * historical rows stop meaning anything. The ticket that removes the account
+ * creation step owns deciding their fate.
  */
 
 /**
