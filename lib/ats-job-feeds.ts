@@ -66,7 +66,7 @@
  * set"}`, meaning a per customer key that no candidate side integration has.
  * Boards still get registry rows, so nothing is lost when a route is found;
  * `ingestBoard` returns `deferred` for them rather than pretending to sync.
- * Tracked as its own follow up, see the JOB-003 pull request.
+ * Tracked as issue #7, split out of JOB-003 rather than blocking it.
  *
  * ── What comes out ──────────────────────────────────────────────────────────
  * One `FeedJob` shape, whatever the platform. Descriptions are reduced to plain
@@ -252,7 +252,9 @@ export function toPlainText(value: unknown): string | null {
   const plain = working
     .replace(/<\s*(br|\/p|\/div|\/li|\/h[1-6])\s*\/?>/gi, "\n")
     .replace(/<[^>]*>/g, "")
-    .replace(/[ \t ]+/g, " ")
+    // The literal is spelled as an escape on purpose: a non breaking space in
+    // source is invisible to a reader and to most diffs.
+    .replace(/[ \t\u00a0]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
