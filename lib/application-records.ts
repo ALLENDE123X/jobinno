@@ -346,14 +346,25 @@ const UNCLAIMABLE: ReadonlySet<string> = new Set(["submitted", "submission_uncon
  *    every generated answer stands on that attestation, so a run for a profile
  *    that has never made it is a run with nothing behind what it will submit.
  *
- *  · **They have applications left.** `profiles.applications_cap` defaults to
- *    zero, and the schema is explicit that zero means "cannot apply yet" rather
- *    than "no limit" — the failure of the other reading is billable work done
- *    for free on someone else's job board. The count compared against it is a
- *    live count of this person's `applications` rows rather than
- *    `profiles.applications_used`, because nothing in this repository increments
- *    that column yet and a guard that reads a number nobody maintains is not a
- *    guard. Wiring the counter up belongs to whichever ticket owns billing.
+ *  · **They have applications left.** `profiles.applications_used` is compared
+ *    against `profiles.applications_cap`, both straight off the profile row.
+ *    The cap defaults to zero and the schema is explicit that zero means
+ *    "cannot apply yet" rather than "no limit" — the failure of the other
+ *    reading is billable work done for free on someone else's job board.
+ *
+ *    This used to be a live `count(*)` of the person's `applications` rows,
+ *    because nothing wrote the counter. `lib/application-quota.ts` writes it
+ *    now, and the count had two bugs the counter does not have: it was a
+ *    lifetime total, so JOB-010 resetting it to zero on a genuine plan change
+ *    bought somebody 150 applications and handed them 150 minus whatever they
+ *    had already done; and it had no status filter, so a `discovered` row and
+ *    every failed or skipped attempt spent allowance nobody applied with.
+ *
+ *    This check is the cheap one, and it is deliberately not the enforcement.
+ *    It exists so that a person with nothing left is refused before a browser
+ *    is launched. What actually enforces the cap is the conditional UPDATE in
+ *    `reserveApplicationSlot`, which the pipeline runs between this and the
+ *    submit — see that module for the race this check cannot close on its own.
  *
  *  · **The listing has not already been submitted to.** Re-claiming a row at
  *    `submitted` or `submission_unconfirmed` would hand a live row id to a
@@ -397,7 +408,7 @@ export async function claimApplicationRow(
 
   const { data: profileRows, error: profileError } = await supabase
     .from("profiles")
-    .select("id,attested_at,applications_cap")
+    .select("id,attested_at,applications_used,applications_cap")
     .eq("id", userId)
     .limit(1);
   if (profileError) throw new Error(`profiles lookup failed: ${profileError.message}`);
@@ -419,13 +430,7 @@ export async function claimApplicationRow(
   }
 
   const cap = typeof profile.applications_cap === "number" ? profile.applications_cap : 0;
-  const { count, error: countError } = await supabase
-    .from("applications")
-    .select("id", { count: "exact", head: true })
-    .eq("user_id", userId);
-  if (countError) throw new Error(`applications count failed: ${countError.message}`);
-
-  const used = count ?? 0;
+  const used = typeof profile.applications_used === "number" ? profile.applications_used : 0;
   if (used >= cap) {
     throw new Error(
       `Profile ${userId} has used ${used} of ${cap} applications. A cap of zero is the default ` +

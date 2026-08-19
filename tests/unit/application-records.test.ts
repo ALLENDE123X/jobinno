@@ -27,10 +27,15 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 
 import postgres from "postgres";
 
-const USER_ID = "11111111-1111-4111-8111-111111111111";
-const JOB_ID = "22222222-2222-4222-8222-222222222222";
-const APPLICATION_ID = "33333333-3333-4333-8333-333333333333";
-const BOARD_ID = "44444444-4444-4444-8444-444444444444";
+import { liveDbId, liveDbSuite, liveDbUrl } from "../live-db-gate";
+
+// Minted per run, never written down. See `tests/live-db-gate.ts`: a constant
+// UUID is a value a real row can hold, and the live block below deletes the ids
+// it was given.
+const USER_ID = liveDbId();
+const JOB_ID = liveDbId();
+const APPLICATION_ID = liveDbId();
+const BOARD_ID = liveDbId();
 
 // ───────────────────────────────────
 // A Supabase client that records instead of answering
@@ -70,7 +75,17 @@ function fakeClient() {
           call.payload = payload;
           return chain;
         },
-        single: async () => ({ data: (rows[table] ?? [])[0] ?? null, error: null }),
+        // An insert that asks for columns back gets its own payload back, plus
+        // an id, because that is what PostgREST does and because a module that
+        // checks the returned id — `claimApplicationRow` does — is otherwise
+        // untestable on its success path.
+        single: async () => ({
+          data:
+            call.verb === "insert"
+              ? { id: APPLICATION_ID, ...(call.payload as Record<string, unknown>) }
+              : ((rows[table] ?? [])[0] ?? null),
+          error: null,
+        }),
         then: (resolve: (value: ReturnType<typeof result>) => unknown) =>
           Promise.resolve(result()).then(resolve),
       };
@@ -363,10 +378,77 @@ describe("claimApplicationRow", () => {
 
   it("refuses when the plan's application cap is used up, and reads zero as none left", async () => {
     rows.applications = [];
-    rows.profiles = [{ id: USER_ID, attested_at: "2026-08-01T00:00:00Z", applications_cap: 0 }];
+    rows.profiles = [
+      {
+        id: USER_ID,
+        attested_at: "2026-08-01T00:00:00Z",
+        applications_used: 0,
+        applications_cap: 0,
+      },
+    ];
     await expect(
       claimApplicationRow(client(), { userId: USER_ID, jobId: JOB_ID })
     ).rejects.toThrow(/has used 0 of 0 applications/);
+  });
+
+  /**
+   * The counter, not a count. `profiles.applications_used` is now written by
+   * `lib/application-quota.ts`, and the guard reads it off the same row it
+   * already loads for the attestation.
+   */
+  it("compares the stored counter against the cap rather than counting rows", async () => {
+    // No `applications` row for this pair at all, and the person is still out:
+    // a lifetime count would have said zero and let this through.
+    rows.applications = [];
+    rows.profiles = [
+      {
+        id: USER_ID,
+        attested_at: "2026-08-01T00:00:00Z",
+        applications_used: 150,
+        applications_cap: 150,
+      },
+    ];
+
+    await expect(
+      claimApplicationRow(client(), { userId: USER_ID, jobId: JOB_ID })
+    ).rejects.toThrow(/has used 150 of 150 applications/);
+
+    expect(callTo("profiles").columns).toBe("id,attested_at,applications_used,applications_cap");
+    // One `applications` call, the lookup for this (user, job) pair. The old
+    // guard's second call — a `count(*)` of every row this person has ever had,
+    // `discovered` and failed ones included — is gone, and with it the defect
+    // where a board that refused us spent somebody's allowance.
+    expect(calls.filter((call) => call.table === "applications")).toHaveLength(1);
+  });
+
+  /**
+   * The cross-ticket bug, from the other side. JOB-010 resets the counter to
+   * zero when somebody genuinely changes plan, so a long standing customer's
+   * history must not be able to refuse them the allowance they just paid for.
+   */
+  it("lets a renewed allowance through however long the person's history is", async () => {
+    rows.applications = [];
+    rows.profiles = [
+      {
+        id: USER_ID,
+        attested_at: "2026-08-01T00:00:00Z",
+        applications_used: 0,
+        applications_cap: 150,
+      },
+    ];
+
+    const claimed = await claimApplicationRow(client(), { userId: USER_ID, jobId: JOB_ID });
+
+    expect(claimed).toEqual({
+      applicationId: APPLICATION_ID,
+      status: "discovered",
+      created: true,
+    });
+    expect(calls.find((call) => call.verb === "insert")?.payload).toEqual({
+      user_id: USER_ID,
+      job_id: JOB_ID,
+      status: "discovered",
+    });
   });
 });
 
@@ -416,26 +498,22 @@ describe("listCandidateApplications", () => {
 // ───────────────────────────────────
 
 /**
- * Runs only against a local throwaway Postgres, and skips otherwise.
+ * Runs only against a throwaway Postgres somebody deliberately pointed it at,
+ * and skips otherwise. `tests/live-db-gate.ts` is the gate and explains itself.
  *
- * Two gates rather than one, and the second is the important one. HARD STOP 5
- * says nothing destructive runs against a real `DATABASE_URL`, and while an
- * insert followed by a delete of the same rows is not destructive in the
- * TRUNCATE sense, writing rows into a live product's database from a test suite
- * is not something a developer should be able to do by having an environment
- * variable exported. So the host has to be localhost as well, which the CI
- * service container is and a Supabase pooler is not.
+ * The short version, because this is the file the hole was found in: requiring
+ * a `localhost` host was not enough, since a port forward to production is
+ * `localhost` too, and the fixture ids were hard-coded UUIDs, so the `afterAll`
+ * below was a `delete from auth.users` aimed at whatever row held one. The ids
+ * are now minted per run and writing needs `ALLOW_LIVE_DB_TESTS=1` on top of
+ * the host check.
  *
  * Everything created below is deleted in `afterAll`, and the delete is scoped to
  * the ids created here. There is no truncate, no reset and no unfiltered delete
  * anywhere in this file.
  */
-const DATABASE_URL = process.env.DATABASE_URL;
-const isLocal = DATABASE_URL !== undefined && /@(localhost|127\.0\.0\.1)[:/]/.test(DATABASE_URL);
-const liveSuite = isLocal ? describe : describe.skip;
-
-liveSuite("the columns the code writes exist in the real schema", () => {
-  const sql = postgres(DATABASE_URL ?? "", { prepare: false, max: 1, onnotice: () => {} });
+liveDbSuite("the columns the code writes exist in the real schema", () => {
+  const sql = postgres(liveDbUrl, { prepare: false, max: 1, onnotice: () => {} });
 
   afterAll(async () => {
     // Scoped to the ids this file created. `applications` and `skip_log` go

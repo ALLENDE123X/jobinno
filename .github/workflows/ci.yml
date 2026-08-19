@@ -35,6 +35,13 @@ jobs:
       # should run against a real DATABASE_URL without an explicit opt in gate.
       DATABASE_URL: postgres://test:test@localhost:5432/jobinno_test
 
+      # That gate. The suites in `tests/unit` that create and delete rows check
+      # this as well as the host, because a `localhost` host is also what a port
+      # forward to production looks like — see `tests/live-db-gate.ts`. Set here
+      # and nowhere else: a developer's laptop has to export it per run, which is
+      # the point of it.
+      ALLOW_LIVE_DB_TESTS: "1"
+
       # Supabase Auth, not NextAuth. These are placeholders so that the build
       # and the type check have something structurally valid to read; CI never
       # talks to a real Supabase project.

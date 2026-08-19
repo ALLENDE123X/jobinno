@@ -91,6 +91,10 @@ import "./load-env";
 import { Inngest, NonRetriableError, eventType, staticSchema } from "inngest";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
+import {
+  releaseApplicationSlot,
+  reserveApplicationSlot,
+} from "@/lib/application-quota";
 import { claimApplicationRow } from "@/lib/application-records";
 import { APPLICATION_STATUS } from "@/lib/application-status";
 import { loadCandidate } from "@/lib/candidate-intake";
@@ -464,6 +468,50 @@ export const discoverListings = inngest.createFunction(
 );
 
 // ───────────────────────────────────
+// The plan allowance
+// ───────────────────────────────────
+
+/**
+ * Gives the reserved slot back, unless the row says an application really was
+ * sent. See `lib/application-quota.ts` for why the decision is one statement.
+ *
+ * Never throws, and that is the whole point of it existing here rather than
+ * being called inline. It runs on two paths — after a run that finished and
+ * after one that failed — and on both, an accounting problem is the less
+ * important of the two things happening. Throwing on the failure path would
+ * replace the error that explains the run with one about a counter, and
+ * throwing on the success path would fail a run whose application is already
+ * with an employer. So it reports and returns.
+ */
+async function settleApplicationSlot(userId: string, applicationId: string) {
+  try {
+    const settled = await releaseApplicationSlot({ userId, applicationId });
+
+    if (settled.outcome === "released") {
+      console.log(
+        `${LOG} applications ${applicationId} — nothing was submitted, allowance ` +
+          `returned (${settled.used} used)`
+      );
+    } else if (settled.outcome === "kept") {
+      console.log(
+        `${LOG} applications ${applicationId} — ${settled.status}, allowance spent`
+      );
+    }
+
+    return settled;
+  } catch (err) {
+    // A leaked slot costs this person one application off their allowance and
+    // nothing else. Loud, because nothing else will ever notice it.
+    console.error(
+      `${LOG} applications ${applicationId} — COULD NOT SETTLE THE ALLOWANCE for ${userId}. ` +
+        `A reserved application slot has leaked and profiles.applications_used is one too ` +
+        `high. ${err instanceof Error ? err.message : String(err)}`
+    );
+    return { outcome: "settle_failed" as const };
+  }
+}
+
+// ───────────────────────────────────
 // 2. Apply — one listing, one run
 // ───────────────────────────────────
 
@@ -526,10 +574,12 @@ export const applyToJob = inngest.createFunction(
     // pair instead of inserting a second one, and refuses outright to hand back
     // a row that has already had a submit click issued against it.
     //
-    // This is also where the two guards that gate a real application live — the
-    // person has attested to their intake, and they have applications left on
-    // their plan. See that function for why both are checked there rather than
-    // here.
+    // This is also where the attestation guard lives — nothing may be submitted
+    // on behalf of somebody who has never confirmed their intake is true — plus
+    // a cheap look at the allowance so that a person with nothing left is
+    // refused before a browser is launched. The allowance is not *enforced*
+    // there; `reserve-application-slot` below is what enforces it, for the
+    // reason given on that step.
     const claim = await step.run("claim-application-row", async () => {
       const supabase = getSupabaseClient();
       const listing = await loadListing(supabase, jobId);
@@ -556,41 +606,133 @@ export const applyToJob = inngest.createFunction(
         `(${claim.created ? "new" : "reusing existing row"})`
     );
 
+    // ── Take the application off the plan's allowance ───────────────────────
+    // This is the cap, and it is enforced here rather than in the claim above
+    // because a cap can only be enforced while refusing is still possible —
+    // which is to say before a browser opens, not after a submit control has
+    // been pressed. `reserveApplicationSlot` is one conditional UPDATE, so the
+    // `browserConcurrencyLimit()` runs this person has in flight at once cannot
+    // between them take a 150th and a 151st slot: the second statement finds no
+    // row to update and comes back refused.
+    //
+    // Its own step, so that Inngest memoizes it. A retry of the submit below
+    // replays this from state instead of re-running it, which is what stops one
+    // listing spending two applications.
+    //
+    // The claim step's check reads the same two columns and is deliberately not
+    // this. It is there to refuse a person with nothing left before any of the
+    // above costs anything; this is what the product's promise actually rests
+    // on.
+    const reservation = await step.run("reserve-application-slot", async () => {
+      const outcome = await reserveApplicationSlot(userId);
+
+      if (outcome.reserved) return { used: outcome.used, cap: outcome.cap };
+
+      // Neither refusal improves by being retried. The cap moves when somebody
+      // pays, which is a Stripe webhook and not this run, and a missing profile
+      // is a broken event rather than a slow one.
+      if (outcome.reason === "no_profile") {
+        throw new NonRetriableError(
+          `No profiles row with id ${userId}, so there is no allowance to apply against.`
+        );
+      }
+
+      throw new NonRetriableError(
+        `Profile ${userId} has used ${outcome.used} of ${outcome.cap} applications, so ` +
+          `${claim.company} / ${claim.title} was not opened. A cap of zero is the default and ` +
+          `means this account has not been provisioned to apply yet, not that it may apply ` +
+          `without limit.`
+      );
+    });
+
+    console.log(
+      `${LOG} applications ${applicationId} — allowance ${reservation.used} of ` +
+        `${reservation.cap} reserved`
+    );
+
     // ── ACT-008, which calls ACT-007 inside it. ONE step, one browser ────────
     // See correction 2 in the header: `submitApplication` fills the form via
     // `fillApplicationFormRetainingSession` and submits in that same session.
     // Splitting this in two would fill a form in a browser that is then closed.
-    const submission = await step.run("fill-and-submit-application", async () => {
-      try {
-        const result = await submitApplication({
-          jobApplicationId: applicationId,
-          requiresCoverLetter: claim.requiresCoverLetter,
-          // Deliberately not passed. ACT-008's `preflight` reads
-          // `jobs.description` off the row it already loads, which keeps up to
-          // 8KB of scraped job text out of this run's durable step state. The
-          // claim step drops it for the same reason.
-          ...(additionalAnswers === undefined ? {} : { additionalAnswers }),
-        });
-        // Trimmed for the same reason as the claim: the full result nests
-        // ACT-007's entire field-by-field report and the parsed resume profile —
-        // a candidate's real personal data, which has no business being copied
-        // into durable step state that outlives the run.
-        return {
-          status: result.status,
-          submitted: result.submitted,
-          submitAttempted: result.submitAttempted,
-          confirmationRef: result.confirmationRef,
-          submitControlLabel: result.submitControlLabel,
-          blockedReason: result.blockedReason,
-          unconfirmedReason: result.unconfirmedReason,
-          screenshotPath: result.screenshotPath,
-          rowUpdated: result.rowUpdated,
-          finalUrl: result.finalUrl,
-        };
-      } catch (err) {
-        rethrowTerminal(err);
-      }
-    });
+    const fillAndSubmit = () =>
+      step.run("fill-and-submit-application", async () => {
+        try {
+          const result = await submitApplication({
+            jobApplicationId: applicationId,
+            requiresCoverLetter: claim.requiresCoverLetter,
+            // Deliberately not passed. ACT-008's `preflight` reads
+            // `jobs.description` off the row it already loads, which keeps up to
+            // 8KB of scraped job text out of this run's durable step state. The
+            // claim step drops it for the same reason.
+            ...(additionalAnswers === undefined ? {} : { additionalAnswers }),
+          });
+          // Trimmed for the same reason as the claim: the full result nests
+          // ACT-007's entire field-by-field report and the parsed resume profile —
+          // a candidate's real personal data, which has no business being copied
+          // into durable step state that outlives the run.
+          return {
+            status: result.status,
+            submitted: result.submitted,
+            submitAttempted: result.submitAttempted,
+            confirmationRef: result.confirmationRef,
+            submitControlLabel: result.submitControlLabel,
+            blockedReason: result.blockedReason,
+            unconfirmedReason: result.unconfirmedReason,
+            screenshotPath: result.screenshotPath,
+            rowUpdated: result.rowUpdated,
+            finalUrl: result.finalUrl,
+          };
+        } catch (err) {
+          rethrowTerminal(err);
+        }
+      });
+
+    // ── Settle the allowance, whichever way the run went ─────────────────────
+    // A reservation that did not turn into an application goes back, and that
+    // is what makes a blocked form, a dead board and a captcha free — which the
+    // old lifetime row count, with no status filter on it, did not.
+    //
+    // `settleApplicationSlot` decides from the `applications` row: `submitted`
+    // and `submission_unconfirmed` keep the slot, everything else gives it back.
+    // Both mean a submit control was pressed, and an unknown outcome has to be
+    // charged for, because the alternative is refunding an application that may
+    // be sitting in an employer's inbox.
+    //
+    // The `catch` runs after the submit step has exhausted the function's
+    // retries — Inngest throws a `StepError` into the body at that point — so a
+    // run that ends in an exception still settles before the error propagates.
+    // Its own step name so that the two paths cannot both be memoized.
+    let submission: Awaited<ReturnType<typeof fillAndSubmit>>;
+    try {
+      submission = await fillAndSubmit();
+    } catch (error) {
+      await step.run("settle-application-slot-after-failure", () =>
+        settleApplicationSlot(userId, applicationId)
+      );
+      throw error;
+    }
+
+    // On this path the run knows one thing the row may not. `rowUpdated: false`
+    // means ACT-008 pressed the control and then could not write the status
+    // down, so the row can still say `form_filled` while an application really
+    // is with the employer — and a refund decided from the row alone would hand
+    // the allowance back for it. Any sign of a click from this run keeps the
+    // slot, and the row is only consulted when there was none.
+    const clicked =
+      submission.submitAttempted ||
+      submission.submitted ||
+      submission.status === APPLICATION_STATUS.SUBMITTED ||
+      submission.status === APPLICATION_STATUS.SUBMISSION_UNCONFIRMED;
+
+    if (clicked) {
+      console.log(
+        `${LOG} applications ${applicationId} — submit control pressed, allowance spent`
+      );
+    } else {
+      await step.run("settle-application-slot", () =>
+        settleApplicationSlot(userId, applicationId)
+      );
+    }
 
     if (submission.status === APPLICATION_STATUS.SUBMISSION_UNCONFIRMED) {
       // The loudest thing this pipeline can say. ACT-008 has already recorded it
