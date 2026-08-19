@@ -29,6 +29,13 @@
       "when": 1787164098535,
       "tag": "0003_profiles_column_privileges",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1787167270091,
+      "tag": "0004_calm_banshee",
+      "breakpoints": true
     }
   ]
 }
