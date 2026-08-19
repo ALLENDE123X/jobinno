@@ -18,6 +18,21 @@
  *    fix, not cosmetics.
  *
  * Nothing else about the behaviour is different.
+ *
+ * ── JOB-006 ─────────────────────────────────────────────────────────────────
+ * One more cache sits in front of the file backed one below, and it is the one
+ * that matters commercially. The file cache is keyed by page URL, so it can only
+ * help a posting this machine has already opened, and in production every
+ * posting is one nobody has opened. `lib/form-action-cache.ts` keys the same
+ * answers by what the *form* looks like instead, in Postgres, shared by every
+ * run, so a first visit to a new Greenhouse posting already knows where the
+ * email box is.
+ *
+ * The wiring here is three small things: `BrowserSession` can carry an
+ * `actionPlan`, `resolveAction` consults it before anything else and files what
+ * it learns back into it, and `reResolveLive` is the escape hatch a caller uses
+ * when a replayed answer fails the checks it is put through. With no plan
+ * attached every function below behaves exactly as it did before.
  */
 
 import {
@@ -30,6 +45,12 @@ import {
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  planInvalidate,
+  planLookup,
+  planRecord,
+  type ActionPlan,
+} from "@/lib/form-action-cache";
 
 /**
  * Model driving `act`/`extract`/`observe`. Stagehand validates this string
@@ -55,6 +76,17 @@ export type BrowserSession = {
   page: Page;
   /** Log prefix of the flow that opened this session, e.g. `[act-007]`. */
   logTag: string;
+  /**
+   * JOB-006. The replayable plan for the form shape this session has landed on,
+   * once a caller has looked one up and attached it.
+   *
+   * Mutable and optional on purpose. Optional because a session is opened long
+   * before there is a form to fingerprint, and every helper here behaves exactly
+   * as it did before this field existed when it is absent. Mutable because a run
+   * both reads from it and teaches it, and what it learned is written back once
+   * at the end rather than a row at a time.
+   */
+  actionPlan?: ActionPlan | null;
 };
 
 export type OpenBrowserSessionOptions = {
@@ -503,24 +535,74 @@ async function saveObserveCache(cache: ObserveCache, logTag: string): Promise<vo
   }
 }
 
+/** What a resolve produced, and where it came from. */
+export type ResolvedAction = {
+  action: CachedAction;
+  cacheKey: string;
+  /** True when the per URL file cache answered, so a retry may safely re observe. */
+  cached: boolean;
+  /**
+   * JOB-006. True when the shared per shape plan answered instead of a model.
+   *
+   * Callers use it for one thing: a replayed answer that does not hold up when
+   * it is checked against the DOM, or that fails when acted on, earns exactly
+   * one live observation rather than being treated as a real result. See
+   * `reResolveLive`.
+   */
+  replayed: boolean;
+};
+
 /**
  * The cached half of the observe → act pattern: return a replayable `Action`
  * for `instruction` on this page, observing only on a miss.
  *
  * Throws when nothing matches. Callers that treat an absent control as an
  * ordinary outcome should use `tryResolveAction`.
+ *
+ * JOB-006 put one more cache in front of the two that were already here. The
+ * order is shared plan, then per URL file, then a model, and it goes that way
+ * because it is cheapest first: the plan is the only one that can answer for a
+ * posting this machine has never opened, which in production is every posting.
+ * A plan is only consulted for the instructions its owner marked cacheable, so
+ * click paths reach the model exactly as they always did.
  */
 export async function resolveAction(
   session: BrowserSession,
   url: string,
   instruction: string
-): Promise<{ action: CachedAction; cacheKey: string; cached: boolean }> {
+): Promise<ResolvedAction> {
   const cacheKey = observeCacheKey(url, instruction);
+
+  const planned = planLookup(session.actionPlan, instruction);
+  if (planned.hit) {
+    if (planned.action === null) {
+      console.log(`${session.logTag} form action plan says absent (no model call): ${instruction}`);
+      throw new ControlNotFoundError(instruction, url);
+    }
+    console.log(
+      `${session.logTag} form action plan REPLAY (no model call): ${instruction} → ` +
+        `${planned.action.selector}`
+    );
+    return {
+      // The caller's own constant, never a stored model written description.
+      // `lib/form-action-cache.ts` explains at length why nothing else is
+      // allowed to come out of a table every user's runs read.
+      action: {
+        selector: planned.action.selector,
+        description: instruction,
+        ...(planned.action.method === undefined ? {} : { method: planned.action.method }),
+      },
+      cacheKey,
+      cached: false,
+      replayed: true,
+    };
+  }
+
   const cache = await loadObserveCache();
   const hit = cache[cacheKey];
   if (hit?.selector) {
     console.log(`${session.logTag} observe cache HIT — ${instruction}`);
-    return { action: hit, cacheKey, cached: true };
+    return { action: hit, cacheKey, cached: true, replayed: false };
   }
 
   const { data: candidates } = await session.stagehand.observe(instruction, {
@@ -528,6 +610,9 @@ export async function resolveAction(
   });
   const found = candidates[0];
   if (!found?.selector) {
+    // An absence is worth remembering too. A board with no LinkedIn box costs a
+    // model call to discover that on every single run otherwise.
+    planRecord(session.actionPlan, instruction, null);
     throw new ControlNotFoundError(instruction, url);
   }
 
@@ -538,10 +623,14 @@ export async function resolveAction(
   };
   cache[cacheKey] = action;
   await saveObserveCache(cache, session.logTag);
+  planRecord(session.actionPlan, instruction, {
+    selector: action.selector,
+    ...(action.method === undefined ? {} : { method: action.method }),
+  });
   console.log(
     `${session.logTag} observe cache MISS — cached ${instruction} → ${action.selector}`
   );
-  return { action, cacheKey, cached: false };
+  return { action, cacheKey, cached: false, replayed: false };
 }
 
 /**
@@ -568,13 +657,42 @@ export async function tryResolveAction(
   session: BrowserSession,
   url: string,
   instruction: string
-): Promise<{ action: CachedAction; cacheKey: string; cached: boolean } | null> {
+): Promise<ResolvedAction | null> {
   try {
     return await resolveAction(session, url, instruction);
   } catch (err) {
     if (err instanceof ControlNotFoundError) return null;
     throw err;
   }
+}
+
+/**
+ * JOB-006. Throws away a replayed answer that did not survive checking, and
+ * observes the control live instead.
+ *
+ * This is what keeps the shared cache from ever being able to make a run worse
+ * than it was before the cache existed. A stored selector is a guess made on
+ * some other posting; the caller checks it against the DOM the way it checks
+ * every other observation, and when the check fails this drops the entry from
+ * the plan, drops the per URL copy with it, and pays for one real model call.
+ * The cost of a wrong row is therefore exactly the call it tried to save.
+ *
+ * Returns `null` when the live observation finds nothing either, which is a real
+ * answer and not a failure: the control is genuinely not on this page.
+ */
+export async function reResolveLive(
+  session: BrowserSession,
+  url: string,
+  instruction: string,
+  why: string
+): Promise<ResolvedAction | null> {
+  console.warn(
+    `${session.logTag} replayed action for "${instruction}" did not hold up (${why}); ` +
+      `observing it live once`
+  );
+  planInvalidate(session.actionPlan, instruction);
+  await forgetAction(observeCacheKey(url, instruction), session.logTag);
+  return await tryResolveAction(session, url, instruction);
 }
 
 export async function forgetAction(cacheKey: string, logTag: string): Promise<void> {
@@ -629,7 +747,7 @@ export async function typeInto(
   instruction: string,
   value: string
 ): Promise<CachedAction> {
-  const { action, cacheKey, cached } = await resolveAction(session, url, instruction);
+  const { action, cacheKey, cached, replayed } = await resolveAction(session, url, instruction);
 
   try {
     await session.stagehand.act(
@@ -643,16 +761,20 @@ export async function typeInto(
     );
     return action;
   } catch (err) {
-    if (!cached) throw err;
-    // A cached selector that no longer resolves is the one failure this can
-    // recover from safely: nothing has been submitted, and re-observing a field
-    // and filling it again is idempotent. Deliberately not extended to any
-    // click, where a retry is not idempotent at all.
+    // JOB-006 widened this from `cached` to "not observed live in this call".
+    // A selector replayed from the shared per shape plan is a guess made against
+    // some other posting, so it fails this way more often than a per URL one
+    // does, and it is recoverable for exactly the same reason: nothing has been
+    // submitted, and filling a field twice is idempotent. Still deliberately not
+    // extended to any click, where a retry is not idempotent at all.
+    if (!cached && !replayed) throw err;
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(
       `${session.logTag} cached selector for "${instruction}" no longer works (${reason}); ` +
         `re-observing once`
     );
+    // Both layers, or the same stale answer comes straight back.
+    planInvalidate(session.actionPlan, instruction);
     await forgetAction(cacheKey, session.logTag);
     const fresh = await resolveAction(session, url, instruction);
     await session.stagehand.act(
