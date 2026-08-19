@@ -723,11 +723,54 @@ const NON_TEXT_INPUT_TYPES = new Set([
 
 type Corroboration = { ok: true; via: string } | { ok: false; why: string };
 
+/**
+ * JOB-006 review follow up. Why a replayed selector may not be corroborated by
+ * the description it carries.
+ *
+ * A replayed action's description is one of this module's own `INSTRUCTIONS`
+ * constants, because `lib/form-action-cache.ts` deliberately stores no model
+ * written text in a table every user's runs read. Every one of those constants
+ * names its own field in plain words, so matching one against `FIELD_KEYWORDS`
+ * is matching a string we wrote against itself and succeeds for every replay,
+ * whatever the stored selector actually points at.
+ *
+ * That would be harmless if a stored selector could only ever come from a form
+ * like this one, and it cannot: `selectorShape()` reduces an XPath to its leaf
+ * tag, so two unrelated self hosted careers pages with no element ids really do
+ * fingerprint the same. A replay whose selector lands on an unlabelled element,
+ * or inside an iframe, or nowhere at all, would then pass corroboration with no
+ * evidence behind it, and the only remaining check reads back that *a* value
+ * landed rather than that the right value landed in the right box.
+ *
+ * So when the DOM offers nothing independent, a replay fails. That is not a
+ * dead end: `corroborateResolved` answers a failed replay by dropping the row
+ * and observing the control live, which is exactly what the run would have done
+ * without a cache. The cost of a colliding row stays one model call.
+ */
+function replayNeedsDomEvidence(what: string): Corroboration {
+  return {
+    ok: false,
+    why:
+      `${what}, and this selector was replayed from the shared form action cache rather than ` +
+      `observed on this page, so nothing identifies it except the instruction this run asked ` +
+      `with`,
+  };
+}
+
+/**
+ * Whether the control at a selector is the field it is supposed to be.
+ *
+ * `replayed` says where the selector came from, and it is a safety input rather
+ * than bookkeeping: it is what stops the two branches below that have no DOM
+ * fact to work with from accepting a cached selector on the strength of our own
+ * instruction string. See `replayNeedsDomEvidence`.
+ */
 export function corroborate(
   key: FieldKey,
   descriptor: ControlDescriptor,
   observedDescription: string,
-  multiline: boolean
+  multiline: boolean,
+  replayed: boolean
 ): Corroboration {
   const self = FIELD_KEYWORDS[key];
 
@@ -751,6 +794,9 @@ export function corroborate(
       // A control with no name, id, placeholder or label at all — Workday's
       // sign-up email box is exactly this. There is no DOM fact to check, so
       // fall back to what the reader said, and say so in the report.
+      if (replayed) {
+        return replayNeedsDomEvidence("the control carries no name, id, placeholder or label");
+      }
       return self.test(observedDescription)
         ? {
             ok: true,
@@ -783,6 +829,9 @@ export function corroborate(
 
   // Selector did not resolve at the top level. Common and legitimate: the form
   // is inside an iframe. The reader's description is all there is.
+  if (replayed) {
+    return replayNeedsDomEvidence("the selector does not resolve in the top level document");
+  }
   return self.test(observedDescription)
     ? {
         ok: true,
@@ -1681,7 +1730,13 @@ async function corroborateResolved(
 ): Promise<FieldCorroboration> {
   const judge = async (candidate: ResolvedAction): Promise<{ ok: true; via: string } | { ok: false; why: string }> => {
     const descriptor = await describeControl(session.page, candidate.action.selector);
-    return corroborate(field.key, descriptor, candidate.action.description, field.multiline);
+    return corroborate(
+      field.key,
+      descriptor,
+      candidate.action.description,
+      field.multiline,
+      candidate.replayed
+    );
   };
 
   const first = await judge(resolved);
@@ -2623,6 +2678,12 @@ async function attachResume(
     // rule that `corroborate` enforces for text fields would be backwards.
     const evidenceFor = async (candidate: ResolvedAction): Promise<string> => {
       const descriptor = await describeControl(session.page, candidate.action.selector);
+      // Same rule as `corroborate`, for the same reason: a replayed action's
+      // description is this module's own instruction, which says "resume or CV"
+      // in so many words, so falling back to it would let any replayed selector
+      // read as a resume upload however wrong it is. A replay is worth what the
+      // DOM says about it and nothing else. See `replayNeedsDomEvidence`.
+      if (candidate.replayed) return descriptor.haystack;
       return descriptor.haystack || candidate.action.description;
     };
     let evidence = await evidenceFor(resolved);
@@ -2633,10 +2694,20 @@ async function attachResume(
     // to reach that outcome on its own.
     if (resolved.replayed && !FIELD_KEYWORDS.resume.test(evidence)) {
       const fresh = await reResolveLive(session, url, INSTRUCTIONS.RESUME_UPLOAD, "it does not read as a resume upload");
-      if (fresh !== null) {
-        resolved = fresh;
-        evidence = await evidenceFor(fresh);
+      if (fresh === null) {
+        // The live observation found nothing either, so the replayed selector
+        // was the only thing claiming this control exists and it has just been
+        // dropped. Same stop as an absent control above, rather than a report
+        // that the upload "describes itself as" the empty string.
+        throw new FormFillBlockedError(
+          `The application form at "${url}" reports a resume upload control, but the only ` +
+            `selector for it came from the shared form action cache and nothing on this page ` +
+            `corroborates it. An application without the resume attached is not worth ` +
+            `submitting, so this stops here. Nothing was submitted.`
+        );
       }
+      resolved = fresh;
+      evidence = await evidenceFor(fresh);
     }
     if (!FIELD_KEYWORDS.resume.test(evidence)) {
       throw new FormFillBlockedError(

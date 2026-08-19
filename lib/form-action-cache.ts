@@ -32,9 +32,15 @@
  *     table every user reads would hand that string a much longer life than it
  *     has today. A replayed action carries the caller's own constant
  *     instruction as its description instead, which is what `typeInto()`
- *     overwrites it with anyway, and which `corroborate()` in
- *     `lib/fill-application-form.ts` still matches successfully because every
- *     one of those constants names its own field in plain words.
+ *     overwrites it with anyway.
+ *
+ *     What that costs, and it is worth saying plainly because a review found it
+ *     the hard way: a replayed description is a string this codebase wrote, and
+ *     every one of those constants names its own field in plain words, so
+ *     checking one against `FIELD_KEYWORDS` is checking it against itself.
+ *     `corroborate()` therefore refuses to accept a replayed selector on the
+ *     strength of its description at all. A replay has to be corroborated by
+ *     the DOM or be observed again.
  *
  *  2. **Only fields are served, never clicks.** `clickControl()` decides whether
  *     a control is safe to click by testing `observe()`'s fresh description
@@ -50,10 +56,17 @@
  *
  * ── Replay is checked, never trusted ────────────────────────────────────────
  * A replayed selector is not assumed to be right. `fill-application-form.ts`
- * reads the control out of the DOM and corroborates it exactly as it does for a
- * freshly observed one, and a replayed action that fails that check, or that
- * fails when acted on, is dropped from the plan and observed live once. So the
- * worst a wrong row can do is cost the model call it was trying to save.
+ * reads the control out of the DOM and corroborates it against what the DOM
+ * says, and a replayed action that fails that check, or that fails when acted
+ * on, is dropped from the plan and observed live once. So the worst a wrong row
+ * can do is cost the model call it was trying to save.
+ *
+ * It has to be a stricter check than the one a fresh observation gets, because
+ * a fingerprint really can collide between two forms that are not the same
+ * form. `selectorShape()` keeps only an XPath's leaf tag, so two self hosted
+ * careers pages whose controls carry no ids can key the same, and then one page
+ * replays the other's absolute XPaths. Nothing about that is exotic, so a
+ * replay is believed only where the page itself says so.
  *
  * ── Storage ─────────────────────────────────────────────────────────────────
  * Postgres, in `cached_form_actions`, reached through `@supabase/supabase-js` on

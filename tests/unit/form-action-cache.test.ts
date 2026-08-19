@@ -27,7 +27,12 @@ import {
   type CoreSlot,
   type ShapeField,
 } from "@/lib/form-action-cache";
-import { CACHEABLE_INSTRUCTION_SLOTS, FIELD_KEYWORDS } from "@/lib/fill-application-form";
+import {
+  CACHEABLE_INSTRUCTION_SLOTS,
+  corroborate,
+  FIELD_KEYWORDS,
+  type ControlDescriptor,
+} from "@/lib/fill-application-form";
 import { runFleet } from "@/scripts/form-action-cache-benchmark";
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -183,6 +188,28 @@ describe("detectAts", () => {
 // The two label tables have to agree
 // ───────────────────────────────────
 
+/** A control the DOM found and that says nothing about itself. Workday's is real. */
+const UNLABELLED_CONTROL: ControlDescriptor = {
+  found: true,
+  tag: "input",
+  type: "text",
+  haystack: "",
+  attachedFiles: -1,
+  text: "",
+  role: "",
+};
+
+/** A selector that resolves to nothing here, which is what an iframe looks like. */
+const NOT_IN_THIS_DOCUMENT: ControlDescriptor = {
+  found: false,
+  tag: "",
+  type: "",
+  haystack: "",
+  attachedFiles: -1,
+  text: "",
+  role: "",
+};
+
 describe("slot classification", () => {
   /** Labels lifted from the three boards' real forms. */
   const CORPUS: readonly (readonly [string, CoreSlot])[] = [
@@ -219,14 +246,51 @@ describe("slot classification", () => {
   });
 
   it("classifies each cacheable instruction as the slot it is mapped to", () => {
-    // The instruction constants are what a replayed action carries as its
-    // description, and `corroborate()` matches that description against
-    // `FIELD_KEYWORDS` when the DOM has nothing to say. If an instruction stops
-    // naming its own field, replay silently stops corroborating.
+    // A cached absence is only honoured when the live form's own slot set agrees
+    // the field is not there, so the map's idea of which slot an instruction
+    // asks about has to be the same as `classifyCoreSlot`'s. That is what this
+    // pins, and it is the only thing it pins.
     for (const [instruction, slot] of CACHEABLE_INSTRUCTION_SLOTS) {
       expect(classifyCoreSlot(instruction)).toBe(slot);
-      expect(FIELD_KEYWORDS[slot].test(instruction)).toBe(true);
     }
+  });
+
+  it("never lets an instruction stand in as corroboration of a replay of itself", () => {
+    // This test used to assert the opposite, and the reasoning it carried was
+    // the bug. Every instruction names its own field in plain words, so
+    // `FIELD_KEYWORDS[slot].test(instruction)` is true for all nine of them, and
+    // a replayed action carries the instruction as its description. Letting the
+    // description answer for a replay therefore meant `corroborate()` matching a
+    // string this codebase wrote against itself and passing every single time,
+    // whatever the stored selector actually pointed at.
+    //
+    // The self match below is still true and still deliberately asserted: it is
+    // the trap, and it has to stay visible so nobody restores the fallback that
+    // walked into it.
+    for (const [instruction, slot] of CACHEABLE_INSTRUCTION_SLOTS) {
+      expect(FIELD_KEYWORDS[slot].test(instruction)).toBe(true);
+
+      expect(corroborate(slot, UNLABELLED_CONTROL, instruction, false, true)).toMatchObject({
+        ok: false,
+      });
+      expect(corroborate(slot, NOT_IN_THIS_DOCUMENT, instruction, false, true)).toMatchObject({
+        ok: false,
+      });
+    }
+  });
+
+  it("still lets a live observation speak for a control the DOM cannot describe", () => {
+    // The other half of the same rule. A freshly observed description is a
+    // model's account of this page rather than a constant of ours, so it is real
+    // evidence, and Workday's unlabelled sign up email box has nothing else.
+    // Narrowing this would turn a cost fix into a regression.
+    const fresh = "the email address box at the top of the sign up panel";
+    expect(corroborate("email", UNLABELLED_CONTROL, fresh, false, false)).toMatchObject({
+      ok: true,
+    });
+    expect(corroborate("email", NOT_IN_THIS_DOCUMENT, fresh, false, false)).toMatchObject({
+      ok: true,
+    });
   });
 
   it("serves no instruction that would be clicked", () => {
@@ -367,6 +431,140 @@ describe("planInvalidate", () => {
     planInvalidate(plan, EMAIL);
     expect(plan.stats.invalidated).toBe(0);
     expect(plan.dirty).toBe(false);
+  });
+});
+
+// ───────────────────────────────────
+// The collision the review found, end to end
+// ───────────────────────────────────
+
+/**
+ * Two unrelated companies, each hosting its own careers page, neither putting an
+ * id on anything. `form-fields.ts` answers with absolute XPaths for all of them,
+ * `selectorShape()` keeps only the leaf tag, and what is left of both forms is
+ * the same four tokens. The DOM ladders below have nothing in common and the
+ * labels are not even the same words; the fingerprint cannot tell them apart,
+ * and that is not a flaw in the test, it is the shape of the key.
+ */
+const SELF_HOSTED_ALPHA: readonly ShapeField[] = [
+  field("First Name", "text", "xpath=/html[1]/body[1]/div[1]/main[1]/form[1]/div[1]/input[1]"),
+  field("Last Name", "text", "xpath=/html[1]/body[1]/div[1]/main[1]/form[1]/div[2]/input[1]"),
+  field("Email", "text", "xpath=/html[1]/body[1]/div[1]/main[1]/form[1]/div[3]/input[1]"),
+  field("Resume", "file", "xpath=/html[1]/body[1]/div[1]/main[1]/form[1]/div[4]/input[1]"),
+];
+
+const SELF_HOSTED_BETA: readonly ShapeField[] = [
+  field(
+    "Given name",
+    "text",
+    "xpath=/html[1]/body[1]/section[3]/article[1]/form[2]/fieldset[1]/p[4]/input[1]"
+  ),
+  field(
+    "Surname",
+    "text",
+    "xpath=/html[1]/body[1]/section[3]/article[1]/form[2]/fieldset[1]/p[6]/input[1]"
+  ),
+  field(
+    "E-mail address",
+    "text",
+    "xpath=/html[1]/body[1]/section[3]/article[1]/form[2]/fieldset[1]/p[9]/input[1]"
+  ),
+  field(
+    "Curriculum Vitae",
+    "file",
+    "xpath=/html[1]/body[1]/section[3]/article[1]/form[2]/fieldset[1]/p[11]/input[1]"
+  ),
+];
+
+/** Alpha's email box, which is nowhere near where Beta keeps its own. */
+const ALPHAS_EMAIL_SELECTOR = "xpath=/html[1]/body[1]/div[1]/main[1]/form[1]/div[3]/input[1]";
+
+describe("a fingerprint collision between two unrelated forms", () => {
+  const alpha = fingerprintFormShape("unknown", SELF_HOSTED_ALPHA);
+  const beta = fingerprintFormShape("unknown", SELF_HOSTED_BETA);
+
+  it("really does happen, which is why replay has to be checked against the DOM", () => {
+    expect(beta.fingerprint).toBe(alpha.fingerprint);
+    expect(beta.ats).toBe("unknown");
+  });
+
+  it("serves one company's selector to the other company's form", () => {
+    // Nothing here is contrived. Alpha ran first and filed what it observed;
+    // Beta looks the row up under the key it computed from its own DOM and gets
+    // a hit, because the key is the same key.
+    const beforeBeta = emptyActionPlan(alpha, CACHEABLE);
+    planRecord(beforeBeta, EMAIL, { selector: ALPHAS_EMAIL_SELECTOR, method: "fill" });
+
+    const onBeta = emptyActionPlan(beta, CACHEABLE);
+    onBeta.entries = new Map(beforeBeta.entries);
+    onBeta.warm = true;
+
+    expect(planLookup(onBeta, EMAIL)).toEqual({
+      hit: true,
+      action: { selector: ALPHAS_EMAIL_SELECTOR, method: "fill" },
+    });
+  });
+
+  it("does not get typed into on corroboration that came from our own instruction", () => {
+    // The two ways Alpha's XPath can land on Beta's page without the DOM having
+    // anything to say about it. Before the fix both of these returned ok, on the
+    // strength of the instruction matching itself, and a real candidate's email
+    // address went into whatever box that selector happened to reach.
+    const landedOnSomethingUnlabelled = corroborate(
+      "email",
+      UNLABELLED_CONTROL,
+      EMAIL,
+      false,
+      true
+    );
+    const landedNowhere = corroborate("email", NOT_IN_THIS_DOCUMENT, EMAIL, false, true);
+
+    expect(landedOnSomethingUnlabelled.ok).toBe(false);
+    expect(landedNowhere.ok).toBe(false);
+    // And the reason given names the cache, so the log says what happened.
+    expect(landedOnSomethingUnlabelled.ok === false && landedOnSomethingUnlabelled.why).toContain(
+      "shared form action cache"
+    );
+  });
+
+  it("is still refused when the wrong box is one the DOM can describe", () => {
+    // The check that was already here, unchanged, kept next to the new one so the
+    // whole matrix is visible: a labelled control that belongs to another field
+    // was always caught, and it is the unlabelled and unresolvable cases that
+    // were not.
+    const beta_phone: ControlDescriptor = {
+      ...UNLABELLED_CONTROL,
+      haystack: "applicant_phone | Phone number",
+    };
+    expect(corroborate("email", beta_phone, EMAIL, false, true).ok).toBe(false);
+  });
+
+  it("drops the colliding row and goes back to the model, once", () => {
+    // What `reResolveLive` does with the refusal above, in the terms this module
+    // owns: the entry is dropped, the drop is counted, and the next lookup for
+    // the same instruction is a miss, so the run observes live exactly as it
+    // would have with no cache at all. A colliding row costs one model call and
+    // never a wrong answer.
+    const onBeta = emptyActionPlan(beta, CACHEABLE);
+    onBeta.entries.set(EMAIL, { selector: ALPHAS_EMAIL_SELECTOR, method: "fill" });
+    onBeta.warm = true;
+
+    expect(planLookup(onBeta, EMAIL)).toMatchObject({ hit: true });
+    planInvalidate(onBeta, EMAIL);
+
+    expect(planLookup(onBeta, EMAIL)).toEqual({ hit: false });
+    expect(onBeta.stats.invalidated).toBe(1);
+    expect(onBeta.dirty).toBe(true);
+
+    // And what the live observation then finds is filed under Beta's own key, so
+    // the next Beta run is warm with Beta's selector rather than Alpha's.
+    const betasOwnEmail =
+      "xpath=/html[1]/body[1]/section[3]/article[1]/form[2]/fieldset[1]/p[9]/input[1]";
+    planRecord(onBeta, EMAIL, { selector: betasOwnEmail, method: "fill" });
+    expect(planLookup(onBeta, EMAIL)).toEqual({
+      hit: true,
+      action: { selector: betasOwnEmail, method: "fill" },
+    });
   });
 });
 
