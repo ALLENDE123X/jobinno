@@ -40,8 +40,9 @@
  * This repository still has no Inngest serve route, so nothing registers this
  * function with Inngest and the cron cannot fire yet. That route is its own
  * ticket and would have registered the whole ported pipeline along with it,
- * which is more than JOB-003 should be deciding. Until it lands, the sync is
- * run by calling the functions in `lib/board-ingest.ts` directly.
+ * which is more than JOB-003 should be deciding. Until it lands, `npm run
+ * sync-boards` makes the same two calls this function makes, without Inngest
+ * in the way. See `lib/board-sync-cli.ts`.
  */
 
 // The pipeline's first import is `./load-env`, so importing the client from it
