@@ -22,6 +22,7 @@
 
 import {
   Stagehand,
+  browserbase,
   localBrowser,
   type Page,
   type StagehandBrowser,
@@ -61,19 +62,169 @@ export type OpenBrowserSessionOptions = {
   logTag: string;
 };
 
+// ───────────────────────────────────
+// Which browser provider this process uses (JOB-005)
+// ───────────────────────────────────
+
 /**
- * Launches a Chrome this run owns outright and attaches Stagehand to it.
+ * What the readers below accept. `process.env` satisfies it, and so does a
+ * plain object literal, which `NodeJS.ProcessEnv` does not: Next.js augments
+ * that interface with a required `NODE_ENV`, so every test fixture would have
+ * to carry a `NODE_ENV` it does not care about to typecheck.
+ */
+export type EnvSource = Readonly<Record<string, string | undefined>>;
+
+export const BROWSERBASE_API_KEY_ENV_VAR = "BROWSERBASE_API_KEY";
+export const BROWSERBASE_PROJECT_ID_ENV_VAR = "BROWSERBASE_PROJECT_ID";
+export const BROWSERBASE_CONCURRENCY_ENV_VAR = "BROWSERBASE_CONCURRENCY";
+
+/**
+ * Sessions this Browserbase project may run at once, when
+ * `BROWSERBASE_CONCURRENCY` does not say otherwise.
+ *
+ * Not a guess. `GET /v1/projects/{id}` on the live Jobinno project reports
+ * `"concurrency": 3`, which is the plan's own cap: ask for a fourth session and
+ * Browserbase refuses it rather than queueing it. The number is therefore a
+ * property of the billing plan, so it lives in an env var and this constant is
+ * only the fallback for an environment that has not set one.
+ */
+export const BROWSERBASE_DEFAULT_CONCURRENCY = 3;
+
+/**
+ * Seconds before Browserbase ends a session on its own, passed on every launch
+ * rather than left at the project default of 300.
+ *
+ * One application is an account check, a form fill of up to a few dozen fields
+ * and a submit, and every step of that waits on both an LLM call and a slow
+ * careers SPA. Five minutes is not reliably enough. A session cut off mid
+ * submit lands the row on `submission_unconfirmed`, which is terminal and never
+ * retried, so a ceiling set too low costs the candidate an application they
+ * cannot recover, while one set too high costs nothing: Browserbase bills the
+ * minutes a session actually uses, and `closeBrowserSession` closes on every
+ * exit path. Twenty minutes is generous for a form that is working and still
+ * bounded for one that is not.
+ */
+export const BROWSERBASE_SESSION_TIMEOUT_S = 20 * 60;
+
+/**
+ * Sessions the local Chromium path may run at once.
+ *
+ * Two, and the reason is memory rather than taste, as
+ * `inngest/job-application-pipeline.ts` records at length: a 5 wide fan out on
+ * an 8 GB machine put the load average at 32 on 8 cores and pushed swap to 5 GB
+ * of 6 GB, at which point Chrome stops answering CDP or dies outright. That is
+ * a property of one developer machine and it has nothing to say about remote
+ * sessions, which is exactly why the two numbers are now separate.
+ */
+export const LOCAL_BROWSER_CONCURRENCY = 2;
+
+/**
+ * Which provider `openBrowserSession` will use, and why.
+ *
+ * `incomplete` is a third state on purpose. One credential set and the other
+ * missing is a typo every time, never a choice, and silently falling back to a
+ * local Chromium there is the worst of the three outcomes: it looks like it
+ * worked, right up until the same code runs somewhere that has no Chrome
+ * installed at all.
+ */
+export type BrowserProviderChoice =
+  | { provider: "browserbase"; apiKey: string; projectId: string }
+  | { provider: "local" }
+  | { provider: "incomplete"; missing: string; present: string };
+
+/** Trimmed value, or undefined when the variable is unset or only whitespace. */
+function readEnv(env: EnvSource, name: string): string | undefined {
+  const raw = env[name]?.trim();
+  return raw === undefined || raw === "" ? undefined : raw;
+}
+
+/**
+ * Reads the provider choice out of the environment. Pure, and takes the env it
+ * reads, so a test can exercise both branches without a browser and without
+ * mutating `process.env` around whatever else is running.
+ *
+ * Additive by design. With neither Browserbase variable set this returns
+ * `local` and the Chromium path behaves exactly as it did before JOB-005, which
+ * is what keeps `npm run fill-form` working on a laptop with no Browserbase
+ * account.
+ */
+export function chooseBrowserProvider(
+  env: EnvSource = process.env
+): BrowserProviderChoice {
+  const apiKey = readEnv(env, BROWSERBASE_API_KEY_ENV_VAR);
+  const projectId = readEnv(env, BROWSERBASE_PROJECT_ID_ENV_VAR);
+
+  if (apiKey !== undefined && projectId !== undefined) {
+    return { provider: "browserbase", apiKey, projectId };
+  }
+  if (apiKey === undefined && projectId === undefined) {
+    return { provider: "local" };
+  }
+  return apiKey === undefined
+    ? {
+        provider: "incomplete",
+        missing: BROWSERBASE_API_KEY_ENV_VAR,
+        present: BROWSERBASE_PROJECT_ID_ENV_VAR,
+      }
+    : {
+        provider: "incomplete",
+        missing: BROWSERBASE_PROJECT_ID_ENV_VAR,
+        present: BROWSERBASE_API_KEY_ENV_VAR,
+      };
+}
+
+/**
+ * How many sessions may run at once under the active provider.
+ *
+ * `inngest/job-application-pipeline.ts` reads this for `applyToJob`'s
+ * `concurrency.limit`, so the fan out width and the launch queue below always
+ * agree about which bottleneck is real: this machine's cores when the browsers
+ * are local, and the Browserbase plan's session cap when they are not.
+ *
+ * Never throws, including on the `incomplete` case. It runs at module load in
+ * the pipeline, and a tuning number is not worth failing an import over. The
+ * run that would have used it fails with a readable reason in
+ * `openBrowserSession` instead.
+ */
+export function browserConcurrencyLimit(env: EnvSource = process.env): number {
+  if (chooseBrowserProvider(env).provider !== "browserbase") {
+    return LOCAL_BROWSER_CONCURRENCY;
+  }
+
+  const configured = readEnv(env, BROWSERBASE_CONCURRENCY_ENV_VAR);
+  if (configured === undefined) return BROWSERBASE_DEFAULT_CONCURRENCY;
+
+  const parsed = Number(configured);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    console.warn(
+      `${BROWSERBASE_CONCURRENCY_ENV_VAR}=${JSON.stringify(configured)} is not a positive ` +
+        `whole number; falling back to ${BROWSERBASE_DEFAULT_CONCURRENCY}`
+    );
+    return BROWSERBASE_DEFAULT_CONCURRENCY;
+  }
+  return parsed;
+}
+
+/**
+ * Launches a browser this run owns outright and attaches Stagehand to it.
+ *
+ * JOB-005 made which browser a property of the environment rather than of this
+ * function: a Browserbase session when both credentials are set, and the local
+ * Chromium below when neither is. Nothing else in the function changed, because
+ * nothing else needed to. Stagehand hands back the same `StagehandBrowser`
+ * either way, so every caller, the observe cache and the teardown path are all
+ * provider blind by construction.
  *
  * Deliberately no shared instance, no keepalive, no pool: a browser nobody else
  * can reach is what makes a hijack-defence layer unnecessary, and it is also
- * what makes `concurrency: { limit: 5 }` in
- * `inngest/job-application-pipeline.ts` safe — five calls are five Chrome
- * processes with five temp profiles.
+ * what makes `applyToJob`'s `concurrency.limit` in
+ * `inngest/job-application-pipeline.ts` safe: N calls are N browsers, with N
+ * temp profiles locally and N isolated remote sessions on Browserbase.
  *
- * `port` and `userDataDir` are deliberately left unset. Stagehand's launcher
- * only picks a random free port and a fresh temp profile when they are absent;
- * pinning either would make concurrent runs collide on the debug port or on
- * Chrome's profile lock.
+ * `port` and `userDataDir` are deliberately left unset on the local path.
+ * Stagehand's launcher only picks a random free port and a fresh temp profile
+ * when they are absent; pinning either would make concurrent runs collide on
+ * the debug port or on Chrome's profile lock.
  */
 /**
  * How many browsers may be *starting* at once. Not how many may be running.
@@ -96,15 +247,37 @@ export type OpenBrowserSessionOptions = {
  * starts keeps `concurrency: { limit: 5 }` in
  * `inngest/job-application-pipeline.ts` meaning what it says, while never
  * putting more than this many launches in flight at once.
+ *
+ * ── JOB-005: the limit is now the active provider's, not a constant ──────────
+ *
+ * Every word above is about a Chrome process starting on this machine, so none
+ * of it applies to a Browserbase session. There `launch()` is one HTTPS call
+ * that creates a session on someone else's fleet, it costs this process no CPU,
+ * and starts do not contend with each other at all.
+ *
+ * The queue is kept rather than skipped for the remote path, for one reason
+ * that is worth being precise about. Browserbase caps concurrent sessions per
+ * project and refuses the one over the line instead of queueing it, so a bound
+ * is still wanted. Set to the plan's cap it is close to a no op underneath
+ * `applyToJob`'s own `concurrency.limit`, which reads the same number. It earns
+ * its place on the entry points that never touch Inngest, `npm run fill-form`
+ * and `npm run submit-application`, where nothing else is counting.
+ *
+ * What it deliberately does not claim to be is an enforcement of that cap. It
+ * gates starts, not runs, and releases as soon as a session is up, so three
+ * live sessions plus a fourth start is still a refusal from Browserbase. The
+ * pipeline's `concurrency.limit` is what actually holds the line.
  */
-const MAX_CONCURRENT_LAUNCHES = 2;
+function maxConcurrentLaunches(): number {
+  return browserConcurrencyLimit();
+}
 
 /** Resolves when a launch slot is free; the returned function gives it back. */
 const launchQueue: Array<() => void> = [];
 let launchesInFlight = 0;
 
 async function acquireLaunchSlot(logTag: string): Promise<() => void> {
-  if (launchesInFlight >= MAX_CONCURRENT_LAUNCHES) {
+  if (launchesInFlight >= maxConcurrentLaunches()) {
     console.log(
       `${logTag} waiting for a browser-launch slot (${launchesInFlight} starting, ` +
         `${launchQueue.length} already queued) — starts are serialised so none of them ` +
@@ -136,15 +309,45 @@ export async function openBrowserSession(
     );
   }
 
+  // Resolved before a slot is taken, so a half configured environment fails
+  // immediately and without ever occupying the queue.
+  const choice = chooseBrowserProvider();
+  if (choice.provider === "incomplete") {
+    throw new Error(
+      `${choice.present} is set but ${choice.missing} is not. Browserbase needs both, and ` +
+        `running a local Chromium instead would hide the mistake rather than report it. ` +
+        `Set both to use remote browsers, or unset both to use the local browser.`
+    );
+  }
+
   // Held across launch *and* `Stagehand.create()`, because the 60s ceiling
   // covers both and init is not the cheap half.
   const releaseLaunchSlot = await acquireLaunchSlot(options.logTag);
-  let browser: Awaited<ReturnType<typeof localBrowser.launch>>;
+  let browser: StagehandBrowser;
   try {
-    browser = await localBrowser.launch({ headless: options.headless });
+    browser =
+      choice.provider === "browserbase"
+        ? await browserbase.launch({
+            apiKey: choice.apiKey,
+            projectId: choice.projectId,
+            // `options.headless` has no remote equivalent and is not silently
+            // mapped to anything: a Browserbase session has no display either
+            // way, and its live view is how a run gets watched.
+            api_timeout: BROWSERBASE_SESSION_TIMEOUT_S,
+          })
+        : await localBrowser.launch({ headless: options.headless });
   } catch (err) {
     releaseLaunchSlot();
     throw err;
+  }
+
+  if (browser.provider === "browserbase") {
+    // The session id is the only handle on the recording and the live view in
+    // the Browserbase dashboard, and there is no way back to it from a log line
+    // that does not carry it.
+    console.log(
+      `${options.logTag} Browserbase session ${browser.sessionId ?? "(id unavailable)"} started`
+    );
   }
 
   try {
@@ -178,6 +381,11 @@ export async function openBrowserSession(
  * `stagehand.close()` releases the SDK's connection to the browser but leaves
  * the Chrome process running — only `browser.close()` kills it.
  *
+ * Both halves matter more on Browserbase than they did locally, not less. A
+ * remote session that is never closed keeps burning billed minutes until the
+ * project timeout ends it, and it holds one of the plan's concurrency slots the
+ * whole time, so the next run waits on a browser nobody is using.
+ *
  * Never throws. This runs in a `finally` next to a real error often enough that
  * letting a teardown failure replace the original diagnosis would be a bad
  * trade every time.
@@ -193,7 +401,8 @@ export async function closeBrowserSession(session: BrowserSession): Promise<void
     await session.browser.close();
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    console.warn(`${session.logTag} closing the local browser failed (ignored): ${reason}`);
+    const what = session.browser.provider === "browserbase" ? "Browserbase" : "local";
+    console.warn(`${session.logTag} closing the ${what} browser failed (ignored): ${reason}`);
   }
 }
 
