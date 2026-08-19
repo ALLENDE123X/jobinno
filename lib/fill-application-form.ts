@@ -245,7 +245,7 @@ const INSTRUCTIONS = Object.freeze({
  * and which boilerplate slot each one is asking about.
  *
  * The list is short because it is an allowlist rather than an exclusion list,
- * and the two entries it deliberately omits are the point.
+ * and the two groups it deliberately leaves out are the point.
  *
  *  · **Every click is missing.** `APPLY_START`, `SIGN_IN_SUBMIT`,
  *    `VERIFICATION_SUBMIT` and `COVER_LETTER_MANUAL` all go through
