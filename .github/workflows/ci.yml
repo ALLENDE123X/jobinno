@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: jobinno_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Throwaway service container, not a real database. Nothing destructive
+      # should run against a real DATABASE_URL without an explicit opt in gate.
+      DATABASE_URL: postgres://test:test@localhost:5432/jobinno_test
+
+      # Supabase Auth, not NextAuth. These are placeholders so that the build
+      # and the type check have something structurally valid to read; CI never
+      # talks to a real Supabase project.
+      NEXT_PUBLIC_SUPABASE_URL: http://localhost:54321
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: test-anon-key
+      SUPABASE_URL: http://localhost:54321
+      SUPABASE_SERVICE_ROLE_KEY: test-service-role-key
+
+      # Anything genuinely secret comes from repository secrets. An unset secret
+      # resolves to an empty string, which every module is expected to handle by
+      # failing closed rather than by guessing.
+      STAGEHAND_LLM_API_KEY: ${{ secrets.STAGEHAND_LLM_API_KEY }}
+      RESUME_LLM_API_KEY: ${{ secrets.RESUME_LLM_API_KEY }}
+      BROWSERBASE_API_KEY: ${{ secrets.BROWSERBASE_API_KEY }}
+      BROWSERBASE_PROJECT_ID: ${{ secrets.BROWSERBASE_PROJECT_ID }}
+      APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+      INNGEST_EVENT_KEY: ${{ secrets.INNGEST_EVENT_KEY }}
+      INNGEST_SIGNING_KEY: ${{ secrets.INNGEST_SIGNING_KEY }}
+      STRIPE_SECRET_KEY: test_sk
+      STRIPE_WEBHOOK_SECRET: whsec_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build to generate types
+        run: npm run build
+
+      - name: Push database schema
+        run: npx drizzle-kit push
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: test
+    # Only worth the minutes when the PR actually touches the UI. Runs when the
+    # PR is labeled 'ui', or its title mentions ui, dashboard, or page.
+    if: |
+      contains(github.event.pull_request.title, 'ui') ||
+      contains(github.event.pull_request.title, 'dashboard') ||
+      contains(github.event.pull_request.title, 'page') ||
+      contains(toJson(github.event.pull_request.labels), 'ui')
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: jobinno_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://test:test@localhost:5432/jobinno_test
+      NEXT_PUBLIC_SUPABASE_URL: http://localhost:54321
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: test-anon-key
+      SUPABASE_URL: http://localhost:54321
+      SUPABASE_SERVICE_ROLE_KEY: test-service-role-key
+      STRIPE_SECRET_KEY: test_sk
+      STRIPE_WEBHOOK_SECRET: whsec_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Push database schema
+        run: npx drizzle-kit push
+
+      - name: Build
+        run: npm run build
+
+      - name: Run E2E tests
+        run: npx playwright test
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:3000
+          E2E_TEST_USER_EMAIL: e2e-test@example.com
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
