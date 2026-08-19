@@ -2,7 +2,9 @@
  * ACT-009 — the orchestration layer. Two Inngest functions, wired to the real
  * ACT-002 through ACT-008 modules and, since JOB-004, to Jobinno's own schema.
  *
- *   1. discoverListings — ONE bulk search per request, runs once.
+ *   1. discoverListings — ONE match against the synced `jobs` table per
+ *                         request, runs once. Since JOB-008 it selects rather
+ *                         than searches; see its own header.
  *   2. applyToJob       — fans out from that single list. N listings = N
  *                         independent runs, with `concurrency` capping how many
  *                         are in flight at the active browser provider's limit.
@@ -78,10 +80,19 @@
  * `filling_form` → `form_filled` → `submitted`). That row is the tracker; a
  * second writer would only ever disagree with it.
  *
- * It also does not decide *which* listings a person should apply to. JOB-008
- * owns matching. `discoverListings` below is the ported search, bridged onto
- * the `jobs` table so its fan-out produces rows that exist; it is a stopgap
- * that JOB-008 should replace rather than build on.
+ * It also does not decide *which* listings a person should apply to on its own
+ * any more. JOB-008 moved that into `lib/job-matching.ts`, and what is left
+ * here is the orchestration: ask that module what matched, fan out one event
+ * per answer. The ported live search this used to call, and the URL
+ * reconciliation that bridged it onto `jobs`, are both gone — that code called
+ * itself a stopgap and this is the ticket it named.
+ *
+ * ── What sends the events ───────────────────────────────────────────────────
+ * `lib/job-search-trigger.ts` and, on a schedule,
+ * `inngest/job-search-schedule.ts`. Before JOB-008 nothing sent
+ * `job-search/requested` at all, anywhere, which is a failure mode worth naming
+ * because it is silent: a registered Inngest function with no trigger type
+ * checks, lints, tests, deploys and never runs.
  */
 
 // FIRST, and it has to stay first: the Inngest client below reads `INNGEST_DEV`
@@ -97,14 +108,17 @@ import {
 } from "@/lib/application-quota";
 import { claimApplicationRow } from "@/lib/application-records";
 import { APPLICATION_STATUS } from "@/lib/application-status";
-import { loadCandidate } from "@/lib/candidate-intake";
 import { FormFillBlockedError } from "@/lib/fill-application-form";
-import { InjectionSuspectedError } from "@/lib/resume-parser";
 import {
-  requiresCoverLetterFromQuestions,
-  searchJobListings,
-  type JobSearchPreferences,
-} from "@/lib/search-job-listings";
+  fanOutLimit,
+  loadMatchProfile,
+  matchJobsForUser,
+  remainingAllowance,
+  searchBlockedReason,
+  type MatchPreferences,
+} from "@/lib/job-matching";
+import { InjectionSuspectedError } from "@/lib/resume-parser";
+import { requiresCoverLetterFromQuestions } from "@/lib/search-job-listings";
 import { browserConcurrencyLimit } from "@/lib/stagehand-session";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 import { SubmissionBlockedError, submitApplication } from "@/lib/submit-application";
@@ -160,17 +174,35 @@ export const JOB_APPLICATION_REQUESTED = "job-application/requested";
 export type JobSearchRequestedData = {
   userId: string;
   /**
-   * Optional, but less optional than it was.
+   * Optional, and every field inside it optional too (JOB-008).
    *
-   * actinno fell back to `candidates.target_title`, `pay_min` and `locations`
-   * when the event left them out. Jobinno's `profiles` has a column for exactly
-   * one of those three: `target_locations`. So `title` and `payMin` now have no
-   * stored fallback at all and must be supplied here if they are wanted, and a
-   * search sent without a title searches every relevant listing on the named
-   * boards. `CandidateRecord` in `lib/candidate-intake.ts` records that gap and
-   * what closing it would take.
+   * ── What this used to be, and why it shrank ───────────────────────────────
+   * It was `Partial<JobSearchPreferences> & { companies: string[] }`: the live
+   * ATS search's own preference type, because the handler used to run that
+   * search. It no longer does. Matching selects from `jobs`, so the event may
+   * only carry things `jobs` can actually be matched on, and the type is that
+   * list rather than a wider one whose extra fields would be quietly dropped.
+   *
+   * Three changes fall out of that:
+   *
+   *  · `companies` is optional now, and an event with none means every active
+   *    board rather than no boards. The old required array made sense when each
+   *    entry was a board API about to be read live; against a synced registry
+   *    the useful default is "all of it".
+   *  · `payMin` is gone. There is no compensation column on `jobs` and no
+   *    reliable compensation field across the platforms that fill it — see
+   *    `lib/job-matching.ts` and `JobSearchPreferences`'s own note. It is
+   *    removed rather than accepted and ignored, so that nothing can send a pay
+   *    floor and believe it was applied.
+   *  · `maxPerCompany` is gone with it, for a plainer reason: it was a cap on
+   *    how many listings one live board read could contribute, and there is no
+   *    per board read any more. The fan out is capped by the person's remaining
+   *    allowance instead.
+   *
+   * `title` survives as a substring filter over `jobs.title` and nothing more.
+   * `locations` overrides `profiles.target_locations` for one search.
    */
-  preferences: Partial<JobSearchPreferences> & { companies: string[] };
+  preferences?: MatchPreferences;
 };
 
 /**
@@ -354,104 +386,138 @@ async function loadListing(supabase: SupabaseClient, jobId: string): Promise<Lis
 }
 
 // ───────────────────────────────────
-// 1. Discovery — one search, then fan out
+// 1. Discovery — match against `jobs`, then fan out
 // ───────────────────────────────────
 
+/**
+ * JOB-008 replaced the body of this function outright.
+ *
+ * It used to call `searchJobListings`, read the ATS platforms live, and then
+ * reconcile what came back to `jobs` rows by apply URL, dropping every listing
+ * the board sync had not written yet and logging the count as "unmatched". The
+ * comment on that code called it a stopgap and named this ticket as the fix.
+ *
+ * It now selects from `jobs` joined to `boards`, which is the table JOB-003's
+ * sync exists to fill. Three consequences worth stating, because each was a
+ * real defect in the old shape rather than an inefficiency:
+ *
+ *  · **A search no longer reads sixty three employers' APIs to answer one
+ *    person.** The sync reads them four times a day for everybody.
+ *  · **A repeated search is idempotent.** The match excludes any listing this
+ *    person already has an `applications` row for, so running it twice does not
+ *    fan out a second run at a listing already in flight, already blocked, or
+ *    already submitted. The old path had no such exclusion at all: it would
+ *    re-dispatch everything it found, every time.
+ *  · **The fan out is bounded by what the person can actually spend.** See
+ *    `fanOutLimit`.
+ */
 export const discoverListings = inngest.createFunction(
   { id: "discover-listings", triggers: [{ event: jobSearchRequested }] },
   async ({ event, step }) => {
     const userId = requireUuid(event.data.userId, "userId", "a profiles.id UUID");
-    const requested = event.data.preferences ?? { companies: [] };
+    const preferences = event.data.preferences;
 
-    // Also the existence check. A `userId` that is a well-formed UUID but not a
-    // real profile would otherwise survive discovery and fail N times over in N
-    // fanned-out runs.
+    // One step, and everything it needs read inside it. The allowance in
+    // particular has to be read here rather than passed in or remembered: it
+    // moves under this function from two directions at once — every `applyToJob`
+    // run reserves and settles against it, and JOB-010's Stripe webhook resets
+    // it the moment somebody pays.
     //
-    // Only the search preference comes back out of the step. The rest of the
-    // record — the email, the resume path — is not needed here, and a step's
-    // return value is durable state that outlives the run: there is no reason
-    // for a person's details to exist in two systems when one of them was not
-    // asked to hold them.
-    const stored = await step.run("load-candidate", async () => ({
-      locations: (await loadCandidate(userId)).locations,
-    }));
+    // Only the ids and the counts come back out. A step's return value is
+    // durable state that outlives the run, and there is no reason for a list of
+    // job titles to be stored twice.
+    const matched = await step.run("match-jobs", async () => {
+      const profile = await loadMatchProfile(userId);
+      if (!profile) {
+        // A well formed UUID that names nobody. This is also the existence
+        // check the old `load-candidate` step did, and it is worth doing here
+        // for the same reason: without it the failure happens N times over, in
+        // N fanned out runs, instead of once.
+        throw new NonRetriableError(
+          `No profiles row with id ${userId}. A profile is created by signing in; see ` +
+            `app/auth/callback/route.ts.`
+        );
+      }
 
-    // `||` rather than `??` on purpose: an empty string or an empty array in the
-    // event means "I did not specify this", and should fall through to the
-    // person's own stored preference rather than override it with nothing.
-    //
-    // `title` and `payMin` have no stored fallback left to reach for. See
-    // `JobSearchRequestedData`.
-    const preferences: JobSearchPreferences = {
-      companies: requested.companies ?? [],
-      title: requested.title?.trim() || undefined,
-      payMin: requested.payMin ?? undefined,
-      locations: requested.locations?.length ? requested.locations : stored.locations ?? undefined,
-      ...(requested.maxPerCompany === undefined ? {} : { maxPerCompany: requested.maxPerCompany }),
-    };
+      // Attestation and a resume, checked once here rather than N times in N
+      // fanned out runs. The live search this replaced had the same property by
+      // accident: it called `loadCandidate`, which threw on either. Neither
+      // improves by being retried, so neither is retried.
+      const blocked = searchBlockedReason(profile);
+      if (blocked !== null) {
+        throw new NonRetriableError(`No search for ${userId}: ${blocked}`);
+      }
 
-    const listings = await step.run("bulk-search-job-boards", () =>
-      searchJobListings(preferences)
-    );
+      const remaining = remainingAllowance(profile);
+      if (remaining <= 0) {
+        return {
+          jobIds: [] as string[],
+          remaining,
+          limit: 0,
+          cap: profile.applicationsCap,
+          used: profile.applicationsUsed,
+        };
+      }
 
-    // ── The bridge, and why it is a bridge (JOB-004) ────────────────────────
-    //
-    // `searchJobListings` reads the ATS platforms live and returns listing
-    // objects. `applications.job_id` is a foreign key onto `jobs`, so a listing
-    // that has no row there cannot be applied to, however real it is. The two
-    // discovery paths in this repository are independent: the board sync writes
-    // `jobs` from the same platforms on a schedule, and this reads them
-    // directly, right now.
-    //
-    // So each listing is matched back to a `jobs` row by its apply URL, and the
-    // ones with no match are counted and reported rather than dropped silently.
-    // A high `unmatched` count is the signal that the sync has not run recently,
-    // and it is far more useful surfaced than swallowed.
-    //
-    // This is a stopgap. Two independent discovery mechanisms is one too many,
-    // and the right shape is for the matching ticket to select from `jobs`
-    // rather than for this to reconcile against it.
-    const resolved = await step.run("resolve-listings-to-jobs", async () => {
-      const urls = [...new Set(listings.map((listing) => listing.applyUrl))];
-      if (urls.length === 0) return { jobIds: [] as string[], unmatched: 0 };
+      const limit = fanOutLimit(remaining);
+      const matches = await matchJobsForUser({ userId, profile, preferences, limit });
 
-      const supabase = getSupabaseClient();
-      const { data, error } = await supabase.from("jobs").select("id,url").in("url", urls);
-      if (error) throw new Error(`jobs lookup failed: ${error.message}`);
+      // Logged in here, where the titles are already in memory, rather than
+      // returned so the caller can log them.
+      for (const match of matches) {
+        console.log(
+          `${LOG} match for ${userId}: ${match.company} / ${match.title}` +
+            (match.location === null ? "" : ` (${match.location})`)
+        );
+      }
 
-      const byUrl = new Map((data ?? []).map((row) => [String(row.url), String(row.id)]));
-      const jobIds = urls.map((url) => byUrl.get(url)).filter((id): id is string => id !== undefined);
-      return { jobIds, unmatched: urls.length - jobIds.length };
+      return {
+        jobIds: matches.map((match) => match.jobId),
+        remaining,
+        limit,
+        cap: profile.applicationsCap,
+        used: profile.applicationsUsed,
+      };
     });
 
-    if (resolved.jobIds.length === 0) {
+    if (matched.remaining <= 0) {
       console.warn(
-        `${LOG} no known listings matched for ${userId} ` +
-          `(boards: ${JSON.stringify(preferences.companies)}, ` +
-          `title: ${JSON.stringify(preferences.title ?? "(any)")}) — ` +
-          `${listings.length} found live, ${resolved.unmatched} of them absent from jobs. ` +
-          `Run the board sync (npm run sync-boards) and try again.`
+        `${LOG} no search for ${userId}: ${matched.used} of ${matched.cap} applications used. ` +
+          `A cap of zero is the default and means this account has not been provisioned to ` +
+          `apply yet.`
       );
-      return { userId, discovered: listings.length, dispatched: 0, unmatched: resolved.unmatched };
+      return { userId, remaining: 0, matched: 0, dispatched: 0 };
+    }
+
+    if (matched.jobIds.length === 0) {
+      console.warn(
+        `${LOG} nothing matched for ${userId} ` +
+          `(boards: ${JSON.stringify(preferences?.companies ?? "(any)")}, ` +
+          `title: ${JSON.stringify(preferences?.title ?? "(any)")}, ` +
+          `locations: ${JSON.stringify(preferences?.locations ?? "(from profile)")}). ` +
+          `Either the board sync has not run (try npm run sync-boards) or every listing ` +
+          `that matched already has an applications row for this person.`
+      );
+      return { userId, remaining: matched.remaining, matched: 0, dispatched: 0 };
     }
 
     console.log(
-      `${LOG} ${resolved.jobIds.length} listing(s) for ${userId} → ` +
-        `${resolved.jobIds.length} concurrent apply-to-job run(s), ` +
-        `${browserConcurrencyLimit()} at a time` +
-        (resolved.unmatched === 0 ? "" : ` (${resolved.unmatched} not in jobs, skipped)`)
+      `${LOG} ${matched.jobIds.length} listing(s) for ${userId} → ` +
+        `${matched.jobIds.length} concurrent apply-to-job run(s), ` +
+        `${browserConcurrencyLimit()} at a time ` +
+        `(${matched.remaining} application(s) left, ceiling ${matched.limit})`
     );
 
     // The fan-out. One event per listing; Inngest starts one run of `applyToJob`
     // per event and its `concurrency.limit` does the batching. The ids are
-    // already distinct — `resolve-listings-to-jobs` de-duplicated the URLs — and
-    // that matters: `claimApplicationRow` reuses the row for a (user, job) pair,
+    // distinct by construction — they are primary keys off one select — and that
+    // matters: `claimApplicationRow` reuses the row for a (user, job) pair,
     // which is what makes its own retries safe, but `(user_id, job_id)` has no
     // unique index, so two *concurrent* runs on the same listing would both
     // insert and the tracker would show one listing twice.
     await step.sendEvent(
       "fan-out-applications",
-      resolved.jobIds.map((jobId) => ({
+      matched.jobIds.map((jobId) => ({
         name: JOB_APPLICATION_REQUESTED,
         data: { userId, jobId } satisfies JobApplicationRequestedData,
       }))
@@ -459,10 +525,10 @@ export const discoverListings = inngest.createFunction(
 
     return {
       userId,
-      discovered: listings.length,
-      dispatched: resolved.jobIds.length,
-      unmatched: resolved.unmatched,
-      companies: preferences.companies,
+      remaining: matched.remaining,
+      matched: matched.jobIds.length,
+      dispatched: matched.jobIds.length,
+      limit: matched.limit,
     };
   }
 );
