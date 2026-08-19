@@ -151,12 +151,21 @@ import { allowedSenderDomains } from "@/lib/future-gmail/gmail-verification-list
 import {
   closeBrowserSession,
   openBrowserSession,
+  reResolveLive,
   tryResolveAction,
   typeInto,
   NAVIGATION_TIMEOUT_MS,
   type BrowserSession,
   type CachedAction,
+  type ResolvedAction,
 } from "@/lib/stagehand-session";
+import {
+  detectAts,
+  fingerprintFormShape,
+  loadActionPlan,
+  saveActionPlan,
+  type CoreSlot,
+} from "@/lib/form-action-cache";
 import {
   decideFieldAnswers,
   generateCoverLetter,
@@ -230,6 +239,47 @@ const INSTRUCTIONS = Object.freeze({
     "the control that switches the cover letter from a file upload to typing the text in " +
     "directly, labelled something like \"Enter manually\", \"Type\", \"Write\" or \"Paste\"",
 } as const);
+
+/**
+ * JOB-006. The instructions the shared form action cache is allowed to answer,
+ * and which boilerplate slot each one is asking about.
+ *
+ * The list is short because it is an allowlist rather than an exclusion list,
+ * and the two entries it deliberately omits are the point.
+ *
+ *  · **Every click is missing.** `APPLY_START`, `SIGN_IN_SUBMIT`,
+ *    `VERIFICATION_SUBMIT` and `COVER_LETTER_MANUAL` all go through
+ *    `clickControl`, which decides whether a control is safe to press by testing
+ *    what `observe()` freshly said about it against `SUBMIT_WORD_RE`. A replayed
+ *    action carries this module's own constant as its description, so serving
+ *    that path from a cache would turn a real guard into a test of a string we
+ *    wrote against itself. These stay live on every run. There are only one to
+ *    three of them, and they are the calls where being wrong means pressing
+ *    something that submits a real person's application.
+ *
+ *  · **The two password fields are missing.** Nothing about a sign in form is
+ *    worth sharing between users, and the shape this cache keys on is the
+ *    application form rather than the wall in front of it.
+ *
+ * The slot each instruction maps to has to agree with what
+ * `classifyCoreSlot()` makes of the same field's label, because a cached
+ * absence is only honoured when the live form's slot set agrees that the field
+ * is not there. `tests/unit/form-action-cache.test.ts` pins both directions.
+ */
+const CACHEABLE_INSTRUCTIONS: ReadonlyMap<string, CoreSlot> = new Map<string, CoreSlot>([
+  [INSTRUCTIONS.FIRST_NAME, "firstName"],
+  [INSTRUCTIONS.LAST_NAME, "lastName"],
+  [INSTRUCTIONS.FULL_NAME, "fullName"],
+  [INSTRUCTIONS.EMAIL, "email"],
+  [INSTRUCTIONS.PHONE, "phone"],
+  [INSTRUCTIONS.LINKEDIN, "linkedin"],
+  [INSTRUCTIONS.WEBSITE, "website"],
+  [INSTRUCTIONS.RESUME_UPLOAD, "resume"],
+  [INSTRUCTIONS.COVER_LETTER_TEXT, "coverLetter"],
+]);
+
+/** Exported for the test that pins it against `classifyCoreSlot`. */
+export const CACHEABLE_INSTRUCTION_SLOTS = CACHEABLE_INSTRUCTIONS;
 
 // ───────────────────────────────────
 // Reading the page
@@ -1601,6 +1651,51 @@ function buildFieldPlan(
   return plan;
 }
 
+/** What the DOM check made of a resolved control, after any retry it earned. */
+type FieldCorroboration =
+  | { ok: true; check: { ok: true; via: string } }
+  | { ok: false; why: string; resolved: ResolvedAction | null };
+
+/**
+ * JOB-006. Checks a resolved control against DOM truth, and gives a replayed one
+ * a single live observation before believing the bad news.
+ *
+ * This is the guarantee that makes the shared cache safe to turn on. A stored
+ * selector was worked out on some other company's posting, so the interesting
+ * question is not whether it can be wrong but what happens when it is. Without
+ * this, a wrong replay would corroborate as "that control calls itself something
+ * else" and the field would be reported skipped and left blank, which is a real
+ * regression against observing live. With it, the plan entry is dropped, the
+ * model is asked, and the run continues exactly as it would have before the
+ * cache existed. A wrong row can therefore cost money and never correctness.
+ *
+ * A freshly observed control gets no retry. There is nothing to retry with:
+ * asking the same model the same question about the same page is not a second
+ * opinion.
+ */
+async function corroborateResolved(
+  session: BrowserSession,
+  url: string,
+  field: FieldPlan,
+  resolved: ResolvedAction
+): Promise<FieldCorroboration> {
+  const judge = async (candidate: ResolvedAction): Promise<{ ok: true; via: string } | { ok: false; why: string }> => {
+    const descriptor = await describeControl(session.page, candidate.action.selector);
+    return corroborate(field.key, descriptor, candidate.action.description, field.multiline);
+  };
+
+  const first = await judge(resolved);
+  if (first.ok) return { ok: true, check: first };
+  if (!resolved.replayed) return { ok: false, why: first.why, resolved };
+
+  const fresh = await reResolveLive(session, url, field.instruction, first.why);
+  if (fresh === null) return { ok: false, why: first.why, resolved: null };
+
+  const second = await judge(fresh);
+  if (second.ok) return { ok: true, check: second };
+  return { ok: false, why: second.why, resolved: fresh };
+}
+
 async function fillFields(
   session: BrowserSession,
   url: string,
@@ -1644,25 +1739,23 @@ async function fillFields(
       continue;
     }
 
-    const descriptor = await describeControl(session.page, resolved.action.selector);
-    const check = corroborate(
-      field.key,
-      descriptor,
-      resolved.action.description,
-      field.multiline
-    );
-    if (!check.ok) {
+    const checked = await corroborateResolved(session, url, field, resolved);
+    if (!checked.ok) {
       // Fail closed at field level: a wrong value in a real employer's form is
       // worse than a blank one a human can fill in.
       outcomes.push({
         field: field.key,
         intended: field.value,
-        outcome: "skipped",
-        detail: `not filled — ${check.why}`,
+        outcome: checked.resolved === null ? "not-on-form" : "skipped",
+        detail:
+          checked.resolved === null
+            ? "no control on the page matched this field"
+            : `not filled — ${checked.why}`,
       });
-      console.warn(`${LOG} skipping ${field.key}: ${check.why}`);
+      console.warn(`${LOG} skipping ${field.key}: ${checked.why}`);
       continue;
     }
+    const check = checked.check;
 
     const used = await typeInto(session, url, field.instruction, field.value);
     const readBack = await readControlValue(session.page, used.selector);
@@ -2517,7 +2610,7 @@ async function attachResume(
     selector = "input[type=file]";
     via = "the page's only file input (no inference needed)";
   } else {
-    const resolved = await tryResolveAction(session, url, INSTRUCTIONS.RESUME_UPLOAD);
+    let resolved = await tryResolveAction(session, url, INSTRUCTIONS.RESUME_UPLOAD);
     if (resolved === null) {
       throw new FormFillBlockedError(
         `The application form at "${url}" reports a resume upload control, but no control ` +
@@ -2525,11 +2618,26 @@ async function attachResume(
           `this stops here. Nothing was submitted.`
       );
     }
-    const descriptor = await describeControl(session.page, resolved.action.selector);
     // Only the labelling half of the corroboration applies here: a file input is
     // exactly what we want for this one, so the "not something to type into"
     // rule that `corroborate` enforces for text fields would be backwards.
-    const evidence = descriptor.haystack || resolved.action.description;
+    const evidenceFor = async (candidate: ResolvedAction): Promise<string> => {
+      const descriptor = await describeControl(session.page, candidate.action.selector);
+      return descriptor.haystack || candidate.action.description;
+    };
+    let evidence = await evidenceFor(resolved);
+    // JOB-006, and the same rule `corroborateResolved` applies to text fields: a
+    // replayed selector that does not describe itself as a resume upload buys
+    // one live observation rather than blocking the run. Refusing to attach a
+    // resume stops the application dead, so a stale cache row must not be able
+    // to reach that outcome on its own.
+    if (resolved.replayed && !FIELD_KEYWORDS.resume.test(evidence)) {
+      const fresh = await reResolveLive(session, url, INSTRUCTIONS.RESUME_UPLOAD, "it does not read as a resume upload");
+      if (fresh !== null) {
+        resolved = fresh;
+        evidence = await evidenceFor(fresh);
+      }
+    }
     if (!FIELD_KEYWORDS.resume.test(evidence)) {
       throw new FormFillBlockedError(
         `The control found for the resume upload describes itself as ${JSON.stringify(evidence)}, ` +
@@ -2839,6 +2947,20 @@ async function runBrowserFlow(
     let signals = await reachApplicationForm(session, state, verification.signals);
     console.log(`${LOG} application form reached at ${signals.url}`);
 
+    // ── JOB-006: pick up whatever an earlier run learned about this form shape.
+    //
+    // Here and not earlier, because "this form shape" needs the form to be on
+    // screen: before the apply control is clicked the page is a job description
+    // and its shape says nothing about the form behind it. Here and not later,
+    // because every field lookup below this line is a lookup the plan can answer
+    // without a model.
+    //
+    // The read is the same `enumerateFormFields` the ACT-015 pass runs, which is
+    // pure DOM and costs no inference. Running it a second time is a page
+    // evaluate, which is the cheapest thing in this file by orders of magnitude,
+    // and it is worth it to fingerprint the form while it is still untouched.
+    await attachFormActionPlan(supabase, session, signals.url);
+
     // The cover letter needs somewhere to go before anything is typed. Doing
     // this first means a required-but-impossible cover letter blocks the run
     // before it has half-filled a real employer's form.
@@ -2983,7 +3105,42 @@ async function runBrowserFlow(
       session: null,
     };
   } finally {
+    // JOB-006. In the `finally` so that a blocked run still contributes what it
+    // worked out before it stopped: the fields it did resolve are the same
+    // fields on that form shape whatever happened afterwards, and a partial plan
+    // is strictly better than none. Never throws, so it cannot displace the
+    // failure that brought the run here.
+    await saveActionPlan(supabase, session.actionPlan, LOG);
     if (!retained) await closeBrowserSession(session);
+  }
+}
+
+/**
+ * JOB-006. Fingerprints the form on screen and hangs the stored plan for that
+ * shape off the session.
+ *
+ * Never throws, and never leaves the session without a plan: a shape nobody has
+ * filed yet produces an empty plan, which serves nothing and collects
+ * everything this run observes. That is what turns the first application against
+ * a new ATS layout into the one that pays for all the others.
+ */
+async function attachFormActionPlan(
+  supabase: SupabaseClient,
+  session: BrowserSession,
+  url: string
+): Promise<void> {
+  try {
+    const fields = await enumerateFormFields(session.page);
+    const shape = fingerprintFormShape(detectAts(url), fields);
+    console.log(
+      `${LOG} form shape ${shape.ats}/${shape.fingerprint} from ${fields.length} control(s): ` +
+        `${[...shape.slots].join(", ") || "no recognised boilerplate field"}`
+    );
+    session.actionPlan = await loadActionPlan(supabase, shape, CACHEABLE_INSTRUCTIONS, LOG);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(`${LOG} could not attach a form action plan (observing instead): ${reason}`);
+    session.actionPlan = null;
   }
 }
 

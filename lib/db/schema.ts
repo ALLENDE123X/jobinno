@@ -485,3 +485,67 @@ export const feedback = pgTable(
     }),
   ]
 );
+
+// ───────────────────────────────────
+// cached_form_actions
+// ───────────────────────────────────
+
+/**
+ * JOB-006. One replayable action plan per ATS form shape.
+ *
+ * Not user data. A row says "on a Greenhouse form of this shape, the First Name
+ * box is at this selector", which is a fact about a public job board that every
+ * user's run reads and every user's run may improve. That sharing is the whole
+ * point: `observe()` is an LLM call, and paying for it once per form shape
+ * rather than once per application is what makes a $99 Season Pass covering 500
+ * applications work at all.
+ *
+ * `lib/form-action-cache.ts` owns the format and the rules, including why no
+ * model written `description` is ever stored here and why only field lookups
+ * are served from it.
+ *
+ * ── Why RLS is on with no policy at all ─────────────────────────────────────
+ * `boards` and `jobs` are world readable because a signed in user's dashboard
+ * has a reason to read them. Nothing in the browser has any reason to read a
+ * selector, so this gets the posture `skip_log` gets for its writes, applied to
+ * every verb: RLS enabled and no policy, which is PostgREST refusing anon and
+ * authenticated outright. The pipeline holds the service role key, which
+ * bypasses RLS and is unaffected. Leaving RLS off instead would make the table
+ * fully writable by anyone holding the anon key, and a stranger who can write
+ * here can aim a real candidate's resume at a control of their choosing.
+ */
+export const cachedFormActions = pgTable(
+  "cached_form_actions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    /** Platform slug, from the form's own hostname. `unknown` for a self hosted board. */
+    ats: text("ats").notNull(),
+    /** Hex digest of the form's boilerplate shape. See `fingerprintFormShape`. */
+    formFingerprint: text("form_fingerprint").notNull(),
+    /**
+     * Which recipe produced `form_fingerprint`. Stored as well as folded into
+     * the digest, so that a superseded generation of rows can be found and
+     * deleted rather than only ever being missed.
+     */
+    shapeVersion: integer("shape_version").notNull().default(1),
+    /** The tokens the digest was built from, so a changed key can be explained. */
+    shapeTokens: jsonb("shape_tokens"),
+    /**
+     * Instruction to `{ selector, method }`, or to null meaning the form does
+     * not have that field. The null entries matter as much as the others: a
+     * board with no LinkedIn box costs a model call to discover that on every
+     * run until something remembers it.
+     */
+    actions: jsonb("actions").notNull(),
+    /** How many field lookups this row has answered without a model call. */
+    replayHits: integer("replay_hits").notNull().default(0),
+    /** How many replays failed validation and had to be observed live instead. */
+    replayInvalidations: integer("replay_invalidations").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique("cached_form_actions_ats_fingerprint_key").on(table.ats, table.formFingerprint),
+    index("cached_form_actions_ats_idx").on(table.ats),
+  ]
+).enableRLS();
