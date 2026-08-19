@@ -228,21 +228,44 @@ export type ApplyPlanChangeResult =
   | { ok: false; message: string };
 
 /**
- * Activating a paid plan resets the counter as well as raising the cap.
+ * Activating a paid plan raises the cap, and on a genuine first activation it
+ * resets the counter too.
  *
  * "150 applications per month" has to mean 150 from the moment the person pays,
  * and somebody who upgrades after burning all ten free applications would
- * otherwise be sold 150 and handed 140. The recurring monthly reset for a
- * Starter subscription is a separate job on `invoice.paid` and is deliberately
- * not built here; see the PR for the follow up.
+ * otherwise be sold 150 and handed 140. So the reset is right the first time.
+ *
+ * ── Why the reset is conditional ────────────────────────────────────────────
+ * It used to be unconditional, which made it a way to get free applications.
+ * Stripe redelivers: an endpoint that times out, answers 5xx, or is simply
+ * retried gets the same `checkout.session.completed` again, sometimes days
+ * later. Writing `applications_used = 0` on each of those handed a paying
+ * Starter customer their 150 back every time an old event was replayed, and
+ * nothing anywhere would have looked wrong afterwards, because the row is in a
+ * state it could legitimately have been in.
+ *
+ * The caller decides by comparing the plan already on the row, which is the
+ * cheapest honest signal available without an event ledger: if the profile is
+ * already on the plan this event is activating, the activation has happened
+ * before and the counter is somebody's real usage, not a leftover.
+ *
+ * The recurring monthly reset for a Starter subscription is a separate job on
+ * `invoice.paid` and is deliberately not built here; see the PR for the follow
+ * up.
  */
-function activationRow(change: Extract<PlanChange, { kind: "activate" }>) {
+function activationRow(
+  change: Extract<PlanChange, { kind: "activate" }>,
+  resetCounter: boolean
+) {
   const row: Record<string, unknown> = {
     plan: change.plan,
     applications_cap: change.applicationsCap,
-    applications_used: 0,
     updated_at: new Date().toISOString(),
   };
+
+  if (resetCounter) {
+    row.applications_used = 0;
+  }
 
   // Only write the customer id when Stripe gave us one, so that a retry of an
   // event that carried none cannot blank a value an earlier event stored.
@@ -298,9 +321,26 @@ export async function applyPlanChange(
     }
 
     if (change.kind === "activate") {
+      // Read before writing, so a redelivery cannot reset a paying customer's
+      // usage counter. A profile already sitting on the plan this event is
+      // activating has been through this activation once already, so whatever
+      // `applications_used` holds now is real usage and has to survive.
+      const { data: existing, error: readError } = await client
+        .from(PROFILES_TABLE)
+        .select("id, plan")
+        .eq("id", change.userId)
+        .maybeSingle();
+
+      // A read failure is not a reason to guess. Reporting it lets the route
+      // answer 500 and Stripe try again, which is safe, where writing anyway
+      // would be the exact reset this is here to prevent.
+      if (readError) return { ok: false, message: readError.message };
+
+      const firstActivation = existing?.plan !== change.plan;
+
       const { error } = await client
         .from(PROFILES_TABLE)
-        .update(activationRow(change))
+        .update(activationRow(change, firstActivation))
         .eq("id", change.userId);
 
       if (error) return { ok: false, message: error.message };
@@ -308,7 +348,9 @@ export async function applyPlanChange(
       return {
         ok: true,
         applied: "activated",
-        detail: `${change.plan} with a cap of ${change.applicationsCap}`,
+        detail: firstActivation
+          ? `${change.plan} with a cap of ${change.applicationsCap}`
+          : `${change.plan} was already active, so the counter was left alone`,
       };
     }
 

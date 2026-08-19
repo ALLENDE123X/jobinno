@@ -65,11 +65,36 @@ export async function POST(request: NextRequest) {
 
   const payload = await request.text();
 
+  // ── Building the client is a separate failure from verifying the signature ──
+  // Both used to happen inside one try, and both came out of it as a 400. That
+  // is right for a signature and badly wrong for a missing `STRIPE_SECRET_KEY`:
+  // Stripe retries 5xx and does not retry 4xx, so a deployment that lost its
+  // key answered 400 to a real payment, Stripe marked the event delivered, and
+  // the plan activation was gone for good with nothing left to replay. A
+  // configuration problem has to look like a server problem, because that is
+  // what it is, and because a retry after somebody fixes the variable is the
+  // only thing that saves the payment.
+  let stripe;
+  try {
+    stripe = createStripeClient();
+  } catch (thrown) {
+    const detail =
+      thrown instanceof Error ? thrown.message : "Stripe client unavailable.";
+    console.error(`[stripe-webhook] cannot build a Stripe client: ${detail}`);
+    // Generic in the body. The detail names which environment variable is
+    // empty, which is exactly what the server log is for and exactly what an
+    // unauthenticated public endpoint should not hand back to a caller.
+    return NextResponse.json(
+      { error: "Billing webhook is not configured." },
+      { status: 500 }
+    );
+  }
+
   let event;
   try {
     // The async variant, because it uses WebCrypto and therefore behaves the
     // same on every runtime this could end up deployed to.
-    event = await createStripeClient().webhooks.constructEventAsync(
+    event = await stripe.webhooks.constructEventAsync(
       payload,
       signature,
       signingSecret
@@ -87,9 +112,10 @@ export async function POST(request: NextRequest) {
   const change = planChangeForEvent(event);
 
   // Retries are safe without an event ledger because every write here is
-  // idempotent: activation sets the plan and the cap to constants from the
-  // catalog, and a lapse is guarded on the profile still being on `starter`.
-  // Replaying an event lands the row in the state it is already in.
+  // idempotent. Activation reads the row first and only resets the counter when
+  // the plan is genuinely changing, a lapse is guarded on the profile still
+  // being on `starter`, and everything else is a constant from the catalog. See
+  // `applyPlanChange`, which is where that is enforced rather than hoped for.
   const result = await applyPlanChange(
     createServiceRoleClient() as unknown as ProfileBillingClient,
     change
@@ -100,8 +126,13 @@ export async function POST(request: NextRequest) {
       `[stripe-webhook] ${event.type} (${event.id}) failed: ${result.message}`
     );
     // 500 so Stripe retries. A dropped upgrade is somebody who paid and did not
-    // get what they paid for, which is the worst outcome available here.
-    return NextResponse.json({ error: result.message }, { status: 500 });
+    // get what they paid for, which is the worst outcome available here. The
+    // reason stays in the log: it is a Postgres error and can name columns and
+    // constraints, which is not something a public endpoint should recite.
+    return NextResponse.json(
+      { error: "Could not record that event." },
+      { status: 500 }
+    );
   }
 
   console.info(

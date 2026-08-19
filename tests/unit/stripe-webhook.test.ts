@@ -553,6 +553,144 @@ describe("applyPlanChange", () => {
 });
 
 // ───────────────────────────────────
+// Replaying an event must not hand out free applications
+// ───────────────────────────────────
+
+/**
+ * Stripe redelivers. An endpoint that times out, answers 5xx, or is replayed
+ * from the dashboard gets the same `checkout.session.completed` again, and it
+ * can arrive days later.
+ *
+ * The activation write used to set `applications_used = 0` unconditionally, so
+ * every one of those redeliveries handed a paying Starter customer their 150
+ * applications back. Nothing looked wrong afterwards either, because a reset
+ * counter is a state the row could legitimately have been in.
+ */
+describe("activation is idempotent", () => {
+  it("resets the counter on a genuine first activation", async () => {
+    const { client, updates } = recordingClient([
+      { id: USER_ID, plan: "free" },
+    ]);
+
+    const result = await applyPlanChange(
+      client,
+      planChangeForEvent(checkoutEvent())
+    );
+
+    expect(result).toMatchObject({ ok: true, applied: "activated" });
+    expect(updates[0].values).toMatchObject({
+      plan: "starter",
+      applications_cap: 150,
+      applications_used: 0,
+    });
+  });
+
+  it("leaves the counter alone when the same activation arrives again", async () => {
+    // The profile is already on Starter, so this event has been processed
+    // before and whatever the counter holds now is real usage.
+    const { client, updates } = recordingClient([
+      { id: USER_ID, plan: "starter" },
+    ]);
+
+    const result = await applyPlanChange(
+      client,
+      planChangeForEvent(checkoutEvent())
+    );
+
+    expect(result).toMatchObject({ ok: true, applied: "activated" });
+    expect(updates).toHaveLength(1);
+    // The cap and the plan are still written, because rewriting a constant is
+    // harmless. The counter is the one field that must survive.
+    expect(updates[0].values).toMatchObject({
+      plan: "starter",
+      applications_cap: 150,
+    });
+    expect(updates[0].values).not.toHaveProperty("applications_used");
+  });
+
+  it("does not reset the Season Pass counter on a redelivery either", async () => {
+    const { client, updates } = recordingClient([
+      { id: USER_ID, plan: "season_pass" },
+    ]);
+
+    await applyPlanChange(
+      client,
+      planChangeForEvent(
+        checkoutEvent({
+          mode: "payment",
+          metadata: { user_id: USER_ID, plan: "season_pass" },
+        })
+      )
+    );
+
+    expect(updates[0].values).not.toHaveProperty("applications_used");
+  });
+
+  it("still resets when somebody genuinely upgrades to a different plan", async () => {
+    const { client, updates } = recordingClient([
+      { id: USER_ID, plan: "starter" },
+    ]);
+
+    await applyPlanChange(
+      client,
+      planChangeForEvent(
+        checkoutEvent({
+          mode: "payment",
+          metadata: { user_id: USER_ID, plan: "season_pass" },
+        })
+      )
+    );
+
+    // 500 applications were sold and 500 have to be handed over, even if the
+    // person had already spent some of their Starter allowance this month.
+    expect(updates[0].values).toMatchObject({
+      plan: "season_pass",
+      applications_cap: 500,
+      applications_used: 0,
+    });
+  });
+
+  it("refuses to guess when it cannot read the row first", async () => {
+    // Writing anyway would be the exact reset this is here to prevent, so the
+    // failure has to surface and let Stripe retry.
+    const unreadable: ProfileBillingClient = {
+      from() {
+        return {
+          update() {
+            return {
+              async eq() {
+                return { error: null };
+              },
+            };
+          },
+          select() {
+            return {
+              eq() {
+                return {
+                  async maybeSingle() {
+                    return {
+                      data: null,
+                      error: { message: "statement timeout" },
+                    };
+                  },
+                };
+              },
+            };
+          },
+        };
+      },
+    };
+
+    const result = await applyPlanChange(
+      unreadable,
+      planChangeForEvent(checkoutEvent())
+    );
+
+    expect(result).toMatchObject({ ok: false, message: "statement timeout" });
+  });
+});
+
+// ───────────────────────────────────
 // Which client does the writing
 // ───────────────────────────────────
 
@@ -692,6 +830,37 @@ describe("the webhook route's choice of client", () => {
 
     const response = await deliver(checkoutEvent());
     expect(response.status).toBe(500);
+  });
+
+  /**
+   * ── Why the status code here is the whole bug ─────────────────────────────
+   * Stripe retries 5xx and does not retry 4xx. Building the Stripe client used
+   * to happen inside the same try that catches a bad signature, so a
+   * deployment missing `STRIPE_SECRET_KEY` answered 400 to a real payment.
+   * Stripe reads that as "delivered, do not send again", and the plan
+   * activation for somebody who has already been charged is gone with nothing
+   * left to replay. The only thing that saves that payment is a 500, because
+   * it is still there to retry once the variable is put back.
+   */
+  it("answers 500, not 400, when the secret key is missing", async () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "");
+
+    const response = await deliver(checkoutEvent());
+
+    expect(response.status).toBe(500);
+    expect(serviceRoleClient.updates).toHaveLength(0);
+  });
+
+  it("does not recite the configuration problem to the caller", async () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "");
+
+    const response = await deliver(checkoutEvent());
+    const body = JSON.stringify(await response.json());
+
+    // The endpoint is public and unauthenticated. Which environment variable is
+    // empty belongs in the server log and nowhere else.
+    expect(body).not.toContain("STRIPE_SECRET_KEY");
+    expect(body).not.toContain(".env");
   });
 
   it("acknowledges an event it does not act on rather than making Stripe retry", async () => {
