@@ -12,9 +12,18 @@
  * reading the platforms, on a schedule, into `jobs`; this module reads what it
  * wrote.
  *
- * `lib/search-job-listings.ts` is untouched and still does exactly what it did.
- * It is JOB-003's own path and the CLIs still drive it. What changed is that a
- * user facing search no longer goes down it.
+ * `lib/search-job-listings.ts` is untouched, and this ticket deliberately did
+ * not touch it. One consequence should be said out loud rather than discovered
+ * later: `searchJobListings` now has no caller anywhere in the repository. The
+ * board sync does not use it — it reads `lib/ats-job-feeds.ts` directly — so
+ * `discoverListings` was its last one. What is still imported from that module
+ * is `requiresCoverLetterFromQuestions`, which `loadListing` asks of a stored
+ * `jobs.raw` payload.
+ *
+ * Deleting it is not this ticket's call. It is several hundred lines of
+ * evidence about how each platform's board API really behaves, gathered against
+ * live boards under ACT-018, and the ticket that removes it should be the one
+ * that has decided nothing wants that behaviour back.
  *
  * ── What the match is actually made of ──────────────────────────────────────
  * Only signals the schema really carries, which is a shorter list than the old
