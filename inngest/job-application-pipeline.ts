@@ -1,13 +1,13 @@
 /**
  * ACT-009 — the orchestration layer. Two Inngest functions, wired to the real
- * ACT-002 through ACT-008 modules.
+ * ACT-002 through ACT-008 modules and, since JOB-004, to Jobinno's own schema.
  *
  *   1. discoverListings — ONE bulk search per request, runs once.
  *   2. applyToJob       — fans out from that single list. N listings = N
  *                         independent runs, with `concurrency` capping how many
  *                         are in flight at the active browser provider's limit.
  *                         Each run is its own sequential chain internally
- *                         (account → maybe verify → fill+submit) because those
+ *                         (claim the row, then fill and submit) because those
  *                         are causally dependent; every listing's chain runs in
  *                         parallel with every other listing's.
  *
@@ -18,10 +18,9 @@
  * `account.session` into a later `fill-application` step. Inngest's durable
  * execution can run those two steps in different invocations of this process —
  * that is the whole point of it — so `account.session` would arrive as a JSON
- * corpse of a Playwright page. This is exactly why ACT-012/007/008 were each
- * built as self-contained, re-entrant calls keyed only by a `job_applications`
- * row id: `createBoardAccount` takes strings and returns plain data,
- * `submitApplication` takes a row id and returns plain data, and neither has a
+ * corpse of a Playwright page. This is exactly why ACT-007 and ACT-008 were
+ * each built as self-contained, re-entrant calls keyed only by an application
+ * row id: `submitApplication` takes a row id and returns plain data, and has no
  * session in its signature at all. Nothing crosses a step boundary here but ids
  * and strings.
  *
@@ -33,33 +32,56 @@
  * throw it away, and then ask the second to submit a form it never filled. So
  * there is one `fill-and-submit-application` step and it calls ACT-008 alone.
  *
- * **3. The verification wait is conditional.** The stub always waited for
- * `email/verification-received` before proceeding. Most Greenhouse listings are
- * direct-apply — ACT-012's whole design — and `createBoardAccount` reports that
- * as `no_account_required`, meaning there is no account, no signup mail, and
- * nothing to wait for. Waiting anyway would park the majority of real listings
- * on a ten-minute timeout for an email that is never sent. The wait is entered
- * on exactly one status, `awaiting_verification`, which is the only one that
- * means a signup was actually submitted.
+ * **3. There is no verification wait at all any more (JOB-004).** The stub
+ * always waited for `email/verification-received`; the port narrowed that to
+ * the one status that meant a signup had really been submitted. Jobinno removes
+ * it outright, and the reason is a product decision rather than a simplification.
  *
- * **4. Events carry a `candidateId`, not raw resume/LinkedIn/email strings.**
- * `candidates.resume_url` is a bucket-qualified path into a *private* bucket
- * (`resumes/{id}.pdf`), not a fetchable URL, and ACT-007 reads the object itself
- * with the service-role client rather than being handed a link. `linkedin_url`
- * and `application_email` live on the same row. So the events carry the row's
- * id and the one step that needs the email looks it up. The field is spelled
- * `candidateId` rather than the stub's `userId` because that is what it has to
- * be: see `verificationMatch` below.
+ * Jobinno creates no accounts on employers' boards. `lib/future-gmail/README.md`
+ * explains why that is a V2 question, and there is no `board_password` column
+ * in `lib/db/schema.ts` to hold what a signup would produce. With no signup
+ * there is no signup mail, so a wait for one could only ever time out.
+ *
+ * The `create-account` step is gone with it, and so is
+ * `lib/account-creation-placeholder.ts`, the compile time stub JOB-001 pointed
+ * it at. That file's own TODO asked to be deleted in the same change that
+ * removed the step, and this is that change: the step could never have run,
+ * because the stub threw unconditionally, so registering this function with
+ * Inngest while it was still in the chain would have registered a function
+ * guaranteed to fail on its first step.
+ *
+ * Underneath that is the rule the whole schema is shaped around: **skip and log,
+ * do not pause and wait.** actinno parked a run at `awaiting_verification` and
+ * left the row sitting there. Jobinno gives a run that cannot finish a terminal
+ * status and a `skip_log` row saying why, and moves on. A listing behind a login
+ * wall is not a run to keep alive; it is a listing this version cannot apply to,
+ * recorded as `verification_required` and left for a human to read.
+ *
+ * **4. Events carry ids, not raw resume/LinkedIn/email strings.** A resume is a
+ * bucket-qualified path into a *private* bucket, not a fetchable URL, and ACT-007
+ * reads the object itself with the service-role client rather than being handed
+ * a link. So the events carry `userId` and `jobId` and the steps that need
+ * anything else look it up.
+ *
+ * The field is spelled `userId` and not the port's `candidateId`, which is
+ * JOB-004 renaming a thing to what it already was. actinno minted its own
+ * `candidates.id`; Jobinno has no such id. `profiles.id` is a foreign key onto
+ * `auth.users.id`, the auth callback writes the row straight off the verified
+ * session, and `applications.user_id` points back at it. The ported code's own
+ * guard already described this value as "the same identity as ... the userId",
+ * so the two names were one thing and now have one name.
  *
  * ── What this file does NOT do ──────────────────────────────────────────────
- * It never writes to `job_applications`. The stub had a `log-to-tracker` step
- * calling `updateTrackerRow`, and there is no table for it to write to: the
- * actinno project has exactly two tables, `candidates` and `job_applications`,
- * and every module in the chain already writes its own status to the latter as
- * it goes (`creating_account` → `no_account_required` / `awaiting_verification`
- * → `email_verified` → `filling_form` → `form_filled` → `submitted`). That row
- * *is* the tracker; a second writer would only ever disagree with it. The one
- * Supabase call in this file is a read of `candidates`.
+ * It never writes a *status*. It creates the `applications` row, because
+ * something has to and the module that used to is not ported, and after that
+ * every module in the chain writes its own status as it goes (`discovered` →
+ * `filling_form` → `form_filled` → `submitted`). That row is the tracker; a
+ * second writer would only ever disagree with it.
+ *
+ * It also does not decide *which* listings a person should apply to. JOB-008
+ * owns matching. `discoverListings` below is the ported search, bridged onto
+ * the `jobs` table so its fan-out produces rows that exist; it is a stopgap
+ * that JOB-008 should replace rather than build on.
  */
 
 // FIRST, and it has to stay first: the Inngest client below reads `INNGEST_DEV`
@@ -67,37 +89,61 @@
 import "./load-env";
 
 import { Inngest, NonRetriableError, eventType, staticSchema } from "inngest";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-import { loadCandidate } from "@/lib/candidate-intake";
-// JOB-001: actinno imported all three of these from `lib/create-board-account.ts`.
-// That module was deliberately not ported, so this one import splits in two: the
-// status vocabulary now lives in a module of its own, and `createBoardAccount`
-// resolves to a placeholder that throws (see `lib/account-creation-placeholder.ts`
-// for why the step is still here at all). The `create-account` step below is
-// otherwise untouched. A later ticket owns removing it and rewiring the chain.
-import { APPLICATION_STATUS, type ApplicationStatus } from "@/lib/application-status";
-import { createBoardAccount } from "@/lib/account-creation-placeholder";
-import { FormFillBlockedError, type VerificationInput } from "@/lib/fill-application-form";
-// A value import, and it costs a second or two of startup: this module reaches
-// `gmail-client.ts`, which loads `googleapis`. Worth it. `VERIFICATION_EVENT_NAME`
-// and `VerificationEventData` are the producer side of the contract the wait
-// below depends on, and importing them makes a rename over there a compile error
-// over here instead of a ten-minute timeout with no visible cause.
 import {
-  VERIFICATION_EVENT_NAME,
-  type VerificationEventData,
-} from "@/lib/future-gmail/gmail-verification-listener";
+  releaseApplicationSlot,
+  reserveApplicationSlot,
+} from "@/lib/application-quota";
+import { claimApplicationRow } from "@/lib/application-records";
+import { APPLICATION_STATUS } from "@/lib/application-status";
+import { loadCandidate } from "@/lib/candidate-intake";
+import { FormFillBlockedError } from "@/lib/fill-application-form";
 import { InjectionSuspectedError } from "@/lib/resume-parser";
 import {
+  requiresCoverLetterFromQuestions,
   searchJobListings,
-  type JobListing,
   type JobSearchPreferences,
 } from "@/lib/search-job-listings";
 import { browserConcurrencyLimit } from "@/lib/stagehand-session";
+import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 import { SubmissionBlockedError, submitApplication } from "@/lib/submit-application";
 
-/** Same app id ACT-006's sender uses. */
+/**
+ * The app id every function in this repository registers under.
+ *
+ * Still `actinno-job-agent`, and deliberately not renamed by JOB-004. Changing
+ * an Inngest app id is not cosmetic: functions registered under a different id
+ * are a different app, with their own dashboard, their own concurrency budget
+ * and their own signing key, and any run in flight under the old id is orphaned
+ * at the moment of the change. Renaming it is a deployment operation and wants
+ * its own ticket rather than a line in a schema change.
+ */
 export const inngest = new Inngest({ id: "actinno-job-agent" });
+
+const LOG = "[act-009]";
+
+// ───────────────────────────────────
+// Supabase
+// ───────────────────────────────────
+
+/**
+ * Service-role client, matching every ported module in `lib/`. The guard is the
+ * shared one JOB-002 lifted out of the four private copies.
+ */
+function getSupabaseClient(): SupabaseClient {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) {
+    throw new Error(
+      "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars are required (see .env.example)"
+    );
+  }
+  assertSupabaseProject(url);
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
 
 // ───────────────────────────────────
 // Events
@@ -109,100 +155,61 @@ export const JOB_APPLICATION_REQUESTED = "job-application/requested";
 /**
  * What starts a search.
  *
- * `candidateId` **is the `candidates.id` UUID** minted by ACT-003, and it is
- * carried through to `job_applications.candidate_id` unchanged. That is not a
- * naming preference; it is the contract described under `verificationMatch`.
+ * `userId` is `profiles.id`, which is `auth.users.id`. See the header.
  */
 export type JobSearchRequestedData = {
-  candidateId: string;
+  userId: string;
   /**
-   * Optional. `companies` (Greenhouse board slugs) is the only field with no
-   * column on `candidates`, so it must be supplied; `title`, `payMin` and
-   * `locations` fall back to `target_title` / `pay_min` / `locations` on the
-   * candidate's own row, which is what ACT-003 stored them for and what nothing
-   * has read until now.
+   * Optional, but less optional than it was.
+   *
+   * actinno fell back to `candidates.target_title`, `pay_min` and `locations`
+   * when the event left them out. Jobinno's `profiles` has a column for exactly
+   * one of those three: `target_locations`. So `title` and `payMin` now have no
+   * stored fallback at all and must be supplied here if they are wanted, and a
+   * search sent without a title searches every relevant listing on the named
+   * boards. `CandidateRecord` in `lib/candidate-intake.ts` records that gap and
+   * what closing it would take.
    */
   preferences: Partial<JobSearchPreferences> & { companies: string[] };
 };
 
-/** One listing, one run. Everything else is looked up from `candidateId`. */
+/**
+ * One listing, one run.
+ *
+ * `jobId` is a `jobs.id`, not a listing object, and that is JOB-004's other
+ * contract change. `applications.job_id` is a NOT NULL foreign key onto `jobs`,
+ * so an application cannot exist for a listing the database has never seen —
+ * which means an event carrying a hand-written listing could not be honoured
+ * even in principle. The board sync (JOB-003) is what puts listings there, and
+ * the matching ticket (JOB-008) is what will choose among them.
+ */
 export type JobApplicationRequestedData = {
-  candidateId: string;
-  listing: JobListing;
+  userId: string;
+  jobId: string;
   /**
    * ACT-015. The candidate's own answers to questions a previous attempt could
    * not answer truthfully — work authorization, current country, and whatever
    * else a particular board asks that no stored fact covers.
    *
-   * Optional, and additive to ACT-009's contract on purpose: an event sent
-   * without it behaves exactly as it did before. Its presence is what turns a
-   * run that stopped at `form_fill_blocked` with `needsInput` into one that
-   * finishes, without any state having been kept in between — the caller asked
-   * the person, and re-sends the same event with the answers attached.
+   * Optional, and additive on purpose: an event sent without it behaves exactly
+   * as it did before. Its presence is what turns a run that stopped at
+   * `form_fill_blocked` into one that finishes, without any state having been
+   * kept in between — the caller asked the person, and re-sends the same event
+   * with the answers attached.
    */
   additionalAnswers?: Record<string, string>;
 };
 
 // `staticSchema` gives the handlers real types without a runtime validation
-// dependency. It is a passthrough at runtime, so the two guards below —
-// `requireCandidateId` and `normalizeListing` — are what actually reject a
-// malformed event, and they do it with a message that names the contract that
-// was broken rather than a schema path.
+// dependency. It is a passthrough at runtime, so the guards below are what
+// actually reject a malformed event, and they do it with a message that names
+// the contract that was broken rather than a schema path.
 export const jobSearchRequested = eventType(JOB_SEARCH_REQUESTED, {
   schema: staticSchema<JobSearchRequestedData>(),
 });
 export const jobApplicationRequested = eventType(JOB_APPLICATION_REQUESTED, {
   schema: staticSchema<JobApplicationRequestedData>(),
 });
-/** The consumer side of ACT-006's event. Name and shape imported, not retyped. */
-export const verificationReceived = eventType(VERIFICATION_EVENT_NAME, {
-  schema: staticSchema<VerificationEventData>(),
-});
-
-/**
- * How long to hold a run open for a verification email.
- *
- * Deliberately still the stub's ten minutes. ACT-006 sized its own 15-minute
- * `VERIFICATION_WINDOW_MS` as "just above the pipeline's own timeout: 10m" —
- * moving this without moving that would either strand runs waiting past the
- * window in which the listener will still look, or leave the listener matching
- * mail no run is listening for.
- */
-const VERIFICATION_TIMEOUT = "10m";
-
-/**
- * ══ THE ONE CONTRACT THAT CANNOT BE ENFORCED BY A TYPE ══════════════════════
- *
- * ACT-006 sends `email/verification-received` with
- * `data.userId = job_applications.candidate_id` and `data.company =
- * job_applications.company`, and those two fields are the *only* thing that
- * decides whether a parked run wakes up. So:
- *
- *  · `async.data.userId` is compared against this pipeline's `candidateId`.
- *    The field names differ because ACT-006's is already written and deployed;
- *    the *values* are the same UUID, which is the half that matters. Anything
- *    else in `candidateId` — an auth subject, an email address — and this wait
- *    times out silently. `requireCandidateId` and `loadCandidate` between them
- *    make that fail at the start of the run instead.
- *
- *  · `async.data.company` is compared against the company string. ACT-006 reads
- *    it back out of the row, and ACT-005 wrote `input.company.trim()` into that
- *    row — so the comparison is against the *trimmed* company, which is why
- *    `normalizeListing` trims once and both the `createBoardAccount` call and
- *    this expression use its output.
- *
- * Both values are interpolated with `JSON.stringify`, not with bare quotes.
- * `company` is scraped text off a real employer's job board; a listing titled
- * `Acme " || true || "` pasted straight into this expression is a broken match
- * at best and a match on somebody else's mail at worst.
- * ════════════════════════════════════════════════════════════════════════════
- */
-function verificationMatch(candidateId: string, company: string): string {
-  return (
-    `async.data.userId == ${JSON.stringify(candidateId)} && ` +
-    `async.data.company == ${JSON.stringify(company)}`
-  );
-}
 
 // ───────────────────────────────────
 // Event-payload guards
@@ -215,65 +222,26 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * `NonRetriableError`. Retrying a malformed payload just fills the dashboard
  * with identical failures and buries the one that explains them.
  */
-function requireCandidateId(raw: unknown): string {
+function requireUuid(raw: unknown, field: string, what: string): string {
   const id = String(raw ?? "").trim();
   if (!UUID_RE.test(id)) {
     throw new NonRetriableError(
-      `candidateId must be the candidates.id UUID, got ${JSON.stringify(raw)}. It is the ` +
-        `same identity as job_applications.candidate_id and as the userId ACT-006 puts on ` +
-        `${VERIFICATION_EVENT_NAME} — see verificationMatch() in this file.`
+      `${field} must be ${what}, got ${JSON.stringify(raw)}.`
     );
   }
   return id;
 }
 
 /**
- * The listing, trimmed and checked once, at the top of the run.
- *
- * `applyToJob` is triggered by an event, and an event can be hand-written — from
- * the Inngest dev dashboard today, from the MCP `apply-to-job` tool once ACT-010
- * wires it. So the listing is not assumed to have come from
- * `searchJobListings`. The https check in particular is `createBoardAccount`'s
- * own rule, applied here so a bad URL fails before a browser is launched.
- */
-function normalizeListing(raw: JobListing | undefined): JobListing {
-  const listing = raw ?? ({} as JobListing);
-  const company = String(listing.company ?? "").trim();
-  const title = String(listing.title ?? "").trim();
-  const applyUrl = String(listing.applyUrl ?? "").trim();
-
-  const reject = (why: string): never => {
-    throw new NonRetriableError(`job-application/requested carries an unusable listing: ${why}`);
-  };
-
-  if (company === "") reject("no company");
-  if (title === "") reject("no title");
-  try {
-    if (new URL(applyUrl).protocol !== "https:") reject(`applyUrl is not https: ${applyUrl}`);
-  } catch {
-    reject(`applyUrl is not a URL: ${JSON.stringify(listing.applyUrl)}`);
-  }
-
-  return {
-    company,
-    title,
-    applyUrl,
-    location: typeof listing.location === "string" ? listing.location : null,
-    atsProvider: listing.atsProvider ?? "greenhouse",
-    requiresCoverLetter: listing.requiresCoverLetter === true,
-    jobDescription: typeof listing.jobDescription === "string" ? listing.jobDescription : null,
-  };
-}
-
-/**
  * ACT-015 — the candidate's answers off the wire, shaped and bounded.
  *
- * An event can be hand-written, so this is checked rather than trusted, on the
- * same reasoning as `normalizeListing` above. Bounded rather than validated:
- * whether a key names a real field and whether a value is a real option are
- * questions only the live form can answer, and ACT-007 asks them there. What
- * this rules out is the shapes that are not answers at all — non-strings,
- * blanks, and a payload large enough to be something other than a few replies.
+ * An event can be hand-written, from the Inngest dev dashboard today and from
+ * whatever fires these in anger later, so this is checked rather than trusted.
+ * Bounded rather than validated: whether a key names a real field and whether a
+ * value is a real option are questions only the live form can answer, and
+ * ACT-007 asks them there. What this rules out is the shapes that are not
+ * answers at all — non-strings, blanks, and a payload large enough to be
+ * something other than a few replies.
  */
 function normalizeAdditionalAnswers(raw: unknown): Record<string, string> | undefined {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
@@ -297,7 +265,7 @@ function normalizeAdditionalAnswers(raw: unknown): Record<string, string> | unde
  * anything irreversible happens*: `FormFillBlockedError` and
  * `InjectionSuspectedError` come from ACT-007, which never submits anything at
  * all, and `SubmissionBlockedError` comes from ACT-008's pre-flight, which runs
- * before a browser is opened. The row already carries the reason.
+ * before a browser is opened. The skip is already logged.
  *
  * Everything else propagates unchanged and stays retryable — which is safe for
  * the reason ACT-008 documents at the top of `submitApplication`: a rejected
@@ -316,122 +284,242 @@ function rethrowTerminal(err: unknown): never {
 }
 
 // ───────────────────────────────────
+// The listing, read back out of `jobs`
+// ───────────────────────────────────
+
+/** What a run needs about a listing that its own modules do not read for it. */
+type ListingBrief = {
+  jobId: string;
+  company: string;
+  title: string;
+  applyUrl: string;
+  requiresCoverLetter: boolean;
+};
+
+/**
+ * One `jobs` row, with the employer name from the `boards` row behind it.
+ *
+ * `description` is not read. It is the largest column on the table and the only
+ * consumer of it is the cover letter, which ACT-008 writes after reading the
+ * same row itself. Reading it here would put kilobytes of scraped job text into
+ * this run's durable step state to no end.
+ *
+ * `requiresCoverLetter` is derived here rather than stored, because there is no
+ * column for it and adding one would be a migration that only Greenhouse could
+ * ever populate. `jobs.raw` keeps the vendor's payload for exactly this kind of
+ * question — a field the parse of the day did not extract — and
+ * `requiresCoverLetterFromQuestions` is the same predicate the live search
+ * applies, imported rather than copied. Every other platform reports false,
+ * which is what it reported through the search path too: neither Lever's nor
+ * Ashby's public API describes the application form at all.
+ */
+async function loadListing(supabase: SupabaseClient, jobId: string): Promise<ListingBrief> {
+  const { data, error } = await supabase
+    .from("jobs")
+    .select("id,title,url,raw,boards!inner(company)")
+    .eq("id", jobId)
+    .limit(1);
+  if (error) throw new Error(`jobs lookup failed: ${error.message}`);
+
+  const row = data?.[0];
+  if (!row) {
+    throw new NonRetriableError(
+      `No jobs row with id ${jobId}. Listings are written by the board sync (JOB-003); a ` +
+        `job-application/requested event has to name one that exists.`
+    );
+  }
+
+  const board = Array.isArray(row.boards) ? row.boards[0] : row.boards;
+  const raw = (row.raw ?? {}) as Record<string, unknown>;
+
+  const applyUrl = String(row.url ?? "").trim();
+  try {
+    // The https rule is inherited from ACT-005 and applied here so a bad URL
+    // fails before a browser is launched.
+    if (new URL(applyUrl).protocol !== "https:") {
+      throw new NonRetriableError(`jobs ${jobId} has a non https url: ${applyUrl}`);
+    }
+  } catch (err) {
+    if (err instanceof NonRetriableError) throw err;
+    throw new NonRetriableError(`jobs ${jobId} has an unusable url: ${JSON.stringify(row.url)}`);
+  }
+
+  return {
+    jobId,
+    company: String((board as Record<string, unknown> | undefined)?.company ?? "").trim(),
+    title: String(row.title ?? "").trim(),
+    applyUrl,
+    requiresCoverLetter: requiresCoverLetterFromQuestions(raw.questions),
+  };
+}
+
+// ───────────────────────────────────
 // 1. Discovery — one search, then fan out
 // ───────────────────────────────────
 
 export const discoverListings = inngest.createFunction(
   { id: "discover-listings", triggers: [{ event: jobSearchRequested }] },
   async ({ event, step }) => {
-    const candidateId = requireCandidateId(event.data.candidateId);
+    const userId = requireUuid(event.data.userId, "userId", "a profiles.id UUID");
     const requested = event.data.preferences ?? { companies: [] };
 
-    // Also the existence check. A `candidateId` that is a well-formed UUID but
-    // not a real row would otherwise survive discovery and fail N times over in
-    // N fanned-out runs.
+    // Also the existence check. A `userId` that is a well-formed UUID but not a
+    // real profile would otherwise survive discovery and fail N times over in N
+    // fanned-out runs.
     //
-    // Only the three search-preference columns come back out of the step. The
-    // rest of the row — the email, the LinkedIn URL — is not needed here, and a
-    // step's return value is durable state that outlives the run: there is no
-    // reason for a candidate's contact details to exist in two systems when one
-    // of them was not asked to hold them.
-    const stored = await step.run("load-candidate", async () => {
-      const candidate = await loadCandidate(candidateId);
-      return {
-        targetTitle: candidate.targetTitle,
-        payMin: candidate.payMin,
-        locations: candidate.locations,
-      };
-    });
+    // Only the search preference comes back out of the step. The rest of the
+    // record — the email, the resume path — is not needed here, and a step's
+    // return value is durable state that outlives the run: there is no reason
+    // for a person's details to exist in two systems when one of them was not
+    // asked to hold them.
+    const stored = await step.run("load-candidate", async () => ({
+      locations: (await loadCandidate(userId)).locations,
+    }));
 
     // `||` rather than `??` on purpose: an empty string or an empty array in the
     // event means "I did not specify this", and should fall through to the
-    // candidate's own stored preferences rather than override them with nothing.
+    // person's own stored preference rather than override it with nothing.
+    //
+    // `title` and `payMin` have no stored fallback left to reach for. See
+    // `JobSearchRequestedData`.
     const preferences: JobSearchPreferences = {
       companies: requested.companies ?? [],
-      title: requested.title?.trim() || stored.targetTitle || undefined,
-      payMin: requested.payMin ?? stored.payMin ?? undefined,
+      title: requested.title?.trim() || undefined,
+      payMin: requested.payMin ?? undefined,
       locations: requested.locations?.length ? requested.locations : stored.locations ?? undefined,
-      ...(requested.maxPerCompany === undefined
-        ? {}
-        : { maxPerCompany: requested.maxPerCompany }),
+      ...(requested.maxPerCompany === undefined ? {} : { maxPerCompany: requested.maxPerCompany }),
     };
 
     const listings = await step.run("bulk-search-job-boards", () =>
       searchJobListings(preferences)
     );
 
-    // One run per apply URL. ACT-005's `claimApplicationRow` reuses the row for
-    // a (candidate, apply_url) pair — which is what makes its own retries safe —
-    // but `(candidate_id, apply_url)` has no unique index, so two *concurrent*
-    // runs on the same URL would both insert and the tracker would show one
-    // listing twice. A duplicate in the actor's output is cheap to drop here and
-    // expensive to untangle there.
-    const seen = new Set<string>();
-    const dispatch = listings.filter((listing) => {
-      const key = listing.applyUrl;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
+    // ── The bridge, and why it is a bridge (JOB-004) ────────────────────────
+    //
+    // `searchJobListings` reads the ATS platforms live and returns listing
+    // objects. `applications.job_id` is a foreign key onto `jobs`, so a listing
+    // that has no row there cannot be applied to, however real it is. The two
+    // discovery paths in this repository are independent: the board sync writes
+    // `jobs` from the same platforms on a schedule, and this reads them
+    // directly, right now.
+    //
+    // So each listing is matched back to a `jobs` row by its apply URL, and the
+    // ones with no match are counted and reported rather than dropped silently.
+    // A high `unmatched` count is the signal that the sync has not run recently,
+    // and it is far more useful surfaced than swallowed.
+    //
+    // This is a stopgap. Two independent discovery mechanisms is one too many,
+    // and the right shape is for the matching ticket to select from `jobs`
+    // rather than for this to reconcile against it.
+    const resolved = await step.run("resolve-listings-to-jobs", async () => {
+      const urls = [...new Set(listings.map((listing) => listing.applyUrl))];
+      if (urls.length === 0) return { jobIds: [] as string[], unmatched: 0 };
+
+      const supabase = getSupabaseClient();
+      const { data, error } = await supabase.from("jobs").select("id,url").in("url", urls);
+      if (error) throw new Error(`jobs lookup failed: ${error.message}`);
+
+      const byUrl = new Map((data ?? []).map((row) => [String(row.url), String(row.id)]));
+      const jobIds = urls.map((url) => byUrl.get(url)).filter((id): id is string => id !== undefined);
+      return { jobIds, unmatched: urls.length - jobIds.length };
     });
 
-    if (dispatch.length === 0) {
+    if (resolved.jobIds.length === 0) {
       console.warn(
-        `[act-009] no listings matched for candidate ${candidateId} ` +
+        `${LOG} no known listings matched for ${userId} ` +
           `(boards: ${JSON.stringify(preferences.companies)}, ` +
-          `title: ${JSON.stringify(preferences.title ?? "(any)")}) — nothing to fan out`
+          `title: ${JSON.stringify(preferences.title ?? "(any)")}) — ` +
+          `${listings.length} found live, ${resolved.unmatched} of them absent from jobs. ` +
+          `Run the board sync (npm run sync-boards) and try again.`
       );
-      return { candidateId, discovered: listings.length, dispatched: 0 };
+      return { userId, discovered: listings.length, dispatched: 0, unmatched: resolved.unmatched };
     }
 
     console.log(
-      `[act-009] ${dispatch.length} listing(s) for candidate ${candidateId} → ` +
-        `${dispatch.length} concurrent apply-to-job run(s), ` +
-        `${browserConcurrencyLimit()} at a time`
+      `${LOG} ${resolved.jobIds.length} listing(s) for ${userId} → ` +
+        `${resolved.jobIds.length} concurrent apply-to-job run(s), ` +
+        `${browserConcurrencyLimit()} at a time` +
+        (resolved.unmatched === 0 ? "" : ` (${resolved.unmatched} not in jobs, skipped)`)
     );
 
     // The fan-out. One event per listing; Inngest starts one run of `applyToJob`
-    // per event and its `concurrency.limit` does the batching.
+    // per event and its `concurrency.limit` does the batching. The ids are
+    // already distinct — `resolve-listings-to-jobs` de-duplicated the URLs — and
+    // that matters: `claimApplicationRow` reuses the row for a (user, job) pair,
+    // which is what makes its own retries safe, but `(user_id, job_id)` has no
+    // unique index, so two *concurrent* runs on the same listing would both
+    // insert and the tracker would show one listing twice.
     await step.sendEvent(
       "fan-out-applications",
-      dispatch.map((listing) => ({
+      resolved.jobIds.map((jobId) => ({
         name: JOB_APPLICATION_REQUESTED,
-        data: { candidateId, listing } satisfies JobApplicationRequestedData,
+        data: { userId, jobId } satisfies JobApplicationRequestedData,
       }))
     );
 
     return {
-      candidateId,
+      userId,
       discovered: listings.length,
-      dispatched: dispatch.length,
+      dispatched: resolved.jobIds.length,
+      unmatched: resolved.unmatched,
       companies: preferences.companies,
     };
   }
 );
 
 // ───────────────────────────────────
-// 2. Apply — one listing, one run
+// The plan allowance
 // ───────────────────────────────────
 
 /**
- * The part of `CreateBoardAccountResult` the `create-account` step keeps. What
- * it drops is `signals` — every clickable label the page reader saw, which is
- * useful in a log and pure weight in durable step state.
+ * Gives the reserved slot back, unless the row says an application really was
+ * sent. See `lib/application-quota.ts` for why the decision is one statement.
+ *
+ * Never throws, and that is the whole point of it existing here rather than
+ * being called inline. It runs on two paths — after a run that finished and
+ * after one that failed — and on both, an accounting problem is the less
+ * important of the two things happening. Throwing on the failure path would
+ * replace the error that explains the run with one about a counter, and
+ * throwing on the success path would fail a run whose application is already
+ * with an employer. So it reports and returns.
  */
-type AccountOutcome = {
-  jobApplicationId: string;
-  status: ApplicationStatus;
-  accountGate: boolean;
-  accountCreated: boolean;
-  finalUrl: string;
-  reasons: string[];
-};
+async function settleApplicationSlot(userId: string, applicationId: string) {
+  try {
+    const settled = await releaseApplicationSlot({ userId, applicationId });
+
+    if (settled.outcome === "released") {
+      console.log(
+        `${LOG} applications ${applicationId} — nothing was submitted, allowance ` +
+          `returned (${settled.used} used)`
+      );
+    } else if (settled.outcome === "kept") {
+      console.log(
+        `${LOG} applications ${applicationId} — ${settled.status}, allowance spent`
+      );
+    }
+
+    return settled;
+  } catch (err) {
+    // A leaked slot costs this person one application off their allowance and
+    // nothing else. Loud, because nothing else will ever notice it.
+    console.error(
+      `${LOG} applications ${applicationId} — COULD NOT SETTLE THE ALLOWANCE for ${userId}. ` +
+        `A reserved application slot has leaked and profiles.applications_used is one too ` +
+        `high. ${err instanceof Error ? err.message : String(err)}`
+    );
+    return { outcome: "settle_failed" as const };
+  }
+}
+
+// ───────────────────────────────────
+// 2. Apply — one listing, one run
+// ───────────────────────────────────
 
 export const applyToJob = inngest.createFunction(
   {
     id: "apply-to-job",
     triggers: [{ event: jobApplicationRequested }],
-    // Listings in flight = browsers, which is why `createBoardAccount` closes
-    // its browser on every exit path.
+    // Listings in flight = browsers.
     //
     // ── Why this was 2, and why it is no longer a literal (JOB-005) ──────────
     //
@@ -473,185 +561,200 @@ export const applyToJob = inngest.createFunction(
     retries: 2,
   },
   async ({ event, step }) => {
-    const candidateId = requireCandidateId(event.data.candidateId);
-    const listing = normalizeListing(event.data.listing);
+    const userId = requireUuid(event.data.userId, "userId", "a profiles.id UUID");
+    const jobId = requireUuid(event.data.jobId, "jobId", "a jobs.id UUID");
     // ACT-015. Passed through untouched: these are the candidate's own words,
     // and every check that matters — does this key name a field on the form, is
     // this value one of that control's options — can only be made against the
     // live page, which is ACT-007's job and not this file's.
     const additionalAnswers = normalizeAdditionalAnswers(event.data.additionalAnswers);
-    // What the run *reports*, as opposed to what it works from. The full listing
-    // carries up to 8KB of job-description text, and echoing that back into
-    // every run's output would triple the size of the run list for no reader's
-    // benefit — the description is already in the event that started the run.
-    const summary = {
-      company: listing.company,
-      title: listing.title,
-      applyUrl: listing.applyUrl,
-    };
 
-    // The email, and only the email — see `discoverListings`'s note on keeping a
-    // candidate's details out of durable step state. `createBoardAccount` needs
-    // it explicitly; every module after that one reads what it needs off the
-    // `job_applications` row instead.
-    const { applicationEmail } = await step.run("load-candidate", async () => ({
-      applicationEmail: (await loadCandidate(candidateId)).applicationEmail,
-    }));
-
-    // ── ACT-005/ACT-012: is there even an account gate? ──────────────────────
-    // Safe to retry: `claimApplicationRow` reuses the row for this (candidate,
-    // apply URL) instead of inserting a second one, and every failure past the
-    // signup click returns `account_gate_blocked` rather than throwing, so a
-    // retry can never re-submit a signup.
-    const account: AccountOutcome = await step.run("create-account", async () => {
-      const result = await createBoardAccount({
-        candidateId,
-        company: listing.company,
-        jobTitle: listing.title,
-        applyUrl: listing.applyUrl,
-        applicationEmail,
-        atsProvider: listing.atsProvider,
-      });
-      // Trimmed deliberately. The full result carries `signals`, which includes
-      // every clickable label on the page — useful in a log, pure weight in
-      // durable step state that Inngest stores and replays on every subsequent
-      // step of this run.
+    // ── Claim the row ────────────────────────────────────────────────────────
+    // Safe to retry: `claimApplicationRow` reuses the row for this (user, job)
+    // pair instead of inserting a second one, and refuses outright to hand back
+    // a row that has already had a submit click issued against it.
+    //
+    // This is also where the attestation guard lives — nothing may be submitted
+    // on behalf of somebody who has never confirmed their intake is true — plus
+    // a cheap look at the allowance so that a person with nothing left is
+    // refused before a browser is launched. The allowance is not *enforced*
+    // there; `reserve-application-slot` below is what enforces it, for the
+    // reason given on that step.
+    const claim = await step.run("claim-application-row", async () => {
+      const supabase = getSupabaseClient();
+      const listing = await loadListing(supabase, jobId);
+      const claimed = await claimApplicationRow(supabase, { userId, jobId });
+      // Only ids and strings cross the boundary, and the description is left
+      // behind: `jobs.description` runs to kilobytes, ACT-008 re-reads it from
+      // the row a moment later, and a step's return value is durable state that
+      // Inngest stores and replays on every subsequent step of this run.
       return {
-        jobApplicationId: result.jobApplicationId,
-        status: result.status,
-        accountGate: result.accountGate,
-        accountCreated: result.accountCreated,
-        finalUrl: result.finalUrl,
-        reasons: result.reasons,
+        applicationId: claimed.applicationId,
+        created: claimed.created,
+        company: listing.company,
+        title: listing.title,
+        applyUrl: listing.applyUrl,
+        requiresCoverLetter: listing.requiresCoverLetter,
       };
     });
 
-    const jobApplicationId = account.jobApplicationId;
+    const applicationId = claim.applicationId;
+    const summary = { company: claim.company, title: claim.title, applyUrl: claim.applyUrl };
 
-    if (account.status === APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED) {
-      // A captcha, an SSO-only signup, a signup form sharing a page with the
-      // application form. ACT-005 has already written the status and the reason
-      // to the row; there is nothing for this run to add and nothing safe for it
-      // to do next.
-      console.warn(
-        `[act-009] ${listing.company} — ${account.status}: ${account.reasons.at(-1) ?? ""}`
-      );
-      return { jobApplicationId, status: account.status, listing: summary, needsHuman: true };
-    }
+    console.log(
+      `${LOG} applications ${applicationId} — ${claim.company} / ${claim.title} ` +
+        `(${claim.created ? "new" : "reusing existing row"})`
+    );
 
-    // ── Correction 3: the wait is entered only when a signup really happened ──
-    let verification: VerificationInput | undefined;
+    // ── Take the application off the plan's allowance ───────────────────────
+    // This is the cap, and it is enforced here rather than in the claim above
+    // because a cap can only be enforced while refusing is still possible —
+    // which is to say before a browser opens, not after a submit control has
+    // been pressed. `reserveApplicationSlot` is one conditional UPDATE, so the
+    // `browserConcurrencyLimit()` runs this person has in flight at once cannot
+    // between them take a 150th and a 151st slot: the second statement finds no
+    // row to update and comes back refused.
+    //
+    // Its own step, so that Inngest memoizes it. A retry of the submit below
+    // replays this from state instead of re-running it, which is what stops one
+    // listing spending two applications.
+    //
+    // The claim step's check reads the same two columns and is deliberately not
+    // this. It is there to refuse a person with nothing left before any of the
+    // above costs anything; this is what the product's promise actually rests
+    // on.
+    const reservation = await step.run("reserve-application-slot", async () => {
+      const outcome = await reserveApplicationSlot(userId);
 
-    if (account.status === APPLICATION_STATUS.AWAITING_VERIFICATION) {
-      const received = await step.waitForEvent("await-verification", {
-        event: verificationReceived,
-        timeout: VERIFICATION_TIMEOUT,
-        if: verificationMatch(candidateId, listing.company),
-      });
+      if (outcome.reserved) return { used: outcome.used, cap: outcome.cap };
 
-      if (!received) {
-        // The row stays at `awaiting_verification`, and that is the truthful
-        // status: no mail arrived, and one still might. Nothing is written here
-        // — see this file's header on why the pipeline is not a second writer to
-        // `job_applications`. Re-running this listing once the mail lands is a
-        // supported path (ACT-007 accepts `awaiting_verification` and takes the
-        // code/link as input); a stray `verification_timeout` in the status
-        // column would take that path away.
-        console.warn(
-          `[act-009] no ${VERIFICATION_EVENT_NAME} for ${listing.company} within ` +
-            `${VERIFICATION_TIMEOUT} (job_applications ${jobApplicationId}, candidate ` +
-            `${candidateId}). Row left at ${APPLICATION_STATUS.AWAITING_VERIFICATION}. Check ` +
-            `that the ACT-006 listener is running and that its Gmail credentials are fresh.`
+      // Neither refusal improves by being retried. The cap moves when somebody
+      // pays, which is a Stripe webhook and not this run, and a missing profile
+      // is a broken event rather than a slow one.
+      if (outcome.reason === "no_profile") {
+        throw new NonRetriableError(
+          `No profiles row with id ${userId}, so there is no allowance to apply against.`
         );
-        return {
-          jobApplicationId,
-          status: "verification_timeout" as const,
-          listing: summary,
-          needsHuman: true,
-        };
       }
 
-      // ACT-006 only *detects* the mail. Completing the verification — opening
-      // the link, or typing the code — is ACT-007's job, and this is how it gets
-      // handed the single-use credential to do it with.
-      verification = {
-        code: received.data.verificationCode,
-        link: received.data.verificationLink,
-      };
-      console.log(
-        `[act-009] verification received for ${listing.company} ` +
-          `(${verification.code ? "code" : "no code"}, ${verification.link ? "link" : "no link"})`
-      );
-    } else if (account.status !== APPLICATION_STATUS.NO_ACCOUNT_REQUIRED) {
-      // `no_account_required` and a verified `awaiting_verification` are equally
-      // ready to fill — ACT-012's own words, and ACT-007's `READY_STATUSES`
-      // agrees. Any *other* status out of `createBoardAccount` is a state this
-      // wiring has not been reasoned about, and guessing on a real employer's
-      // site is the one thing every module here refuses to do.
       throw new NonRetriableError(
-        `createBoardAccount returned an unexpected status "${account.status}" for ` +
-          `${listing.company} (job_applications ${jobApplicationId}). Refusing to fill or ` +
-          `submit anything from a state this pipeline does not recognise.`
+        `Profile ${userId} has used ${outcome.used} of ${outcome.cap} applications, so ` +
+          `${claim.company} / ${claim.title} was not opened. A cap of zero is the default and ` +
+          `means this account has not been provisioned to apply yet, not that it may apply ` +
+          `without limit.`
       );
-    }
+    });
+
+    console.log(
+      `${LOG} applications ${applicationId} — allowance ${reservation.used} of ` +
+        `${reservation.cap} reserved`
+    );
 
     // ── ACT-008, which calls ACT-007 inside it. ONE step, one browser ────────
     // See correction 2 in the header: `submitApplication` fills the form via
     // `fillApplicationFormRetainingSession` and submits in that same session.
     // Splitting this in two would fill a form in a browser that is then closed.
-    const submission = await step.run("fill-and-submit-application", async () => {
-      try {
-        const result = await submitApplication({
-          jobApplicationId,
-          requiresCoverLetter: listing.requiresCoverLetter,
-          jobDescription: listing.jobDescription,
-          ...(verification === undefined ? {} : { verification }),
-          ...(additionalAnswers === undefined ? {} : { additionalAnswers }),
-        });
-        // Trimmed for the same reason as `create-account`: the full result nests
-        // ACT-007's entire field-by-field report and the parsed resume profile —
-        // a candidate's real personal data, which has no business being copied
-        // into durable step state that outlives the run.
-        return {
-          status: result.status,
-          submitted: result.submitted,
-          submitAttempted: result.submitAttempted,
-          confirmationRef: result.confirmationRef,
-          submitControlLabel: result.submitControlLabel,
-          blockedReason: result.blockedReason,
-          unconfirmedReason: result.unconfirmedReason,
-          screenshotPath: result.screenshotPath,
-          rowUpdated: result.rowUpdated,
-          finalUrl: result.finalUrl,
-        };
-      } catch (err) {
-        rethrowTerminal(err);
-      }
-    });
+    const fillAndSubmit = () =>
+      step.run("fill-and-submit-application", async () => {
+        try {
+          const result = await submitApplication({
+            jobApplicationId: applicationId,
+            requiresCoverLetter: claim.requiresCoverLetter,
+            // Deliberately not passed. ACT-008's `preflight` reads
+            // `jobs.description` off the row it already loads, which keeps up to
+            // 8KB of scraped job text out of this run's durable step state. The
+            // claim step drops it for the same reason.
+            ...(additionalAnswers === undefined ? {} : { additionalAnswers }),
+          });
+          // Trimmed for the same reason as the claim: the full result nests
+          // ACT-007's entire field-by-field report and the parsed resume profile —
+          // a candidate's real personal data, which has no business being copied
+          // into durable step state that outlives the run.
+          return {
+            status: result.status,
+            submitted: result.submitted,
+            submitAttempted: result.submitAttempted,
+            confirmationRef: result.confirmationRef,
+            submitControlLabel: result.submitControlLabel,
+            blockedReason: result.blockedReason,
+            unconfirmedReason: result.unconfirmedReason,
+            screenshotPath: result.screenshotPath,
+            rowUpdated: result.rowUpdated,
+            finalUrl: result.finalUrl,
+          };
+        } catch (err) {
+          rethrowTerminal(err);
+        }
+      });
+
+    // ── Settle the allowance, whichever way the run went ─────────────────────
+    // A reservation that did not turn into an application goes back, and that
+    // is what makes a blocked form, a dead board and a captcha free — which the
+    // old lifetime row count, with no status filter on it, did not.
+    //
+    // `settleApplicationSlot` decides from the `applications` row: `submitted`
+    // and `submission_unconfirmed` keep the slot, everything else gives it back.
+    // Both mean a submit control was pressed, and an unknown outcome has to be
+    // charged for, because the alternative is refunding an application that may
+    // be sitting in an employer's inbox.
+    //
+    // The `catch` runs after the submit step has exhausted the function's
+    // retries — Inngest throws a `StepError` into the body at that point — so a
+    // run that ends in an exception still settles before the error propagates.
+    // Its own step name so that the two paths cannot both be memoized.
+    let submission: Awaited<ReturnType<typeof fillAndSubmit>>;
+    try {
+      submission = await fillAndSubmit();
+    } catch (error) {
+      await step.run("settle-application-slot-after-failure", () =>
+        settleApplicationSlot(userId, applicationId)
+      );
+      throw error;
+    }
+
+    // On this path the run knows one thing the row may not. `rowUpdated: false`
+    // means ACT-008 pressed the control and then could not write the status
+    // down, so the row can still say `form_filled` while an application really
+    // is with the employer — and a refund decided from the row alone would hand
+    // the allowance back for it. Any sign of a click from this run keeps the
+    // slot, and the row is only consulted when there was none.
+    const clicked =
+      submission.submitAttempted ||
+      submission.submitted ||
+      submission.status === APPLICATION_STATUS.SUBMITTED ||
+      submission.status === APPLICATION_STATUS.SUBMISSION_UNCONFIRMED;
+
+    if (clicked) {
+      console.log(
+        `${LOG} applications ${applicationId} — submit control pressed, allowance spent`
+      );
+    } else {
+      await step.run("settle-application-slot", () =>
+        settleApplicationSlot(userId, applicationId)
+      );
+    }
 
     if (submission.status === APPLICATION_STATUS.SUBMISSION_UNCONFIRMED) {
       // The loudest thing this pipeline can say. ACT-008 has already recorded it
       // and refused to retry; this makes it visible in the run list too.
       console.error(
-        `[act-009] ══ ${listing.company} / ${listing.title}: SUBMIT CLICKED, OUTCOME ` +
-          `UNKNOWN ══\n[act-009] job_applications ${jobApplicationId} — do NOT re-run this ` +
-          `listing until a human has checked the employer's side. ` +
-          `${submission.unconfirmedReason ?? ""}`
+        `${LOG} ══ ${claim.company} / ${claim.title}: SUBMIT CLICKED, OUTCOME UNKNOWN ══\n` +
+          `${LOG} applications ${applicationId} — do NOT re-run this listing until a human ` +
+          `has checked the employer's side. ${submission.unconfirmedReason ?? ""}`
       );
     } else {
       console.log(
-        `[act-009] ${listing.company} / ${listing.title} → ${submission.status}` +
+        `${LOG} ${claim.company} / ${claim.title} → ${submission.status}` +
           (submission.confirmationRef === null ? "" : ` (${submission.confirmationRef})`)
       );
     }
 
     return {
-      jobApplicationId,
+      applicationId,
+      jobId,
       status: submission.status,
       submitted: submission.submitted,
       confirmationRef: submission.confirmationRef,
-      accountGate: account.accountGate,
-      verificationRequired: account.status === APPLICATION_STATUS.AWAITING_VERIFICATION,
       listing: summary,
       needsHuman:
         submission.status !== APPLICATION_STATUS.SUBMITTED || submission.rowUpdated === false,
@@ -659,5 +762,11 @@ export const applyToJob = inngest.createFunction(
   }
 );
 
-/** Everything `inngest/serve.ts` registers. */
+/**
+ * The functions this module contributes to the serve route.
+ *
+ * The board sync is deliberately not in this list. It lives in `board-sync.ts`,
+ * imports the client from here, and adding it here as well would be a circular
+ * import. `app/api/inngest/route.ts` is the one place that knows about both.
+ */
 export const functions = [discoverListings, applyToJob];

@@ -2,12 +2,12 @@
  * ACT-007 — filling a job application form from the candidate's resume, and
  * stopping dead before it is submitted.
  *
- * Given nothing but a `job_applications` row id, this opens its own browser,
+ * Given nothing but an `applications` row id, this opens its own browser,
  * gets itself to the application form (completing the emailed verification and
  * signing in on the way, when the row needs that), types the candidate's data
  * into the fields it can positively identify, attaches the resume PDF, and
  * leaves the form sitting there filled. **It never submits.** Submission is
- * ACT-008; the handoff is `job_applications.status = "form_filled"`.
+ * ACT-008; the handoff is `applications.status = "form_filled"`.
  *
  * ── The untrusted-text boundary ─────────────────────────────────────────────
  * Resume text, job-description text and application-question text are all
@@ -79,7 +79,7 @@
  * person's name, so every field is categorised (`resolveDecision` below):
  *
  *  · **Answered from stored data** — work authorization, sponsorship, country,
- *    city, relocation — from the `candidates` columns ACT-015 added, collected
+ *    city, relocation — from the `profiles` columns ACT-015 named, collected
  *    once at intake. A value must trace to a named fact in a closed catalogue.
  *  · **Generated** — free-text essay questions ("Why do you want to work at
  *    Discord?"), which are a cover letter under another name and go through the
@@ -193,7 +193,11 @@ import {
   type EnumeratedField,
   type FormFieldKind,
 } from "@/lib/form-fields";
-import { toApplicationAnswers, type CandidateApplicationAnswers } from "@/lib/candidate-intake";
+import { loadCandidate, type CandidateApplicationAnswers } from "@/lib/candidate-intake";
+// JOB-004. Both copies of `updateApplication` and `recordFailure` that the port
+// carried are gone; this module and `submit-application.ts` share one now. See
+// that file's header for why a failure is two writes here and was one there.
+import { recordFailure, updateApplication } from "@/lib/application-records";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 const LOG = "[act-007]";
@@ -942,7 +946,7 @@ export type VerificationInput = {
 };
 
 export type FillApplicationFormInput = {
-  /** `job_applications.id`. Everything else is read from the row. */
+  /** `applications.id`. Everything else is read from the row. */
   jobApplicationId: string;
   /**
    * ACT-002's `requiresCoverLetter` for this listing. Passed in explicitly
@@ -1089,75 +1093,17 @@ function getSupabaseClient(): SupabaseClient {
   });
 }
 
-type ApplicationPatch = {
-  status?: ApplicationStatus;
-  error_message?: string | null;
-};
-
-async function updateApplication(
-  supabase: SupabaseClient,
-  jobApplicationId: string,
-  patch: ApplicationPatch
-): Promise<void> {
-  // `updated_at` defaults to now() on insert only — nothing bumps it on UPDATE.
-  const { error } = await supabase
-    .from("job_applications")
-    .update({ ...patch, updated_at: new Date().toISOString() })
-    .eq("id", jobApplicationId);
-  if (error) {
-    throw new Error(
-      `Failed to update job_applications ${jobApplicationId} ` +
-        `(${JSON.stringify(Object.keys(patch))}): ${error.message}`
-    );
-  }
-}
-
-/**
- * How much of a failure message survives onto the row.
- *
- * This was 2000, on the reasoning that a full stack dump in a status table
- * helps nobody. That is right for a stack trace and badly wrong for the other
- * thing that comes through here: the `needsInput` questions, which are the
- * whole mechanism by which a blocked application reaches a human.
- *
- * A real SoFi form asked 49 required questions. The list was written here,
- * truncated at 2000 characters, and the caller saw four of them — so 45
- * questions the candidate had to answer were simply unreachable, and the
- * application could never be completed by anyone. `error_message` is an
- * unbounded `text` column; the cap was protecting nothing.
- */
-const MAX_ERROR_MESSAGE_CHARS = 16_000;
-
-/** Records a failure on the row. Best-effort; never throws over the original error. */
-async function recordFailure(
-  supabase: SupabaseClient,
-  jobApplicationId: string,
-  status: ApplicationStatus,
-  message: string
-): Promise<void> {
-  const trimmed =
-    message.length > MAX_ERROR_MESSAGE_CHARS
-      ? `${message.slice(0, MAX_ERROR_MESSAGE_CHARS)}…`
-      : message;
-  try {
-    await updateApplication(supabase, jobApplicationId, { status, error_message: trimmed });
-    console.error(`${LOG} job_applications ${jobApplicationId} → ${status}: ${trimmed}`);
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    console.error(
-      `${LOG} could not record ${status} on job_applications ${jobApplicationId}: ${reason}`
-    );
-  }
-}
-
 type ApplicationState = {
   jobApplicationId: string;
   candidateId: string;
+  /** `applications.job_id`. Needed to log a skip against the listing. */
+  jobId: string;
+  /** `jobs.ats`. Same. */
+  ats: string;
   company: string;
   jobTitle: string;
   applyUrl: string;
   status: string;
-  boardPassword: string | null;
   candidate: CandidateRecord & { resumeUrl: string };
   /**
    * ACT-015. The reusable form answers intake collected, or `{}` when it
@@ -1188,6 +1134,12 @@ type ApplicationState = {
  * yet looked at something that needs looking at.
  */
 const READY_STATUSES: ReadonlySet<string> = new Set([
+  // JOB-004. The status a freshly claimed row carries, and now the ordinary way
+  // a run starts: Jobinno creates no accounts, so nothing writes
+  // `no_account_required` any more and a row goes straight from claimed to
+  // filled. Safe to start from for the same reason the two below are — nothing
+  // has been submitted, because nothing has happened at all.
+  APPLICATION_STATUS.DISCOVERED,
   APPLICATION_STATUS.NO_ACCOUNT_REQUIRED,
   APPLICATION_STATUS.AWAITING_VERIFICATION,
   APPLICATION_STATUS.EMAIL_VERIFIED,
@@ -1201,75 +1153,90 @@ async function loadApplicationState(
   supabase: SupabaseClient,
   jobApplicationId: string
 ): Promise<ApplicationState> {
+  // ── JOB-004: one query became a join ──────────────────────────────────────
+  // actinno's `job_applications` carried the company, the job title and the
+  // apply URL as columns of its own. Jobinno normalizes them: the listing is a
+  // `jobs` row and the employer is the `boards` row behind it, so the three
+  // strings this module needs come from two embedded reads rather than from the
+  // application row. The embeds are inner joins because an application whose
+  // listing has been deleted has nothing to fill a form from, and reporting
+  // that as three empty strings would be a worse failure than saying so.
   const { data: rows, error } = await supabase
-    .from("job_applications")
-    .select("id,candidate_id,company,job_title,apply_url,status,board_password")
+    .from("applications")
+    .select("id,user_id,job_id,status,jobs!inner(title,url,ats,boards!inner(company))")
     .eq("id", jobApplicationId)
     .limit(1);
-  if (error) throw new Error(`job_applications lookup failed: ${error.message}`);
+  if (error) throw new Error(`applications lookup failed: ${error.message}`);
 
   const row = rows?.[0];
-  if (!row) throw new Error(`No job_applications row with id ${jobApplicationId}.`);
+  if (!row) throw new Error(`No applications row with id ${jobApplicationId}.`);
 
   const status = String(row.status ?? "");
   if (!READY_STATUSES.has(status)) {
     throw new Error(
-      `job_applications ${jobApplicationId} is at status "${status}". ACT-007 only runs from ` +
-        `${[...READY_STATUSES].join(", ")}. A row at "${APPLICATION_STATUS.CREATING_ACCOUNT}" has ` +
-        `an ACT-005 run in flight; one at "${APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED}" or ` +
-        `"${APPLICATION_STATUS.ERROR}" needs a human before anything is typed into a real ` +
-        `employer's form.`
+      `applications ${jobApplicationId} is at status "${status}". ACT-007 only runs from ` +
+        `${[...READY_STATUSES].join(", ")}. A row at "${APPLICATION_STATUS.FILLING_FORM}" has a ` +
+        `run in flight; one at "${APPLICATION_STATUS.SUBMITTED}" or ` +
+        `"${APPLICATION_STATUS.SUBMISSION_UNCONFIRMED}" has already had a submit click issued ` +
+        `against it and must never be opened again.`
     );
   }
 
-  const candidateId = String(row.candidate_id ?? "");
-  const { data: candidateRows, error: candidateError } = await supabase
-    .from("candidates")
-    // ACT-015's additive columns are named explicitly rather than reached with
-    // `*`, so a row written before the migration reads back as "never asked"
-    // instead of failing. One string literal, not a concatenation: supabase-js
-    // infers the row type from the literal it is handed.
-    .select(
-      "id,resume_url,linkedin_url,application_email,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate"
-    )
-    .eq("id", candidateId)
-    .limit(1);
-  if (candidateError) throw new Error(`candidates lookup failed: ${candidateError.message}`);
+  // PostgREST returns a to-one embed as an object, but its inferred types are
+  // not always sure which of object and array it will be. Both are accepted
+  // rather than asserted, because guessing wrong costs an empty company name on
+  // a real employer's form and the check is one line.
+  const one = (value: unknown): Record<string, unknown> => {
+    const picked = Array.isArray(value) ? value[0] : value;
+    return picked !== null && typeof picked === "object" ? (picked as Record<string, unknown>) : {};
+  };
+  const job = one(row.jobs);
+  const board = one(job.boards);
 
-  const candidate = candidateRows?.[0];
-  if (!candidate) {
-    throw new Error(`job_applications ${jobApplicationId} points at missing candidate ${candidateId}.`);
+  const candidateId = String(row.user_id ?? "");
+  const jobId = String(row.job_id ?? "");
+  const applyUrl = String(job.url ?? "");
+  if (applyUrl === "") {
+    throw new Error(`applications ${jobApplicationId} points at a job with no url.`);
   }
-  const applicationEmail = String(candidate.application_email ?? "").trim();
-  if (applicationEmail === "") {
-    throw new Error(`candidates ${candidateId} has no application_email.`);
-  }
+
+  // The person, their answers and their resume, all from `loadCandidate` rather
+  // than from a second hand written query. actinno read the `candidates` row
+  // inline here because it was one table; Jobinno's is two, and duplicating the
+  // profile-plus-resume join would be a second place for the "which resume?"
+  // rule to be decided differently.
+  const candidate = await loadCandidate(candidateId);
 
   return {
     jobApplicationId,
     candidateId,
-    company: String(row.company ?? ""),
-    jobTitle: String(row.job_title ?? ""),
-    applyUrl: String(row.apply_url ?? ""),
+    jobId,
+    ats: String(job.ats ?? ""),
+    company: String(board.company ?? ""),
+    jobTitle: String(job.title ?? ""),
+    applyUrl,
     status,
-    boardPassword: typeof row.board_password === "string" ? row.board_password : null,
     candidate: {
       id: candidateId,
-      applicationEmail,
-      linkedinUrl: typeof candidate.linkedin_url === "string" ? candidate.linkedin_url : null,
-      resumeUrl: String(candidate.resume_url ?? ""),
+      applicationEmail: candidate.applicationEmail,
+      linkedinUrl: candidate.linkedinUrl,
+      resumeUrl: candidate.resumeUrl,
     },
-    applicationAnswers: toApplicationAnswers(candidate as Record<string, unknown>),
+    applicationAnswers: candidate.applicationAnswers,
   };
 }
 
 /**
- * Finds the row for a (candidate, apply URL) pair.
+ * Finds the row for a (person, apply URL) pair.
  *
  * Exists for the CLI, where a human has the listing in front of them and not a
- * row id. Same lookup ACT-005's `claimApplicationRow` does, and it inherits the
- * same caveat: `(candidate_id, apply_url)` has no unique index, so the oldest
- * matching row wins.
+ * row id. Same lookup `claimApplicationRow` does, and it inherits the same
+ * caveat: `(user_id, job_id)` has no unique index, so the oldest matching row
+ * wins.
+ *
+ * The URL filter reaches through the join now, because the URL is a column of
+ * `jobs` and not of `applications`. `jobs!inner` is what makes that filter
+ * narrow the applications rather than blank out the embed.
  */
 export async function findJobApplicationId(
   candidateId: string,
@@ -1277,19 +1244,20 @@ export async function findJobApplicationId(
 ): Promise<string> {
   const supabase = getSupabaseClient();
   const { data, error } = await supabase
-    .from("job_applications")
-    .select("id")
-    .eq("candidate_id", candidateId.trim())
-    .eq("apply_url", applyUrl.trim())
+    .from("applications")
+    .select("id,jobs!inner(url)")
+    .eq("user_id", candidateId.trim())
+    .eq("jobs.url", applyUrl.trim())
     .order("created_at", { ascending: true })
     .limit(1);
-  if (error) throw new Error(`job_applications lookup failed: ${error.message}`);
+  if (error) throw new Error(`applications lookup failed: ${error.message}`);
 
   const id = data?.[0]?.id;
   if (typeof id !== "string") {
     throw new Error(
-      `No job_applications row for candidate ${candidateId} and apply URL ${applyUrl}. ` +
-        `Run \`npm run create-account\` (ACT-005) for this listing first.`
+      `No applications row for user ${candidateId} and apply URL ${applyUrl}. Send a ` +
+        `job-application/requested event for this listing first, or claim the row with ` +
+        `\`claimApplicationRow\`.`
     );
   }
   return id;
@@ -1335,7 +1303,7 @@ async function completeVerification(
   const code = input?.code?.trim() || null;
   if (link === null && code === null) {
     throw new FormFillBlockedError(
-      `job_applications ${state.jobApplicationId} is at ` +
+      `applications ${state.jobApplicationId} is at ` +
         `"${APPLICATION_STATUS.AWAITING_VERIFICATION}" but no verification code or link was ` +
         `supplied. ACT-006 carries both on its \`${"email/verification-received"}\` event ` +
         `(verificationCode / verificationLink) — pass them through. Nothing was opened.`
@@ -1394,9 +1362,8 @@ async function completeVerification(
   // to a credential the board has already burned.
   await updateApplication(supabase, state.jobApplicationId, {
     status: APPLICATION_STATUS.EMAIL_VERIFIED,
-    error_message: null,
   });
-  console.log(`${LOG} job_applications ${state.jobApplicationId} → ${APPLICATION_STATUS.EMAIL_VERIFIED}`);
+  console.log(`${LOG} applications ${state.jobApplicationId} → ${APPLICATION_STATUS.EMAIL_VERIFIED}`);
 
   return { required: true, method, completed: true, detail, signals };
 }
@@ -1553,62 +1520,37 @@ async function reachApplicationForm(
 }
 
 /**
- * Signs in with the password ACT-004 generated and ACT-005 stored.
+ * A sign-in wall in front of an application form. Always a stop (JOB-004).
  *
- * The isolation rule is ACT-005's, for ACT-005's reason: a page that carries a
- * file upload alongside its password box is not a pure sign-in page, and the
- * button we are about to press may be wired to something more consequential than
- * a login. That risk is not worth taking on a real employer's site.
+ * ── What this used to do, and why it does not ───────────────────────────────
+ * actinno signed in here, with a password its own account creation step (ACT-004
+ * and ACT-005) had generated and stored on `job_applications.board_password`.
+ * Jobinno runs no such step: creating an account on an employer's site is a V2
+ * question that has not been answered, and there is deliberately no column in
+ * `lib/db/schema.ts` to hold a board password. So there is no credential to
+ * type, and every path that reaches this function is a listing this version
+ * cannot apply to.
+ *
+ * The implementation is not carried here as unreachable code. It is intact in
+ * the actinno checkout at `/Users/pranavlende/code/actinno`, which CLAUDE.md
+ * keeps read only for exactly this purpose, and the ticket that brings account
+ * creation back should port it from there along with the rest of the flow it
+ * belongs to. What is kept here is the reason, because that is the part that
+ * would otherwise be lost.
+ *
+ * `session` is still in the signature and still unused. The caller passes it,
+ * and the day this becomes a real sign-in again it needs it.
  */
 async function signIn(
-  session: BrowserSession,
-  state: ApplicationState,
+  _session: BrowserSession,
+  _state: ApplicationState,
   signals: FormSignals
 ): Promise<FormSignals> {
-  if (state.boardPassword === null || state.boardPassword === "") {
-    throw new FormFillBlockedError(
-      `A sign-in form is in front of the application at "${signals.url}", but ` +
-        `job_applications ${state.jobApplicationId} has no stored board_password to sign in ` +
-        `with. Nothing was typed.`
-    );
-  }
-  if (signals.fileInputCount > 0) {
-    throw new FormFillBlockedError(
-      `A sign-in form is in front of the application at "${signals.url}", but the page also ` +
-        `carries ${signals.fileInputCount} file upload control(s), so the sign-in form is not ` +
-        `isolated from the application form. Pressing sign-in here could submit something ` +
-        `else. Nothing was typed.`
-    );
-  }
-
-  console.log(`${LOG} signing in as ${state.candidate.applicationEmail}`);
-  await typeInto(session, signals.url, INSTRUCTIONS.SIGN_IN_EMAIL, state.candidate.applicationEmail);
-  // The board password reaches the browser as a literal argument and is never
-  // part of a prompt, never logged, and never written to the observe cache.
-  await typeInto(session, signals.url, INSTRUCTIONS.SIGN_IN_PASSWORD, state.boardPassword);
-  const clicked = await clickControl(
-    session,
-    signals.url,
-    "the sign-in button",
-    INSTRUCTIONS.SIGN_IN_SUBMIT,
-    /(sign|log|continue|submit|enter)/i
+  throw new FormFillBlockedError(
+    `A sign-in form is in front of the application at "${signals.url}", and Jobinno holds no ` +
+      `account on this board. Creating one on an employer's site is deliberately out of scope ` +
+      `for this version, so this listing cannot be applied to automatically. Nothing was typed.`
   );
-  if (clicked === null) {
-    throw new FormFillBlockedError(
-      `Filled the sign-in form at "${signals.url}" but found no control that signs in. Nothing ` +
-        `was submitted.`
-    );
-  }
-
-  const next = await readFormSignals(session);
-  if (next.passwordFieldCount > 0 && !next.applicationFormPresent) {
-    throw new FormFillBlockedError(
-      `Signed in at "${signals.url}" but a password field is still on screen at "${next.url}" — ` +
-        `the board rejected the credentials, or wants something else. Nothing was typed into ` +
-        `an application.`
-    );
-  }
-  return next;
 }
 
 // ───────────────────────────────────
@@ -2799,7 +2741,7 @@ async function captureFilledForm(
 // ───────────────────────────────────
 
 /**
- * Fills the application form for one `job_applications` row and stops. The
+ * Fills the application form for one `applications` row and stops. The
  * browser is always closed before this returns.
  *
  * Always leaves the row in a state that says what happened:
@@ -2868,7 +2810,7 @@ async function runFill(
   const state = await loadApplicationState(supabase, jobApplicationId);
 
   console.log(
-    `${LOG} job_applications ${jobApplicationId} — ${state.company} / ${state.jobTitle} ` +
+    `${LOG} applications ${jobApplicationId} — ${state.company} / ${state.jobTitle} ` +
       `(status "${state.status}")`
   );
 
@@ -2901,7 +2843,6 @@ async function runFill(
 
     await updateApplication(supabase, jobApplicationId, {
       status: APPLICATION_STATUS.FILLING_FORM,
-      error_message: null,
     });
 
     const { report, session } = await runBrowserFlow(
@@ -2915,12 +2856,14 @@ async function runFill(
     );
 
     if (report.blockedReason !== null) {
-      await recordFailure(
-        supabase,
-        jobApplicationId,
-        APPLICATION_STATUS.FORM_FILL_BLOCKED,
-        report.blockedReason
-      );
+      await recordFailure(supabase, {
+        applicationId: jobApplicationId,
+        jobId: state.jobId,
+        ats: state.ats,
+        status: APPLICATION_STATUS.FORM_FILL_BLOCKED,
+        message: report.blockedReason,
+        log: LOG,
+      });
       // `session` is null on every blocked path — `runBrowserFlow` closed it.
       return {
         result: { ...report, status: APPLICATION_STATUS.FORM_FILL_BLOCKED },
@@ -2931,7 +2874,6 @@ async function runFill(
     try {
       await updateApplication(supabase, jobApplicationId, {
         status: APPLICATION_STATUS.FORM_FILLED,
-        error_message: null,
       });
     } catch (err) {
       // A retained session is live at this point and nothing downstream will
@@ -2941,7 +2883,7 @@ async function runFill(
       throw err;
     }
     console.log(
-      `${LOG} job_applications ${jobApplicationId} → ${APPLICATION_STATUS.FORM_FILLED} ` +
+      `${LOG} applications ${jobApplicationId} → ${APPLICATION_STATUS.FORM_FILLED} ` +
         `(the form is filled and NOT submitted — submission is ACT-008)`
     );
     return { result: { ...report, status: APPLICATION_STATUS.FORM_FILLED }, session };
@@ -2951,16 +2893,25 @@ async function runFill(
     // stop happened before or after the browser existed — a suspected injection
     // in the resume, say — but it is still a stop-for-a-human, not a retry.
     if (err instanceof FormFillBlockedError || err instanceof InjectionSuspectedError) {
-      await recordFailure(
-        supabase,
-        jobApplicationId,
-        APPLICATION_STATUS.FORM_FILL_BLOCKED,
-        err.message
-      );
+      await recordFailure(supabase, {
+        applicationId: jobApplicationId,
+        jobId: state.jobId,
+        ats: state.ats,
+        status: APPLICATION_STATUS.FORM_FILL_BLOCKED,
+        message: err.message,
+        log: LOG,
+      });
       throw err;
     }
     const message = err instanceof Error ? err.message : String(err);
-    await recordFailure(supabase, jobApplicationId, APPLICATION_STATUS.ERROR, message);
+    await recordFailure(supabase, {
+      applicationId: jobApplicationId,
+      jobId: state.jobId,
+      ats: state.ats,
+      status: APPLICATION_STATUS.ERROR,
+      message,
+      log: LOG,
+    });
     throw err;
   }
 }

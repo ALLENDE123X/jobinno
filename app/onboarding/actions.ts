@@ -88,7 +88,7 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   const { error: resumeError } = await supabase.from("resumes").insert({
     user_id: user.id,
     // Bucket qualified, matching the convention `lib/candidate-intake.ts` uses
-    // for `candidates.resume_url`: a path to sign a URL from, never a URL.
+    // for every stored resume path: a path to sign a URL from, never a URL.
     storage_path: `${RESUMES_BUCKET}/${intake.resumePath}`,
     linkedin_pdf_path: intake.linkedinPdfPath
       ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`

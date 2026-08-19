@@ -31,6 +31,8 @@ const h = vi.hoisted(() => {
   const APPLY_URL = "https://careers.example.com/jobs/42/apply";
   const JOB_APPLICATION_ID = "11111111-1111-4111-8111-111111111111";
   const CANDIDATE_ID = "22222222-2222-4222-8222-222222222222";
+  /** `jobs.id`. The listing is its own row since JOB-004. */
+  const JOB_ID = "33333333-3333-4333-8333-333333333333";
 
   /**
    * The one control every run in this file clicks. A test that cares about a
@@ -196,6 +198,7 @@ const h = vi.hoisted(() => {
     APPLY_URL,
     JOB_APPLICATION_ID,
     CANDIDATE_ID,
+    JOB_ID,
   };
 });
 
@@ -218,25 +221,39 @@ vi.mock("node:fs/promises", async (importOriginal) => ({
   writeFile: async () => undefined,
 }));
 
+/**
+ * The database, as three tables rather than actinno's two (JOB-004).
+ *
+ * `loadApplicationState` now reads `applications` with the listing and the
+ * employer embedded, and reaches `loadCandidate` for the person, which is two
+ * more reads again. So the client is a chainable stub rather than a fixed
+ * `select().eq().limit()` shape: every filter returns the builder and the
+ * builder is thenable, which is close enough to PostgREST's own interface that
+ * a query changing its filters does not have to change this mock.
+ */
 vi.mock("@supabase/supabase-js", () => {
   const rows: Record<string, unknown[]> = {
-    job_applications: [
+    applications: [
       {
         id: h.JOB_APPLICATION_ID,
-        candidate_id: h.CANDIDATE_ID,
-        company: "Example",
-        job_title: "Software Engineer Intern",
-        apply_url: h.APPLY_URL,
-        status: "no_account_required",
-        board_password: null,
+        user_id: h.CANDIDATE_ID,
+        job_id: h.JOB_ID,
+        status: "discovered",
+        // PostgREST returns a to-one embed as a nested object, which is what
+        // `loadApplicationState` unwraps.
+        jobs: {
+          title: "Software Engineer Intern",
+          url: h.APPLY_URL,
+          ats: "greenhouse",
+          boards: { company: "Example" },
+        },
       },
     ],
-    candidates: [
+    profiles: [
       {
         id: h.CANDIDATE_ID,
-        resume_url: "resumes/candidate.pdf",
-        linkedin_url: null,
-        application_email: "candidate@example.com",
+        email: "candidate@example.com",
+        target_locations: null,
         work_authorized_us: null,
         requires_sponsorship: null,
         current_country: null,
@@ -244,22 +261,24 @@ vi.mock("@supabase/supabase-js", () => {
         willing_to_relocate: null,
       },
     ],
+    resumes: [
+      { storage_path: "resumes/candidate.pdf", created_at: "2026-01-01T00:00:00.000Z" },
+    ],
   };
-  return {
-    createClient: () => ({
-      from(table: string) {
-        return {
-          select: () => ({
-            eq: () => ({
-              limit: async () => ({ data: rows[table] ?? [], error: null }),
-            }),
-          }),
-          update: () => ({ eq: async () => ({ error: null }) }),
-          upsert: async () => ({ error: null }),
-        };
-      },
-    }),
+
+  const builder = (table: string) => {
+    const result = { data: rows[table] ?? [], error: null };
+    const chain: Record<string, unknown> = {
+      single: async () => ({ data: rows[table]?.[0] ?? null, error: null }),
+      then: (resolve: (value: typeof result) => unknown) => Promise.resolve(result).then(resolve),
+    };
+    for (const method of ["select", "eq", "ilike", "in", "gte", "order", "limit", "update", "insert", "upsert"]) {
+      chain[method] = () => chain;
+    }
+    return chain;
   };
+
+  return { createClient: () => ({ from: (table: string) => builder(table) }) };
 });
 
 vi.mock("@/lib/resume-parser", () => ({

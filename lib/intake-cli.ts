@@ -3,12 +3,24 @@
  * Local test entrypoint for ACT-003 (candidate intake).
  *
  * Run from `lib/`:
- *   npm run intake -- --resume ./resume.pdf --email jane@example.com \
- *     --linkedin https://linkedin.com/in/jane --title "entry-level software engineer" \
- *     --pay-min 90000 --locations "Remote,New York"
+ *   npm run intake -- --user-id 0f8f... --resume ./resume.pdf \
+ *     --locations "Remote,New York" --country "United States" --city Atlanta
+ *
+ * ── What JOB-004 changed ────────────────────────────────────────────────────
+ * This used to mint a person. It cannot any more: a person is an `auth.users`
+ * row, and only signing in creates one. So the id is an argument now, and what
+ * this does is attach a resume and some answers to a profile that already
+ * exists. The web path for the same thing is /login then /onboarding; this
+ * stays because a terminal is a much faster way to set up a test account than
+ * clicking through a form, and because it can point at a resume on disk.
+ *
+ * The `--email`, `--linkedin`, `--title` and `--pay-min` flags are gone.
+ * `profiles.email` is written from the address Supabase Auth verified and is
+ * not ours to overwrite; the other three have no column in Jobinno's schema.
+ * See `CandidateRecord` in `lib/candidate-intake.ts` for what that costs.
  *
  * Reads credentials from the repo-root `.env.local` (gitignored). This writes
- * real rows and real storage objects to the actinno Supabase project.
+ * real rows and real storage objects to Jobinno's Supabase project.
  */
 
 import { config } from "dotenv";
@@ -32,11 +44,8 @@ if (localEnv.error) {
 }
 
 const FLAGS = [
+  "--user-id",
   "--resume",
-  "--email",
-  "--linkedin",
-  "--title",
-  "--pay-min",
   "--locations",
   // ACT-015. The reusable answers every ATS form asks for. Collected once here
   // so no application has to stop and ask for them; each is genuinely optional,
@@ -50,9 +59,11 @@ const FLAGS = [
 type Flag = (typeof FLAGS)[number];
 
 const USAGE = [
-  "Usage: npm run intake -- --resume <path-to-pdf> --email <email>",
-  "                        [--linkedin <url>] [--title <title>] [--pay-min <integer>]",
+  "Usage: npm run intake -- --user-id <profiles.id uuid> --resume <path-to-pdf>",
   "                        [--locations <csv>]",
+  "",
+  "  --user-id is the signed in person's own id. Sign in at /login first; that",
+  "  is what creates the profile this attaches to.",
   "",
   "  Application answers (ACT-015) — asked on almost every ATS form, stored once,",
   "  reused on every application. Omit any you have not been told; omitted means",
@@ -88,7 +99,7 @@ function parseYesNo(flag: Flag, raw: string | undefined): boolean | undefined {
 
 /**
  * Parses `--flag value` and `--flag=value`. Rejects unknown flags, repeated
- * flags, and missing values so a typo (e.g. `--linkedln`) fails loudly instead
+ * flags, and missing values so a typo (e.g. `--locatons`) fails loudly instead
  * of silently dropping the field.
  */
 function parseArgs(argv: string[]): Map<Flag, string> {
@@ -126,16 +137,6 @@ function parseArgs(argv: string[]): Map<Flag, string> {
   return out;
 }
 
-function parsePayMin(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  // Plain decimal digits only — Number() would also accept "1e5" or "0x100"
-  // as valid integers, which isn't what a human typing --pay-min intends.
-  if (!/^\d+$/.test(raw)) {
-    throw new Error(`--pay-min must be a non-negative whole number, got: ${raw}`);
-  }
-  return Number(raw);
-}
-
 /** Never let a credential reach stdout/stderr, even inside a wrapped error. */
 function redact(text: string): string {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -146,9 +147,9 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   const resumeFilePath = args.get("--resume");
-  const applicationEmail = args.get("--email");
-  if (!resumeFilePath || !applicationEmail) {
-    throw new Error(`--resume and --email are required\n${USAGE}`);
+  const userId = args.get("--user-id");
+  if (!resumeFilePath || !userId) {
+    throw new Error(`--user-id and --resume are required\n${USAGE}`);
   }
 
   const locationsRaw = args.get("--locations");
@@ -177,11 +178,8 @@ async function main(): Promise<void> {
   };
 
   const result = await intakeCandidate({
+    userId,
     resumeFilePath,
-    applicationEmail,
-    linkedinUrl: args.get("--linkedin"),
-    targetTitle: args.get("--title"),
-    payMin: parsePayMin(args.get("--pay-min")),
     locations: locationsRaw?.split(",").map((s) => s.trim()).filter(Boolean),
     ...(Object.keys(applicationAnswers).length === 0 ? {} : { applicationAnswers }),
   });

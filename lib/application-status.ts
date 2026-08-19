@@ -1,5 +1,16 @@
 /**
- * `job_applications.status`: the whole pipeline's status vocabulary.
+ * `applications.status`: the whole pipeline's status vocabulary.
+ *
+ * ── JOB-004 ─────────────────────────────────────────────────────────────────
+ * The table is `applications` now, not actinno's `job_applications`, and the
+ * column is still free text for the reason `lib/db/schema.ts` gives in its
+ * header: a status column that rejects a value a running pipeline wants to
+ * write fails in the worst possible place, halfway through a real application.
+ *
+ * One value was added, `discovered`, and nothing was removed. See the note on
+ * it below, and see `lib/application-records.ts` for where the *reasons* behind
+ * the blocked statuses now live, which is the part of actinno's model that did
+ * change.
  *
  * ── Provenance (JOB-001) ────────────────────────────────────────────────────
  * Lifted verbatim from actinno's `lib/create-board-account.ts`, which is the
@@ -23,7 +34,7 @@
  */
 
 /**
- * `job_applications.status` values this module writes. The column is free text
+ * `applications.status` values this module writes. The column is free text
  * with a `discovered` default, so these are a convention, not a constraint.
  *
  * `no_account_required` is this ticket's addition: ACT-005's brief names
@@ -44,6 +55,17 @@
  * anything.
  */
 export const APPLICATION_STATUS = {
+  /**
+   * The row exists and nothing has been attempted against it yet.
+   *
+   * Added by JOB-004, and it is a correction rather than a new idea: this has
+   * been the column's default in `lib/db/schema.ts` since JOB-002, and the
+   * docstring above has named it since the port. It was simply missing from the
+   * table, so the one status every row starts life in could not be referred to
+   * in code. `claimApplicationRow` writes it, and ACT-007's `READY_STATUSES`
+   * accepts it, which is what makes a freshly claimed row fillable.
+   */
+  DISCOVERED: "discovered",
   /** Row created; browser work in flight. */
   CREATING_ACCOUNT: "creating_account",
   /** Direct-apply board — no signup exists, proceed straight to form fill. */
@@ -101,7 +123,7 @@ export const APPLICATION_STATUS = {
 
   /**
    * The application was really submitted to the employer. Terminal, and the one
-   * status in this table that can never be undone — `confirmation_ref` carries
+   * status in this table that can never be undone — `confirmation_text` carries
    * whatever the board showed back (a reference number, the confirmation
    * wording, or "email confirmation incoming").
    *

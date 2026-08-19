@@ -8,10 +8,11 @@
  * of each table are what keeps that difference safe. The service role bypasses
  * RLS entirely, so every policy below is written for the browser side only.
  *
- * The ported modules in `lib/` still read actinno's `candidates` and
- * `job_applications` tables through `@supabase/supabase-js` rather than through
- * Drizzle. Pointing them at these tables is deliberately not this ticket: it
- * rewrites live query code in four modules and deserves its own review.
+ * JOB-004 pointed the ported modules at these tables. They still reach Supabase
+ * through `@supabase/supabase-js` rather than through Drizzle, which is the half
+ * of that reconciliation still open, but the names and columns they use are the
+ * ones below. `lib/future-gmail/` is the one exception, and it is unwired
+ * reference code; see its README.
  *
  * ── Why `profiles` and not `users` ──────────────────────────────────────────
  * Supabase Auth owns `auth.users`. A second table called `users` in `public`
@@ -244,8 +245,8 @@ export const profiles = pgTable(
 /**
  * A resume is a private Storage object; this row is the pointer to it plus
  * whatever the parser made of it. `storage_path` is a bucket qualified path and
- * not a fetchable URL, matching the convention `lib/candidate-intake.ts`
- * already uses for `candidates.resume_url`.
+ * not a fetchable URL, which is the convention `lib/candidate-intake.ts` writes
+ * it under and `lib/resume-parser.ts` reads it under.
  */
 export const resumes = pgTable(
   "resumes",
