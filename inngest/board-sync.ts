@@ -36,13 +36,13 @@
  * from a memoized step's output, so they are stable across a replay, which is
  * what Inngest needs them to be.
  *
- * ── Not yet reachable ───────────────────────────────────────────────────────
- * This repository still has no Inngest serve route, so nothing registers this
- * function with Inngest and the cron cannot fire yet. That route is its own
- * ticket and would have registered the whole ported pipeline along with it,
- * which is more than JOB-003 should be deciding. Until it lands, `npm run
- * sync-boards` makes the same two calls this function makes, without Inngest
- * in the way. See `lib/board-sync-cli.ts`.
+ * ── Reachable since JOB-004 ─────────────────────────────────────────────────
+ * `app/api/inngest/route.ts` registers this function, which is what makes the
+ * schedule above real: a cron is stored on Inngest's side from what that
+ * route's sync reply says, so before it existed this function had a cron
+ * expression and no schedule. `npm run sync-boards` still makes the same two
+ * calls without Inngest in the way, which is the faster way to run one by
+ * hand. See `lib/board-sync-cli.ts`.
  */
 
 // The pipeline's first import is `./load-env`, so importing the client from it

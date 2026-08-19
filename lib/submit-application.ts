@@ -95,6 +95,10 @@ import { applyFieldValue, enumerateFormFields, type EnumeratedField } from "@/li
 // time-bounded search that ends in its code extractor.
 import { allowedSenderDomains, waitForMailboxCode } from "@/lib/future-gmail/gmail-verification-listener";
 import { createGmailClient } from "@/lib/future-gmail/gmail-client";
+// JOB-004. `updateApplication` used to be a private copy of the one in
+// `fill-application-form.ts`; both now come from here, along with the skip
+// logging that replaced actinno's `error_message` column.
+import { recordSkipQuietly, updateApplication } from "@/lib/application-records";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 const LOG = "[act-008]";
@@ -327,7 +331,7 @@ export const AUTO_APPROVE_SUBMISSION: SubmissionApprover = async () => ({
 // ───────────────────────────────────
 
 export type SubmitApplicationInput = {
-  /** `job_applications.id`. Everything else about the row is read from it. */
+  /** `applications.id`. Everything else about the row is read from it. */
   jobApplicationId: string;
   /** ACT-002's `requiresCoverLetter` for this listing. Passed straight to ACT-007. */
   requiresCoverLetter: boolean;
@@ -377,7 +381,7 @@ export type SubmitApplicationResult = {
    * the employer and a human has to check. Nothing may retry on it.
    */
   submitAttempted: boolean;
-  /** What went into `job_applications.confirmation_ref`. */
+  /** What went into `applications.confirmation_text`. */
   confirmationRef: string | null;
   /** Everything the page said after the click. Null when nothing was clicked. */
   confirmation: ConfirmationCapture | null;
@@ -430,35 +434,25 @@ function getSupabaseClient(): SupabaseClient {
   });
 }
 
-type ApplicationPatch = {
-  status?: ApplicationStatus;
-  error_message?: string | null;
-  /** Nullable `text` column, already present on the live table — no migration in this ticket. */
-  confirmation_ref?: string | null;
-};
-
-async function updateApplication(
-  supabase: SupabaseClient,
-  jobApplicationId: string,
-  patch: ApplicationPatch
-): Promise<void> {
-  // `updated_at` defaults to now() on insert only — nothing bumps it on UPDATE.
-  const { error } = await supabase
-    .from("job_applications")
-    .update({ ...patch, updated_at: new Date().toISOString() })
-    .eq("id", jobApplicationId);
-  if (error) {
-    throw new Error(
-      `Failed to update job_applications ${jobApplicationId} ` +
-        `(${JSON.stringify(Object.keys(patch))}): ${error.message}`
-    );
-  }
-}
-
 type PreflightRow = {
   status: string;
   company: string;
   jobTitle: string;
+  /** `applications.job_id`, so a skip can be logged against the listing. */
+  jobId: string;
+  /**
+   * `jobs.description`. Read here so the caller does not have to carry it.
+   *
+   * JOB-004. The pipeline used to pass this down from its event, which meant up
+   * to 8KB of scraped job text crossing an Inngest step boundary and being kept
+   * in durable step state for the life of the run. It is a column of a table
+   * this function already reads, one row away, so it is read rather than
+   * carried. An explicit `jobDescription` on the input still wins, for the CLI
+   * and for a caller that has a better copy of it.
+   */
+  jobDescription: string | null;
+  /** `jobs.ats`. Same. */
+  ats: string;
   confirmationRef: string | null;
   /**
    * ACT-017. The board the agent itself navigated to — the only evidence
@@ -482,32 +476,49 @@ async function preflight(
   supabase: SupabaseClient,
   jobApplicationId: string
 ): Promise<PreflightRow> {
+  // JOB-004: the company, the title and the apply URL are columns of `jobs` and
+  // `boards` now, not of the application row. Inner joins, so a listing that has
+  // been deleted fails the lookup rather than arriving as three empty strings.
   const { data: rows, error } = await supabase
-    .from("job_applications")
-    .select("status,company,job_title,confirmation_ref,apply_url")
+    .from("applications")
+    // One literal, not a concatenation, and that is load bearing rather than
+    // untidy: supabase-js infers the row's type by parsing the string it is
+    // handed, and gives up on anything it cannot see through, leaving every
+    // column read off the result a type error. Same rule as `CANDIDATE_COLUMNS`
+    // in `lib/candidate-intake.ts`.
+    .select("status,job_id,confirmation_text,jobs!inner(title,url,ats,description,boards!inner(company))")
     .eq("id", jobApplicationId)
     .limit(1);
-  if (error) throw new Error(`job_applications lookup failed: ${error.message}`);
+  if (error) throw new Error(`applications lookup failed: ${error.message}`);
 
   const row = rows?.[0];
-  if (!row) throw new Error(`No job_applications row with id ${jobApplicationId}.`);
+  if (!row) throw new Error(`No applications row with id ${jobApplicationId}.`);
+
+  // See the identical note in `fill-application-form.ts`: PostgREST's to-one
+  // embed is an object, and supabase-js is not always sure of that.
+  const one = (value: unknown): Record<string, unknown> => {
+    const picked = Array.isArray(value) ? value[0] : value;
+    return picked !== null && typeof picked === "object" ? (picked as Record<string, unknown>) : {};
+  };
+  const job = one(row.jobs);
+  const board = one(job.boards);
 
   const status = String(row.status ?? "");
   const confirmationRef =
-    typeof row.confirmation_ref === "string" ? row.confirmation_ref : null;
+    typeof row.confirmation_text === "string" ? row.confirmation_text : null;
 
   if (status === APPLICATION_STATUS.SUBMITTED) {
     throw new SubmissionBlockedError(
-      `job_applications ${jobApplicationId} is already at "${APPLICATION_STATUS.SUBMITTED}" — ` +
+      `applications ${jobApplicationId} is already at "${APPLICATION_STATUS.SUBMITTED}" — ` +
         `this application has been sent to the employer once already` +
-        (confirmationRef === null ? "" : ` (confirmation_ref: ${confirmationRef})`) +
+        (confirmationRef === null ? "" : ` (confirmation_text: ${confirmationRef})`) +
         `. Refusing to submit it a second time. There is no version of this that is worth ` +
         `risking a duplicate application under a real candidate's name.`
     );
   }
   if (status === APPLICATION_STATUS.SUBMISSION_UNCONFIRMED) {
     throw new SubmissionBlockedError(
-      `job_applications ${jobApplicationId} is at ` +
+      `applications ${jobApplicationId} is at ` +
         `"${APPLICATION_STATUS.SUBMISSION_UNCONFIRMED}": an earlier run clicked this listing's ` +
         `submit control and could not confirm what happened. An application may already exist ` +
         `at the employer. A human has to check that — the board's own account, and the inbox ` +
@@ -517,10 +528,13 @@ async function preflight(
 
   return {
     status,
-    company: String(row.company ?? ""),
-    jobTitle: String(row.job_title ?? ""),
+    company: String(board.company ?? ""),
+    jobTitle: String(job.title ?? ""),
+    jobId: String(row.job_id ?? ""),
+    ats: String(job.ats ?? ""),
+    jobDescription: typeof job.description === "string" ? job.description : null,
     confirmationRef,
-    applyUrl: typeof row.apply_url === "string" ? row.apply_url : "",
+    applyUrl: typeof job.url === "string" ? job.url : "",
   };
 }
 
@@ -1127,7 +1141,7 @@ export async function submitApplication(
   const supabase = getSupabaseClient();
   const row = await preflight(supabase, jobApplicationId);
   console.log(
-    `${LOG} job_applications ${jobApplicationId} — ${row.company} / ${row.jobTitle} ` +
+    `${LOG} applications ${jobApplicationId} — ${row.company} / ${row.jobTitle} ` +
       `(status "${row.status}")`
   );
   console.log(
@@ -1142,7 +1156,11 @@ export async function submitApplication(
   const { result: fill, session } = await fillApplicationFormRetainingSession({
     jobApplicationId,
     requiresCoverLetter: input.requiresCoverLetter,
-    jobDescription: input.jobDescription ?? null,
+    // The caller's copy if it gave one, otherwise the listing's own, off the
+    // row `preflight` already read. Never undefined: the fill layer reads null
+    // as "no description available" and would read undefined the same way, but
+    // only one of the two is a decision.
+    jobDescription: input.jobDescription ?? row.jobDescription,
     ...(input.verification === undefined ? {} : { verification: input.verification }),
     ...(input.additionalAnswers === undefined
       ? {}
@@ -1156,7 +1174,7 @@ export async function submitApplication(
   if (fill.blockedReason !== null || session === null) {
     // ACT-007 stopped for a human and closed its own browser. Nothing was
     // clicked here, and nothing here writes to the row: `form_fill_blocked` and
-    // its `error_message` are already on it and are the accurate description.
+    // its `skip_log` row are already recorded and are the accurate description.
     if (session !== null) await closeBrowserSession(session);
     console.warn(`${LOG} the fill did not complete — nothing to submit. Not clicking anything.`);
     return {
@@ -1292,21 +1310,36 @@ async function runSubmitPhase(
     const message = `${UNCONFIRMED_TAG}: ${why}`;
     let rowUpdated = false;
     try {
+      // Status first and on its own, so that the write which stops this row
+      // being picked up again does not share a failure with the write that only
+      // explains it. `submitted_at` is stamped even though the outcome is
+      // unknown: the click happened at this instant, and that is the fact a
+      // human checking the employer's side needs in order to find it.
       await updateApplication(supabase, jobApplicationId, {
         status: APPLICATION_STATUS.SUBMISSION_UNCONFIRMED,
-        error_message: message.length > 2000 ? `${message.slice(0, 2000)}…` : message,
+        submittedAt: new Date().toISOString(),
       });
       rowUpdated = true;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       console.error(
         `${LOG} could not record ${APPLICATION_STATUS.SUBMISSION_UNCONFIRMED} on ` +
-          `job_applications ${jobApplicationId} (the row may not reflect this): ${reason}. Not ` +
+          `applications ${jobApplicationId} (the row may not reflect this): ${reason}. Not ` +
           `escalating to a retryable status regardless — the submit control was already ` +
           `clicked, and a retry could file a second real application. A human has to check this ` +
           `row and the employer's side directly.`
       );
     }
+    // The reason, in the log table. `recordFailure` would rewrite the status it
+    // was just handed, so only the skip half is called here: this path has
+    // already decided what the status must be and why nothing may change it.
+    await recordSkipQuietly(supabase, {
+      applicationId: jobApplicationId,
+      jobId: row.jobId,
+      ats: row.ats,
+      reason: "submit_failed",
+      message,
+    });
     console.error(
       `${LOG} ══ SUBMIT CLICKED, OUTCOME UNKNOWN ═══════════════════════════════\n` +
         `${LOG} ${why}\n` +
@@ -1344,16 +1377,22 @@ async function runSubmitPhase(
     try {
       await updateApplication(supabase, jobApplicationId, {
         status: APPLICATION_STATUS.SUBMISSION_BLOCKED,
-        error_message: message.length > 2000 ? `${message.slice(0, 2000)}…` : message,
       });
       rowUpdated = true;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       console.error(
-        `${LOG} could not record ${APPLICATION_STATUS.SUBMISSION_BLOCKED} on job_applications ` +
+        `${LOG} could not record ${APPLICATION_STATUS.SUBMISSION_BLOCKED} on applications ` +
           `${jobApplicationId}: ${reason}`
       );
     }
+    await recordSkipQuietly(supabase, {
+      applicationId: jobApplicationId,
+      jobId: row.jobId,
+      ats: row.ats,
+      reason: "submit_failed",
+      message,
+    });
     console.warn(`${LOG} ${APPLICATION_STATUS.SUBMISSION_BLOCKED}: ${why}`);
     return await finish({
       status: APPLICATION_STATUS.SUBMISSION_BLOCKED,
@@ -1398,7 +1437,7 @@ async function runSubmitPhase(
   ): Promise<SubmitApplicationResult> => {
     const confirmationRef = buildConfirmationRef(capture);
     console.log(
-      `${LOG} submitted (${how}). confirmation_ref = ${JSON.stringify(confirmationRef)} ` +
+      `${LOG} submitted (${how}). confirmation_text = ${JSON.stringify(confirmationRef)} ` +
         `(confirmation page: ${capture.confirmationPresent}, ` +
         `form gone: ${!capture.applicationFormStillPresent}, ` +
         `navigated: ${!samePage(capture.url, wasAt)})`
@@ -1408,20 +1447,24 @@ async function runSubmitPhase(
     try {
       await updateApplication(supabase, jobApplicationId, {
         status: APPLICATION_STATUS.SUBMITTED,
-        confirmation_ref: confirmationRef,
-        error_message: null,
+        confirmationText: confirmationRef,
+        submittedAt: new Date().toISOString(),
+        // Where the board sent the browser after the click. Null when it stayed
+        // put, which is itself worth recording: it is the shape of a board that
+        // confirms in place rather than on a thank-you page.
+        redirectUrl: samePage(capture.url, wasAt) ? null : capture.url,
       });
       rowUpdated = true;
       console.log(
-        `${LOG} job_applications ${jobApplicationId} → ${APPLICATION_STATUS.SUBMITTED}`
+        `${LOG} applications ${jobApplicationId} → ${APPLICATION_STATUS.SUBMITTED}`
       );
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       console.error(
         `${LOG} the application WAS submitted and the board confirmed it, but recording ` +
-          `${APPLICATION_STATUS.SUBMITTED} on job_applications ${jobApplicationId} failed: ` +
+          `${APPLICATION_STATUS.SUBMITTED} on applications ${jobApplicationId} failed: ` +
           `${reason}. The row still reads its previous status and a human must fix it by hand — ` +
-          `confirmation_ref would have been ${JSON.stringify(confirmationRef)}. Not retrying ` +
+          `confirmation_text would have been ${JSON.stringify(confirmationRef)}. Not retrying ` +
           `anything, and not reporting a failure status: the submission itself succeeded.`
       );
     }

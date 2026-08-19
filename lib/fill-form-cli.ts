@@ -9,18 +9,22 @@
  *     --keep-browser
  *
  * or, once you know the row id:
- *   npm run fill-form -- --application <job_applications uuid>
+ *   npm run fill-form -- --application <applications uuid>
  *
  * Prerequisites, in order:
- *   1. `npm run intake` (ACT-003) — a `candidates` row with a **text** PDF
- *      resume in the private `resumes` bucket. A scanned resume has no text
- *      layer and this will refuse it; OCR is out of scope.
- *   2. `npm run create-account` (ACT-005) — a `job_applications` row sitting at
- *      `no_account_required` or `awaiting_verification`.
- *   3. If the row is at `awaiting_verification`, the code and/or link from
- *      ACT-006's `email/verification-received` event, passed with
- *      `--verification-link` / `--verification-code`. This is the step that
- *      actually completes the verification — ACT-006 only reports it.
+ *   1. A signed in person. `profiles` rows are created by signing in at /login,
+ *      and nothing else creates one.
+ *   2. A **text** PDF resume in the private `resumes` bucket, from /onboarding
+ *      or from `npm run intake`. A scanned resume has no text layer and this
+ *      will refuse it; OCR is out of scope.
+ *   3. An `applications` row for the listing. JOB-004 moved that row's creation
+ *      out of the account creation step that was never ported and into
+ *      `claimApplicationRow` in `lib/application-records.ts`, which the Inngest
+ *      pipeline calls; `--candidate` plus `--apply-url` finds an existing one.
+ *
+ * `--verification-link` and `--verification-code` are still accepted and still
+ * do what they did, but nothing in Jobinno produces a row that needs them:
+ * account creation is not ported, so no signup mail is ever sent.
  *
  * ── This is the acceptance test ─────────────────────────────────────────────
  * ACT-007's criterion is "run against one real listing, confirm the filled-but-
@@ -89,7 +93,7 @@ const USAGE = [
   "                          [--verification-link <url>] [--verification-code <code>]",
   "                          [--screenshot-dir <path>] [--keep-browser]",
   "",
-  "  --application             job_applications row id (from ACT-005)",
+  "  --application             applications row id",
   "  --candidate / --apply-url look the row up instead of passing its id",
   "  --requires-cover-letter   ACT-002's requiresCoverLetter for this listing. A cover",
   "                            letter is written ONLY when this is given.",
@@ -206,7 +210,7 @@ function redact(text: string): string {
 function printReport(result: FillApplicationFormResult): void {
   const line = "─".repeat(78);
   console.log(`\n${line}`);
-  console.log(`ACT-007 form fill — job_applications ${result.jobApplicationId}`);
+  console.log(`ACT-007 form fill — applications ${result.jobApplicationId}`);
   console.log(`status: ${result.status}    submitted: ${result.submitted}`);
   console.log(`page:   ${result.finalUrl}`);
   console.log(line);
@@ -302,7 +306,7 @@ async function main(): Promise<void> {
       );
     }
     jobApplicationId = await findJobApplicationId(candidateId, applyUrl);
-    console.log(`[act-007] resolved job_applications ${jobApplicationId}`);
+    console.log(`[act-007] resolved applications ${jobApplicationId}`);
   }
 
   const descriptionFile = values.get("--job-description-file");

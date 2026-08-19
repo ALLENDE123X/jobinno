@@ -1,7 +1,34 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  /**
+   * Packages the bundler must leave alone and let Node `require` at runtime.
+   *
+   * Added by JOB-004, and not a tuning knob: without it `npm run build` fails
+   * outright. `app/api/inngest/route.ts` is the first thing under `app/` to
+   * import the pipeline, which reaches Stagehand, and Stagehand resolves its
+   * bundled browser extension with `new URL("../", import.meta.url)`. Turbopack
+   * tries to resolve that as a module specifier, cannot, and stops the build:
+   *
+   *   Module not found: Can't resolve '../'
+   *   ./node_modules/@browserbasehq/stagehand/dist/index.mjs
+   *
+   * The pattern is a real path relative to the installed package, so the fix is
+   * to stop bundling the package rather than to work around the expression. All
+   * four listed here are Node only and server only, none of them is reachable
+   * from a client component, and every one of them either ships or reads real
+   * files on disk, which is the case bundling cannot preserve.
+   */
+  serverExternalPackages: [
+    // Ships a browser extension it locates relative to its own package root.
+    "@browserbasehq/stagehand",
+    // Reads bundled PDF worker assets the same way.
+    "unpdf",
+    // Enormous, CommonJS, and loads its API discovery documents at runtime.
+    "googleapis",
+    // A native-ish socket driver with no business in a browser bundle.
+    "postgres",
+  ],
 };
 
 export default nextConfig;

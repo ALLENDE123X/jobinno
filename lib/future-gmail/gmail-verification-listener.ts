@@ -1,6 +1,22 @@
 /**
  * ACT-006 — Gmail verification listener.
  *
+ * ── Unwired, and still naming actinno's table (JOB-004) ─────────────────────
+ * Nothing in the running app calls this module, and the `job_applications`
+ * query below reads a table Jobinno does not have. That is deliberate on both
+ * counts; see `lib/future-gmail/README.md` for the reasoning in full.
+ *
+ * The short version: this polls for rows parked at `awaiting_verification`, and
+ * Jobinno's pipeline never parks anything. A run that meets a verification gate
+ * is given a terminal status and a `skip_log` row with reason
+ * `verification_required`, because the rule this schema is built around is skip
+ * and log rather than pause and wait. Repointing the query at `applications`
+ * would produce code that compiles, runs and can only ever return zero rows.
+ * The ticket that brings back automated account creation owns the state this
+ * waits on and the query that finds it, together.
+ *
+ * Everything below is actinno's text, unchanged.
+ *
  * ACT-005/ACT-012 (`create-board-account.ts`) submits a signup on a real
  * employer's job board and parks the row at
  * `job_applications.status = "awaiting_verification"`. Meanwhile the Inngest

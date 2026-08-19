@@ -541,8 +541,13 @@ function matchesLocation(job: BoardJob, wanted: readonly string[]): boolean {
  * `label` ("Cover Letter") and the underlying field names (`cover_letter`,
  * `cover_letter_text`), the latter surviving a board that has renamed the
  * label.
+ *
+ * Exported by JOB-004 so the pipeline can ask the same question of a `jobs`
+ * row's stored `raw` payload. The alternative was a second copy of the two
+ * patterns above, which is how the day a board renames its label turns into two
+ * bugs instead of one.
  */
-function requiresCoverLetterFromQuestions(questions: unknown): boolean {
+export function requiresCoverLetterFromQuestions(questions: unknown): boolean {
   return asArray(questions).some((entry) => {
     const question = asRecord(entry);
     if (question.required !== true) return false;

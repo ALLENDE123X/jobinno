@@ -1,5 +1,24 @@
 /**
- * ACT-003 — candidate intake: resume upload + `candidates` row.
+ * ACT-003 — candidate intake: resume upload plus the rows that make a person
+ * applyable. Repointed at Jobinno's real schema by JOB-004.
+ *
+ * ── What JOB-004 changed, and why the shape moved with the names ────────────
+ * actinno kept one `candidates` row per person, minted here with a fresh UUID
+ * and holding the resume path, the email, the search preferences and the
+ * reusable form answers all together. Jobinno has no such table and cannot
+ * have one: a person is an `auth.users` row, `profiles` is keyed by that same
+ * id, and a resume is a separate `resumes` row pointing back at it. So this is
+ * not a rename of `candidates` to `profiles`; it is one row becoming two, and
+ * the id stopping being ours to mint.
+ *
+ * The consequence worth stating plainly: nothing here creates a person any
+ * more. `app/auth/callback/route.ts` creates the `profiles` row at signup, and
+ * every function below attaches to a profile that already exists. Passing an
+ * id that is not a real signed up user is an error rather than an insert.
+ *
+ * Two columns actinno had did not survive the move, and neither is papered
+ * over here. See `CandidateRecord` for `targetTitle` and `payMin`, and
+ * `linkedinUrl` for the third.
  *
  * Targets the Supabase project named by `EXPECTED_SUPABASE_PROJECT_REF`, see
  * `.env.example`. JOB-002 moved that from a literal in this file into the
@@ -8,11 +27,16 @@
  * than a silent write. That matters because more than one live product shares
  * the Supabase account. The README's "meminno project" line is stale.
  *
- * Storage layout: bucket `resumes` (private), object key `{candidateId}.pdf`.
- * `candidates.resume_url` stores the bucket-qualified path
- * `resumes/{candidateId}.pdf` — NOT a fetchable URL. The bucket is private, so
- * downstream consumers must mint a signed URL from `bucket` + `objectPath`
- * (both returned here) rather than using `resume_url` directly.
+ * Storage layout: bucket `resumes` (private), object key
+ * `{userId}/{uuid}.pdf`. The owner scoped first segment is JOB-007's
+ * convention, not a preference: the storage policies on `storage.objects` key
+ * off it, so an object stored anywhere else is readable by its owner through
+ * the service role and by nobody else at all.
+ *
+ * `resumes.storage_path` stores the bucket-qualified path
+ * `resumes/{userId}/{uuid}.pdf` — NOT a fetchable URL. The bucket is private,
+ * so downstream consumers must mint a signed URL from `bucket` + `objectPath`
+ * (both returned here) rather than using the stored path directly.
  *
  * ACT-014 adds a second prefix to the same bucket, `resumes/staging/`, holding
  * presigned uploads that have not yet become anybody's resume. See the ACT-014
@@ -34,6 +58,15 @@ const PDF_MAGIC = "%PDF-";
 
 export type CandidateIntakeInput = {
   /**
+   * The person this resume belongs to: `profiles.id`, which is `auth.users.id`.
+   *
+   * Supplied rather than minted, and that is the whole of what JOB-004 changed
+   * about this function. actinno generated a `candidates.id` here and handed it
+   * back; Jobinno's id belongs to Supabase Auth, so the row has to exist before
+   * a resume can be hung off it.
+   */
+  userId: string;
+  /**
    * Path to a PDF resume on the local filesystem. Exactly one of this and
    * `assetHandle` must be given — see `resolveResumeSource`.
    */
@@ -45,11 +78,13 @@ export type CandidateIntakeInput = {
    * filesystem this process can read.
    */
   assetHandle?: string;
-  applicationEmail: string;
-  linkedinUrl?: string;
-  targetTitle?: string;
-  /** Whole dollars per year. Column is `integer`. */
-  payMin?: number;
+  /**
+   * Where the person wants to work, written to `profiles.target_locations`.
+   *
+   * The one search preference of actinno's three that Jobinno has a column for.
+   * `targetTitle` and `payMin` used to sit beside it and no longer do — see
+   * `CandidateRecord` for what that costs and who owns closing it.
+   */
   locations?: string[];
   /**
    * ACT-015. The facts an ATS application form asks for on almost every listing.
@@ -112,18 +147,21 @@ function applicationAnswerColumns(
 }
 
 export type CandidateIntakeResult = {
-  candidateId: string;
-  /** Value written to `candidates.resume_url`: `resumes/{candidateId}.pdf`. */
+  /** `profiles.id`, echoed back. The caller supplied it; nothing minted it. */
+  userId: string;
+  /** The new `resumes.id`. */
+  resumeId: string;
+  /** Value written to `resumes.storage_path`: `resumes/{userId}/{uuid}.pdf`. */
   resumeUrl: string;
   /** Storage bucket name — use with `objectPath` to sign a URL. */
   bucket: string;
-  /** Object key within the bucket: `{candidateId}.pdf`. */
+  /** Object key within the bucket: `{userId}/{uuid}.pdf`. */
   objectPath: string;
   /** Which of the two `CandidateIntakeInput` resume sources was used. */
   resumeSource: "file" | "staged-upload";
   /**
    * ACT-014, and only present for `resumeSource: "staged-upload"`. The bytes now
-   * live at `{candidateId}.pdf`, so the staging copy is a duplicate and is
+   * live at `{userId}/{uuid}.pdf`, so the staging copy is a duplicate and is
    * deleted; `removed: false` means that delete failed and one object is left
    * behind, which the 24h sweep in `createResumeUploadSlot()` will reclaim.
    */
@@ -163,37 +201,24 @@ function normalizeOptionalText(value: string | undefined): string | null {
 function validateInput(input: CandidateIntakeInput): void {
   // The resume source is checked by `resolveResumeSource()`, which the caller
   // runs first so that "which resume?" is answered before anything else is —
-  // including before an email typo is reported, because the answer decides
+  // including before a malformed id is reported, because the answer decides
   // whether Supabase is touched at all.
 
-  // `application_email` is NOT NULL and the whole downstream pipeline keys off
-  // it, so reject obvious garbage rather than persisting it.
-  const email = input.applicationEmail?.trim();
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+  // The email check actinno did here is gone, and not because it stopped
+  // mattering. `profiles.email` is written from the verified address Supabase
+  // Auth hands back at signup, so by the time anything reaches this function
+  // the address has already been proved to belong to the person. Revalidating
+  // a value this function no longer accepts would only be theatre.
+  //
+  // What is checked instead is the id, for the reason `loadCandidate` gives at
+  // length: it is the one identity in this system, and a malformed one fails
+  // deep inside a query rather than here unless something says so first.
+  const userId = String(input.userId ?? "").trim();
+  if (!UUID_RE.test(userId)) {
     throw new Error(
-      `applicationEmail must be a valid email address (got: ${JSON.stringify(
-        input.applicationEmail
-      )})`
+      `userId must be a profiles.id UUID (the same id as auth.users.id), got ` +
+        `${JSON.stringify(input.userId)}.`
     );
-  }
-
-  // `pay_min` is int4: catch out-of-range here so we never upload a resume
-  // only to have Postgres reject the row and force a rollback.
-  const INT4_MAX = 2147483647;
-  if (input.payMin !== undefined) {
-    if (!Number.isInteger(input.payMin) || input.payMin < 0 || input.payMin > INT4_MAX) {
-      throw new Error(
-        `payMin must be an integer between 0 and ${INT4_MAX} (column is int4), got: ${input.payMin}`
-      );
-    }
-  }
-
-  if (input.linkedinUrl?.trim()) {
-    try {
-      new URL(input.linkedinUrl.trim());
-    } catch {
-      throw new Error(`linkedinUrl must be a valid URL, got: ${input.linkedinUrl}`);
-    }
   }
 }
 
@@ -271,9 +296,19 @@ function assertUsableResumeBytes(bytes: Buffer, source: string): void {
 }
 
 /**
- * Uploads a resume to the private `resumes` bucket and inserts the matching
- * `candidates` row. On insert failure the uploaded object is removed so a
- * failed intake does not leave an orphan behind.
+ * Uploads a resume to the private `resumes` bucket and attaches it to an
+ * existing profile: one `resumes` row for the file, one `profiles` update for
+ * whatever preferences and reusable answers came with it. On failure the
+ * uploaded object is removed so a failed intake does not leave an orphan
+ * behind.
+ *
+ * ── Why two writes and not one, and why the resume goes first ───────────────
+ * `app/onboarding/actions.ts` writes the same two rows in the opposite order,
+ * and its own comment explains why it does: on the web the profile answers are
+ * the thing being attested to, so a resume pointing at an unanswered profile is
+ * the state worth avoiding. Here the answers are optional and the resume is the
+ * point, so the resume is what gets the cleanup path wrapped around it. Both
+ * orders are safe because neither row is ever read without the other.
  *
  * The resume comes from **either** a local file (`resumeFilePath`) **or** a
  * staged presigned upload (`assetHandle`, ACT-014). Both routes converge on the
@@ -292,8 +327,12 @@ export async function intakeCandidate(
   validateInput(input);
 
   const supabase = getSupabaseClient();
-  const candidateId = randomUUID();
-  const objectPath = `${candidateId}.pdf`;
+  const userId = input.userId.trim();
+  // Owner scoped first segment, then a fresh uuid rather than a fixed name.
+  // Both halves are JOB-007's convention: the segment is what the storage
+  // policies match on, and the uuid is what lets a second upload be a new
+  // resume rather than a silent overwrite of the one already applied with.
+  const objectPath = `${userId}/${randomUUID()}.pdf`;
   const resumeUrl = `${RESUMES_BUCKET}/${objectPath}`;
   const resumeBytes =
     source.kind === "file"
@@ -317,18 +356,32 @@ export async function intakeCandidate(
     ?.map((l) => l.trim())
     .filter((l) => l.length > 0);
 
+  let resumeId: string;
   try {
+    // The profile has to already exist. `resumes.user_id` is a foreign key onto
+    // it, so an unknown id would be caught by Postgres either way — but as a
+    // constraint violation naming a constraint, three frames deep, rather than
+    // as the one sentence that says what to do about it.
+    const { data: profileRows, error: profileLookupError } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("id", userId)
+      .limit(1);
+    if (profileLookupError) {
+      throw new Error(`profiles lookup failed: ${profileLookupError.message}`);
+    }
+    if (!profileRows?.[0]) {
+      throw new Error(
+        `No profiles row with id ${userId}. A profile is created by signing in, ` +
+          `not by this function — see app/auth/callback/route.ts.`
+      );
+    }
+
     const { data, error: insertError } = await supabase
-      .from("candidates")
+      .from("resumes")
       .insert({
-        id: candidateId,
-        resume_url: resumeUrl,
-        linkedin_url: normalizeOptionalText(input.linkedinUrl),
-        application_email: input.applicationEmail.trim(),
-        target_title: normalizeOptionalText(input.targetTitle),
-        pay_min: input.payMin ?? null,
-        locations: locations && locations.length > 0 ? locations : null,
-        ...applicationAnswerColumns(input.applicationAnswers),
+        user_id: userId,
+        storage_path: resumeUrl,
       })
       // Round-trips the id so a silently-filtered insert (e.g. RLS) surfaces
       // as an error instead of a false success.
@@ -336,18 +389,37 @@ export async function intakeCandidate(
       .single();
 
     if (insertError) {
-      throw new Error(`Candidate row insert failed: ${insertError.message}`);
+      throw new Error(`Resume row insert failed: ${insertError.message}`);
     }
-    if (data?.id !== candidateId) {
+    if (typeof data?.id !== "string") {
       throw new Error(
-        `Candidate row insert did not return the expected id (got: ${data?.id ?? "none"})`
+        `Resume row insert did not return an id (got: ${JSON.stringify(data?.id)})`
       );
+    }
+    resumeId = data.id;
+
+    // Preferences and reusable answers, and only the ones actually given.
+    // `applicationAnswerColumns` already drops anything unstated, and
+    // `locations` is added on the same rule: saying nothing must never blank a
+    // column that already holds an answer.
+    const profilePatch: Record<string, unknown> = {
+      ...applicationAnswerColumns(input.applicationAnswers),
+      ...(locations && locations.length > 0 ? { target_locations: locations } : {}),
+    };
+    if (Object.keys(profilePatch).length > 0) {
+      const { error: profileError } = await supabase
+        .from("profiles")
+        .update({ ...profilePatch, updated_at: new Date().toISOString() })
+        .eq("id", userId);
+      if (profileError) {
+        throw new Error(`Profile update failed: ${profileError.message}`);
+      }
     }
   } catch (err) {
     await cleanupOrphanedResume(supabase, objectPath, err);
     // The staged object is deliberately NOT removed here. Everything that can
-    // fail between this line and the read above is retryable — a duplicate
-    // email, a Postgres blip, a failed upload — and the expensive, fragile part
+    // fail between this line and the read above is retryable — an id typo, a
+    // Postgres blip, a failed upload — and the expensive, fragile part
     // of an ACT-014 intake is the upload leg, not the insert. Leaving the
     // staging object in place means the retry is one more actor call with the
     // same handle rather than another round trip through the model's execution
@@ -357,13 +429,14 @@ export async function intakeCandidate(
   }
 
   if (source.kind === "staged-upload") {
-    // Success: the bytes now exist at `{candidateId}.pdf`, so the staging copy
+    // Success: the bytes now exist at `{userId}/{uuid}.pdf`, so the staging copy
     // is a duplicate of a resume that has an owner. Best-effort, and reported
     // rather than thrown — an intake that completed is not going to be failed
     // over a leftover object the sweep will collect within the day.
     const removal = await deleteStagedUpload(supabase, source.objectPath);
     return {
-      candidateId,
+      userId,
+      resumeId,
       resumeUrl,
       bucket: RESUMES_BUCKET,
       objectPath,
@@ -378,7 +451,8 @@ export async function intakeCandidate(
   }
 
   return {
-    candidateId,
+    userId,
+    resumeId,
     resumeUrl,
     bucket: RESUMES_BUCKET,
     objectPath,
@@ -390,29 +464,61 @@ export async function intakeCandidate(
  * Everything the pipeline needs to know about a candidate, read back out of the
  * row this module wrote.
  *
- * Added for ACT-009. Its `job-search/requested` and `job-application/requested`
- * events carry a `candidateId` and nothing else about the person — see that
- * file's header for why — so something has to turn that id into an
- * `application_email` for `createBoardAccount`, and this module owns the
- * `candidates` table's conventions (the project guard, the private-bucket
- * caveat on `resume_url`). Putting the read anywhere else would mean a second
- * guarded Supabase client to keep in step with this one.
+ * Added for ACT-009. Its two events carry a `userId` and nothing else about
+ * the person — see that file's header for why — so something has to turn that
+ * id into an email and a resume, and this module owns the conventions involved
+ * (the project guard, the private-bucket caveat on the stored path). Putting
+ * the read anywhere else would mean a second guarded Supabase client to keep in
+ * step with this one.
  *
  * `resumeUrl` is repeated here with the same caveat it carries on the way in:
- * it is the bucket-qualified path `resumes/{candidateId}.pdf`, not something
+ * it is the bucket-qualified path `resumes/{userId}/{uuid}.pdf`, not something
  * that can be fetched. Nothing in the pipeline uses it — ACT-007's
  * `loadResume` reads the object itself with the service-role client — and it is
  * returned only so a caller cannot mistake its absence for the file not
  * existing.
  */
 export type CandidateRecord = {
-  candidateId: string;
+  /** `profiles.id`, which is `auth.users.id`. See `loadCandidate`. */
+  userId: string;
   applicationEmail: string;
+  /**
+   * ── A genuine gap, left visible on purpose (JOB-004) ──────────────────────
+   *
+   * Always null today. actinno stored `candidates.linkedin_url`, the profile
+   * URL a form asks for by name on almost every listing. Jobinno's schema has
+   * no column for it: `resumes.linkedin_pdf_path` is JOB-007's *PDF export*, a
+   * file in a private bucket, and handing a storage path to a box that wants
+   * `linkedin.com/in/...` would be worse than handing it nothing.
+   *
+   * The reason this is a gap rather than a hole is `lib/resume-parser.ts`,
+   * whose `linkedinUrl` falls back to a linkedin.com URL found in the resume
+   * text when this is null — which for a real resume is most of the time. So
+   * forms still get filled; they get filled from the resume instead of from a
+   * stated answer. Closing it properly is a `profiles.linkedin_url` column plus
+   * a field on the intake form, which is a JOB-007 follow up and not this
+   * ticket's to add.
+   */
   linkedinUrl: string | null;
   /** Bucket-qualified path, NOT a fetchable URL. */
   resumeUrl: string;
-  targetTitle: string | null;
-  payMin: number | null;
+  /**
+   * `profiles.target_locations`. The only one of actinno's three search
+   * preferences that has a column here.
+   *
+   * ── The other two, and why they are absent rather than null ───────────────
+   *
+   * `candidates.target_title` and `candidates.pay_min` have no Jobinno
+   * equivalent. JOB-007's intake asks about work authorization, location and
+   * dates; it never asks what job the person wants or what it has to pay.
+   *
+   * They are dropped from this type rather than kept and hard wired to null,
+   * because a field that is structurally always null reads as data a caller can
+   * wait for, and callers write `?? fallback` against it and move on. Removing
+   * them makes `discoverListings` say out loud that a title filter has to come
+   * from its event, which is true, and turns the day a column is added into a
+   * compile error at every site that should start using it.
+   */
   locations: string[] | null;
   /**
    * ACT-015. Only the answers that were actually given — an absent key means
@@ -433,9 +539,15 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * cannot see through — a `+` concatenation, or a nested `as const` template —
  * leaving every column read off the result a type error. The trailing five are
  * ACT-015's; keep them in step with `toApplicationAnswers` below.
+ *
+ * JOB-004 repointed this at `profiles`. Five of the eight names are unchanged,
+ * because JOB-007 spelled its columns the way actinno already had; `id` is now
+ * `auth.users.id`, `application_email` is now plain `email`, and `locations` is
+ * now `target_locations`. The resume is not in this list at all any more — it
+ * is a row in another table, read by `loadActiveResume`.
  */
 const CANDIDATE_COLUMNS =
-  "id,resume_url,linkedin_url,application_email,target_title,pay_min,locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate";
+  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate";
 
 /**
  * Row → the answers that were actually recorded.
@@ -461,84 +573,139 @@ export function toApplicationAnswers(row: Record<string, unknown>): CandidateApp
   return answers;
 }
 
-/** Row → record. Shared by `loadCandidate` and `findCandidateByEmail`. */
-function toCandidateRecord(row: Record<string, unknown>): CandidateRecord {
-  const candidateId = String(row.id ?? "").trim();
-  const applicationEmail = String(row.application_email ?? "").trim();
+/**
+ * Row → record. Shared by `loadCandidate` and `findCandidateByEmail`.
+ *
+ * `resumeUrl` is passed in rather than read off the row, because it lives on a
+ * different table now. Exported so the mapping can be tested against a row
+ * shape without a database in the way.
+ */
+export function toCandidateRecord(
+  row: Record<string, unknown>,
+  resumeUrl: string
+): CandidateRecord {
+  const userId = String(row.id ?? "").trim();
+  const applicationEmail = String(row.email ?? "").trim();
   if (applicationEmail === "") {
-    throw new Error(`candidates ${candidateId} has no application_email.`);
+    // `profiles.email` is NOT NULL and is written from the address Supabase
+    // Auth verified at signup, so an empty one means something wrote this row
+    // that was not the auth callback.
+    throw new Error(`profiles ${userId} has no email.`);
   }
 
   return {
-    candidateId,
+    userId,
     applicationEmail,
-    linkedinUrl: typeof row.linkedin_url === "string" ? row.linkedin_url : null,
-    resumeUrl: String(row.resume_url ?? ""),
-    targetTitle: typeof row.target_title === "string" ? row.target_title : null,
-    payMin: typeof row.pay_min === "number" ? row.pay_min : null,
-    locations: Array.isArray(row.locations) ? row.locations.map(String) : null,
+    // See the type. There is no column to read this from yet.
+    linkedinUrl: null,
+    resumeUrl,
+    locations: Array.isArray(row.target_locations) ? row.target_locations.map(String) : null,
     applicationAnswers: toApplicationAnswers(row),
   };
 }
 
 /**
- * Reads one `candidates` row by id.
+ * The resume the pipeline should apply with: the newest active one.
  *
- * The UUID check is not defensive clutter. `candidates.id` is the only
- * per-person key this schema has, `job_applications.candidate_id` is a foreign
- * key onto it, and ACT-006 emits it as `email/verification-received.data.userId`
- * for the pipeline's `waitForEvent` to match on. Anything else passed in here —
- * an auth subject, an email address — would be *accepted by Postgres as a
+ * A person can have more than one `resumes` row — re uploading is the ordinary
+ * way to replace a resume, and JOB-007's onboarding inserts rather than
+ * updates — so "the resume" needs a rule. Newest active row wins, which is the
+ * same rule `findCandidateByEmail` applies to duplicate profiles and for the
+ * same reason: the most recent thing the person did is the thing they meant.
+ *
+ * Throws rather than returning an empty path. A run that reaches a real
+ * employer's form with no resume to attach has already wasted a browser and an
+ * application slot, and the failure is far more legible here.
+ */
+async function loadActiveResume(supabase: SupabaseClient, userId: string): Promise<string> {
+  const { data, error } = await supabase
+    .from("resumes")
+    .select("storage_path,created_at")
+    .eq("user_id", userId)
+    .eq("is_active", true)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (error) throw new Error(`resumes lookup failed: ${error.message}`);
+
+  const storagePath = String(data?.[0]?.storage_path ?? "").trim();
+  if (storagePath === "") {
+    throw new Error(
+      `No active resumes row for profile ${userId}. Finish onboarding at /onboarding, ` +
+        `or attach one from the command line with \`npm run intake\`.`
+    );
+  }
+  return storagePath;
+}
+
+/**
+ * Reads one profile, with its resume, by the person's own id.
+ *
+ * ── The identity, settled (JOB-004) ─────────────────────────────────────────
+ * actinno minted a `candidates.id` of its own and carried it everywhere. This
+ * id is not that. It is `auth.users.id`: `profiles.id` is declared as a foreign
+ * key onto it in `lib/db/schema.ts`, `app/auth/callback/route.ts` upserts the
+ * row as `{ id: user.id }` straight off the verified session, and
+ * `applications.user_id` is a foreign key onto `profiles.id`. One id, from
+ * Supabase Auth, all the way through. The old code's own comment already said
+ * as much — it called this "the same identity as ... the userId" — so JOB-004
+ * renamed the parameter to match what was already true rather than leaving two
+ * names for one thing.
+ *
+ * The UUID check is not defensive clutter. Anything else passed in here — an
+ * email address, an Inngest run id — would be *accepted by Postgres as a
  * malformed-uuid error* deep inside a query, or worse, silently match nothing;
  * failing on the shape first is what turns that into one legible sentence.
  */
-export async function loadCandidate(candidateId: string): Promise<CandidateRecord> {
-  const id = String(candidateId ?? "").trim();
+export async function loadCandidate(userId: string): Promise<CandidateRecord> {
+  const id = String(userId ?? "").trim();
   if (!UUID_RE.test(id)) {
     throw new Error(
-      `candidateId must be a candidates.id UUID, got ${JSON.stringify(candidateId)}. ` +
-        `This is the same identity as job_applications.candidate_id and as the userId ` +
-        `ACT-006 puts on email/verification-received — an email address or an auth ` +
-        `subject here will make the pipeline's verification wait time out with no ` +
-        `visible cause.`
+      `userId must be a profiles.id UUID, got ${JSON.stringify(userId)}. This is the ` +
+        `same identity as auth.users.id and as applications.user_id — an email address ` +
+        `or an auth provider's subject claim here will match nothing at all.`
     );
   }
 
   const supabase = getSupabaseClient();
   const { data, error } = await supabase
-    .from("candidates")
+    .from("profiles")
     .select(CANDIDATE_COLUMNS)
     .eq("id", id)
     .limit(1);
-  if (error) throw new Error(`candidates lookup failed: ${error.message}`);
+  if (error) throw new Error(`profiles lookup failed: ${error.message}`);
 
   const row = data?.[0];
-  if (!row) throw new Error(`No candidates row with id ${id} — run ACT-003 intake first.`);
+  if (!row) {
+    throw new Error(
+      `No profiles row with id ${id}. A profile is created by signing in — see ` +
+        `app/auth/callback/route.ts — so this id has never signed in to Jobinno.`
+    );
+  }
 
-  return toCandidateRecord(row);
+  return toCandidateRecord(row, await loadActiveResume(supabase, id));
 }
 
 /**
- * ACT-013 — reads one `candidates` row by the address applications are filed
- * under, so a person can be identified by something they know.
+ * ACT-013 — reads one profile by the address applications are filed under, so
+ * a person can be identified by something they know.
  *
  * `loadCandidate` above is the pipeline's lookup and takes the row's UUID,
  * which is right for a machine and useless for a human: before this, onboarding
  * through Claude Desktop ended with the user holding a bare UUID they had to
  * paste back for every apply. This is the same read keyed on
- * `application_email` instead, and it lives here rather than in the MCP server
- * for the reason given above `loadCandidate` — this module owns the
- * `candidates` table's conventions and the `assertSupabaseProject` guard, and a
- * second Supabase client elsewhere would be a copy of both.
+ * `profiles.email` instead, and it lives here rather than in the MCP server
+ * for the reason given above `loadCandidate` — this module owns the schema's
+ * conventions and the `assertSupabaseProject` guard, and a second Supabase
+ * client elsewhere would be a copy of both.
  *
- * ── Why this can fail on a *successful* query ───────────────────────────────
- * `application_email` has **no unique constraint** (checked: `candidates` has
- * exactly one index, the primary key on `id`), and nothing stops intake being
- * run twice for the same address — an updated resume is the obvious way it
- * happens. So an email is a *hint* at an identity, not an identity. Two matches
- * means two different resumes, and picking the newer one would silently file
- * applications with a resume the user did not choose. It throws instead, naming
- * both ids so the caller can re-run with the `candidateId` it wants.
+ * ── Why the duplicate handling stays (JOB-004) ──────────────────────────────
+ * `profiles.email` has no unique constraint of its own. In practice a duplicate
+ * is now much harder to produce than it was on `candidates`: the column is
+ * written once, at signup, from the address Supabase Auth verified, and
+ * `auth.users.email` is unique. But "harder" is not "cannot" — two auth
+ * identities for one address, one emailed and one from an OAuth provider, land
+ * as two profiles — so the newest wins rule below is kept rather than deleted
+ * on the strength of a constraint that lives on a different table.
  *
  * ── Why the query is `ilike` and the comparison is not ──────────────────────
  * Users type `Jane@Example.com` for a row stored as `jane@example.com`, so the
@@ -565,8 +732,8 @@ export async function findCandidateByEmail(applicationEmail: string): Promise<Ca
   const columns = `${CANDIDATE_COLUMNS},created_at`;
 
   // Exact first: wildcard-free, and the case that hits on nearly every call.
-  const exact = await supabase.from("candidates").select(columns).eq("application_email", wanted);
-  if (exact.error) throw new Error(`candidates lookup failed: ${exact.error.message}`);
+  const exact = await supabase.from("profiles").select(columns).eq("email", wanted);
+  if (exact.error) throw new Error(`profiles lookup failed: ${exact.error.message}`);
 
   let rows = exact.data ?? [];
   if (rows.length === 0) {
@@ -575,24 +742,22 @@ export async function findCandidateByEmail(applicationEmail: string): Promise<Ca
     // truncated over-match could otherwise drop the one true row and report
     // "no such candidate" for a candidate that exists.
     const folded = await supabase
-      .from("candidates")
+      .from("profiles")
       .select(columns)
-      .ilike("application_email", escapeLikePattern(wanted))
+      .ilike("email", escapeLikePattern(wanted))
       .limit(200);
-    if (folded.error) throw new Error(`candidates lookup failed: ${folded.error.message}`);
+    if (folded.error) throw new Error(`profiles lookup failed: ${folded.error.message}`);
     const target = wanted.toLowerCase();
     rows = (folded.data ?? []).filter(
-      (row) => String(row.application_email ?? "").trim().toLowerCase() === target
+      (row) => String(row.email ?? "").trim().toLowerCase() === target
     );
   }
 
   if (rows.length === 0) {
     throw new Error(
-      `No candidate has been set up for ${wanted}. Run intake first — ` +
-        `\`actinno/intake-candidate\` from an MCP client, or \`npm run intake\` in \`lib/\` — ` +
-        `with a resume PDF and this email address, then apply with the candidateId it returns ` +
-        `(or with this same email). Nothing can be applied to until that row exists: the ` +
-        `resume, LinkedIn URL and application email all come from it.`
+      `Nobody has signed up for ${wanted}. A profile is created by signing in at /login ` +
+        `and finishing intake at /onboarding; nothing else creates one. Until that row ` +
+        `exists there is no email, no resume and nothing to apply with.`
     );
   }
 
@@ -614,9 +779,9 @@ export async function findCandidateByEmail(applicationEmail: string): Promise<Ca
     // it is what testing onboarding three times produces.
     const older = rows.length - 1;
     console.warn(
-      `[act-003] ${rows.length} candidates rows share ${wanted}; using the most recently ` +
-        `created one and ignoring ${older} older row(s). If that is wrong, pass candidateId ` +
-        `explicitly — each row has its own uploaded resume.`
+      `[act-003] ${rows.length} profiles rows share ${wanted}; using the most recently ` +
+        `created one and ignoring ${older} older row(s). If that is wrong, pass the userId ` +
+        `explicitly — each profile has its own resumes.`
     );
   }
 
@@ -628,7 +793,7 @@ export async function findCandidateByEmail(applicationEmail: string): Promise<Ca
     return (Number.isNaN(right) ? -Infinity : right) - (Number.isNaN(left) ? -Infinity : left);
   })[0]!;
 
-  return toCandidateRecord(newest);
+  return toCandidateRecord(newest, await loadActiveResume(supabase, String(newest.id)));
 }
 
 /**
@@ -1121,83 +1286,165 @@ async function sweepStaleStagedUploads(supabase: SupabaseClient): Promise<number
 // ACT-015 — reading back how an application went
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// `apply-to-job` is fire-and-forget: it posts an Inngest event, gets a tracking
-// id, and returns in about a second while a browser chain runs for minutes.
-// That was fine while the only two outcomes were "submitted" and "a human has
-// to look at it", because the candidate learns the first from the employer's own
-// confirmation email.
+// Applying is fire-and-forget: something posts an Inngest event and returns in
+// about a second while a browser chain runs for minutes. That was fine while
+// the only two outcomes were "submitted" and "a human has to look at it",
+// because the candidate learns the first from the employer's own confirmation
+// email.
 //
-// ACT-015 adds a third: the run filled everything it could, refused to invent an
-// answer to a required question, and stopped with the question written down.
-// That outcome is *addressed to the user* — it is a question for them — and
-// until now there was no way for it to reach them at all, because nothing in the
-// MCP layer could read a `job_applications` row.
+// ACT-015 added a third: the run filled everything it could, refused to invent
+// an answer to a required question, and stopped with the question written down.
+// That outcome is *addressed to the user* — it is a question for them — and it
+// has to be able to reach them.
 //
-// This is that read. It deliberately introduces no new state: the questions are
-// already in `error_message`, written there by the same code that writes every
-// other blocked reason, and this reports what is there. It lives in this module
-// rather than in a new one because this module already owns the Supabase client
-// and `assertSupabaseProject`; a separate file would be a second guarded
-// client to keep in step, which this repo has said twice it does not want.
+// ── Where the reason lives now (JOB-004) ────────────────────────────────────
+// actinno kept it in `job_applications.error_message`, a free text column that
+// held stack traces, blocked reasons and unanswered questions alike. Jobinno
+// has no such column and deliberately so: `skip_log` records the same thing as
+// a row, with a `reason` drawn from a closed set and the detail in
+// `raw_context`. So this read joins the two rather than selecting one column,
+// and what it reports is the newest skip against the application.
+//
+// It still introduces no new state. Everything below is written by the same
+// code that writes every other outcome.
 
 export type ApplicationStatusRecord = {
-  jobApplicationId: string;
+  applicationId: string;
+  /** `jobs.id`. The listing, which is a row here rather than three columns. */
+  jobId: string;
   company: string;
   jobTitle: string;
   applyUrl: string;
   status: string;
-  /** Whatever the last run recorded, including any questions it needs answered. */
-  errorMessage: string | null;
-  /** The employer's own reference, once ACT-008 has one. */
-  confirmationRef: string | null;
+  /**
+   * The newest `skip_log` row against this application, or null if nothing has
+   * been skipped. `detail` is the message the run recorded, including any
+   * questions it needs the candidate to answer.
+   */
+  skip: { reason: string; detail: string | null; at: string | null } | null;
+  /** The employer's own reference, once the submit step has one. */
+  confirmationText: string | null;
+  submittedAt: string | null;
+  redirectUrl: string | null;
   createdAt: string | null;
-  updatedAt: string | null;
 };
 
 /** Applications per read. A candidate applying to more than this wants a dashboard. */
 const MAX_APPLICATIONS_LISTED = 50;
 
 /**
- * Every application filed for one candidate, most recently touched first.
+ * Every application filed for one person, most recently created first.
  *
  * Read-only, and the columns are named rather than starred so a schema change
- * cannot quietly widen what this returns — `board_password` in particular lives
- * on this table and has no business leaving it.
+ * cannot quietly widen what this returns.
  */
 export async function listCandidateApplications(
-  candidateId: string,
+  userId: string,
   options: { applyUrl?: string; limit?: number } = {}
 ): Promise<ApplicationStatusRecord[]> {
-  const id = String(candidateId ?? "").trim();
+  const id = String(userId ?? "").trim();
   if (!UUID_RE.test(id)) {
-    throw new Error(
-      `candidateId must be a candidates.id UUID, got ${JSON.stringify(candidateId)}.`
-    );
+    throw new Error(`userId must be a profiles.id UUID, got ${JSON.stringify(userId)}.`);
   }
 
   const supabase = getSupabaseClient();
   let query = supabase
-    .from("job_applications")
-    .select("id,company,job_title,apply_url,status,error_message,confirmation_ref,created_at,updated_at")
-    .eq("candidate_id", id)
-    .order("updated_at", { ascending: false })
+    .from("applications")
+    // ── Why this literal is inlined and not a named constant ─────────────────
+    // supabase-js infers the row's type by parsing the *literal* handed to
+    // `select()`, and gives up on anything it cannot see through, including a
+    // constant. Same reason `CANDIDATE_COLUMNS` above is written out in full.
+    //
+    // `jobs!inner` rather than `jobs` so that the optional `applyUrl` filter
+    // below narrows *applications* and not just the embedded listing. Without
+    // the inner join a non matching filter returns every application with a
+    // null job on it, which reads as "no listing" rather than "no match" and is
+    // the worse of the two lies.
+    .select("id,job_id,status,submitted_at,confirmation_text,redirect_url,created_at,jobs!inner(title,url,boards(company)),skip_log(reason,raw_context,created_at)")
+    .eq("user_id", id)
+    // `applications` has no `updated_at`, so creation order is the only order
+    // this table can be read in. It is also the honest one: a row's status
+    // changes, but the run it belongs to does not move in the queue.
+    .order("created_at", { ascending: false })
     .limit(Math.min(Math.max(options.limit ?? MAX_APPLICATIONS_LISTED, 1), MAX_APPLICATIONS_LISTED));
 
   const applyUrl = options.applyUrl?.trim();
-  if (applyUrl !== undefined && applyUrl !== "") query = query.eq("apply_url", applyUrl);
+  if (applyUrl !== undefined && applyUrl !== "") query = query.eq("jobs.url", applyUrl);
 
   const { data, error } = await query;
-  if (error) throw new Error(`job_applications lookup failed: ${error.message}`);
+  if (error) throw new Error(`applications lookup failed: ${error.message}`);
 
-  return (data ?? []).map((row) => ({
-    jobApplicationId: String(row.id ?? ""),
-    company: String(row.company ?? ""),
-    jobTitle: String(row.job_title ?? ""),
-    applyUrl: String(row.apply_url ?? ""),
+  // Through `unknown` deliberately. supabase-js infers an error-shaped union for
+  // an embedded select it cannot fully resolve, and a direct assertion from that
+  // union is a type error rather than a lie about the data: PostgREST returned
+  // rows or it returned an error, and the error branch was already thrown above.
+  return (data ?? []).map((row) =>
+    toApplicationStatusRecord(row as unknown as Record<string, unknown>)
+  );
+}
+
+/**
+ * One joined row → one record. Exported so the join's shape can be tested
+ * without a database, which is the part of this read most likely to drift.
+ *
+ * PostgREST returns an embedded to-one relationship as an object and a to-many
+ * as an array, and supabase-js's inferred types do not always agree with which
+ * of the two a given foreign key produces. Both shapes are accepted here rather
+ * than asserted, because a wrong guess costs a null company on a real
+ * dashboard and the check is two lines.
+ */
+export function toApplicationStatusRecord(row: Record<string, unknown>): ApplicationStatusRecord {
+  const one = (value: unknown): Record<string, unknown> | null => {
+    const candidate = Array.isArray(value) ? value[0] : value;
+    return candidate !== null && typeof candidate === "object"
+      ? (candidate as Record<string, unknown>)
+      : null;
+  };
+
+  const job = one(row.jobs);
+  const board = one(job?.boards);
+
+  const skips = Array.isArray(row.skip_log)
+    ? (row.skip_log as Record<string, unknown>[])
+    : one(row.skip_log)
+      ? [one(row.skip_log) as Record<string, unknown>]
+      : [];
+  // Newest skip wins. An application can be attempted more than once, and the
+  // reason the person needs to see is the one from the attempt that just ran.
+  const newestSkip = [...skips].sort((a, b) => {
+    const left = Date.parse(String(a.created_at ?? ""));
+    const right = Date.parse(String(b.created_at ?? ""));
+    return (Number.isNaN(right) ? -Infinity : right) - (Number.isNaN(left) ? -Infinity : left);
+  })[0];
+
+  return {
+    applicationId: String(row.id ?? ""),
+    jobId: String(row.job_id ?? ""),
+    company: String(board?.company ?? ""),
+    jobTitle: String(job?.title ?? ""),
+    applyUrl: String(job?.url ?? ""),
     status: String(row.status ?? ""),
-    errorMessage: typeof row.error_message === "string" ? row.error_message : null,
-    confirmationRef: typeof row.confirmation_ref === "string" ? row.confirmation_ref : null,
+    skip:
+      newestSkip === undefined
+        ? null
+        : {
+            reason: String(newestSkip.reason ?? ""),
+            detail: skipDetail(newestSkip.raw_context),
+            at: typeof newestSkip.created_at === "string" ? newestSkip.created_at : null,
+          },
+    confirmationText:
+      typeof row.confirmation_text === "string" ? row.confirmation_text : null,
+    submittedAt: typeof row.submitted_at === "string" ? row.submitted_at : null,
+    redirectUrl: typeof row.redirect_url === "string" ? row.redirect_url : null,
     createdAt: typeof row.created_at === "string" ? row.created_at : null,
-    updatedAt: typeof row.updated_at === "string" ? row.updated_at : null,
-  }));
+  };
+}
+
+/** `skip_log.raw_context.message`, when there is one. See `recordSkip`. */
+function skipDetail(rawContext: unknown): string | null {
+  if (rawContext === null || typeof rawContext !== "object" || Array.isArray(rawContext)) {
+    return null;
+  }
+  const message = (rawContext as Record<string, unknown>).message;
+  return typeof message === "string" && message.trim() !== "" ? message : null;
 }

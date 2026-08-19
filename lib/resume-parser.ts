@@ -109,11 +109,19 @@ export type EducationEntry = {
 export type ResumeProfile = {
   firstName: string | null;
   lastName: string | null;
-  /** `candidates.application_email`. The address the board account is registered with. */
+  /** `profiles.email`. The verified address the account was created with. */
   email: string;
   phone: string | null;
   location: string | null;
-  /** `candidates.linkedin_url` when set, else a linkedin.com URL found in the resume. */
+  /**
+   * A linkedin.com URL found in the resume.
+   *
+   * There is no stored answer to fall back on any more. actinno had
+   * `candidates.linkedin_url`; Jobinno has no column for it, so
+   * `CandidateRecord.linkedinUrl` is always null and the resume is the only
+   * source. See that type in `lib/candidate-intake.ts` for what closing the gap
+   * would take.
+   */
   linkedinUrl: string | null;
   websiteUrl: string | null;
   workHistory: WorkHistoryEntry[];
@@ -702,7 +710,7 @@ export type LoadedResume = {
 const PDF_MAGIC = "%PDF-";
 
 /**
- * Downloads `candidates.resume_url` and pulls its text layer out.
+ * Downloads `resumes.storage_path` and pulls its text layer out.
  *
  * `resume_url` is a bucket-qualified path (`resumes/{candidateId}.pdf`), not a
  * fetchable URL — see `candidate-intake.ts`. The bucket is private, so this goes
@@ -713,7 +721,7 @@ export async function loadResume(
   resumeUrl: string
 ): Promise<LoadedResume> {
   const trimmed = resumeUrl.trim();
-  if (trimmed === "") throw new Error("candidates.resume_url is empty — nothing to fill from.");
+  if (trimmed === "") throw new Error("resumes.storage_path is empty — nothing to fill from.");
 
   const objectPath = trimmed.startsWith(`${RESUMES_BUCKET}/`)
     ? trimmed.slice(RESUMES_BUCKET.length + 1)
@@ -796,7 +804,7 @@ export async function loadResume(
 
 export type CandidateRecord = {
   id: string;
-  /** NOT NULL in `candidates`; the address the whole pipeline keys off. */
+  /** NOT NULL in `profiles`; the address the whole pipeline keys off. */
   applicationEmail: string;
   linkedinUrl: string | null;
 };

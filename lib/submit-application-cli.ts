@@ -20,18 +20,20 @@
  *
  * Run from `lib/`:
  *   npm run submit-application -- \
- *     --application <job_applications uuid> \
+ *     --application <applications uuid> \
  *     --yes-really-submit
  *
  * or, when you have the listing rather than the row id:
  *   npm run submit-application -- \
  *     --candidate <uuid> --apply-url <listing url> --yes-really-submit
  *
- * Prerequisites, in order: `npm run intake` (ACT-003), `npm run create-account`
- * (ACT-005), and — if the row is at `awaiting_verification` — the code and/or
- * link from ACT-006's `email/verification-received` event. There is no separate
- * `npm run fill-form` step to do first: this runs the fill itself, in the same
- * browser session, because a filled form cannot outlive its browser.
+ * Prerequisites, in order: a signed in person with a resume (/login then
+ * /onboarding, or `npm run intake`), and an `applications` row for the listing.
+ * JOB-004 moved that row's creation into `claimApplicationRow` in
+ * `lib/application-records.ts`; `--candidate` plus `--apply-url` finds an
+ * existing one. There is no separate `npm run fill-form` step to do first: this
+ * runs the fill itself, in the same browser session, because a filled form
+ * cannot outlive its browser.
  *
  * ACT-017 adds one more: the Gmail credentials ACT-006 uses (`GOOGLE_OAUTH_*` in
  * `.env.local`, minted by `npm run gmail-auth`) must be live. Greenhouse answers
@@ -42,7 +44,7 @@
  *
  * ── This is the acceptance test ─────────────────────────────────────────────
  * ACT-008's criterion is "one real end-to-end submission, confirmation email
- * lands in the inbox used for ACT-006, `job_applications` row correctly reflects
+ * lands in the inbox used for ACT-006, `applications` row correctly reflects
  * `submitted` status". The report below covers the third of those and captures
  * what the board itself said; the inbox is checked by a human afterwards, and
  * deliberately not re-detected here (that is ACT-006's job, and re-implementing
@@ -119,7 +121,7 @@ const USAGE = [
   "",
   "  --yes-really-submit       REQUIRED. This really does send a real application to a",
   "                            real employer, under a real candidate's name, with no undo.",
-  "  --application             job_applications row id (from ACT-005)",
+  "  --application             applications row id",
   "  --candidate / --apply-url look the row up instead of passing its id",
   "  --requires-cover-letter   ACT-002's requiresCoverLetter for this listing. A cover",
   "                            letter is written ONLY when this is given.",
@@ -233,7 +235,7 @@ function redact(text: string): string {
 function printReport(result: SubmitApplicationResult): void {
   const line = "─".repeat(78);
   console.log(`\n${line}`);
-  console.log(`ACT-008 submit — job_applications ${result.jobApplicationId}`);
+  console.log(`ACT-008 submit — applications ${result.jobApplicationId}`);
   console.log(`status:    ${result.status}`);
   console.log(`submitted: ${result.submitted}    submit clicked: ${result.submitAttempted}`);
   console.log(`page:      ${result.finalUrl}`);
@@ -332,7 +334,7 @@ async function main(): Promise<void> {
       );
     }
     jobApplicationId = await findJobApplicationId(candidateId, applyUrl);
-    console.log(`[act-008] resolved job_applications ${jobApplicationId}`);
+    console.log(`[act-008] resolved applications ${jobApplicationId}`);
   }
 
   const descriptionFile = values.get("--job-description-file");
