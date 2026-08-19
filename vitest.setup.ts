@@ -1,5 +1,5 @@
 // `@testing-library/jest-dom/vitest` registers the DOM matchers with Vitest's
-// `expect` on import — there is no separate `expect.extend(matchers)` call to
+// `expect` on import, so there is no separate `expect.extend(matchers)` call to
 // make. Doing both (as some older setups do) registers every matcher twice.
 import "@testing-library/jest-dom/vitest";
 

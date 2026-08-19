@@ -19,8 +19,8 @@ export default defineConfig({
     // way that reads like a broken suite rather than a misrouted one.
     exclude: ["**/node_modules/**", "**/.next/**", "tests/e2e/**"],
     testTimeout: 20000,
-    // Scaffold state: there are no unit tests yet. Drop this once there are —
-    // an empty suite passing silently is only acceptable while it is expected.
+    // Scaffold state. Drop this once the suite is load bearing: an empty suite
+    // passing silently is only acceptable while it is expected.
     passWithNoTests: true,
   },
   resolve: {
