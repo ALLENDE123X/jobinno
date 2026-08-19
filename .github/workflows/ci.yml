@@ -25,6 +25,12 @@ jobs:
           --health-retries 5
 
     env:
+      # A GitHub runner gives Node a 2GB heap by default, and type checking this
+      # project needs more than that: `googleapis`, which the Gmail modules pull
+      # in, ships enormous type definitions and costs about 1.8GB on its own.
+      # The runner has 16GB, so this is headroom rather than a real ceiling.
+      NODE_OPTIONS: --max-old-space-size=6144
+
       # Throwaway service container, not a real database. Nothing destructive
       # should run against a real DATABASE_URL without an explicit opt in gate.
       DATABASE_URL: postgres://test:test@localhost:5432/jobinno_test
@@ -107,6 +113,8 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
+      # See the note on the same variable in the `test` job above.
+      NODE_OPTIONS: --max-old-space-size=6144
       DATABASE_URL: postgres://test:test@localhost:5432/jobinno_test
       NEXT_PUBLIC_SUPABASE_URL: http://localhost:54321
       NEXT_PUBLIC_SUPABASE_ANON_KEY: test-anon-key
