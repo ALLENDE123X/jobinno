@@ -412,7 +412,32 @@ async function loadListing(supabase: SupabaseClient, jobId: string): Promise<Lis
  *    `fanOutLimit`.
  */
 export const discoverListings = inngest.createFunction(
-  { id: "discover-listings", triggers: [{ event: jobSearchRequested }] },
+  {
+    id: "discover-listings",
+    triggers: [{ event: jobSearchRequested }],
+    // One discovery run per person at a time, keyed on the person.
+    //
+    // Two `job-search/requested` events for the same user — a double click on a
+    // "Find Jobs Now" button, a retry racing the original, the cron overlapping
+    // a manual trigger — both reach the anti join below before either has
+    // written an `applications` row. Both therefore match the same listings,
+    // and both fan out. `(user_id, job_id)` has no unique index, as the fan-out
+    // comment further down says, so the second run's `claimApplicationRow`
+    // inserts a second row rather than reusing the first, and the employer
+    // receives two real applications for one listing.
+    //
+    // The key is what makes this a guard rather than a bottleneck: `limit: 1`
+    // alone would serialize every user in the system behind one run. Inngest
+    // queues the second event rather than dropping it, which is the behaviour
+    // wanted — by the time it runs, the first run's rows exist and the anti
+    // join excludes exactly the listings already in flight.
+    //
+    // `scheduleJobSearches` keeps its own six hour in-flight window and the two
+    // do not conflict: that window decides who is dispatched at all, a whole
+    // cron run ahead of this, and cannot see a run whose rows do not exist yet.
+    // This closes the gap it structurally cannot.
+    concurrency: { limit: 1, key: "event.data.userId" },
+  },
   async ({ event, step }) => {
     const userId = requireUuid(event.data.userId, "userId", "a profiles.id UUID");
     const preferences = event.data.preferences;

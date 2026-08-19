@@ -54,12 +54,10 @@ afterEach(() => {
 describe("classifyTitle", () => {
   const keep: [string, { isIntern: boolean; isNewGrad: boolean }][] = [
     ["Software Engineer Intern, Summer 2027", { isIntern: true, isNewGrad: false }],
-    ["2027 Summer Internship - Quantitative Trading", { isIntern: true, isNewGrad: false }],
+    ["2027 Summer Internship - Software Engineering", { isIntern: true, isNewGrad: false }],
     ["New Grad Software Engineer", { isIntern: false, isNewGrad: true }],
-    ["New-Grad Backend Engineer", { isIntern: false, isNewGrad: true }],
     ["Software Engineer, University Graduate", { isIntern: false, isNewGrad: true }],
-    ["Early Career Data Engineer", { isIntern: false, isNewGrad: true }],
-    ["Infrastructure Software Engineer", { isIntern: false, isNewGrad: false }],
+    ["Early Career Software Engineer", { isIntern: false, isNewGrad: true }],
     ["SWE Intern (Platform)", { isIntern: true, isNewGrad: false }],
   ];
 
@@ -84,6 +82,60 @@ describe("classifyTitle", () => {
 
   it.each(drop)("drops %s", (title) => {
     expect(classifyTitle(title).relevant).toBe(false);
+  });
+
+  // ── The discipline gate ───────────────────────────────────────────────────
+  // Every title below classified as `relevant: true` while the rule was
+  // `isIntern || isNewGrad || SWE_RE.test(title)`, because the seniority word
+  // alone carried it. `matchJobsForUser` is title blind whenever no title is
+  // supplied — which is always, on the daily cron — so each of these was a
+  // listing a real browser could be sent to apply to, spending an application
+  // off a paying person's allowance on a discipline this product does not
+  // serve. The first four are the reviewer's; the rest are verbatim from the
+  // live `jobs` table, where 289 rows like them had already been ingested.
+  const wrongDiscipline = [
+    "Marketing Intern",
+    "Legal Intern",
+    "Investment Banking Summer Analyst Internship",
+    "University Relations Coordinator",
+    "Early Career Sales Associate",
+    "Intern - Maintenance Technician",
+    "Finance Intern - Summer 2027",
+    "Intern, Commodity Sourcing",
+    "2027 Point72 Academy Investment Analyst Summer Internship Program - Hong Kong",
+    "Environmental Health & Safety Intern - Summer 2027",
+    "2026 Early Career Mechanical Engineer",
+  ];
+
+  it.each(wrongDiscipline)("drops %s, which is an internship in the wrong field", (title) => {
+    expect(classifyTitle(title).relevant).toBe(false);
+  });
+
+  it("still records the career stage on a title it refuses", () => {
+    // The two booleans describe the title; `relevant` decides whether the row
+    // is written. Keeping them honest on a rejected title is what makes the
+    // assertions above about `relevant` specifically, rather than about the
+    // seniority regexes having quietly stopped matching.
+    expect(classifyTitle("Marketing Intern")).toEqual({
+      relevant: false,
+      isIntern: true,
+      isNewGrad: false,
+    });
+    expect(classifyTitle("Early Career Sales Associate")).toEqual({
+      relevant: false,
+      isIntern: false,
+      isNewGrad: true,
+    });
+  });
+
+  it("drops a software role that is neither an internship nor for a new graduate", () => {
+    // The other half of the "and". A plain mid level posting says nothing about
+    // being open to a new graduate, and this product is for people who are one.
+    expect(classifyTitle("Infrastructure Software Engineer")).toEqual({
+      relevant: false,
+      isIntern: false,
+      isNewGrad: false,
+    });
   });
 
   it("does not read Internal as intern", () => {
@@ -111,21 +163,27 @@ describe("classifyTitle", () => {
     expect(classifyTitle("SRE Software Engineer Intern").relevant).toBe(true);
   });
 
-  it("keeps an internship whatever seniority word the title also carries", () => {
+  it("keeps a software internship whatever seniority word the title also carries", () => {
     // The exclusion loses to an explicit internship on purpose. Dropping a real
-    // internship is the expensive mistake; a stray listing is a cheap one.
-    expect(classifyTitle("Engineering Manager Intern")).toEqual({
+    // software internship is the expensive mistake; a stray listing is a cheap
+    // one. The discipline half of the test still has to pass, though — which is
+    // why the bare "Engineering Manager Intern" this used to assert on now
+    // appears below as a title that is dropped.
+    expect(classifyTitle("Software Engineering Manager Intern")).toEqual({
       relevant: true,
       isIntern: true,
       isNewGrad: false,
     });
-    expect(classifyTitle("Intern, Lead Generation Engineering").relevant).toBe(true);
+    expect(classifyTitle("Intern, Software Engineering (Lead Generation)").relevant).toBe(true);
+    expect(classifyTitle("Engineering Manager Intern").relevant).toBe(false);
   });
 
   it("does not treat Leadership as the excluded word Lead", () => {
-    expect(classifyTitle("Leadership Development Program, Software Engineering").relevant).toBe(
-      true
-    );
+    // A new grad role rather than an internship, so the seniority exclusion is
+    // live and a `\blead\b` that matched "Leadership" would drop it.
+    expect(
+      classifyTitle("New Grad Software Engineer, Leadership Development Program").relevant
+    ).toBe(true);
   });
 });
 

@@ -54,9 +54,9 @@
  *
  *  · **Seniority, or whether a role suits a new graduate.** `classifyTitle` in
  *    `lib/ats-job-feeds.ts` already applied that at ingest time: a row only
- *    exists in `jobs` if its title reads as an internship, a new grad role or a
- *    software engineering role with no seniority word in it. Re-testing it here
- *    would be a second copy of a filter that has already run.
+ *    exists in `jobs` if its title reads as a software engineering role AND as
+ *    an internship or a new grad role. Re-testing it here would be a second
+ *    copy of a filter that has already run.
  */
 
 import {
@@ -356,11 +356,15 @@ export type MatchInput = {
  * because `jobs` stores none of the latter two, and pretending otherwise would
  * be a filter that reads stricter than it is.
  *
- * When it is absent, matching is title blind, and that is a sound default
- * rather than a gap: `classifyTitle` already refused to write a row for
- * anything that was not an internship, a new grad role or an unsenior software
- * engineering role, so every row in the table is a role this product's users
- * are in the market for.
+ * When it is absent, matching is title blind, and the safety of that rests
+ * entirely on `classifyTitle`, which is the only thing standing between this
+ * query and a listing in a discipline nobody here asked for. It earns that
+ * trust only since the ingest filter was corrected to require a software title
+ * AND an internship or new grad role: under the "or" it replaced, "Marketing
+ * Intern" and "Investment Banking Summer Analyst Internship" were rows in this
+ * table, and a title blind match would have fanned real applications out to
+ * them. Nothing here re-checks the discipline, so a widening of that filter is
+ * a widening of what a scheduled search will apply to, with no second gate.
  *
  * ── The anti join ───────────────────────────────────────────────────────────
  * Any `applications` row for this person and this listing excludes it, whatever
