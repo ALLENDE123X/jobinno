@@ -26,6 +26,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   AUTH_CALLBACK_PATH,
+  safeRelativeDestination,
   AUTH_REDIRECT_ALLOWLIST,
   LOCAL_DEV_ORIGIN,
   PRODUCTION_ORIGIN,
@@ -96,6 +97,49 @@ describe("Supabase Auth redirect allowlist", () => {
       "https://evil.example",
     ])("throws rather than let Supabase silently redirect from %s", (origin) => {
       expect(() => authCallbackUrlFor(origin)).toThrow(/redirect allowlist/);
+    });
+  });
+
+  /**
+   * The open redirect guard added by JOB-010, which both `?next=` and the post
+   * login cookie are filtered through.
+   *
+   * Worth its own tests because the cookie widened the attack surface. A query
+   * parameter has to be put in a link somebody clicks; a cookie can be written
+   * by anything else sharing the origin, and it is then read on the one route
+   * that runs immediately after a session is minted. A miss here is an open
+   * redirect wearing our domain and a freshly signed in person behind it.
+   */
+  describe("safeRelativeDestination", () => {
+    it.each([
+      "/onboarding",
+      "/api/billing/checkout?plan=starter",
+      "/billing/success",
+    ])("allows our own path %s", (value) => {
+      expect(safeRelativeDestination(value)).toBe(value);
+    });
+
+    it.each([
+      // Browsers read a protocol relative host as an absolute URL.
+      "//evil.example",
+      "///evil.example",
+      "https://evil.example",
+      "http://evil.example/onboarding",
+      // Some browsers normalise a backslash to a forward slash, so this leaves
+      // looking relative and arrives somewhere else entirely.
+      "/\\evil.example",
+      "\\\\evil.example",
+      // Not a path at all.
+      "javascript:alert(1)",
+      "onboarding",
+    ])("refuses %s", (value) => {
+      expect(safeRelativeDestination(value)).toBeNull();
+    });
+
+    it("refuses nothing at all", () => {
+      expect(safeRelativeDestination(null)).toBeNull();
+      expect(safeRelativeDestination(undefined)).toBeNull();
+      expect(safeRelativeDestination("")).toBeNull();
     });
   });
 });

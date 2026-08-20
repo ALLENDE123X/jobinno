@@ -23,23 +23,41 @@ import { NextResponse, type NextRequest } from "next/server";
 
 import { ANALYTICS_EVENT } from "@/lib/analytics/events";
 import { captureServerEvent } from "@/lib/analytics/posthog-server";
+import {
+  POST_LOGIN_DESTINATION_COOKIE,
+  safeRelativeDestination,
+} from "@/lib/auth/redirect-urls";
 import { createServerClient, createServiceRoleClient } from "@/lib/supabase/server";
 
 /** Where someone goes once the session exists. */
 const DEFAULT_DESTINATION = "/onboarding";
 
 /**
- * A `next` of `/dashboard` is a caller saying where to go afterwards. A `next`
- * of `//evil.example` or `https://evil.example` is a caller trying to use our
- * domain to launder a redirect, and browsers read a protocol relative `//host`
- * as an absolute URL. Relative paths only, and never two leading slashes.
+ * Where to send somebody once the session exists.
+ *
+ * Three sources, in order. An explicit `?next=`, then the cookie JOB-010's
+ * checkout route sets before sending a signed out buyer here, then intake.
+ * Both of the first two are run through `safeRelativeDestination`: a `next` of
+ * `//evil.example` is a caller trying to use our domain to launder a redirect,
+ * and browsers read a protocol relative `//host` as an absolute URL. The cookie
+ * gets the same treatment, because a cookie is no more trustworthy than a query
+ * string once anything else on the origin can write one.
  */
-function safeDestination(next: string | null): string {
-  if (!next) return DEFAULT_DESTINATION;
-  if (!next.startsWith("/") || next.startsWith("//")) {
-    return DEFAULT_DESTINATION;
-  }
-  return next;
+function destinationFor(request: NextRequest): {
+  destination: string;
+  fromCookie: boolean;
+} {
+  const fromNext = safeRelativeDestination(
+    request.nextUrl.searchParams.get("next")
+  );
+  if (fromNext) return { destination: fromNext, fromCookie: false };
+
+  const fromCookie = safeRelativeDestination(
+    request.cookies.get(POST_LOGIN_DESTINATION_COOKIE)?.value
+  );
+  if (fromCookie) return { destination: fromCookie, fromCookie: true };
+
+  return { destination: DEFAULT_DESTINATION, fromCookie: false };
 }
 
 /**
@@ -79,7 +97,7 @@ function redirectTo(
 
 export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
-  const destination = safeDestination(params.get("next"));
+  const { destination, fromCookie } = destinationFor(request);
 
   // Supabase reports a refused or expired link by redirecting here with an
   // error rather than by failing the request, so this is a real branch.
@@ -135,6 +153,14 @@ export async function GET(request: NextRequest) {
     });
   }
 
+  const response = redirectTo(request, destination);
+
+  // Spent, so it goes. Leaving it set would send the next sign in from this
+  // browser back to a checkout the person already completed.
+  if (fromCookie) {
+    response.cookies.delete(POST_LOGIN_DESTINATION_COOKIE);
+  }
+
   // JOB-014. Fired here rather than in the browser because this route is where
   // the session actually starts to exist, and the browser is mid redirect with
   // none of our JavaScript running.
@@ -157,5 +183,5 @@ export async function GET(request: NextRequest) {
     properties: { destination: knownDestination(destination) },
   });
 
-  return redirectTo(request, destination);
+  return response;
 }

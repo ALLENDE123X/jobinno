@@ -42,15 +42,18 @@ const RLS_TABLES = TABLES;
  * restricts rows and nothing else, so without a column privilege behind it an
  * authenticated user can PATCH any column of the row they already own.
  *
- * `plan`, `applications_used` and `applications_cap` are billing state, which
- * JOB-010 will start trusting. `attested_at` is the completion gate on
- * `/onboarding`, and it is already trusted today.
+ * `plan`, `applications_used` and `applications_cap` are billing state, and
+ * JOB-010's Stripe webhook is what now writes them. `attested_at` is the
+ * completion gate on `/onboarding`. `stripe_customer_id` was added by JOB-010
+ * and classified here rather than granted, because which Stripe customer a
+ * person pays as is our record and not theirs.
  */
 const PROFILE_SYSTEM_COLUMNS = [
   "applications_cap",
   "applications_used",
   "attested_at",
   "plan",
+  "stripe_customer_id",
 ] as const;
 
 /**

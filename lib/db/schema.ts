@@ -166,6 +166,27 @@ export const profiles = pgTable(
      */
     applicationsCap: integer("applications_cap").notNull().default(0),
 
+    /**
+     * The Stripe customer this person pays as. Added by JOB-010.
+     *
+     * Billing state, so it sits on our side of the line that
+     * `drizzle/0003_profiles_column_privileges.sql` drew: no grant to
+     * `authenticated`, which after that migration means a new column is not
+     * writable by a user session at all. Only the Stripe webhook, holding the
+     * service role key, ever sets it.
+     *
+     * It exists because the subscription lifecycle events arrive months after
+     * the checkout that created them and name a customer rather than a person.
+     * `customer.subscription.deleted` carries the metadata we attached, but
+     * `invoice.payment_failed` reliably carries only the customer, so without a
+     * stored id a lapse has no way home to a profile row.
+     *
+     * Unique, because two profiles claiming one Stripe customer would make that
+     * lookup ambiguous exactly when it is deciding whether to take somebody's
+     * paid plan away. Null until the person's first purchase.
+     */
+    stripeCustomerId: text("stripe_customer_id"),
+
     citizenshipStatus: citizenshipStatusEnum("citizenship_status"),
     f1Status: f1StatusEnum("f1_status"),
     workAuthorizedUs: boolean("work_authorized_us"),
@@ -233,6 +254,7 @@ export const profiles = pgTable(
       .defaultNow(),
   },
   (table) => [
+    unique("profiles_stripe_customer_id_key").on(table.stripeCustomerId),
     pgPolicy("profiles_select_own", {
       for: "select",
       to: authenticatedRole,

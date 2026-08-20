@@ -68,3 +68,50 @@ export function authCallbackUrlFor(origin: string): string {
 
   return candidate;
 }
+
+// ───────────────────────────────────
+// Where to go once the session exists
+// ───────────────────────────────────
+
+/**
+ * The cookie carrying an intended destination across a magic link (JOB-010).
+ *
+ * ── Why a cookie and not a query parameter ──────────────────────────────────
+ * `app/auth/callback/route.ts` already honours `?next=`, and the obvious move
+ * is to put the destination on `emailRedirectTo` so it comes back on the link.
+ * That is exactly the thing the top of this file warns about: Supabase compares
+ * `emailRedirectTo` against the project allowlist and silently substitutes the
+ * Site URL when it does not match, so appending a query string to an allowlisted
+ * callback URL risks every sign in link going nowhere useful, and it fails
+ * quietly rather than loudly.
+ *
+ * A cookie sidesteps the allowlist entirely. It is set before the person is
+ * sent to sign in and read back by the callback, so the link itself stays
+ * byte for byte what the allowlist already permits.
+ *
+ * `SameSite=Lax` is deliberate: clicking a link in an email client is a top
+ * level navigation, which is precisely the case Lax still sends cookies for.
+ */
+export const POST_LOGIN_DESTINATION_COOKIE = "jobinno_after_login";
+
+/** An hour, matching how long a magic link stays valid. */
+export const POST_LOGIN_DESTINATION_MAX_AGE_SECONDS = 60 * 60;
+
+/**
+ * A destination that is safe to redirect to, or null.
+ *
+ * Same rule the callback route applies to `?next=`: our own paths only. A value
+ * of `//evil.example` is read by browsers as an absolute URL, so two leading
+ * slashes are refused along with anything carrying a scheme. Without this a
+ * cookie an attacker can set becomes an open redirect wearing our domain.
+ */
+export function safeRelativeDestination(
+  value: string | null | undefined
+): string | null {
+  if (!value) return null;
+  if (!value.startsWith("/") || value.startsWith("//")) return null;
+  // A backslash is normalised to a forward slash by some browsers, so `/\evil`
+  // would leave here looking relative and arrive somewhere else entirely.
+  if (value.includes("\\")) return null;
+  return value;
+}
