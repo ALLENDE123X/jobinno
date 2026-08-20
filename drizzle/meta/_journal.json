@@ -43,6 +43,13 @@
       "when": 1787195605121,
       "tag": "0005_profiles_last_search_requested_at",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1787210646192,
+      "tag": "0006_profiles_stripe_customer_id",
+      "breakpoints": true
     }
   ]
 }
