@@ -141,7 +141,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { APPLICATION_STATUS, type ApplicationStatus } from "@/lib/application-status";
-import { checkApplyUrl } from "@/lib/apply-url-guard";
+import { checkApplyUrl, forLog } from "@/lib/apply-url-guard";
 // Single source of truth for "which domains may speak for this board". ACT-006
 // applies it when it decides a link is safe to *report*; this module applies it
 // again before it is safe to *open*. Importing it costs a googleapis module load
@@ -887,13 +887,14 @@ export class FormFillBlockedError extends Error {
 }
 
 /**
- * The apply URL on the row is not one this pipeline will open. See
- * `loadApplicationState`, which is the only thing that throws it.
+ * The URL is not one this pipeline will open, or is not one it will stay on.
+ * Thrown from two places: `loadApplicationState`, before anything navigates, and
+ * `assertStillOnTheBoard`, against the URL the browser actually reached.
  *
  * A `FormFillBlockedError`, because that is what it is: a stop for a human, and
  * a retry into the same wall would be pointless. It carries the listing and the
- * platform because it is thrown before `runFill` holds an `ApplicationState`,
- * and a `skip_log` row needs both.
+ * platform because the first of those two throws before `runFill` holds an
+ * `ApplicationState`, and a `skip_log` row needs both.
  */
 export class BlockedApplyUrlError extends FormFillBlockedError {
   constructor(
@@ -1121,6 +1122,13 @@ type ApplicationState = {
   jobId: string;
   /** `jobs.ats`. Same. */
   ats: string;
+  /**
+   * `boards.board_token`. Carried on the state, not only read inside
+   * `loadApplicationState`, because the apply URL rule is applied again against
+   * wherever the browser ends up and that check needs the same expectation the
+   * first one was made against. See `assertStillOnTheBoard`.
+   */
+  boardToken: string;
   company: string;
   jobTitle: string;
   applyUrl: string;
@@ -1257,6 +1265,7 @@ async function loadApplicationState(
     candidateId,
     jobId,
     ats: String(job.ats ?? ""),
+    boardToken: String(board.board_token ?? ""),
     company: String(board.company ?? ""),
     jobTitle: String(job.title ?? ""),
     applyUrl,
@@ -1492,6 +1501,59 @@ function assertNotAlreadySubmitted(signals: FormSignals, where: string): void {
   );
 }
 
+/**
+ * The apply URL rule, applied to where the browser actually is rather than to
+ * the string it was told to go to.
+ *
+ * ── Why the check before the navigation is not enough ───────────────────────
+ * `checkApplyUrl` runs in `loadApplicationState`, and what it reads there is a
+ * column. `page.goto` follows redirects, so a listing URL on a genuine ATS host
+ * over https can answer with a 302 to anywhere at all and the browser will be
+ * standing on that page a moment later. Clicking the control that opens the
+ * application form can move it the same way, and so can a form that navigates
+ * between its own steps. None of that is visible to a check made against a
+ * string before any of it happened.
+ *
+ * What lands on the other side of such a redirect is not a page this module
+ * merely looks at. It is the page it types a real name, a real email address, a
+ * real phone number and a real work history into, and uploads a real resume PDF
+ * to. So the rule is applied again here, unchanged and against the same board
+ * the listing came from, at every point where something of the candidate's is
+ * about to leave for whatever is on screen.
+ *
+ * ── What it does not cover ──────────────────────────────────────────────────
+ * A page that navigates itself *during* a fill, between one field and the next.
+ * Closing that would mean a check inside `typeInto` for every field on every
+ * form, and the callers here bracket each thing that sends something: the
+ * fields, the resume, and the ACT-015 pass over everything else. A page that
+ * moves mid sequence is caught at the next bracket, before the next thing goes.
+ *
+ * Returns the URL it accepted, so a caller can log the page it is really on.
+ */
+async function assertStillOnTheBoard(
+  session: BrowserSession,
+  state: ApplicationState,
+  when: string
+): Promise<string> {
+  const landed = String((await session.page.url()) ?? "");
+  const verdict = checkApplyUrl(landed, { ats: state.ats, boardToken: state.boardToken });
+  if (verdict.ok) return landed;
+
+  throw new BlockedApplyUrlError(
+    // `blocked_apply_url` is the tag `lib/application-records.ts` classifies this
+    // stop by. It is first in that file's list because the sentence below quotes
+    // a URL somebody else chose, and a landing page whose path spells one of the
+    // other tags must not be able to file this under a different reason.
+    `blocked_apply_url: the browser is at "${forLog(landed)}" ${when}, and that page does not ` +
+      `belong to the board this listing came from: ${verdict.reason}. The listing pointed at ` +
+      `"${forLog(state.applyUrl)}", which passed this same rule before anything was opened, so ` +
+      `a redirect or a click moved the browser afterwards. Nothing was typed into this page and ` +
+      `no resume was uploaded to it.`,
+    state.jobId,
+    state.ats
+  );
+}
+
 // ───────────────────────────────────
 // Getting to the form
 // ───────────────────────────────────
@@ -1512,6 +1574,11 @@ async function reachApplicationForm(
     await session.page.goto(state.applyUrl, { timeout: NAVIGATION_TIMEOUT_MS });
     signals = await readFormSignals(session);
   }
+  // Unconditional, and not only on the branch that navigated. The `goto` above
+  // is the redirect this catches most often, but the branch that skips it is
+  // reached with a page `completeVerification` opened from an emailed link,
+  // which is allowed onto a wider set of hosts than a form may be filled on.
+  await assertStillOnTheBoard(session, state, "having opened the listing");
   console.log(`${LOG} at ${signals.url} — "${signals.title}"`);
   assertNoCaptcha(signals, "the application page");
   assertNotAlreadySubmitted(signals, "the application page");
@@ -1537,6 +1604,9 @@ async function reachApplicationForm(
     if (clicked === null) break;
     clickedApplyControl = true;
     signals = await readFormSignals(session);
+    // The control that opens an application form is a link like any other, and
+    // where it led is a fact about this run rather than about the listing.
+    await assertStillOnTheBoard(session, state, "after clicking through to the application form");
     assertNoCaptcha(signals, "the page after opening the application");
     assertNotAlreadySubmitted(signals, "the page after opening the application");
   }
@@ -3090,6 +3160,11 @@ async function runBrowserFlow(
     // The read is the same `enumerateFormFields` the ACT-015 pass runs further
     // down: pure DOM, no inference. Running it twice costs a page evaluate,
     // which is the cheapest thing in this file by orders of magnitude.
+    // The last thing before the candidate's own answers start going into boxes,
+    // and the cover letter control above is one more click that could have moved
+    // the page since `reachApplicationForm` last looked.
+    await assertStillOnTheBoard(session, state, "with the application form ready to fill");
+
     await attachFormActionPlan(supabase, session, signals.url);
 
     const plan = buildFieldPlan(profile, signals, coverLetter);
@@ -3101,6 +3176,11 @@ async function runBrowserFlow(
     assertNoMismatches(fields, signals.url);
 
     if (signals.resumeUploadPresent || signals.fileInputCount > 0) {
+      // The resume is the whole reason this rule exists. A multi step form is
+      // free to have moved between the fields above and the upload below, so
+      // where the file is about to go is checked here and not inferred from a
+      // check made before the first character was typed.
+      await assertStillOnTheBoard(session, state, "with the resume about to be uploaded");
       fields.push(await attachResume(session, signals.url, signals, resumeBytes, profile));
     } else {
       fields.push({
@@ -3112,6 +3192,9 @@ async function runBrowserFlow(
     }
 
     // ── ACT-015: everything the eight named fields above do not cover ───────
+    // The third bracket. This pass answers questions from the intake data and
+    // from the resume, which is the same person's data by another route.
+    await assertStillOnTheBoard(session, state, "with the remaining questions about to be answered");
     const remaining = await fillRemainingFields(
       session,
       state,

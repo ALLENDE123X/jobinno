@@ -76,6 +76,18 @@ const h = vi.hoisted(() => {
     shapes: [] as { fingerprint: string; slots: string[] }[],
     /** What the listing row says its URL is. Overridden by the guard tests. */
     applyUrl: APPLY_URL,
+    /**
+     * Where the browser really is, which is not the same question as what the
+     * row says. Null means it went where it was sent; a string is a redirect the
+     * board answered the navigation with, or a page a click led to.
+     */
+    landedUrl: null as string | null,
+    /** Set `landedUrl` to this the first time anything is typed into the form. */
+    moveOnFirstType: null as string | null,
+    /** What the structural DOM read reports. One file input turns the upload on. */
+    fileInputs: 0,
+    /** How many times a resume file was actually set on a control. */
+    resumeAttachments: 0,
     /** Every write the module made, so a terminal status can be asserted. */
     writes: [] as { table: string; op: "update" | "insert"; values: unknown }[],
     /** How many times a browser was opened. */
@@ -98,6 +110,10 @@ const h = vi.hoisted(() => {
     state.events = [];
     state.shapes = [];
     state.applyUrl = APPLY_URL;
+    state.landedUrl = null;
+    state.moveOnFirstType = null;
+    state.fileInputs = 0;
+    state.resumeAttachments = 0;
     state.writes = [];
     state.browsersOpened = 0;
   };
@@ -171,16 +187,27 @@ const h = vi.hoisted(() => {
 
   const page = {
     goto: async () => undefined,
-    url: async () => state.applyUrl,
+    // Where the browser is, not where it was sent. `goto` follows redirects, so
+    // these are two different strings whenever `landedUrl` is set.
+    url: async () => state.landedUrl ?? state.applyUrl,
     title: async () => "Careers at Example",
     evaluate: async (script: unknown) =>
       String(script).includes("passwordFields")
-        ? { passwordFields: 0, fileInputs: 0, textAreas: 1, iframes: 0, textLength: 4000 }
+        ? {
+            passwordFields: 0,
+            fileInputs: state.fileInputs,
+            textAreas: 1,
+            iframes: 0,
+            textLength: 4000,
+          }
         : state.descriptor,
     screenshot: async () => new Uint8Array([1, 2, 3]),
     locator: () => ({
       inputValue: async () => state.lastTyped,
-      setInputFiles: async () => undefined,
+      setInputFiles: async () => {
+        state.resumeAttachments += 1;
+        state.events.push("uploaded the resume");
+      },
     }),
   };
 
@@ -342,6 +369,12 @@ vi.mock("@/lib/stagehand-session", () => ({
   typeInto: async (_session: unknown, _url: string, instruction: string, value: string) => {
     h.state.events.push(`typed into ${instruction}`);
     h.state.lastTyped = value;
+    // A form that moves the browser once the candidate has started answering it.
+    if (h.state.moveOnFirstType !== null) {
+      h.state.landedUrl = h.state.moveOnFirstType;
+      h.state.moveOnFirstType = null;
+      h.state.events.push("the page moved");
+    }
     return { selector: "xpath=/html[1]/body[1]/main[1]/form[1]/div[3]/input[1]", description: instruction };
   },
   tryResolveAction: async (_session: unknown, _url: string, instruction: string) => {
@@ -598,5 +631,156 @@ describe("an apply URL that does not belong to the board it came from", () => {
     expect(result.status).toBe("form_filled");
     expect(result.blockedReason).toBeNull();
     expect(h.state.browsersOpened).toBe(1);
+  });
+});
+
+/**
+ * The half of the rule that a check made before the navigation cannot reach.
+ *
+ * `loadApplicationState` validates a column. `page.goto` follows redirects, so a
+ * listing URL that passes every one of those rules can still answer with a 302,
+ * and the browser is then standing on a page nobody checked. A control clicked
+ * on the way to the form moves it the same way, and so does a form that
+ * navigates between its own steps.
+ *
+ * What each test below asserts is not only that the run stops. It is that it
+ * stopped *before* the thing that page was there to collect: nothing typed and
+ * no file uploaded, with the row and the skip log saying so.
+ */
+describe("a listing that redirects the browser somewhere else", () => {
+  /** Where a redirect of this kind goes: a form the tenant controls. */
+  const ELSEWHERE = "https://example-careers.attacker.example/apply/42";
+
+  const skipRows = () =>
+    h.state.writes
+      .filter((write) => write.table === "skip_log" && write.op === "insert")
+      .map(
+        (write) =>
+          write.values as { reason: string; ats: string; job_id: string; raw_context: { message: string } }
+      );
+
+  const statuses = () =>
+    h.state.writes
+      .filter((write) => write.table === "applications" && write.op === "update")
+      .map((write) => (write.values as { status?: string }).status);
+
+  /**
+   * A fixture in which the candidate's email really would be typed and their
+   * resume really would be uploaded.
+   *
+   * Without this the default fixture resolves no field at all, so "nothing was
+   * typed" and "nothing was uploaded" would both pass on a run that could never
+   * have typed or uploaded anything, and the tests below would prove nothing.
+   * The two assertions the run must earn are asserted directly in the last two
+   * cases in this block.
+   */
+  const aFormWorthFilling = (): void => {
+    h.state.resolve = (instruction: string) =>
+      instruction.includes("email address input")
+        ? {
+            selector: "xpath=/html[1]/body[1]/main[1]/form[1]/div[3]/input[1]",
+            description: instruction,
+            replayed: false,
+          }
+        : h.manualEntryOnly(instruction);
+    h.state.descriptor = {
+      ...h.state.descriptor,
+      found: true,
+      tag: "input",
+      type: "text",
+      haystack: "applicant_email | Email address",
+    };
+    // One real file input, so the resume upload takes the deterministic path.
+    h.state.fileInputs = 1;
+  };
+
+  it("stops before a single field is filled when the first navigation lands off the board", async () => {
+    // The row still says what it always said, and it still passes the pre
+    // navigation check. Only the landing is different, which is the whole point.
+    aFormWorthFilling();
+    h.state.landedUrl = ELSEWHERE;
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("blocked_apply_url");
+    expect(result.blockedReason).toContain("attacker.example");
+    // The URL on the row is quoted too, so the human reading this can see that
+    // the listing itself looked legitimate and the browser was moved.
+    expect(result.blockedReason).toContain("job-boards.greenhouse.io");
+
+    // Nothing of the candidate's reached the page. This is the assertion the
+    // fix exists for: a browser was opened, so a check that only ran before the
+    // navigation would have let everything below happen.
+    expect(h.state.browsersOpened).toBe(1);
+    expect(h.state.events.filter((event) => event.startsWith("typed into"))).toEqual([]);
+    expect(h.state.resumeAttachments).toBe(0);
+    expect(h.state.events).not.toContain("uploaded the resume");
+
+    // Terminal, and logged under the reason the pre navigation refusal uses.
+    expect(statuses()).toEqual(["filling_form", "form_fill_blocked"]);
+    expect(skipRows()).toHaveLength(1);
+    expect(skipRows()[0]!.reason).toBe("dom_changed");
+    expect(skipRows()[0]!.ats).toBe("greenhouse");
+    expect(skipRows()[0]!.job_id).toBe(h.JOB_ID);
+    expect(skipRows()[0]!.raw_context.message).toContain("attacker.example");
+  });
+
+  it("stops before the resume is uploaded when the page moves mid form", async () => {
+    // The redirect that a single check after the first navigation would miss:
+    // the listing opens on its own board, the fields are answered there, and
+    // only then does the form move the browser. The resume is the file this
+    // whole rule exists to protect, and it goes last.
+    aFormWorthFilling();
+    h.state.moveOnFirstType = ELSEWHERE;
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("blocked_apply_url");
+    expect(result.blockedReason).toContain("attacker.example");
+
+    // It got far enough to answer the form, which is what makes this a different
+    // case from the one above rather than the same test twice.
+    expect(h.state.events).toContain("the page moved");
+    expect(h.state.events.filter((event) => event.startsWith("typed into")).length).toBeGreaterThan(0);
+
+    // And the file never went anywhere.
+    expect(h.state.resumeAttachments).toBe(0);
+    expect(skipRows()).toHaveLength(1);
+    expect(skipRows()[0]!.reason).toBe("dom_changed");
+  });
+
+  it("types the email and uploads the resume when nothing moves the browser", async () => {
+    // The control for both tests above. Without it, "nothing was typed" and "the
+    // resume was not uploaded" would pass just as well on a fixture where
+    // neither could ever have happened.
+    aFormWorthFilling();
+
+    const result = await run();
+
+    expect(result.status).toBe("form_filled");
+    expect(result.blockedReason).toBeNull();
+    expect(h.state.events.filter((event) => event.startsWith("typed into")).length).toBeGreaterThan(
+      0
+    );
+    expect(result.fields.find((field) => field.field === "email")?.outcome).toBe("filled");
+    expect(h.state.resumeAttachments).toBe(1);
+    expect(result.fields.find((field) => field.field === "resume")?.outcome).toBe("filled");
+  });
+
+  it("does not mind a redirect that stays on the listing's own board", async () => {
+    // Boards move the browser legitimately all the time: Greenhouse's embed
+    // resolves to the board's own job page, and a multi step form walks through
+    // its own paths. The rule is about which board, not about whether the URL
+    // changed, and a check that blocked this would block real listings.
+    aFormWorthFilling();
+    h.state.landedUrl = "https://job-boards.greenhouse.io/example/jobs/42?gh_src=embed";
+
+    const result = await run();
+
+    expect(result.blockedReason).toBeNull();
+    expect(result.status).toBe("form_filled");
+    expect(h.state.resumeAttachments).toBe(1);
   });
 });
