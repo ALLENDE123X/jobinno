@@ -12,6 +12,15 @@
  * null, and RLS on the table refuses anything else. The id is read from the
  * local session rather than from `getUser()` so that an anonymous visitor on the
  * landing page does not pay a network round trip to be told they are anonymous.
+ * Reading it unverified is safe because nothing downstream trusts it: the insert
+ * carries the same session's token and the `feedback_insert_any` policy checks
+ * the id against `auth.uid()` in Postgres, so a tampered cookie fails the policy
+ * rather than mislabelling a row.
+ *
+ * The client is the app's own, from `lib/supabase/client.ts` (JOB-011). It has
+ * to be. Jobinno's session lives in a cookie, and the private client this file
+ * used to reach for kept its own in `localStorage`, so it never found a session
+ * and stamped every report `user_id: null`. See the header of `lib/feedback.ts`.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -37,11 +46,11 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import {
   captureFeedbackContext,
-  createFeedbackClient,
   submitFeedback,
   FEEDBACK_CATEGORY_OPTIONS,
   type FeedbackCategory,
 } from "@/lib/feedback";
+import { createClient } from "@/lib/supabase/client";
 
 type Phase = "editing" | "sending" | "sent";
 
@@ -65,8 +74,13 @@ export function FeedbackWidget() {
     setPhase("sending");
     setError(null);
 
-    const client = createFeedbackClient();
-    if (!client) {
+    // `createClient` throws when the project is not configured, where the
+    // client this replaced returned null. Same outcome for the person either
+    // way: one sentence saying so, and no half sent report.
+    let client: ReturnType<typeof createClient>;
+    try {
+      client = createClient();
+    } catch {
       setPhase("editing");
       setError("Feedback is not configured in this environment yet.");
       return;
