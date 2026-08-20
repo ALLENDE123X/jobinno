@@ -220,12 +220,15 @@ export function IntakeForm({ userId }: { userId: string }) {
 
   if (done) {
     return (
-      <div className="space-y-2" role="status">
-        <p className="font-medium">Thanks, that is everything.</p>
+      <div
+        className="space-y-3 rounded-2xl border bg-card/40 p-6 text-center sm:p-8"
+        role="status"
+      >
+        <p className="text-lg font-medium">Thanks, that is everything.</p>
         <p className="text-muted-foreground text-sm">
           We have your resume and your answers.
         </p>
-        <Button asChild>
+        <Button asChild size="lg" className="h-10">
           <Link href="/dashboard">Go to your applications</Link>
         </Button>
       </div>
@@ -234,7 +237,7 @@ export function IntakeForm({ userId }: { userId: string }) {
 
   return (
     <form onSubmit={onSubmit} className="space-y-8" noValidate>
-      <section className="space-y-4">
+      <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
         <h2 className="text-lg font-medium">Your documents</h2>
 
         <Field
@@ -269,7 +272,7 @@ export function IntakeForm({ userId }: { userId: string }) {
         </Field>
       </section>
 
-      <section className="space-y-4">
+      <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
         <h2 className="text-lg font-medium">Work authorization</h2>
 
         <Field label="Citizenship status" error={errors.citizenshipStatus}>
@@ -328,7 +331,7 @@ export function IntakeForm({ userId }: { userId: string }) {
         />
       </section>
 
-      <section className="space-y-4">
+      <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
         <h2 className="text-lg font-medium">Where you are and where you want to be</h2>
 
         <Field label="Current city" htmlFor="city" error={errors.currentCity}>
@@ -374,7 +377,7 @@ export function IntakeForm({ userId }: { userId: string }) {
         </Field>
       </section>
 
-      <section className="space-y-4">
+      <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
         <h2 className="text-lg font-medium">Dates</h2>
 
         <Field
@@ -405,7 +408,7 @@ export function IntakeForm({ userId }: { userId: string }) {
         </Field>
       </section>
 
-      <section className="space-y-3">
+      <section className="space-y-3 rounded-2xl border bg-card/40 p-6 sm:p-8">
         <div className="flex items-start gap-3">
           <Checkbox
             id="attestation"
