@@ -1027,7 +1027,10 @@ describe("a careers page that is still hydrating when the browser arrives", () =
 
     // And the message says the page was given its chance, so that whoever reads
     // this skip row can tell it apart from the failure that started JOB-021.
+    // Phrased as the wait that was made rather than an outcome that was
+    // observed, because a settle that times out still waited.
     expect(result.blockedReason).toContain("read 3 times");
+    expect(result.blockedReason).toContain("waiting for it to finish arriving");
   });
 
   it("does not spend its re-reads on a captcha", async () => {
@@ -1044,6 +1047,26 @@ describe("a careers page that is still hydrating when the browser arrives", () =
 
     expect(result.status).toBe("form_fill_blocked");
     expect(result.blockedReason).toContain("captcha_present");
+    expect(h.state.extractCalls).toBe(1);
+  });
+
+  it("does not spend its re-reads on a page that may have already been submitted", async () => {
+    // The captcha's sibling, and the one with teeth. A page reading as a post
+    // submission confirmation means a control may have filed a real application
+    // under this candidate's name, and the correct response is to stop and say
+    // so — not to sit on the board reloading a confirmation page hoping a form
+    // appears on it.
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: false,
+      applicationLikelySubmitted: true,
+      applicationLikelySubmittedEvidence: "Thanks for applying, we will be in touch",
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("possible_unintended_submission");
     expect(h.state.extractCalls).toBe(1);
   });
 

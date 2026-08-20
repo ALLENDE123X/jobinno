@@ -521,17 +521,30 @@ const DOM_STABLE_POLL_MS = 500;
  */
 const DOM_STABLE_BUDGET_MS = 8_000;
 
-/** True while the page is still building itself out rather than sitting still. */
+/**
+ * True while the page is still building itself out rather than sitting still.
+ *
+ * Growth on every measure, never mere difference, and the same rule for all five
+ * so there is one definition to remember. A page that is *losing* things has
+ * finished arriving: a spinner is removed, a cookie banner is dismissed, a
+ * loading skeleton is swapped out. A page that is gaining them has not.
+ *
+ * Treating any change as movement was the first version of this and it is worse
+ * in both directions. It would spend the whole budget on a page whose only sin
+ * was closing a banner, and on an advertisement iframe cycling in and out it
+ * would never report settled at all, which turns a bounded wait into a fixed
+ * eight second tax on every read. Growth cannot oscillate that way.
+ *
+ * A clock ticking from one timestamp to the next changes the text without
+ * lengthening it, which is the other reason this is not an equality test.
+ */
 function stillBuilding(current: StructuralFloor, next: StructuralFloor): boolean {
   return (
-    // Growth, not mere difference. A page whose text shrinks (a banner closing,
-    // a spinner being removed) has settled; one whose text keeps arriving has
-    // not, and a clock ticking from one timestamp to the next does not grow.
     next.textLength > current.textLength ||
-    next.passwordFields !== current.passwordFields ||
-    next.fileInputs !== current.fileInputs ||
-    next.textAreas !== current.textAreas ||
-    next.iframes !== current.iframes
+    next.passwordFields > current.passwordFields ||
+    next.fileInputs > current.fileInputs ||
+    next.textAreas > current.textAreas ||
+    next.iframes > current.iframes
   );
 }
 
@@ -1841,12 +1854,25 @@ async function reachApplicationForm(
         `${signals.textLength} characters of text) with no application form on screen ` +
         `(password fields: ${signals.passwordFieldCount}, file inputs: ${signals.fileInputCount}, ` +
         `iframes: ${signals.iframeCount}). ` +
-        // JOB-021. Says whether the page was given time, because without it this
+        // JOB-021. Says that the page was given time, because without it this
         // sentence reads identically for "the board has no form we can use" and
         // "we read a careers SPA before it had mounted one", and those want
         // opposite responses from whoever picks this up.
-        `The page was read ${rereads + 1} time${rereads === 0 ? "" : "s"} after its content ` +
-        `attached and its DOM stopped changing. ` +
+        //
+        // Describes the wait rather than claiming an outcome for it. A settle
+        // that expires is still a wait, and a longer one; saying the content
+        // "attached and stopped changing" would assert something this run may
+        // have failed to observe, which is the exact species of misleading log
+        // that made the original failure take so long to read. When a settle
+        // does expire it says so itself, at warn level, right above this.
+        //
+        // Do not reword this to say the wait "timed out", however natural that
+        // reads. `skipReasonFor` in `lib/application-records.ts` matches
+        // `/\btimed? ?out\b|timeout/i` against this whole message and files the
+        // row under `timeout` when it hits, so that phrasing would quietly move
+        // every unreachable form out of the bucket this ticket is measured in.
+        `The page was read ${rereads + 1} time${rereads === 0 ? "" : "s"}, each after waiting ` +
+        `for it to finish arriving. ` +
         (clickedApplyControl
           ? `A control was clicked while trying to reach the form, and its effect on the board is ` +
             `unconfirmed — this is NOT the same as "nothing happened". If that control's label ` +
