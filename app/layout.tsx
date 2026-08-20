@@ -30,6 +30,15 @@ export const metadata: Metadata = {
   title: "Jobinno: you sleep, AI applies",
   description:
     "An autonomous job application agent for CS interns and new grads. One resume and one short intake, then it fills and submits the real application forms for you.",
+  icons: {
+    icon: [
+      { url: "/favicon-light-32.png", sizes: "32x32", media: "(prefers-color-scheme: light)" },
+      { url: "/favicon-light-16.png", sizes: "16x16", media: "(prefers-color-scheme: light)" },
+      { url: "/favicon-dark-32.png", sizes: "32x32", media: "(prefers-color-scheme: dark)" },
+      { url: "/favicon-dark-16.png", sizes: "16x16", media: "(prefers-color-scheme: dark)" },
+    ],
+    apple: "/apple-icon-180.png",
+  },
 };
 
 export default function RootLayout({
