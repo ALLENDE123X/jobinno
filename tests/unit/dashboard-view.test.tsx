@@ -14,7 +14,7 @@
  * about what the button does. What it does is tested in
  * `tests/unit/dashboard-find-jobs-action.test.ts`.
  */
-import { render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@/app/dashboard/actions", () => ({
@@ -120,6 +120,23 @@ describe("the dashboard view", () => {
     expect(screen.getByRole("button", { name: "Find jobs now" })).toBeDisabled();
     expect(screen.getByText(/used every application on your plan/)).toBeInTheDocument();
     expect(screen.getByText("Nothing applied for yet")).toBeInTheDocument();
+  });
+
+  it("stops offering another search while the one just started is still running", async () => {
+    // The anti spam property, and it is UX rather than correctness: JOB-008's
+    // concurrency guard already makes a second press safe. What it does not fix
+    // is a button that snaps back to its resting state while a search that
+    // shows nothing for minutes is under way, which reads as a button that did
+    // nothing and invites another press.
+    render(<DashboardView email="me@example.com" quota={toQuota(0, 150)} applications={[]} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Find jobs now" }));
+    });
+
+    const button = screen.getByRole("button", { name: "Search running" });
+    expect(button).toBeDisabled();
+    expect(screen.getByText(/You can start another search in \d+ seconds/)).toBeInTheDocument();
   });
 
   it("tells an unprovisioned account to pick a plan rather than that it is full", () => {
