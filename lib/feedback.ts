@@ -17,9 +17,21 @@
  * anon key is the right client and no server route is needed. Passing it in
  * rather than reaching for a module level singleton keeps the insert callable
  * from a test with a stub that records what it was handed.
+ *
+ * ── Where the client comes from now, and why it moved (JOB-011) ─────────────
+ * This module used to build its own with `createClient` from
+ * `@supabase/supabase-js`, back when nothing else in the app owned a browser
+ * client. That client kept its session in `localStorage`, and Jobinno's never
+ * goes there: sign in finishes in `app/auth/callback/route.ts` on the server
+ * and the session is written to cookies, which is the whole reason
+ * `lib/supabase/client.ts` uses `createBrowserClient` from `@supabase/ssr`.
+ *
+ * So the private client could never see a signed in person. Every report it
+ * sent was stamped `user_id: null`, including the ones from people we could
+ * have written back to, and the column plus its index sat there collecting
+ * nulls. The widget now uses the app's own client and the private one is gone.
+ * `tests/unit/feedback-session.test.ts` holds that line.
  */
-
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 /** The three things a person can be telling us, in submission order. */
 export const FEEDBACK_CATEGORY_OPTIONS = [
@@ -132,33 +144,4 @@ export async function submitFeedback(
       message: thrown instanceof Error ? thrown.message : "Unknown failure.",
     };
   }
-}
-
-let cachedClient: SupabaseClient | null = null;
-
-/**
- * The browser client, created on first use rather than at import time, and then
- * kept. Each `createClient` call builds its own auth client with its own
- * storage listeners, so building a fresh one per submission would accumulate
- * them for as long as the tab is open.
- *
- * This exists only because nothing else in the app owns an app side Supabase
- * client yet. JOB-007 is building the auth flow and will bring its own. When it
- * lands this should be deleted in favour of that one, not kept as a second
- * client alongside it.
- */
-export function createFeedbackClient(): SupabaseClient | null {
-  if (cachedClient) {
-    return cachedClient;
-  }
-
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  if (!url || !anonKey) {
-    return null;
-  }
-
-  cachedClient = createClient(url, anonKey);
-  return cachedClient;
 }
