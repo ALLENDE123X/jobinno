@@ -35,6 +35,38 @@
  * events on the landing page get stitched to the real person the moment they
  * sign in, and `reset()` on sign out stops the next person on a shared machine
  * inheriting the previous one's id.
+ *
+ * ── Why `capture_exceptions` and `enable_heatmaps` are pinned rather than
+ *    left undefined ──────────────────────────────────────────────────────────
+ * Leaving either undefined does not mean "off". It means "ask PostHog's own
+ * dashboard", because both fall back to a remote config flag when the local
+ * config says nothing, and that flag can be flipped on with zero code change
+ * and no PR. For `capture_exceptions` that is browser `$exception` capture —
+ * error message, full stack trace, `$current_url` — on every page, including
+ * the ones holding a resume and a work authorization answer, bypassing this
+ * file's property allowlist entirely since PostHog builds that payload
+ * itself. `enable_heatmaps` is the same remote-gating shape for a smaller
+ * payload — pinned `false` for the same reason, one line, while here.
+ *
+ * ── Why `$geoip_disable` is registered as a super property ──────────────────
+ * PostHog derives `$geoip_city_name`, `$geoip_country_name` and friends from
+ * the request's IP on every event by default, which is a person's
+ * approximate location riding along with page views this PR never put in an
+ * exclusion list. `$geoip_disable` is PostHog's own documented per-event opt
+ * out; registering it once makes it a property PostHog merges into every
+ * capture, `$pageview` included, without this file or `sanitizeProperties`
+ * having to touch it. It does not remove the request's source IP itself —
+ * that is a project level "Discard IP data" setting in the PostHog
+ * dashboard, outside what code here can reach.
+ *
+ * ── Why `before_send` strips the query string off `$current_url` ───────────
+ * `$current_url` is `window.location.href` at capture time, and
+ * `app/login/page.tsx` renders whatever `app/auth/callback/route.ts` put in
+ * `?error=`, which includes Supabase's own `error_description` reflected
+ * back verbatim rather than one of this app's own fixed sentences. A
+ * `$pageview` fired on that URL would carry that text into `$current_url`
+ * unfiltered. Stripping the query string (and hash) before send closes that
+ * for every capture, not just the pageview effect below.
  */
 
 import { useEffect } from "react";
@@ -101,7 +133,34 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
         // took. Nothing is learned from every stray click that is worth
         // hoovering up the labels of controls on a page full of personal data.
         autocapture: false,
+        // See the header: left undefined, both of these ask PostHog's remote
+        // config instead of staying off.
+        capture_exceptions: false,
+        enable_heatmaps: false,
+        // See the header. `cr` is null on a capture PostHog decided not to
+        // send at all — nothing to strip, hand it back unchanged.
+        before_send: (cr) => {
+          if (!cr) return cr;
+
+          const currentUrl = cr.properties?.$current_url;
+          if (typeof currentUrl === "string") {
+            try {
+              const url = new URL(currentUrl);
+              url.search = "";
+              url.hash = "";
+              cr.properties.$current_url = url.toString();
+            } catch {
+              // Not a parseable URL. Leave it alone rather than guess.
+            }
+          }
+
+          return cr;
+        },
       });
+      // See the header. Applies to every capture from here on, `$pageview`
+      // included, because it is a super property rather than an argument to
+      // any one `capture()` call.
+      posthog.register({ $geoip_disable: true });
       started = true;
     } catch (err) {
       console.warn(

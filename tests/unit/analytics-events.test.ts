@@ -85,6 +85,35 @@ function restore(name: string, value: string | undefined) {
   else process.env[name] = value;
 }
 
+/**
+ * Turns each alternative inside `EEO_FIELD_RE` into a plain string that
+ * regex is guaranteed to match, so the drift test above is checking the
+ * regex's own source rather than a separately maintained list of the words
+ * someone thought were in it.
+ *
+ * `EEO_FIELD_RE.source` is `\b(alt1|alt2|...)\b`. Every alternative is
+ * either a bare word or phrase (`gender`, `sexual orientation`) or a word
+ * carrying regex-only decoration: a `\w*`/`\w+` suffix, or an optional
+ * character class like `[-\s]?`. Both decorations are optional by
+ * construction (`\w*` matches zero characters, `?` makes the class
+ * optional), so deleting them rather than trying to expand them into a real
+ * word yields a string the regex was always going to accept — no domain
+ * knowledge about what "disabilit\w*" is short for required.
+ */
+function eeoProbeTerms(re: RegExp): string[] {
+  const body = re.source.replace(/^\\b\(/, "").replace(/\)\\b$/, "");
+
+  return body
+    .split("|")
+    .map((alternative) =>
+      alternative
+        .replace(/\\w[*+]/g, "") // `\w*` / `\w+` — the empty match is legal
+        .replace(/\[[^\]]*\]\??/g, "") // `[-\s]?` and its kin — optional, drop it
+        .replace(/\\/g, "") // any escaping backslash left over
+    )
+    .filter((term) => term.length > 0);
+}
+
 describe("what an event is allowed to carry", () => {
   it("keeps the properties an event declares", () => {
     const clean = sanitizeProperties(ANALYTICS_EVENT.APPLICATION_OUTCOME, {
@@ -150,25 +179,21 @@ describe("what an event is allowed to carry", () => {
     // This file decides which *analytics property* is. They are separate
     // regexes because that module imports Stagehand and this one ships to a
     // browser, so this test is what keeps them saying the same thing.
-    const terms = [
-      "gender",
-      "sex",
-      "race",
-      "ethnicity",
-      "hispanic",
-      "latino",
-      "veteran",
-      "disability",
-      "sexual orientation",
-      "lgbtq",
-      "transgender",
-      "self identify",
-      "demographic",
-    ];
+    //
+    // The probe terms come from `EEO_FIELD_RE.source` itself, via
+    // `eeoProbeTerms` below, rather than a hand typed list. A hand typed list
+    // only proves that the terms someone remembered to type still match both
+    // regexes; it cannot notice a term added to one regex and not the other,
+    // because it never looks at either regex again after being written. This
+    // failed to catch exactly that drift once already: adding `national
+    // origin` and `pregnan\w*` to `EEO_FIELD_RE` without touching
+    // `BANNED_KEY_RE` left the old hardcoded list green.
+    const terms = eeoProbeTerms(EEO_FIELD_RE);
+    expect(terms.length).toBeGreaterThan(10);
 
     for (const term of terms) {
-      expect(EEO_FIELD_RE.test(term), `EEO_FIELD_RE should match ${term}`).toBe(true);
-      expect(BANNED_KEY_RE.test(term), `BANNED_KEY_RE should match ${term}`).toBe(true);
+      expect(EEO_FIELD_RE.test(term), `EEO_FIELD_RE should match "${term}"`).toBe(true);
+      expect(BANNED_KEY_RE.test(term), `BANNED_KEY_RE should match "${term}"`).toBe(true);
     }
   });
 
@@ -392,7 +417,7 @@ describe("capturing when PostHog is configured", () => {
     expect(capture).toHaveBeenCalledWith({
       distinctId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
       event: "application_outcome",
-      properties: { status: "submitted", ats: "greenhouse" },
+      properties: { status: "submitted", ats: "greenhouse", $geoip_disable: true },
     });
     expect(flush).toHaveBeenCalledTimes(1);
   });
@@ -405,12 +430,30 @@ describe("capturing when PostHog is configured", () => {
     });
 
     // A batch waiting on a timer inside a Vercel function or an Inngest step is
-    // a batch that is never sent.
+    // a batch that is never sent, and a short timeout with no retries is what
+    // stops a PostHog outage turning into ~40s of blocking on a real request.
     expect(constructed).toHaveBeenCalledWith("phc_test_project_key", {
       host: "https://us.i.posthog.com",
       flushAt: 1,
       flushInterval: 0,
+      requestTimeout: 2000,
+      fetchRetryCount: 0,
     });
+  });
+
+  it("never lets the request's IP resolve to a city or country on any server event", async () => {
+    // $geoip_disable is added after sanitizeProperties runs, so it cannot be
+    // crowded out by an allowlist and is not something a caller can pass in
+    // or override via `properties`.
+    await captureServerEvent({
+      event: ANALYTICS_EVENT.SEARCH_REQUESTED,
+      distinctId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+      properties: { source: "cron" },
+    });
+
+    expect(capture).toHaveBeenCalledWith(
+      expect.objectContaining({ properties: expect.objectContaining({ $geoip_disable: true }) })
+    );
   });
 
   it("costs the cron one flush rather than one per person", async () => {

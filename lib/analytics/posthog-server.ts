@@ -39,6 +39,19 @@
  * is never sent. `flushAt: 1` with an awaited `flush()` is PostHog's documented
  * answer for serverless, and `captureServerEvents` exists so that the cron's
  * hundred people cost one flush rather than a hundred.
+ *
+ * ── Why the client is built with a short timeout and no retries ─────────────
+ * `posthog-node`'s own defaults are `requestTimeout: 10000` and
+ * `fetchRetryCount: 3` with a `fetchRetryDelay` of `3000`, which is up to
+ * about 40 seconds of retrying before a call to this file's `flush()`
+ * resolves. That flush sits inline, awaited, in three user facing paths: the
+ * sign in redirect in `app/auth/callback/route.ts`, `submitIntake`, and
+ * `findJobsNow`. A PostHog outage on its own defaults would turn into up to
+ * 40 seconds of added latency on those, sign in included — a plausible 504
+ * caused entirely by the least important thing happening on that request.
+ * `requestTimeout: 2000` and `fetchRetryCount: 0` make one fast attempt and
+ * give up rather than retry: a lost analytics event is an acceptable loss and
+ * a slow sign in is not.
  */
 
 import { PostHog } from "posthog-node";
@@ -84,6 +97,11 @@ function serverClient(): PostHog | null {
       // See the header. Serverless runtimes do not survive a timer.
       flushAt: 1,
       flushInterval: 0,
+      // See the header. `posthog-node`'s defaults add up to ~40s of blocking
+      // to a sign in, an intake submission, or a search request when PostHog
+      // is unreachable.
+      requestTimeout: 2000,
+      fetchRetryCount: 0,
     });
   } catch (err) {
     console.warn(`${LOG} could not start the PostHog client, capture is off: ${messageOf(err)}`);
@@ -135,7 +153,15 @@ export async function captureServerEvents(captures: readonly ServerCapture[]): P
       posthog.capture({
         distinctId,
         event: capture.event,
-        properties: sanitizeProperties(capture.event, capture.properties),
+        properties: {
+          ...sanitizeProperties(capture.event, capture.properties),
+          // PostHog derives $geoip_city_name/$geoip_country_name/etc. from
+          // the request's source IP unless told not to, and none of that is
+          // in this PR's exclusion list. The source IP of a Vercel function
+          // or an Inngest worker is not a fact worth allowlisting, so it is
+          // off outright. See the identical note in `components/analytics.tsx`.
+          $geoip_disable: true,
+        },
       });
     } catch (err) {
       console.warn(`${LOG} could not capture ${capture.event}: ${messageOf(err)}`);
