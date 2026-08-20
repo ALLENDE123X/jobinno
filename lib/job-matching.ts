@@ -361,10 +361,18 @@ export type MatchInput = {
  * query and a listing in a discipline nobody here asked for. It earns that
  * trust only since the ingest filter was corrected to require a software title
  * AND an internship or new grad role: under the "or" it replaced, "Marketing
- * Intern" and "Investment Banking Summer Analyst Internship" were rows in this
- * table, and a title blind match would have fanned real applications out to
- * them. Nothing here re-checks the discipline, so a widening of that filter is
+ * Intern" and "Investment Banking Summer Analyst Internship" were written to
+ * this table, and a title blind match fans real applications out to whatever is
+ * in it. Nothing here re-checks the discipline, so a widening of that filter is
  * a widening of what a scheduled search will apply to, with no second gate.
+ *
+ * Which is also why the correction is only half the fix. `board-ingest.ts`
+ * upserts and never prunes, so `jobs` is the accumulation of every version of
+ * that filter that has ever run, not the output of the current one. At the time
+ * of writing the live table holds 958 rows of which 848 are ones this
+ * classifier now rejects, and they are reachable from here until they are
+ * deleted. A row predating the fix is matched exactly as readily as a row
+ * written after it.
  *
  * ── The anti join ───────────────────────────────────────────────────────────
  * Any `applications` row for this person and this listing excludes it, whatever
