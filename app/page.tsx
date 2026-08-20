@@ -155,7 +155,7 @@ export default function Home() {
                 </span>
 
                 <h1 className="text-4xl font-semibold tracking-tight text-balance sm:text-5xl lg:text-6xl">
-                  You sleep. It applies.
+                  You sleep. AI applies.
                 </h1>
 
                 <p className="max-w-xl text-base text-pretty text-muted-foreground sm:text-lg">

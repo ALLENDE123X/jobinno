@@ -27,7 +27,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Jobinno: you sleep, it applies",
+  title: "Jobinno: you sleep, AI applies",
   description:
     "An autonomous job application agent for CS interns and new grads. One resume and one short intake, then it fills and submits the real application forms for you.",
 };
