@@ -78,7 +78,11 @@ npm run db:push      # push the schema straight to Postgres, no migration file
 
 npm run db:storage-bucket    # create the private resumes bucket, then read it back
 npm run supabase:auth-config # push supabase/config.toml to the project, then diff it
+
+npm run skip-rollup          # why applications stopped, across every user, last 7 days
 ```
+
+`skip-rollup` is the operator's view of `skip_log`. The dashboard already tells each person why their own applications stopped; this aggregates the same rows site wide, so that one ATS platform failing or one company's form asking a question the intake cannot answer is visible as a number rather than as a hunch. It only reads. `-- --days 30` widens the window and `-- --json` prints the same numbers for something else to consume.
 
 Schema changes go through `db:generate` and then `db:migrate`, always in that order and always both. `db:push` is for a scratch database only. Applying SQL to a real database by hand leaves drizzle's own bookkeeping table behind, and every migration after that fights the database instead of describing it.
 
