@@ -13,7 +13,7 @@ test("the app serves its home page", async ({ page }) => {
   const response = await page.goto("/");
   expect(response?.status()).toBeLessThan(400);
   await expect(
-    page.getByRole("heading", { level: 1, name: "You sleep. It applies." })
+    page.getByRole("heading", { level: 1, name: "You sleep. AI applies." })
   ).toBeVisible();
 });
 
