@@ -100,3 +100,6 @@ Four modules that implement the emailed security code flow. Nothing in the runni
 * Ported from: `/Users/pranavlende/code/actinno`. Read only, always.
 * Sibling project whose conventions this file adapts: `ALLENDE123X/propinno`.
 * Env: see `.env.example`, which splits variables into the ones code reads today and the ones provisioned ahead of the tickets that need them.
+
+
+<!-- Temporary test PR to confirm CodeRabbit is connected. Will be closed immediately after verifying. -->
