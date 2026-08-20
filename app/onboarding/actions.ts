@@ -23,20 +23,24 @@
  * that the answers arrived and that the person stood behind them, and the whole
  * point of a record like that is that its subject cannot write it. Migration
  * `0003_profiles_column_privileges` takes UPDATE on that column away from
- * `authenticated` for exactly that reason, so the stamp goes through the
- * service role, which is the only writer left.
+ * `authenticated` for exactly that reason, so the stamp goes through
+ * `recordAttestation`, which holds the only writer left.
+ *
+ * That same write is also where the Free plan's ten applications get granted,
+ * once, on a person's first completed intake. See
+ * `lib/onboarding/attestation.ts` for why that grant has to be part of this
+ * one statement rather than a second write here: this action can be reached a
+ * second time for a person already attested, and the module it calls is what
+ * makes that safe.
  */
 
 import { revalidatePath } from "next/cache";
 
 import { ANALYTICS_EVENT } from "@/lib/analytics/events";
 import { captureServerEvent } from "@/lib/analytics/posthog-server";
+import { recordAttestation } from "@/lib/onboarding/attestation";
 import { intakeFieldErrors, intakeSchema } from "@/lib/onboarding/intake-schema";
-import {
-  RESUMES_BUCKET,
-  createServerClient,
-  createServiceRoleClient,
-} from "@/lib/supabase/server";
+import { RESUMES_BUCKET, createServerClient } from "@/lib/supabase/server";
 
 export type IntakeResult =
   | { ok: true }
@@ -112,20 +116,22 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   //
   // Scoped by the id from `getUser()`, which is checked against the Auth server
   // rather than read out of a cookie. That matters more here than anywhere else
-  // in this file: the service role bypasses row level security, so this filter
-  // is the whole of what keeps the write on the right row.
-  const { error: attestationError } = await createServiceRoleClient()
-    .from("profiles")
-    .update({
-      attested_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", user.id);
-
-  if (attestationError) {
+  // in this file: `recordAttestation` writes through the direct Postgres
+  // connection `lib/application-quota.ts` and `lib/search-cooldown.ts` already
+  // use, which bypasses row level security the same way the service role did,
+  // so this id is the whole of what keeps the write on the right row. It is
+  // also, in the same statement, the one and only grant of the Free plan's ten
+  // applications: see `lib/onboarding/attestation.ts` for why that has to be
+  // conditional on `attested_at` still being null rather than something this
+  // action decides.
+  try {
+    await recordAttestation(user.id);
+  } catch (error) {
     return {
       ok: false,
-      message: `Could not record your confirmation: ${attestationError.message}`,
+      message: `Could not record your confirmation: ${
+        error instanceof Error ? error.message : "an unknown error"
+      }`,
     };
   }
 
