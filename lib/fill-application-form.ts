@@ -465,6 +465,9 @@ const STRUCTURAL_FLOOR_SCRIPT = `(() => ({
   fileInputs: document.querySelectorAll('input[type=file]').length,
   textAreas: document.querySelectorAll('textarea').length,
   iframes: document.querySelectorAll('iframe').length,
+  ordinaryInputs: document.querySelectorAll(
+    'input:not([type=hidden]):not([type=password]):not([type=file]), select'
+  ).length,
   textLength: ((document.body && document.body.innerText) || '').trim().length
 }))()`;
 
@@ -473,6 +476,21 @@ type StructuralFloor = {
   fileInputs: number;
   textAreas: number;
   iframes: number;
+  /**
+   * Every other control a person fills in: text, email, tel, date, radio,
+   * checkbox and every `select`. Read for JOB-021's settle check only, and
+   * deliberately not merged into anything `readFormSignals` reports.
+   *
+   * It exists because the other four counts are blind to the commonest way an
+   * application form arrives. A hydrating Ashby form mounts a column of plain
+   * text inputs, and unless it happens to bring a file upload or an iframe with
+   * it, none of `passwordFields`, `fileInputs`, `textAreas` or `iframes` moves
+   * at all. `textLength` usually does, because labels are text, but a form whose
+   * fields carry placeholders rather than visible labels can mount without
+   * lengthening `innerText` by a character. That page would have been read as
+   * settled after a single poll.
+   */
+  ordinaryInputs: number;
   textLength: number;
 };
 
@@ -485,6 +503,7 @@ async function readStructuralFloor(page: Page): Promise<StructuralFloor> {
     fileInputs: count(raw?.fileInputs),
     textAreas: count(raw?.textAreas),
     iframes: count(raw?.iframes),
+    ordinaryInputs: count(raw?.ordinaryInputs),
     textLength: count(raw?.textLength),
   };
 }
@@ -544,7 +563,8 @@ function stillBuilding(current: StructuralFloor, next: StructuralFloor): boolean
     next.passwordFields > current.passwordFields ||
     next.fileInputs > current.fileInputs ||
     next.textAreas > current.textAreas ||
-    next.iframes > current.iframes
+    next.iframes > current.iframes ||
+    next.ordinaryInputs > current.ordinaryInputs
   );
 }
 
@@ -1787,7 +1807,17 @@ async function reachApplicationForm(
 ): Promise<FormSignals> {
   let signals = after;
   let clickedApplyControl = false;
-  let rereads = 0;
+  /**
+   * Every look this function has had at the page, including the one that
+   * produced the signals it was handed.
+   *
+   * Starts at one because `signals` is always the product of a read, whether
+   * `completeVerification` made it or the branch below does. Counted rather than
+   * derived, because the failure message quotes it and there are three separate
+   * places a read happens: here, the re-read loop, and after each apply click.
+   * Deriving it from any one of them under-reports the others.
+   */
+  let pageReads = 1;
 
   if (signals === null || !signals.applicationFormPresent) {
     console.log(`${LOG} navigate → ${state.applyUrl}`);
@@ -1803,7 +1833,9 @@ async function reachApplicationForm(
     // The re-reads cost nothing on the path that check exists for: a page that
     // was substituted for this listing is a page with a form on it, so it is
     // never empty-handed and the loop below breaks on its first line.
-    ({ signals, rereads } = await rereadWhileTheFormCouldStillAppear(session, signals));
+    const settled = await rereadWhileTheFormCouldStillAppear(session, signals);
+    signals = settled.signals;
+    pageReads += settled.rereads;
   }
   // Unconditional, and not only on the branch that navigated. The `goto` above
   // is the redirect this catches most often, but the branch that skips it is
@@ -1835,6 +1867,7 @@ async function reachApplicationForm(
     if (clicked === null) break;
     clickedApplyControl = true;
     signals = await readFormSignals(session);
+    pageReads += 1;
     // The control that opens an application form is a link like any other, and
     // where it led is a fact about this run rather than about the listing.
     await assertStillOnTheBoard(session, state, "after clicking through to the application form");
@@ -1871,7 +1904,7 @@ async function reachApplicationForm(
         // `/\btimed? ?out\b|timeout/i` against this whole message and files the
         // row under `timeout` when it hits, so that phrasing would quietly move
         // every unreachable form out of the bucket this ticket is measured in.
-        `The page was read ${rereads + 1} time${rereads === 0 ? "" : "s"}, each after waiting ` +
+        `The page was read ${pageReads} time${pageReads === 1 ? "" : "s"}, each after waiting ` +
         `for it to finish arriving. ` +
         (clickedApplyControl
           ? `A control was clicked while trying to reach the form, and its effect on the board is ` +

@@ -38,6 +38,7 @@ const h = vi.hoisted(() => {
     fileInputs: number;
     textAreas: number;
     iframes: number;
+    ordinaryInputs: number;
     textLength: number;
   };
 
@@ -241,6 +242,7 @@ const h = vi.hoisted(() => {
     fileInputs: state.fileInputs,
     textAreas: 1,
     iframes: 0,
+    ordinaryInputs: 3,
     textLength: 4000,
   });
 
@@ -888,6 +890,7 @@ type StructuralFloorShape = {
   fileInputs: number;
   textAreas: number;
   iframes: number;
+  ordinaryInputs: number;
   textLength: number;
 };
 
@@ -919,6 +922,7 @@ describe("a careers page that is still hydrating when the browser arrives", () =
     fileInputs: 0,
     textAreas: 0,
     iframes: 0,
+    ordinaryInputs: 0,
     textLength: 0,
   };
 
@@ -928,6 +932,7 @@ describe("a careers page that is still hydrating when the browser arrives", () =
     fileInputs: 0,
     textAreas: 0,
     iframes: 2,
+    ordinaryInputs: 0,
     textLength: 474,
   };
 
@@ -944,6 +949,7 @@ describe("a careers page that is still hydrating when the browser arrives", () =
     fileInputs: 1,
     textAreas: 1,
     iframes: 2,
+    ordinaryInputs: 7,
     textLength: 6141,
   };
 
@@ -969,6 +975,28 @@ describe("a careers page that is still hydrating when the browser arrives", () =
     // And it got there by looking repeatedly rather than by waiting a fixed
     // time: three reads to see the page arrive, a fourth to see it stand still.
     expect(h.state.domReadsAtFirstExtract).toBeGreaterThanOrEqual(4);
+  });
+
+  it("keeps waiting when the only thing arriving is plain form inputs", async () => {
+    // The blind spot the other four counts have, and the commonest shape of the
+    // thing this ticket is about. A form mounting a column of text inputs moves
+    // no password, file, textarea or iframe count, and a form whose fields carry
+    // placeholders rather than visible labels does not lengthen `innerText`
+    // either. Without `ordinaryInputs` in the floor this page reads as settled
+    // on the second poll, and the extraction runs against a page with no fields.
+    const bare = { passwordFields: 0, fileInputs: 0, textAreas: 0, iframes: 1, textLength: 900 };
+    h.state.floors = [
+      { ...bare, ordinaryInputs: 0 },
+      { ...bare, ordinaryInputs: 4 },
+      { ...bare, ordinaryInputs: 9 },
+    ];
+
+    const result = await run();
+
+    expect(result.blockedReason).toBeNull();
+    expect(h.state.floorsAtExtract[0]?.ordinaryInputs).toBe(9);
+    // Four reads: three to watch the fields arrive, a fourth to see them stop.
+    expect(h.state.domReadsAtFirstExtract).toBe(4);
   });
 
   it("waits for content to attach before it reads anything at all", async () => {
@@ -1033,6 +1061,45 @@ describe("a careers page that is still hydrating when the browser arrives", () =
     expect(result.blockedReason).toContain("waiting for it to finish arriving");
   });
 
+  it("counts the reads it made after clicking an apply control", async () => {
+    // The count in that sentence has to be the whole truth or it is worse than
+    // no count at all. Reads happen in three places — the first one, the empty
+    // handed re-reads, and once after every apply click — and a message that
+    // reported only the first two would tell somebody the page was looked at
+    // once when it had in fact been looked at three times, on the very path
+    // where a click has already touched a real employer's site.
+    h.state.resolve = (instruction: string) =>
+      instruction.includes("opens this listing's job application form")
+        ? {
+            selector: "xpath=/html[1]/body[1]/main[1]/a[1]",
+            description: "the Apply for this job button",
+            replayed: false,
+          }
+        : null;
+    // An apply control that is there and never opens anything, which is what a
+    // button whose handler has not been wired up yet looks like.
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: true,
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("Could not reach the job application form");
+
+    // One read on arrival plus one after each of the two clicks. No re-reads:
+    // an apply control on screen is something to act on, so the page was never
+    // empty handed.
+    expect(h.state.extractCalls).toBe(3);
+    expect(result.blockedReason).toContain("read 3 times");
+
+    // And because a click happened, the message says its effect is unconfirmed
+    // rather than claiming nothing happened.
+    expect(result.blockedReason).toContain("A control was clicked");
+    expect(result.blockedReason).not.toContain("Nothing was clicked or typed.");
+  });
+
   it("does not spend its re-reads on a captcha", async () => {
     // A challenge is an answer, not an absence. Re-reading it costs a model call
     // per attempt and tells us nothing we did not already know on the first.
@@ -1082,6 +1149,7 @@ describe("a careers page that is still hydrating when the browser arrives", () =
       fileInputs: 0,
       textAreas: 1,
       iframes: 0,
+      ordinaryInputs: 3,
       textLength: 4000,
     });
     // Two structural reads to establish that the page is standing still, and no
