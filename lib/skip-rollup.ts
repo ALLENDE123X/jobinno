@@ -375,7 +375,7 @@ export function formatSkipRollup(rollup: SkipRollup): string {
     for (const entry of platform.byReason) lines.push(`      ${entry.reason}: ${entry.skips}`);
   }
 
-  lines.push("", "Boards that stopped the most runs:");
+  lines.push("", "Boards with the most skips:");
   if (rollup.topBoards.length === 0) lines.push("  none");
   for (const board of rollup.topBoards) {
     lines.push(`  ${board.company} on ${board.ats}: ${board.skips}`);
