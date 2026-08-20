@@ -22,8 +22,17 @@
  * at all, and pulling Stagehand into the graph to establish that would be cost
  * for nothing. The two halves meet at `requestJobSearch(userId)`, which both
  * files name explicitly.
+ *
+ * `@/lib/search-cooldown` is stubbed here for the same reason, and the work is
+ * split the same way. This file establishes that the action asks it, asks it
+ * last, and sends nothing when it says no. Whether the cooldown itself really
+ * refuses a second call is a claim about a conditional UPDATE under Postgres'
+ * row lock, and only Postgres can settle that: see
+ * `tests/unit/dashboard-find-jobs-cooldown.test.ts`, which drives the real one.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { SearchCooldown } from "@/lib/search-cooldown";
 
 // Typed with the parameter it really takes, so that a change to
 // `requestJobSearch`'s signature is a type error here rather than a mock that
@@ -35,9 +44,24 @@ const getUser = vi.fn();
 const profileRow = { attested_at: "2026-07-01T00:00:00.000Z", applications_used: 3, applications_cap: 150 };
 
 let profile: Record<string, unknown> | null = profileRow;
+/** Non null makes the profile read fail the way PostgREST reports a refusal. */
+let profileError: Record<string, unknown> | null = null;
+
+/** Allowed unless a test says otherwise. Typed, so a changed union is a type error here. */
+const claimSearchSlot = vi.fn(async (userId: string): Promise<SearchCooldown> => {
+  void userId;
+  return { allowed: true };
+});
 
 vi.mock("@/lib/job-search-trigger", () => ({
   requestJobSearch: (userId: string) => requestJobSearch(userId),
+}));
+
+// Partial, so `describeRetryAfter` stays the real one: the sentence a refused
+// caller reads is assembled from it, and a stub would be asserting on itself.
+vi.mock("@/lib/search-cooldown", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/search-cooldown")>()),
+  claimSearchSlot: (userId: string) => claimSearchSlot(userId),
 }));
 
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
@@ -49,7 +73,7 @@ vi.mock("@/lib/supabase/server", () => ({
       const chain: Record<string, unknown> = {
         select: () => chain,
         eq: () => chain,
-        maybeSingle: async () => ({ data: profile, error: null }),
+        maybeSingle: async () => ({ data: profileError ? null : profile, error: profileError }),
       };
       return chain;
     },
@@ -62,7 +86,10 @@ const SESSION_USER = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
 
 beforeEach(() => {
   requestJobSearch.mockClear();
+  claimSearchSlot.mockClear();
+  claimSearchSlot.mockResolvedValue({ allowed: true });
   profile = { ...profileRow };
+  profileError = null;
   getUser.mockResolvedValue({ data: { user: { id: SESSION_USER, email: "me@example.com" } } });
 });
 
@@ -127,5 +154,93 @@ describe("find jobs now", () => {
       message: "There are no applications on your plan yet, so there is nothing to search with.",
     });
     expect(requestJobSearch).not.toHaveBeenCalled();
+  });
+});
+
+describe("the cooldown, as this action uses it", () => {
+  it("sends nothing when the slot was refused, and says how long is left", async () => {
+    claimSearchSlot.mockResolvedValue({
+      allowed: false,
+      reason: "too_soon",
+      retryAfterSeconds: 240,
+    });
+
+    const result = await findJobsNow();
+
+    expect(result).toEqual({
+      ok: false,
+      message: "We are already looking. You can start another search in about 4 minutes.",
+    });
+    expect(requestJobSearch).not.toHaveBeenCalled();
+  });
+
+  it("claims the slot for the session's user and nobody else", async () => {
+    await findJobsNow();
+
+    expect(claimSearchSlot).toHaveBeenCalledWith(SESSION_USER);
+  });
+
+  it("does not spend a window on a call the cap was going to refuse anyway", async () => {
+    // Order matters, because the claim writes. Charging somebody a cooldown for
+    // a request that was refused for a different reason is charging them for a
+    // refusal, and it would lock them out for minutes at a time at the cap.
+    profile = { ...profileRow, applications_used: 150, applications_cap: 150 };
+
+    await findJobsNow();
+
+    expect(claimSearchSlot).not.toHaveBeenCalled();
+  });
+
+  it("refuses without naming the database when the claim itself fails", async () => {
+    claimSearchSlot.mockRejectedValue(new Error('relation "profiles" does not exist'));
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await findJobsNow();
+
+    expect(result).toEqual({
+      ok: false,
+      message: "We could not start that search. Try again in a moment.",
+    });
+    expect(requestJobSearch).not.toHaveBeenCalled();
+    expect(logged.mock.calls.flat().join(" ")).toContain('relation "profiles" does not exist');
+    logged.mockRestore();
+  });
+
+  it("says nothing about our own infrastructure when the send fails", async () => {
+    // Inngest's failures name the event key and the endpoint it tried. That is
+    // ours, not the caller's, and a server action's response body is readable by
+    // whoever called it.
+    requestJobSearch.mockRejectedValueOnce(
+      new Error("failed to send to https://inn.gs/e/signkey-prod-abc123: 401")
+    );
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await findJobsNow();
+
+    expect(result).toEqual({
+      ok: false,
+      message: "We could not start that search. Try again in a moment.",
+    });
+    expect(JSON.stringify(result)).not.toContain("signkey-prod-abc123");
+    expect(logged.mock.calls.flat().join(" ")).toContain("signkey-prod-abc123");
+    logged.mockRestore();
+  });
+
+  it("says nothing about the database when the profile read fails", async () => {
+    // The other half of the same path. `readDashboardProfile` already logs and
+    // throws its own sentence; this asserts the action does not widen that back
+    // out again for a client that fails some other way entirely.
+    profileError = { message: 'permission denied for table "profiles"', code: "42501" };
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await findJobsNow();
+
+    expect(result).toEqual({
+      ok: false,
+      message: "Could not load your profile right now. Try again in a moment.",
+    });
+    expect(JSON.stringify(result)).not.toContain("permission denied");
+    expect(requestJobSearch).not.toHaveBeenCalled();
+    logged.mockRestore();
   });
 });

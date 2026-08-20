@@ -28,6 +28,23 @@
  * `tests/unit/dashboard-data.test.ts` records what this module asks for and
  * checks each name against the real schema, which is the same two sided
  * approach `tests/unit/application-records.test.ts` takes for the same reason.
+ *
+ * ── Why the database's own words never leave this file ──────────────────────
+ * Both reads used to interpolate `error.message` into what they threw, and both
+ * sit on a path that ends in text rendered in somebody's browser: the page calls
+ * them directly, and `app/dashboard/actions.ts` catches them and hands the
+ * message back to the button. PostgREST and Postgres write those messages for
+ * whoever holds the connection, not for the person at the other end of it, so
+ * they name tables, columns, constraints and policies as they really are. "new
+ * row violates row level security policy for table profiles" is one sentence
+ * that teaches a stranger the shape of this schema.
+ *
+ * A server action is a public HTTP endpoint, which is what makes that more than
+ * an untidy error message: anything can POST at the action behind the button and
+ * read whatever comes back. So the real failure is logged where an engineer can
+ * read it, and a fixed sentence is what goes to the browser. The two sentences
+ * are exported so the tests assert on the strings this module really throws
+ * rather than on copies of them.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -98,6 +115,43 @@ export const DASHBOARD_SELECTS = {
 } as const;
 
 /**
+ * Everything a failed read is allowed to say out loud.
+ *
+ * Two sentences, one per query, and neither carries a detail the database
+ * supplied. They are the whole vocabulary on purpose: a set that grows a case
+ * per error code grows back towards describing the failure, and describing the
+ * failure is what this is here to stop. See the header.
+ */
+export const DASHBOARD_READ_FAILED = {
+  applications: "Could not load your applications right now. Try again in a moment.",
+  profile: "Could not load your profile right now. Try again in a moment.",
+} as const;
+
+/**
+ * Logs what really happened, then throws what the person may be told.
+ *
+ * Every field PostgREST fills in goes to the log, because `message` alone often
+ * is not enough to tell a missing column from a policy that refused the row, and
+ * the log is now the only place either is visible. `userId` goes with it so a
+ * report of "my dashboard is broken" can be matched to a line.
+ */
+function failRead(where: string, userId: string, error: unknown, shown: string): never {
+  const detail = error as { message?: unknown; code?: unknown; details?: unknown; hint?: unknown };
+
+  console.error(
+    `[job-009] ${where} failed for user ${userId}:`,
+    {
+      message: String(detail?.message ?? error),
+      code: detail?.code ?? null,
+      details: detail?.details ?? null,
+      hint: detail?.hint ?? null,
+    }
+  );
+
+  throw new Error(shown);
+}
+
+/**
  * The person's applications, newest first.
  *
  * `userId` comes from `supabase.auth.getUser()` at the call site and never from
@@ -115,7 +169,7 @@ export async function listApplications(
     .order("created_at", { ascending: false })
     .limit(DASHBOARD_APPLICATION_LIMIT);
 
-  if (error) throw new Error(`Could not read your applications: ${error.message}`);
+  if (error) failRead("listApplications", userId, error, DASHBOARD_READ_FAILED.applications);
 
   // Cast through `unknown`: `@supabase/supabase-js` types a select string it
   // cannot parse as an error shape rather than as a row, and this project has no
@@ -134,7 +188,7 @@ export async function readDashboardProfile(
     .eq("id", userId)
     .maybeSingle();
 
-  if (error) throw new Error(`Could not read your profile: ${error.message}`);
+  if (error) failRead("readDashboardProfile", userId, error, DASHBOARD_READ_FAILED.profile);
   if (!data) return null;
 
   const row = first(data) ?? {};

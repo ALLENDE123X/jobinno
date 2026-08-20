@@ -26,14 +26,23 @@
  * either: CI's `auth.uid()` is a stub that returns null, so no policy ever
  * matches a row. The filter above is what this suite can prove, and the policy
  * behind it is proven in `tests/unit/db-schema.test.ts`.
+ *
+ * ── And why a suite about what an error does not say ────────────────────────
+ * The last block is the other half of the same worry. Both reads sit on a path
+ * that ends in text in somebody's browser, and Postgres writes its errors for
+ * whoever holds the connection: they name tables, columns, constraints and
+ * policies as they really are. So the assertion there is not that a tidy message
+ * comes back. It is that no fragment of the database's own wording survives into
+ * anything the caller receives, and that all of it survives into the log.
  */
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import postgres from "postgres";
 
 import {
   DASHBOARD_APPLICATION_LIMIT,
+  DASHBOARD_READ_FAILED,
   DASHBOARD_SELECTS,
   listApplications,
   readDashboardProfile,
@@ -257,6 +266,139 @@ describe("the quota arithmetic", () => {
 
   it("never reports a negative remainder if a counter ever overshoots", () => {
     expect(toQuota(160, 150)).toEqual({ used: 160, cap: 150, remaining: 0, atCap: true });
+  });
+});
+
+// ───────────────────────────────────
+// What a failed read is allowed to say
+// ───────────────────────────────────
+
+/**
+ * A real PostgREST error object, in the shape `@supabase/supabase-js` hands
+ * back: `message`, `code`, `details` and `hint`, every one of them describing
+ * the database rather than the request. The four strings below are what must
+ * not appear in anything a caller receives.
+ */
+const POSTGREST_ERROR = {
+  message: 'new row violates row level security policy for table "profiles"',
+  code: "42501",
+  details: 'Failing row contains (3f2504e0, pro, 150, 2026-07-01).',
+  hint: 'Perhaps you meant to reference the column "applications.user_id".',
+};
+
+const LEAKED_STRINGS = [
+  POSTGREST_ERROR.message,
+  POSTGREST_ERROR.code,
+  POSTGREST_ERROR.details,
+  POSTGREST_ERROR.hint,
+  "row level security",
+  "applications.user_id",
+];
+
+/** A client whose every query fails, the way PostgREST reports a refused one. */
+function failingClient(error: unknown): SupabaseClient {
+  return {
+    from() {
+      const chain: Record<string, unknown> = {
+        select: () => chain,
+        eq: () => chain,
+        order: () => chain,
+        limit: () => chain,
+        maybeSingle: () => Promise.resolve({ data: null, error }),
+        then: (resolve: (value: { data: null; error: unknown }) => unknown) =>
+          Promise.resolve({ data: null, error }).then(resolve),
+      };
+      return chain;
+    },
+  } as unknown as SupabaseClient;
+}
+
+describe("a read the database refused", () => {
+  let logged: unknown[] = [];
+
+  /**
+   * Every argument the module logged, flattened to one searchable string.
+   *
+   * `JSON.stringify` would have been shorter and would have been wrong: it
+   * escapes the quotes Postgres puts around an identifier, so a search for
+   * `table "profiles"` finds nothing in a line that plainly contains it.
+   */
+  const loggedText = () =>
+    logged
+      .map((arg) =>
+        arg !== null && typeof arg === "object"
+          ? Object.values(arg as Record<string, unknown>).map(String).join(" ")
+          : String(arg)
+      )
+      .join(" ");
+
+  beforeEach(() => {
+    logged = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      logged.push(...args);
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("throws the fixed sentence for the applications list", async () => {
+    await expect(listApplications(failingClient(POSTGREST_ERROR), ME)).rejects.toThrow(
+      DASHBOARD_READ_FAILED.applications
+    );
+  });
+
+  it("throws the fixed sentence for the profile", async () => {
+    await expect(readDashboardProfile(failingClient(POSTGREST_ERROR), ME)).rejects.toThrow(
+      DASHBOARD_READ_FAILED.profile
+    );
+  });
+
+  it("carries none of the database's own words out of either function", async () => {
+    // The point of the ticket. Whatever the caller ends up rendering, it must
+    // not be able to reconstruct one word of what Postgres said, so the error
+    // is inspected whole rather than only through `.message`.
+    const reads: ((supabase: SupabaseClient, userId: string) => Promise<unknown>)[] = [
+      listApplications,
+      readDashboardProfile,
+    ];
+
+    for (const read of reads) {
+      const thrown = await read(failingClient(POSTGREST_ERROR), ME).then(
+        () => null,
+        (error: unknown) => error
+      );
+
+      expect(thrown).toBeInstanceOf(Error);
+      const error = thrown as Error;
+      const visible = `${error.message} ${JSON.stringify(error, Object.getOwnPropertyNames(error))}`;
+      for (const secret of LEAKED_STRINGS) {
+        expect([secret, visible.includes(secret)]).toEqual([secret, false]);
+      }
+    }
+  });
+
+  it("puts every one of those words in the log instead, with the user id", async () => {
+    // Losing the detail would be the other way to fail this ticket: an engineer
+    // still has to be able to tell a missing column from a policy that refused.
+    await listApplications(failingClient(POSTGREST_ERROR), ME).catch(() => {});
+
+    const line = loggedText();
+    expect(line).toContain("listApplications");
+    expect(line).toContain(ME);
+    for (const secret of LEAKED_STRINGS.slice(0, 4)) {
+      expect([secret, line.includes(secret)]).toEqual([secret, true]);
+    }
+  });
+
+  it("says nothing about the database even when the client throws a bare string", async () => {
+    // `error` is not always an object. A gateway in front of PostgREST can put
+    // an HTML page or a plain sentence there, and `String(error)` on it is just
+    // as much somebody else's words as a `message` field would have been.
+    await expect(
+      readDashboardProfile(failingClient("relation \"profiles\" does not exist"), ME)
+    ).rejects.toThrow(DASHBOARD_READ_FAILED.profile);
   });
 });
 

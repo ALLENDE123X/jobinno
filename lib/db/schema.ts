@@ -209,6 +209,22 @@ export const profiles = pgTable(
      */
     attestedAt: timestamp("attested_at", { withTimezone: true }),
 
+    /**
+     * When a job search was last asked for on this person's behalf. The whole of
+     * the server side rate limit on the dashboard's "Find Jobs Now" button; see
+     * `lib/search-cooldown.ts` for why it is a column and not a derived signal.
+     *
+     * Ours, not the person's, so it stays out of `0003_profiles_column_privileges.sql`'s
+     * grant list deliberately: `authenticated` holds no table wide UPDATE on
+     * `profiles` any more, which leaves this writable only by the service role
+     * and by the Drizzle connection. A rate limit the rate limited party can
+     * reset is not a rate limit.
+     *
+     * Null means nobody has ever pressed the button for them, which is the state
+     * of every row that predates this column and of every new signup.
+     */
+    lastSearchRequestedAt: timestamp("last_search_requested_at", { withTimezone: true }),
+
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

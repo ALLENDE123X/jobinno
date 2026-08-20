@@ -23,13 +23,29 @@
  * before any application exists. That is the documented contract and the honest
  * one: a fan out takes minutes to hours, and the outcome arrives as rows in the
  * list below, not as a return value here.
+ *
+ * ── The third refusal, and why it is last ───────────────────────────────────
+ * `claimSearchSlot` is the real rate limit; the button's cooldown is React
+ * state and a script never rendered it. It runs after the other two checks
+ * because it writes: spending somebody's window on a call that was going to be
+ * refused for being over the cap would be charging them for a refusal. See
+ * `lib/search-cooldown.ts`.
+ *
+ * ── What a failure is allowed to say ────────────────────────────────────────
+ * Every message below is a fixed sentence written here. None is built from an
+ * error somebody else's library produced, because this is a public HTTP endpoint
+ * and its response body is readable by whoever called it: a Postgres error names
+ * tables and policies, and an Inngest one names our own infrastructure. The real
+ * text goes to the log instead. `lib/dashboard/dashboard-data.ts` holds the same
+ * line for the reads it owns.
  */
 
 import { revalidatePath } from "next/cache";
 
 import { requestJobSearch } from "@/lib/job-search-trigger";
 import { createServerClient } from "@/lib/supabase/server";
-import { readDashboardProfile } from "@/lib/dashboard/dashboard-data";
+import { DASHBOARD_READ_FAILED, readDashboardProfile } from "@/lib/dashboard/dashboard-data";
+import { claimSearchSlot, describeRetryAfter } from "@/lib/search-cooldown";
 
 export type FindJobsResult = { ok: true } | { ok: false; message: string };
 
@@ -48,7 +64,12 @@ export async function findJobsNow(): Promise<FindJobsResult> {
   try {
     profile = await readDashboardProfile(supabase, user.id);
   } catch (error) {
-    return { ok: false, message: messageOf(error) };
+    // `readDashboardProfile` has already logged the real failure and thrown one
+    // of its own fixed sentences. This does not repeat what it threw anyway: a
+    // client that fails before PostgREST answers, on DNS or on a socket, throws
+    // through this same catch and its message is ours to keep quiet about too.
+    logFailure("readDashboardProfile", user.id, error);
+    return { ok: false, message: DASHBOARD_READ_FAILED.profile };
   }
 
   if (!profile?.attestedAt) {
@@ -68,10 +89,32 @@ export async function findJobsNow(): Promise<FindJobsResult> {
     };
   }
 
+  let slot;
+  try {
+    slot = await claimSearchSlot(user.id);
+  } catch (error) {
+    logFailure("claimSearchSlot", user.id, error);
+    return { ok: false, message: COULD_NOT_START };
+  }
+
+  if (!slot.allowed) {
+    return {
+      ok: false,
+      message:
+        slot.reason === "too_soon"
+          ? `We are already looking. You can start another search in ${describeRetryAfter(slot.retryAfterSeconds)}.`
+          : COULD_NOT_START,
+    };
+  }
+
   try {
     await requestJobSearch(user.id);
   } catch (error) {
-    return { ok: false, message: `We could not start that search: ${messageOf(error)}` };
+    // Nothing here is repeatable to the browser. `requestJobSearch` throws with
+    // the id it was given when the id is malformed, and Inngest throws with our
+    // own event key and endpoint when it will not accept the event.
+    logFailure("requestJobSearch", user.id, error);
+    return { ok: false, message: COULD_NOT_START };
   }
 
   // The rows this search produces arrive over the next several minutes, so this
@@ -81,6 +124,13 @@ export async function findJobsNow(): Promise<FindJobsResult> {
   return { ok: true };
 }
 
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/** The one sentence every failure that is not the person's doing comes back as. */
+const COULD_NOT_START = "We could not start that search. Try again in a moment.";
+
+/** The real failure, in the log, where it is an engineer reading it and not a caller. */
+function logFailure(where: string, userId: string, error: unknown): void {
+  console.error(
+    `[job-009] ${where} failed for user ${userId}:`,
+    error instanceof Error ? error.message : String(error)
+  );
 }
