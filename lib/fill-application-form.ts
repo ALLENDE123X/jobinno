@@ -141,6 +141,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { APPLICATION_STATUS, type ApplicationStatus } from "@/lib/application-status";
+import { checkApplyUrl } from "@/lib/apply-url-guard";
 // Single source of truth for "which domains may speak for this board". ACT-006
 // applies it when it decides a link is safe to *report*; this module applies it
 // again before it is safe to *open*. Importing it costs a googleapis module load
@@ -886,6 +887,26 @@ export class FormFillBlockedError extends Error {
 }
 
 /**
+ * The apply URL on the row is not one this pipeline will open. See
+ * `loadApplicationState`, which is the only thing that throws it.
+ *
+ * A `FormFillBlockedError`, because that is what it is: a stop for a human, and
+ * a retry into the same wall would be pointless. It carries the listing and the
+ * platform because it is thrown before `runFill` holds an `ApplicationState`,
+ * and a `skip_log` row needs both.
+ */
+export class BlockedApplyUrlError extends FormFillBlockedError {
+  constructor(
+    message: string,
+    readonly jobId: string,
+    readonly ats: string
+  ) {
+    super(message);
+    this.name = "BlockedApplyUrlError";
+  }
+}
+
+/**
  * The last gate in front of every click this module makes.
  *
  * `create-board-account.ts` established the rule at control level — a control
@@ -1163,7 +1184,7 @@ async function loadApplicationState(
   // that as three empty strings would be a worse failure than saying so.
   const { data: rows, error } = await supabase
     .from("applications")
-    .select("id,user_id,job_id,status,jobs!inner(title,url,ats,boards!inner(company))")
+    .select("id,user_id,job_id,status,jobs!inner(title,url,ats,boards!inner(company,board_token))")
     .eq("id", jobApplicationId)
     .limit(1);
   if (error) throw new Error(`applications lookup failed: ${error.message}`);
@@ -1198,6 +1219,30 @@ async function loadApplicationState(
   const applyUrl = String(job.url ?? "");
   if (applyUrl === "") {
     throw new Error(`applications ${jobApplicationId} points at a job with no url.`);
+  }
+
+  // ── The last gate in front of the first navigation ────────────────────────
+  // `lib/board-ingest.ts` screens the same URL before it is ever stored, and
+  // that is the primary gate. This one is not a duplicate of it. Two paths
+  // reach here with a row ingest never saw: `lib/fill-form-cli.ts` and
+  // `lib/submit-application-cli.ts`, both of which take an application id or an
+  // apply URL a human typed. And every row written before the ingest screen
+  // existed is still in the table. A comment saying "ingest already checked
+  // this" would be true of neither, which is why the rule is applied and not
+  // assumed. See `lib/apply-url-guard.ts` for what it is.
+  const verdict = checkApplyUrl(applyUrl, {
+    ats: String(job.ats ?? ""),
+    boardToken: String(board.board_token ?? ""),
+  });
+  if (!verdict.ok) {
+    throw new BlockedApplyUrlError(
+      `Refusing to open the apply URL on applications ${jobApplicationId}: ${verdict.reason}. ` +
+        `Nothing was opened, nothing was typed and no resume was uploaded. A listing URL is ` +
+        `where this pipeline uploads a real person's resume, so it is only ever followed to a ` +
+        `board the listing itself came from.`,
+      jobId,
+      String(job.ats ?? "")
+    );
   }
 
   // The person, their answers and their resume, all from `loadCandidate` rather
@@ -2807,7 +2852,35 @@ async function runFill(
 
   const supabase = getSupabaseClient();
   const jobApplicationId = input.jobApplicationId.trim();
-  const state = await loadApplicationState(supabase, jobApplicationId);
+
+  // The apply URL is checked inside `loadApplicationState`, which runs before
+  // the try below and so before the catch that records a blocked run. A refused
+  // URL still has to leave the row in a state that says what happened, and it
+  // is the one stop that can happen this early, so it is recorded here.
+  let state: ApplicationState;
+  try {
+    state = await loadApplicationState(supabase, jobApplicationId);
+  } catch (err) {
+    if (err instanceof BlockedApplyUrlError) {
+      await recordFailure(supabase, {
+        applicationId: jobApplicationId,
+        jobId: err.jobId,
+        ats: err.ats,
+        status: APPLICATION_STATUS.FORM_FILL_BLOCKED,
+        // Named rather than derived. `skipReasonFor` reads the message for a
+        // tag it recognises, and none of the six reasons in the closed set is
+        // this one: `dom_changed` is the documented fallback for a run that
+        // stopped against a page that is not what the automation expected, and
+        // a listing pointing somewhere the board does not own is exactly that.
+        // A reason of its own is worth having and needs a migration, so it is a
+        // ticket rather than a line here.
+        reason: "dom_changed",
+        message: err.message,
+        log: LOG,
+      });
+    }
+    throw err;
+  }
 
   console.log(
     `${LOG} applications ${jobApplicationId} — ${state.company} / ${state.jobTitle} ` +

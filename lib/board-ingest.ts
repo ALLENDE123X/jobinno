@@ -30,6 +30,7 @@
 
 import { and, eq, inArray, sql } from "drizzle-orm";
 
+import { checkApplyUrl, forLog } from "@/lib/apply-url-guard";
 import {
   harvestBoardsFromListingRepos,
   placeholderCompanyName,
@@ -122,6 +123,8 @@ export type IngestOutcome = {
   seen: number;
   /** Listings that survived it and were written. */
   kept: number;
+  /** Listings dropped because their apply URL failed `checkApplyUrl`. */
+  rejected: number;
   reason?: string;
 };
 
@@ -137,22 +140,28 @@ export async function ingestBoard(board: BoardRow): Promise<IngestOutcome> {
 
   const result = await readBoardFeed(board.ats, board.boardToken);
   if (result.status !== "ok") {
-    return { ...base, status: result.status, seen: 0, kept: 0, reason: result.reason };
+    return { ...base, status: result.status, seen: 0, kept: 0, rejected: 0, reason: result.reason };
   }
 
   const relevant = result.feed.jobs
     .map((job) => ({ job, relevance: classifyTitle(job.title) }))
-    .filter((entry) => entry.relevance.relevant);
+    .filter((entry) => entry.relevance.relevant)
+    .map(({ job, relevance }) => ({
+      job,
+      isIntern: relevance.isIntern,
+      isNewGrad: relevance.isNewGrad,
+    }));
 
-  if (relevant.length > 0) {
-    await upsertJobs(
-      board,
-      relevant.map(({ job, relevance }) => ({
-        job,
-        isIntern: relevance.isIntern,
-        isNewGrad: relevance.isNewGrad,
-      }))
+  const { kept, rejected } = screenApplyUrls(board, relevant);
+  for (const drop of rejected) {
+    console.warn(
+      `[sec] ${board.ats}/${board.boardToken}: dropped listing ${forLog(drop.externalId, 120)} ` +
+        `because ${drop.reason}. The url was ${JSON.stringify(forLog(drop.url))}.`
     );
+  }
+
+  if (kept.length > 0) {
+    await upsertJobs(board, kept);
   }
 
   await db()
@@ -168,11 +177,62 @@ export async function ingestBoard(board: BoardRow): Promise<IngestOutcome> {
     ...base,
     status: "ok",
     seen: result.feed.jobs.length,
-    kept: relevant.length,
+    kept: kept.length,
+    rejected: rejected.length,
   };
 }
 
 type ClassifiedJob = { job: FeedJob; isIntern: boolean; isNewGrad: boolean };
+
+/** One listing this board published that will not be written, and why. */
+export type RejectedListing = { externalId: string; url: string; reason: string };
+
+/**
+ * Splits a board's listings into the ones whose apply URL may be stored and the
+ * ones whose may not.
+ *
+ * ── Why a rejected listing is dropped rather than fatal ─────────────────────
+ * Failing the board, or the sync, would hand any single tenant on any of these
+ * platforms a switch that turns off everybody else's job discovery: one bad
+ * `applyUrl` in one posting would stop the other sixty two boards in the run
+ * from ever being read. That is the same reasoning `ingestBoard` already
+ * applies to a board that is offline, and it points the same way here. The
+ * listing is dropped, the reason is logged with the URL that caused it, and the
+ * count comes back on the outcome so a spike is visible rather than silent.
+ *
+ * A dropped listing loses nothing recoverable either. It is one posting that
+ * cannot be applied to through this pipeline, and the alternative was applying
+ * to it with somebody's real resume at an address the ATS platform does not
+ * control.
+ *
+ * Exported so the screen can be tested without a database, which is where the
+ * interesting cases are.
+ */
+export function screenApplyUrls(
+  board: Pick<BoardRow, "ats" | "boardToken">,
+  entries: readonly ClassifiedJob[]
+): { kept: ClassifiedJob[]; rejected: RejectedListing[] } {
+  const kept: ClassifiedJob[] = [];
+  const rejected: RejectedListing[] = [];
+
+  for (const entry of entries) {
+    const verdict = checkApplyUrl(entry.job.url, {
+      ats: board.ats,
+      boardToken: board.boardToken,
+    });
+    if (verdict.ok) {
+      kept.push(entry);
+    } else {
+      rejected.push({
+        externalId: entry.job.externalId,
+        url: entry.job.url,
+        reason: verdict.reason,
+      });
+    }
+  }
+
+  return { kept, rejected };
+}
 
 /**
  * One entry per `external_id`, first occurrence winning. See `upsertJobs` for
@@ -287,6 +347,8 @@ export type IngestSummary = {
   failed: number;
   seen: number;
   kept: number;
+  /** Listings dropped by `screenApplyUrls`. Should be zero, and is worth watching. */
+  rejected: number;
 };
 
 /**
@@ -319,6 +381,7 @@ export async function ingestBoards(
           status: "failed",
           seen: 0,
           kept: 0,
+          rejected: 0,
           reason: err instanceof Error ? err.message : String(err),
         };
       }
@@ -333,7 +396,15 @@ export async function ingestBoards(
     failed: outcomes.filter((outcome) => outcome.status === "failed").length,
     seen: outcomes.reduce((total, outcome) => total + outcome.seen, 0),
     kept: outcomes.reduce((total, outcome) => total + outcome.kept, 0),
+    rejected: outcomes.reduce((total, outcome) => total + outcome.rejected, 0),
   };
+
+  if (summary.rejected > 0) {
+    console.warn(
+      `[sec] ${summary.rejected} listing(s) were dropped because their apply URL did not ` +
+        `belong to the board that published them. See the [sec] lines above for each one.`
+    );
+  }
 
   for (const outcome of outcomes) {
     if (outcome.status === "failed") {

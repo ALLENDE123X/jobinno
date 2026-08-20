@@ -120,6 +120,52 @@ const SUBDOMAIN_HOSTS: readonly { suffix: string; ats: AtsPlatform }[] = [
 ];
 
 /**
+ * Where a hostname's tenant lives, for the hosts above.
+ *
+ * `path` means the host is one the vendor operates for every one of its
+ * customers (`jobs.lever.co`) and the tenant is in the path. `hostname` means
+ * the tenant is the leftmost label and the host itself names the customer
+ * (`bunq.recruitee.com`). The distinction matters to
+ * `lib/apply-url-guard.ts`, which is allowed to be slightly more forgiving
+ * about a shared vendor host than about a per customer one.
+ */
+export type AtsHostMatch =
+  | { ats: AtsPlatform; tenantIn: "path" }
+  | { ats: AtsPlatform; tenantIn: "hostname"; suffix: string };
+
+/** A hostname, lowercased with any root label dot removed. */
+function normalizeHost(rawHost: string): string {
+  return String(rawHost ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
+}
+
+/**
+ * The ATS platform that operates a hostname, or `null` when no supported
+ * platform does.
+ *
+ * The single reader of both host tables above, so that "is this host really
+ * this platform's?" has one answer everywhere it is asked. `classifyApplicationUrl`
+ * goes through it, and so does the ingest and pre navigation URL check.
+ */
+export function matchAtsHost(rawHost: string): AtsHostMatch | null {
+  const host = normalizeHost(rawHost);
+  if (host === "") return null;
+
+  const pathHost = PATH_SEGMENT_HOSTS.find((entry) => entry.hosts.includes(host));
+  if (pathHost) return { ats: pathHost.ats, tenantIn: "path" };
+
+  const subdomainHost = SUBDOMAIN_HOSTS.find((entry) => host.endsWith(entry.suffix));
+  if (subdomainHost) {
+    return { ats: subdomainHost.ats, tenantIn: "hostname", suffix: subdomainHost.suffix };
+  }
+
+  return null;
+}
+
+/**
  * Hostname labels that are the vendor's own marketing or support site rather
  * than a customer's board. `support.recruitee.com` is not a company called
  * "support", and a registry row for it would fail on every sync forever.
@@ -155,34 +201,31 @@ export function classifyApplicationUrl(rawUrl: string): BoardRef | null {
 
   if (url.protocol !== "https:" && url.protocol !== "http:") return null;
 
-  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  const host = normalizeHost(url.hostname);
   const segments = url.pathname.split("/").filter(Boolean);
 
-  const pathHost = PATH_SEGMENT_HOSTS.find((entry) => entry.hosts.includes(host));
-  if (pathHost) {
+  const match = matchAtsHost(host);
+  if (match === null) return null;
+
+  if (match.tenantIn === "path") {
     const first = (segments[0] ?? "").toLowerCase();
 
     // job-boards.greenhouse.io/embed/job_app?for={token}&token={jobId} is the
     // bare application form, and the only Greenhouse URL shape whose tenant is
     // in the query string rather than in the path.
-    if (pathHost.ats === "greenhouse" && first === "embed") {
-      return board(pathHost.ats, url.searchParams.get("for"));
+    if (match.ats === "greenhouse" && first === "embed") {
+      return board(match.ats, url.searchParams.get("for"));
     }
 
-    return NOT_A_TOKEN.has(first) ? null : board(pathHost.ats, first);
+    return NOT_A_TOKEN.has(first) ? null : board(match.ats, first);
   }
 
-  const subdomainHost = SUBDOMAIN_HOSTS.find((entry) => host.endsWith(entry.suffix));
-  if (subdomainHost) {
-    const label = host.slice(0, -subdomainHost.suffix.length);
-    // Only a single label is a tenant. `careers.acme.recruitee.com` is not a
-    // shape this has been shown to work for, so it is left alone rather than
-    // guessed at.
-    if (label === "" || label.includes(".") || NOT_A_TENANT.has(label)) return null;
-    return board(subdomainHost.ats, label);
-  }
-
-  return null;
+  const label = host.slice(0, -match.suffix.length);
+  // Only a single label is a tenant. `careers.acme.recruitee.com` is not a
+  // shape this has been shown to work for, so it is left alone rather than
+  // guessed at.
+  if (label === "" || label.includes(".") || NOT_A_TENANT.has(label)) return null;
+  return board(match.ats, label);
 }
 
 function board(ats: AtsPlatform, rawToken: string | null | undefined): BoardRef | null {

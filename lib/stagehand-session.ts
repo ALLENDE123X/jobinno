@@ -329,6 +329,62 @@ async function acquireLaunchSlot(logTag: string): Promise<() => void> {
   };
 }
 
+/**
+ * Names and addresses the browser is told to refuse, whoever asks it to go
+ * there.
+ *
+ * This is defence in depth behind `lib/apply-url-guard.ts`, which is the real
+ * gate: no URL reaches a `goto` in this pipeline without having been checked
+ * against the board it claims to belong to. What this adds is a second layer
+ * for the navigations nobody in this repository writes, the ones a page starts
+ * for itself with a redirect or a script, and it matters most on the local
+ * browser: a remote Browserbase session that reaches `169.254.169.254` reaches
+ * Browserbase's own metadata endpoint, while a local one reaches ours.
+ *
+ * The list is names and literal addresses because that is what the API takes.
+ * There is no CIDR here, so this cannot stand in for the address range check in
+ * `unroutableHostReason`, and it is not meant to.
+ */
+export const BLOCKED_BROWSER_DOMAINS: readonly string[] = [
+  "localhost",
+  "127.0.0.1",
+  "0.0.0.0",
+  "::1",
+  // The cloud metadata endpoints. Every one of these answers with credentials
+  // to something, and none of them is ever a job application form.
+  "169.254.169.254",
+  "metadata.google.internal",
+  "metadata.goog",
+  "instance-data",
+  "100.100.100.200",
+];
+
+/**
+ * Applies `BLOCKED_BROWSER_DOMAINS` to a freshly opened context, before it has
+ * been asked to go anywhere.
+ *
+ * Best effort, and deliberately so. `setDomainPolicy` is a call into whichever
+ * Stagehand server is on the other end of the session, and a provider that does
+ * not implement it must not be the reason a candidate's application does not
+ * get filed. A failure is loud in the log and the run continues, protected by
+ * the URL check that would have had to fail first for any of this to matter.
+ */
+async function blockUnroutableDomains(
+  context: { setDomainPolicy(policy: { blockedDomains?: string[] }): Promise<void> },
+  logTag: string
+): Promise<void> {
+  try {
+    await context.setDomainPolicy({ blockedDomains: [...BLOCKED_BROWSER_DOMAINS] });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `${logTag} could not block loopback and metadata addresses at the browser ` +
+        `(${reason}). The run continues; every URL it opens is still checked against the ` +
+        `board it belongs to first.`
+    );
+  }
+}
+
 export async function openBrowserSession(
   options: OpenBrowserSessionOptions
 ): Promise<BrowserSession> {
@@ -395,6 +451,7 @@ export async function openBrowserSession(
     });
 
     const context = stagehand.browser.context;
+    await blockUnroutableDomains(context, options.logTag);
     const page = (await context.activePage()) ?? (await context.newPage());
     return { stagehand, browser, page, logTag: options.logTag };
   } catch (err) {

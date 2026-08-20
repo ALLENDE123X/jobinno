@@ -88,6 +88,7 @@ export const syncJobBoards = inngest.createFunction(
       failed: 0,
       seen: 0,
       kept: 0,
+      rejected: 0,
     };
 
     for (let offset = 0; offset < boardIds.length; offset += BOARDS_PER_STEP) {
@@ -106,12 +107,14 @@ export const syncJobBoards = inngest.createFunction(
       totals.failed += summary.failed;
       totals.seen += summary.seen;
       totals.kept += summary.kept;
+      totals.rejected += summary.rejected;
     }
 
     console.log(
       `[job-003] sync complete: ${registry.inserted} new board(s), ` +
         `${totals.ok} synced, ${totals.deferred} deferred, ${totals.failed} failed, ` +
-        `${totals.kept} listing(s) kept of ${totals.seen} seen`
+        `${totals.kept} listing(s) kept of ${totals.seen} seen` +
+        (totals.rejected > 0 ? `, ${totals.rejected} dropped on an unusable apply URL` : "")
     );
 
     return { registry, ingest: totals };
