@@ -5,17 +5,18 @@
  * Session could not be opened (JOB-010).
  *
  * ── Why this is a client component and not a `searchParams` read ────────────
- * Reading `searchParams` in `app/page.tsx` would be less code, and it would
- * also opt the entire landing page into dynamic rendering. That page is the
- * marketing surface: it is almost always rendered for somebody who has never
- * pressed a pricing button, and making every one of those visits a server
- * render to check a query parameter that is nearly always absent is a bad
- * trade.
+ * `app/page.tsx` now reads `searchParams` itself too, to decide whether to
+ * skip the signed in redirect (JOB-020), so the page is no longer prerendered
+ * regardless of what this component does. The original reason for keeping the
+ * read here, that it let the page stay static and pay the cost only in the
+ * failure case, no longer applies.
  *
- * Reading it here keeps the page prerendered and pays the cost only in the
- * failure case. The Suspense boundary around this component is required rather
- * than decorative: `useSearchParams` suspends during prerender, and without one
- * Next refuses to build.
+ * Left as a client component anyway, because the reason that still holds is
+ * separate from rendering mode: the code to safe message translation and the
+ * alert markup belong together, next to each other, rather than folded into
+ * the page's own growing `searchParams` handling. The Suspense boundary around
+ * this component is required rather than decorative either way: `useSearchParams`
+ * suspends, and without one Next refuses to build.
  *
  * ── The query parameter itself is never rendered ────────────────────────────
  * What arrives is a code, and the sentence shown comes from the table in
