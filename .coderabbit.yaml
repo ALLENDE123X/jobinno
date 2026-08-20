@@ -1,0 +1,21 @@
+# CodeRabbit config for this repo. See https://docs.coderabbit.ai/getting-started/configure-coderabbit
+# Installed as a complement to the manual review process in CLAUDE.md's Ticket
+# and PR protocol, not a replacement for it. It reviews diffs; it has no way to
+# reason across the whole codebase or verify anything against a live
+# environment, which is exactly where this project's worst bugs have lived.
+
+language: en-US
+
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: false
+
+chat:
+  auto_reply: true
