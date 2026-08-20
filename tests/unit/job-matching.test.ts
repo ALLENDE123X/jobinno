@@ -460,9 +460,8 @@ liveDbSuite("matching against the synced jobs table", () => {
     const intern = await insertJob({ title: "Software Engineer Intern", location: "Remote" });
     const newGrad = await insertJob({ title: "Software Engineer, New Grad", location: "Remote" });
 
-    // Title blind by default. Ingest already refused anything that was not an
-    // internship, a new grad role or an unsenior software engineering role, so
-    // an untitled search is still a relevant one.
+    // Title blind by default, which is safe because it is not filter blind:
+    // `classifyTitle` runs over every candidate below. See the next describe.
     expect((await match()).map((row) => row.jobId).sort()).toEqual([intern, newGrad].sort());
 
     expect((await match({ preferences: { title: "intern" } })).map((row) => row.jobId)).toEqual([
@@ -481,8 +480,86 @@ liveDbSuite("matching against the synced jobs table", () => {
     expect(await match({ profile: { targetLocations: ["%"] } })).toEqual([]);
 
     // And the same values, escaped correctly, still match when they really occur.
-    await insertJob({ title: "Site Reliability Engineer 100% Remote", location: "Dublin, Ireland" });
+    // The title has to be one `classifyTitle` keeps, or this would pass for the
+    // wrong reason: a listing dropped for its discipline looks exactly like a
+    // listing dropped by a correctly escaped `%`.
+    await insertJob({ title: "Software Engineer Intern 100% Remote", location: "Dublin, Ireland" });
     expect(await match({ preferences: { title: "100%" } })).toHaveLength(1);
+  });
+  // ───────────────────────────────────
+  // The relevance filter, at match time
+  // ───────────────────────────────────
+
+  describe("a row that predates the corrected classifier", () => {
+    /**
+     * Every listing in these three cases is inserted straight into `jobs`,
+     * bypassing `ingestBoard` and therefore bypassing the ingest filter
+     * entirely. That is the scenario, not a shortcut: `board-ingest.ts` upserts
+     * and never prunes, so the live table holds 848 rows of 958 that were
+     * written under the old `isIntern || isNewGrad || SWE_RE` rule and that the
+     * corrected one rejects. Nothing deletes them, so a test that only
+     * exercised `classifyTitle` at ingest would prove nothing about them.
+     */
+    it("is not matched, however it got into the table", async () => {
+      const swe = await insertJob({ title: "Software Engineer Intern", location: "Remote" });
+
+      // All four titles are real, off the live table.
+      const marketing = await insertJob({ title: "Marketing Intern", location: "Remote" });
+      const finance = await insertJob({
+        title: "Finance Intern - Summer 2027",
+        location: "Remote",
+      });
+      const sourcing = await insertJob({ title: "Intern, Commodity Sourcing", location: "Remote" });
+      const point72 = await insertJob({
+        title: "2027 Point72 Academy Investment Analyst Summer Internship",
+        location: "Remote",
+      });
+
+      // The cron supplies no title, so this is exactly the query that would
+      // have spent a paying person's allowance on a marketing internship.
+      const matched = (await match()).map((row) => row.jobId);
+
+      expect(matched).toEqual([swe]);
+      for (const rejected of [marketing, finance, sourcing, point72]) {
+        expect(matched).not.toContain(rejected);
+      }
+    });
+
+    it("does not take a software role down with it", async () => {
+      // The failure mode on the other side, and the more expensive one. The
+      // filter is `classifyTitle` and nothing narrower: a new grad role with no
+      // "intern" in it, a title that says "university" instead, and an
+      // internship carrying a seniority word are all kept, because the
+      // classifier keeps them.
+      const newGrad = await insertJob({ title: "Software Engineer, New Grad", location: "Remote" });
+      const university = await insertJob({
+        title: "Software Engineer (University Graduate)",
+        location: "Remote",
+      });
+      const abbreviated = await insertJob({ title: "SWE Intern, Ads", location: "Remote" });
+      const managerIntern = await insertJob({
+        title: "Software Engineering Manager Intern",
+        location: "Remote",
+      });
+
+      const matched = (await match()).map((row) => row.jobId);
+
+      expect(matched.sort()).toEqual([newGrad, university, abbreviated, managerIntern].sort());
+    });
+
+    it("does not eat the fan out it was supposed to protect", async () => {
+      // Filtering after the query means the SQL LIMIT caps what is read rather
+      // than what is returned, and on the live table eight candidates in nine
+      // are rejects. A single page sized to the limit would hand back nothing
+      // here; the second pass is what finds the one relevant listing.
+      for (let index = 0; index < 12; index += 1) {
+        await insertJob({ title: `Marketing Intern ${index}`, location: "Remote" });
+      }
+      // Inserted last, so it is the oldest and sorts past the first page of ten.
+      const swe = await insertJob({ title: "Software Engineer Intern", location: "Remote" });
+
+      expect((await match({ limit: 1 })).map((row) => row.jobId)).toEqual([swe]);
+    });
   });
 });
 

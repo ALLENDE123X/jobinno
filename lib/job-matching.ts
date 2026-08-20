@@ -42,6 +42,12 @@
  *
  *  · **Title, only when one is supplied.** See `matchJobsForUser`.
  *
+ *  · **Discipline and career stage.** `classifyTitle` from
+ *    `lib/ats-job-feeds.ts`, run here over `jobs.title` as well as at ingest.
+ *    It is the same function the board sync filters with, called rather than
+ *    reimplemented, so the two points in time cannot disagree about what this
+ *    product is for. See `matchJobsForUser` for why it has to run twice.
+ *
  * And what is deliberately not part of it:
  *
  *  · **A pay floor.** `payMin` is gone from the event, not accepted and
@@ -51,12 +57,6 @@
  *    `lib/search-job-listings.ts` reached the same conclusion and says so at
  *    length. There is no column for it on `jobs` either. A field that looks
  *    like a pay floor and is not one is worse than no field.
- *
- *  · **Seniority, or whether a role suits a new graduate.** `classifyTitle` in
- *    `lib/ats-job-feeds.ts` already applied that at ingest time: a row only
- *    exists in `jobs` if its title reads as a software engineering role AND as
- *    an internship or a new grad role. Re-testing it here would be a second
- *    copy of a filter that has already run.
  */
 
 import {
@@ -76,6 +76,7 @@ import {
 } from "drizzle-orm";
 
 import { APPLICATION_STATUS } from "@/lib/application-status";
+import { classifyTitle } from "@/lib/ats-job-feeds";
 import { db } from "@/lib/db/client";
 import { applications, boards, jobs, profiles, resumes } from "@/lib/db/schema";
 
@@ -338,6 +339,36 @@ function boardPredicate(companies: readonly string[]): SQL | undefined {
 // The match
 // ───────────────────────────────────
 
+/**
+ * How many candidate rows to read per pass, as a multiple of the caller's limit.
+ *
+ * Filtering in the application rather than in the WHERE clause means the SQL
+ * `limit` no longer sizes the result: it caps what is *read*, and whatever
+ * `classifyTitle` then rejects comes out of the caller's fan out. On today's
+ * table roughly one row in nine survives the corrected classifier — 110 of 958
+ * — so a query limited to the fan out ceiling would return the ceiling, throw
+ * most of it away, and hand somebody with ten applications left one or two
+ * listings.
+ *
+ * Ten is that hit rate rounded to a number, and it is a guess about a
+ * distribution that changes every time the sync runs, which is why it is only
+ * a starting page size and not an assumption the result depends on.
+ */
+const CANDIDATE_OVERFETCH = 10;
+
+/**
+ * How many of those passes one match may make before giving up on filling the
+ * limit.
+ *
+ * The loop is what makes the overfetch guess harmless: if a page yields too few
+ * relevant rows it reads the next one. This is the bound on that, and it bounds
+ * two things at once — at most five round trips, and at most `limit × 50` rows
+ * read for one match. Reaching it means fewer than one candidate in fifty was
+ * relevant, which on the numbers above is not this table; a table where it were
+ * true wants the rows pruned, not a longer loop.
+ */
+const MAX_CANDIDATE_PASSES = 5;
+
 export type MatchInput = {
   userId: string;
   profile: MatchProfile;
@@ -356,23 +387,37 @@ export type MatchInput = {
  * because `jobs` stores none of the latter two, and pretending otherwise would
  * be a filter that reads stricter than it is.
  *
- * When it is absent, matching is title blind, and the safety of that rests
- * entirely on `classifyTitle`, which is the only thing standing between this
- * query and a listing in a discipline nobody here asked for. It earns that
- * trust only since the ingest filter was corrected to require a software title
- * AND an internship or new grad role: under the "or" it replaced, "Marketing
- * Intern" and "Investment Banking Summer Analyst Internship" were written to
- * this table, and a title blind match fans real applications out to whatever is
- * in it. Nothing here re-checks the discipline, so a widening of that filter is
- * a widening of what a scheduled search will apply to, with no second gate.
+ * When it is absent, matching is title blind, and what then stands between this
+ * query and a listing in a discipline nobody here asked for is `classifyTitle`,
+ * run below over every candidate row.
  *
- * Which is also why the correction is only half the fix. `board-ingest.ts`
- * upserts and never prunes, so `jobs` is the accumulation of every version of
- * that filter that has ever run, not the output of the current one. At the time
- * of writing the live table holds 958 rows of which 848 are ones this
- * classifier now rejects, and they are reachable from here until they are
- * deleted. A row predating the fix is matched exactly as readily as a row
- * written after it.
+ * ── Why the classifier runs twice ───────────────────────────────────────────
+ * Because `jobs` is not the output of the current filter. `board-ingest.ts`
+ * upserts and never prunes, so the table is the accumulation of every version
+ * of the filter that has ever run. Ingest was corrected to require a software
+ * title AND an internship or a new grad role; under the "or" it replaced,
+ * "Marketing Intern", "Finance Intern - Summer 2027" and "2027 Point72 Academy
+ * Investment Analyst Summer Internship" were all written here as relevant. At
+ * the time of writing the live table holds 958 rows of which 848 are ones the
+ * corrected classifier rejects, and correcting ingest does nothing whatever
+ * about those 848: it only stops the next one being written.
+ *
+ * They are reachable from exactly here. The daily cron supplies no title, so
+ * every one of them was a listing a real browser could be sent to apply to,
+ * against a paying person's finite allowance, for a job in a discipline this
+ * product does not serve. Re-running the classifier at match time closes that
+ * with no write at all, which is the reason to do it this way round: the rows
+ * are 89% of a production table, `jobs.raw` is the only copy of a listing that
+ * has since closed, and a filter can be corrected again next week where a
+ * delete cannot be undone.
+ *
+ * It is the same function and not an equivalent predicate, which is the whole
+ * reason this is a TypeScript filter rather than a regex pushed into the SQL.
+ * Postgres spells a word boundary `\y`; `\b` is a backspace character there,
+ * so a hand translation of `INTERN_RE` and `SWE_RE` would be a second copy of
+ * the rule that compiles, looks right, and silently stops agreeing the first
+ * time either regex is widened. One definition, in `lib/ats-job-feeds.ts`,
+ * called by both the sync that writes and the match that reads.
  *
  * ── The anti join ───────────────────────────────────────────────────────────
  * Any `applications` row for this person and this listing excludes it, whatever
@@ -417,25 +462,52 @@ export async function matchJobsForUser(
     ),
   ];
 
-  const rows = await database
-    .select({
-      jobId: jobs.id,
-      company: boards.company,
-      title: jobs.title,
-      location: jobs.location,
-    })
-    .from(jobs)
-    .innerJoin(boards, eq(jobs.boardId, boards.id))
-    .where(and(...conditions.filter((clause): clause is SQL => clause !== undefined)))
-    // Newest first. A posting's age is the best proxy for whether it is still
-    // open that this table carries, and JOB-003's own header says internships
-    // at these firms can fill within a day of opening. `jobs.id` breaks ties so
-    // that two runs over an unchanged table agree on which listings the limit
-    // cut off.
-    .orderBy(sql`${jobs.postedAt} desc nulls last`, asc(jobs.id))
-    .limit(limit);
+  const where = and(...conditions.filter((clause): clause is SQL => clause !== undefined));
 
-  return rows;
+  const pageSize = limit * CANDIDATE_OVERFETCH;
+  const matches: JobMatch[] = [];
+  const seen = new Set<string>();
+
+  for (let pass = 0; pass < MAX_CANDIDATE_PASSES && matches.length < limit; pass += 1) {
+    const candidates = await database
+      .select({
+        jobId: jobs.id,
+        company: boards.company,
+        title: jobs.title,
+        location: jobs.location,
+      })
+      .from(jobs)
+      .innerJoin(boards, eq(jobs.boardId, boards.id))
+      .where(where)
+      // Newest first. A posting's age is the best proxy for whether it is still
+      // open that this table carries, and JOB-003's own header says internships
+      // at these firms can fill within a day of opening. `jobs.id` breaks ties so
+      // that two runs over an unchanged table agree on which listings the limit
+      // cut off. It is also what makes the paging below well defined.
+      .orderBy(sql`${jobs.postedAt} desc nulls last`, asc(jobs.id))
+      .limit(pageSize)
+      .offset(pass * pageSize);
+
+    for (const candidate of candidates) {
+      // A row can cross a page boundary if the board sync inserts underneath
+      // this loop. Cheaper to notice than to dispatch the same listing twice.
+      if (seen.has(candidate.jobId)) continue;
+      seen.add(candidate.jobId);
+
+      // The gate. `classifyTitle`, not a copy of it — see the note above on
+      // why this is not a `~*` in the WHERE clause.
+      if (!classifyTitle(candidate.title).relevant) continue;
+
+      matches.push(candidate);
+      if (matches.length === limit) break;
+    }
+
+    // A short page is the end of the candidates; the offset arithmetic above is
+    // only exact because every page before this one was full.
+    if (candidates.length < pageSize) break;
+  }
+
+  return matches;
 }
 
 // ───────────────────────────────────
