@@ -19,6 +19,7 @@ import { DotPattern } from "@/components/ui/dot-pattern";
 import { ApplicationFeed } from "@/components/landing/application-feed";
 import { PipelineDiagram } from "@/components/landing/pipeline-diagram";
 import { StatsBand } from "@/components/landing/stats-band";
+import { Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme";
 import { cn } from "@/lib/utils";
 
@@ -114,7 +115,11 @@ export default function Home() {
     <div className="flex min-h-screen flex-col">
       <header className="sticky top-0 z-40 border-b bg-background/80 backdrop-blur">
         <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-4 py-3 sm:px-6">
-          <Link href="/" className="text-base font-semibold tracking-tight">
+          <Link
+            href="/"
+            className="flex items-center gap-2 text-base font-semibold tracking-tight"
+          >
+            <Logo />
             Jobinno
           </Link>
           <nav className="flex items-center gap-1 sm:gap-2">
