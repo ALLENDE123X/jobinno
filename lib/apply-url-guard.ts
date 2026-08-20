@@ -42,14 +42,19 @@
  * for a posting, and refusing it would drop real listings to protect against
  * nothing, since the host is still Workable's and the data still goes to
  * Workable. The exception never applies to a per customer hostname such as
- * `{tenant}.recruitee.com`, where the hostname is the tenant.
+ * `{tenant}.recruitee.com`, where the hostname is the tenant, and it is granted
+ * to those two hosts by name rather than to every host that happens to keep its
+ * tenant in the path. See `TENANT_FREE_LINK_HOSTS`.
  *
  * ── Where this is enforced ──────────────────────────────────────────────────
- * Twice, on purpose. `lib/board-ingest.ts` screens every listing before it is
- * written, which is the primary gate; `lib/fill-application-form.ts` screens
+ * Three times, on purpose. `lib/board-ingest.ts` screens every listing before it
+ * is written, which is the primary gate; `lib/fill-application-form.ts` screens
  * again before it navigates, because the CLI entry points reach that module
  * with a row that never went through ingest, and because a row written before
- * this check existed is still in the table.
+ * this check existed is still in the table; and the same module screens a third
+ * time against the URL the browser actually ended up on, because a URL that
+ * passes the first two checks is still only a string and `goto` follows
+ * redirects.
  *
  * Nothing here does IO. It is URL parsing and two table lookups.
  */
@@ -70,6 +75,34 @@ export type ExpectedBoard = {
 export type ApplyUrlVerdict =
   | { ok: true; host: string }
   | { ok: false; reason: string };
+
+/**
+ * The hosts that may name a posting without naming the board it belongs to.
+ *
+ * This is rule 5's exception, and it is a list of two because the header says it
+ * is a list of two. `matchAtsHost` answers `tenantIn: "path"` for five entries,
+ * three of which are here only because their tenant is the first path segment:
+ * Greenhouse, Ashby and SmartRecruiters. Reading `tenantIn: "path"` as "the
+ * exception applies" therefore granted it to all five, and that is wider than it
+ * reads. `classifyApplicationUrl` returns null on a path host whenever the first
+ * segment is a word it knows is not a tenant, so
+ * `job-boards.greenhouse.io/embed/job_app?token={jobId}` with the `for` parameter
+ * left off was accepted against any Greenhouse board at all, and that URL is a
+ * real application form Greenhouse serves rather than a shape nobody visits. The
+ * host is still the vendor's either way, so this was never the resume going to
+ * an attacker; it was the wrong employer inside the right vendor, which is still
+ * an application the candidate did not choose to make.
+ *
+ * Kept here rather than as a flag on the host table in `lib/ats-boards.ts` so
+ * that the exception and the rule it bends read together. The cost of that is
+ * one pair of duplicated host strings, and the direction it fails in if they
+ * ever drift is closed: an unrecognised host means the exception is not granted,
+ * which refuses a real listing rather than admitting a bad one.
+ */
+const TENANT_FREE_LINK_HOSTS: ReadonlySet<string> = new Set([
+  "apply.workable.com",
+  "jobs.lever.co",
+]);
 
 /** Enough of an untrusted string to identify it in a log, and no more. */
 export function forLog(value: string, max = 200): string {
@@ -175,9 +208,12 @@ export function checkApplyUrl(rawUrl: string, expected: ExpectedBoard): ApplyUrl
 
   const ref = classifyApplicationUrl(url.toString());
   if (ref === null) {
-    // The vendor's own shared host with no tenant in the path. Accepted, and
-    // only here. See the exception in the header.
-    if (hostMatch.tenantIn === "path") return { ok: true, host };
+    // The vendor's own shared host, on one of the two hosts whose short links
+    // name a posting and no account. Accepted, and only here. See the exception
+    // in the header and `TENANT_FREE_LINK_HOSTS`.
+    if (hostMatch.tenantIn === "path" && TENANT_FREE_LINK_HOSTS.has(host)) {
+      return { ok: true, host };
+    }
     return {
       ok: false,
       reason: `"${forLog(host, 80)}" is not the hostname of a single ${expectedAts} board`,

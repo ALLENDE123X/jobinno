@@ -134,6 +134,16 @@ export async function updateApplication(
  * the logs and classifiable in the database from the same string.
  */
 const REASON_TAGS: ReadonlyArray<readonly [RegExp, SkipReason]> = [
+  // `blocked_apply_url:` is written by `fill-application-form.ts` when the
+  // browser has ended up somewhere the listing's own board does not own, and it
+  // is first in this list on purpose. That message quotes the URL the browser
+  // landed on, and the URL is chosen by whoever sent the browser there. A path
+  // spelling `/verify-captcha/` would otherwise file the stop under somebody
+  // else's reason and hide it from anyone reading the log for this one.
+  // `dom_changed` matches what the pre navigation refusal names explicitly, and
+  // for the same stated reason: a listing pointing somewhere the board does not
+  // own is a page that is not what the automation expected.
+  [/blocked_apply_url/i, "dom_changed"],
   [/needs_candidate_input|cannot be answered truthfully/i, "unanswerable_required"],
   [/captcha_present|\bcaptcha\b|hcaptcha|turnstile|recaptcha/i, "captcha"],
   [/submit_clicked_outcome_unknown|submission_blocked/i, "submit_failed"],

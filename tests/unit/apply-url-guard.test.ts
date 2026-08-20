@@ -75,6 +75,32 @@ describe("the listing shapes real ingestion produces", () => {
     expect(verdict.ok).toBe(true);
   });
 
+  it("does not extend that exception to the other hosts whose tenant is in the path", () => {
+    // `matchAtsHost` answers "the tenant is in the path" for Greenhouse, Ashby
+    // and SmartRecruiters as well as for the two hosts the exception is written
+    // for, and reading that answer as "the exception applies" granted it to all
+    // five. Greenhouse serves this URL for real: with `for` left off, the embed
+    // resolves the posting from `token` alone, so a listing ingested from one
+    // board could send the browser to a posting on another. Same vendor, wrong
+    // employer, and still an application the candidate never chose to make.
+    const verdict = checkApplyUrl(
+      "https://job-boards.greenhouse.io/embed/job_app?token=4567890",
+      { ats: "greenhouse", boardToken: "dvtrading" }
+    );
+    expect(verdict.ok).toBe(false);
+  });
+
+  it("does not extend it to a path segment that only looks like a tenant", () => {
+    // The same shape one platform along: `search` is a word the classifier knows
+    // is not a board token, so it yields no board and used to fall through to
+    // the exception.
+    const verdict = checkApplyUrl("https://jobs.smartrecruiters.com/search/engineering", {
+      ats: "smartrecruiters",
+      boardToken: "averydennison",
+    });
+    expect(verdict.ok).toBe(false);
+  });
+
   it("does not extend that exception to a per customer hostname", () => {
     // `support.recruitee.com` is the vendor's help site, not a board, and the
     // hostname is where a Recruitee tenant is named. Nothing to be forgiving
