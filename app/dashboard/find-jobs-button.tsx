@@ -12,8 +12,16 @@
  * button that did nothing is to press it again.
  *
  * The cooldown is one minute of the button saying, plainly, that a search is
- * already running. It is UX and it is not a guard, which is why it lives in the
- * browser where a determined person can reload past it and no harm is done.
+ * already running. It is UX and it is not a guard, which is why it can live in
+ * the browser at all: it is React state, so a reload clears it and a caller that
+ * never rendered it was never subject to it.
+ *
+ * The guard is `claimSearchSlot`, on the server, in `lib/search-cooldown.ts`.
+ * Its window is the longer of the two on purpose, so somebody who reloads past
+ * this one gets an answer in words rather than a search: that answer arrives as
+ * `result.message` below, which is already how every other refusal is rendered.
+ * Do not read the server's window from here and do not shorten it to match this
+ * one, because a limit the browser can choose is not a limit.
  *
  * ── Why the action is called with no arguments ──────────────────────────────
  * Because it takes none. The user id comes from the session on the server; see

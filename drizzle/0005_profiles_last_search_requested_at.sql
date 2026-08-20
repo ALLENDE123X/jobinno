@@ -1,0 +1,34 @@
+-- `profiles.last_search_requested_at`: the server side rate limit on the
+-- dashboard's "Find Jobs Now" button.
+--
+-- The button's cooldown is React state, so a reload clears it and a script that
+-- never rendered it was never subject to it. The action behind it is a public
+-- HTTP endpoint, and every accepted call sends another `job-search/requested`
+-- event that Inngest serialises per user rather than dropping. Nothing was
+-- stopping one caller from building an unbounded backlog of their own runs.
+--
+-- ── Why a column, and not a signal already in the schema ────────────────────
+-- The daily cron already refuses a person whose last search has not finished,
+-- and it needs no column for it: `listUsersDueForSearch` looks for a non
+-- terminal `applications` row created in the last six hours. That signal cannot
+-- do this job. It is written by `discoverListings`, minutes after the event is
+-- accepted, so a burst of calls arriving inside two seconds all read a table
+-- nothing has written to yet and all pass. And a search that matches nothing
+-- writes no row at all, which would leave the person whose searches are pure
+-- waste as the one person the limit never reached.
+--
+-- The stamp below is written by the request itself, in the same conditional
+-- UPDATE that checks it. See `lib/search-cooldown.ts`.
+--
+-- ── No grant, on purpose ────────────────────────────────────────────────────
+-- `0003_profiles_column_privileges.sql` took the table wide UPDATE grant on
+-- `profiles` away from `authenticated` and granted back, by name, the columns a
+-- person owns about themselves. A new column is therefore not writable by
+-- `authenticated` until some migration names it, and this one deliberately does
+-- not: a rate limit the rate limited party can reset is not a rate limit. It is
+-- written by the Drizzle connection and by the service role, and by nothing
+-- else.
+--
+-- Null on every existing row, meaning nobody has ever asked for a search by
+-- hand, which is the correct starting state for all of them.
+ALTER TABLE "profiles" ADD COLUMN "last_search_requested_at" timestamp with time zone;
