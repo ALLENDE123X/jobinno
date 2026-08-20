@@ -28,6 +28,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ANALYTICS_EVENT } from "@/lib/analytics/events";
 import type { ServerCapture } from "@/lib/analytics/posthog-server";
+import type { SearchCooldown } from "@/lib/search-cooldown";
 
 // Typed with the parameters they really take, so that a change to either
 // signature is a type error here rather than a mock that quietly accepts
@@ -71,6 +72,27 @@ vi.mock("@/lib/job-search-trigger", () => ({
   requestJobSearch: (userId: string) => requestJobSearch(userId),
 }));
 
+// `claimSearchSlot` is one conditional UPDATE against the real `profiles`
+// table in Postgres — see `tests/unit/dashboard-find-jobs-cooldown.test.ts`,
+// which is where that claim is actually exercised, live, against a fixture
+// row it inserts and cleans up itself. This file has no such row for
+// `SESSION_USER`, and was never meant to: it is about who fires the analytics
+// event and when, not about the cooldown. Left unmocked, `findJobsNow` reaches
+// the real database, finds no profile row for `SESSION_USER`, and is refused
+// with `{ allowed: false, reason: "no_profile" }` before it ever gets to
+// `captureServerEvent`. Partial, so `describeRetryAfter` stays the real one,
+// matching `tests/unit/dashboard-find-jobs-action.test.ts`, which stubs the
+// same function for the same reason.
+const claimSearchSlot = vi.fn(async (userId: string): Promise<SearchCooldown> => {
+  void userId;
+  return { allowed: true };
+});
+
+vi.mock("@/lib/search-cooldown", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/search-cooldown")>()),
+  claimSearchSlot: (userId: string) => claimSearchSlot(userId),
+}));
+
 vi.mock("@/lib/supabase/server", () => ({
   RESUMES_BUCKET: "resumes",
   createServerClient: async () => ({
@@ -112,6 +134,8 @@ beforeEach(() => {
   captureServerEvent.mockClear();
   captureServerEvents.mockClear();
   requestJobSearch.mockClear();
+  claimSearchSlot.mockClear();
+  claimSearchSlot.mockResolvedValue({ allowed: true });
   profileUpdateError = null;
   resumeInsertError = null;
   profile = { attested_at: "2026-07-01T00:00:00.000Z", applications_used: 3, applications_cap: 150 };
