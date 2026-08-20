@@ -130,6 +130,22 @@
  * it**: `corroborate()` still reads only `tag`, `type` and `haystack`, and
  * nothing here clicks anything that submits an application.
  *
+ * ── JOB-021: nothing is read until it is there ─────────────────────────────
+ * Every read of the page now settles first. `readFormSignals` waits for content
+ * to attach and for the DOM to stop growing before it asks a model what is on
+ * screen, and `reachApplicationForm` reads a freshly opened listing a second and
+ * third time when the first read found nothing at all.
+ *
+ * This was not a precaution. The first production run against real Ashby-hosted
+ * career pages failed 16 of 21 applications, across eight unrelated companies,
+ * inside four minutes, with one shared message: the form was not on screen. The
+ * pages had loaded — the failures quote hundreds to thousands of characters of
+ * text and two file inputs apiece — but `page.goto` returns at
+ * `domcontentloaded` in this SDK, and a client hydrated careers page is still a
+ * shell at that point. See `settleBeforeReading` for why Stagehand's own
+ * `domSettleTimeoutMs` does not cover this: it reaches `act()` and nothing else,
+ * so clicks were settled and navigations never were.
+ *
  * Targets Jobinno's own Supabase project, guarded by the shared
  * `assertSupabaseProject()` check every module here imports.
  */
@@ -153,6 +169,7 @@ import {
   closeBrowserSession,
   openBrowserSession,
   reResolveLive,
+  sleep,
   tryResolveAction,
   typeInto,
   NAVIGATION_TIMEOUT_MS,
@@ -472,8 +489,127 @@ async function readStructuralFloor(page: Page): Promise<StructuralFloor> {
   };
 }
 
+// ───────────────────────────────────
+// JOB-021: waiting for the page to exist before reading it
+// ───────────────────────────────────
+
+/**
+ * What "this page has mounted something" looks like without knowing the board.
+ *
+ * `attached` rather than `visible` is deliberate, and the reason is the same one
+ * `create-board-account.ts` records in the actinno checkout: a selector list
+ * resolves to the *first* match in document order, so a hidden first match (a
+ * skip link, a collapsed nav button) would leave a visibility wait pending on a
+ * page that has in fact rendered. Attachment is the weaker claim, which is the
+ * right one here, because this wait is a trigger to stop waiting rather than
+ * evidence of anything. The stability check below still has to agree afterwards,
+ * so a premature hit costs one DOM read and nothing else.
+ */
+const HYDRATED_CONTENT_SELECTOR = "main, [role='main'], form, h1, button, a[href]";
+
+/** Budget for that wait. Well inside `NAVIGATION_TIMEOUT_MS`. */
+const CONTENT_ATTACH_TIMEOUT_MS = 20_000;
+
+/** Gap between two reads of the DOM's own shape while waiting for it to stop moving. */
+const DOM_STABLE_POLL_MS = 500;
+
+/**
+ * How long the page is given to stop changing. Bounded rather than open ended:
+ * a board that is still mounting new fields this long after its content attached
+ * is not going to be read correctly by waiting longer, and every extra second
+ * here is a second of a browser somebody is paying for.
+ */
+const DOM_STABLE_BUDGET_MS = 8_000;
+
+/** True while the page is still building itself out rather than sitting still. */
+function stillBuilding(current: StructuralFloor, next: StructuralFloor): boolean {
+  return (
+    // Growth, not mere difference. A page whose text shrinks (a banner closing,
+    // a spinner being removed) has settled; one whose text keeps arriving has
+    // not, and a clock ticking from one timestamp to the next does not grow.
+    next.textLength > current.textLength ||
+    next.passwordFields !== current.passwordFields ||
+    next.fileInputs !== current.fileInputs ||
+    next.textAreas !== current.textAreas ||
+    next.iframes !== current.iframes
+  );
+}
+
+/**
+ * Gives a client rendered page a bounded chance to actually be there before a
+ * model is asked what is on it.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ * `page.goto` in this SDK defaults to `waitUntil: "domcontentloaded"` (verified
+ * in `@browserbasehq/stagehand`'s own `goto`, which reads
+ * `options?.waitUntil ?? "domcontentloaded"`), and none of this module's three
+ * navigations passes one. On a server rendered board that is fine. On an Ashby
+ * or SmartRecruiters careers page it returns while the document is still a
+ * shell: the framework has not fetched its data and has mounted nothing, so the
+ * application form does not exist yet in any sense a reader could see.
+ *
+ * The obvious objection is that Stagehand already has a settle step and this
+ * session already configures it — `DOM_SETTLE_TIMEOUT_MS` is passed as
+ * `domSettleTimeoutMs` in `stagehand-session.ts`. It does not cover this. That
+ * setting reaches exactly one place in the SDK, `act()`, which awaits
+ * `waitForDomNetworkQuiet` before it does anything. `extract()` and `observe()`
+ * take no settle parameter and call no such thing, so every *read* this pipeline
+ * makes has always run against whatever the DOM happened to be at that instant.
+ * That is why a click is followed by a correct read and a navigation is not.
+ *
+ * ── What it does ────────────────────────────────────────────────────────────
+ * Waits for *some* content to attach, then reads the DOM's own shape until two
+ * consecutive reads agree that it has stopped growing. Both halves are needed:
+ * the selector wait is what covers an empty shell, and the stability check is
+ * what covers a shell that mounts its header first and its form a moment later.
+ *
+ * Neither is allowed to fail the run. A page that never settles is still read,
+ * because a read of a slow page is a real answer and a thrown error here would
+ * turn a board that renders in nine seconds into a board this product cannot
+ * apply to. The callers' own guards decide what an empty page means.
+ *
+ * Deliberately placed inside `readFormSignals` rather than at the navigations,
+ * so that every read is covered by construction — including the ones taken after
+ * a click, where it is close to free because `act()` has already settled the
+ * page and the first two DOM reads therefore agree.
+ */
+async function settleBeforeReading(session: BrowserSession): Promise<void> {
+  const { page, logTag } = session;
+
+  try {
+    await page.waitForSelector(HYDRATED_CONTENT_SELECTOR, {
+      state: "attached",
+      timeout: CONTENT_ATTACH_TIMEOUT_MS,
+    });
+  } catch (err) {
+    // Not fatal and not even necessarily wrong: the reads below are the actual
+    // measurement. Logged because "nothing attached in twenty seconds" is the
+    // single most useful line in the transcript when this page turns out to be
+    // unreadable.
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `${logTag} nothing matching "${HYDRATED_CONTENT_SELECTOR}" attached within ` +
+        `${CONTENT_ATTACH_TIMEOUT_MS}ms: ${reason}`
+    );
+  }
+
+  let floor = await readStructuralFloor(page);
+  const deadline = Date.now() + DOM_STABLE_BUDGET_MS;
+  while (Date.now() < deadline) {
+    await sleep(DOM_STABLE_POLL_MS);
+    const next = await readStructuralFloor(page);
+    if (!stillBuilding(floor, next)) return;
+    floor = next;
+  }
+  console.warn(
+    `${logTag} the page was still growing after ${DOM_STABLE_BUDGET_MS}ms ` +
+      `(${floor.textLength} characters of text, ${floor.fileInputs} file inputs); reading it anyway`
+  );
+}
+
 async function readFormSignals(session: BrowserSession): Promise<FormSignals> {
   const { stagehand, page } = session;
+  await settleBeforeReading(session);
   const { data: extracted } = await stagehand.extract(
     FORM_EXTRACT_INSTRUCTION,
     FormSignalsSchema,
@@ -1561,6 +1697,76 @@ async function assertStillOnTheBoard(
 /** How many apply-ish controls to click through before giving up. Same budget as ACT-005. */
 const APPLY_CLICK_ROUNDS = 2;
 
+/**
+ * JOB-021. How long to wait before reading a freshly opened listing again, when
+ * the first read found nothing this function could act on.
+ *
+ * Two waits rather than one, and short ones, because this is the *second* line
+ * of defence: `settleBeforeReading` has already waited for content to attach and
+ * for the DOM to stop growing before that first read happened. What is left for
+ * this to catch is a board that mounts its application form later than that
+ * budget allows, and a board which has not mounted a form six seconds after its
+ * DOM went quiet has almost certainly not got one.
+ *
+ * The cost is bounded to runs that were about to fail anyway: every path that
+ * reaches an empty-handed read either ends in the `FormFillBlockedError` at the
+ * bottom of this function or in a click loop that breaks on its first line.
+ */
+const FORM_REREAD_BACKOFF_MS: readonly number[] = [2_000, 4_000];
+
+/**
+ * Whether a read left this function with nothing to do — no form to fill, no
+ * apply control to click, and no sign-in wall to stop at.
+ *
+ * The three tests are exactly the three branches below, so this cannot drift
+ * from the thing it is predicting: an empty-handed read is one that will fall
+ * through the sign-in check, break out of the click loop on its first line, and
+ * land on the throw.
+ */
+function readIsEmptyHanded(signals: FormSignals): boolean {
+  return (
+    !signals.applicationFormPresent &&
+    !signals.applyControlPresent &&
+    signals.passwordFieldCount === 0
+  );
+}
+
+/**
+ * Reads the page again, a couple of times, while it is still telling us nothing.
+ *
+ * Returns the last read and how many re-reads it took, so the failure message
+ * can say whether this run waited or not — the difference between "we looked
+ * once at a page that was still loading" and "we waited and the form was really
+ * not there" is the whole diagnosis, and the first version of this module could
+ * not tell the two apart.
+ *
+ * Stops early on a captcha or a post-submission confirmation. Both are answers
+ * rather than absences, both are about to be raised by the caller's own asserts,
+ * and neither is a page worth poking at repeatedly.
+ */
+async function rereadWhileTheFormCouldStillAppear(
+  session: BrowserSession,
+  first: FormSignals
+): Promise<{ signals: FormSignals; rereads: number }> {
+  let signals = first;
+  let rereads = 0;
+
+  for (const delayMs of FORM_REREAD_BACKOFF_MS) {
+    if (!readIsEmptyHanded(signals)) break;
+    if (signals.captchaPresent || signals.applicationLikelySubmitted) break;
+    console.warn(
+      `${LOG} nothing on screen yet at "${signals.url}" (${signals.textLength} characters of ` +
+        `text, ${signals.fileInputCount} file inputs, no form and no apply control); ` +
+        `reading it again in ${delayMs}ms`
+    );
+    await sleep(delayMs);
+    signals = await readFormSignals(session);
+    rereads += 1;
+  }
+
+  return { signals, rereads };
+}
+
 async function reachApplicationForm(
   session: BrowserSession,
   state: ApplicationState,
@@ -1568,11 +1774,23 @@ async function reachApplicationForm(
 ): Promise<FormSignals> {
   let signals = after;
   let clickedApplyControl = false;
+  let rereads = 0;
 
   if (signals === null || !signals.applicationFormPresent) {
     console.log(`${LOG} navigate → ${state.applyUrl}`);
     await session.page.goto(state.applyUrl, { timeout: NAVIGATION_TIMEOUT_MS });
     signals = await readFormSignals(session);
+    // JOB-021, and only on the branch that navigated: a page handed over by
+    // `completeVerification` has already been read once on a settled DOM, and
+    // re-reading it here would be paying for an extraction to learn what the
+    // caller just told us.
+    //
+    // Above the board check below rather than under it, so that check sees
+    // where the browser ended up rather than where it was six seconds earlier.
+    // The re-reads cost nothing on the path that check exists for: a page that
+    // was substituted for this listing is a page with a form on it, so it is
+    // never empty-handed and the loop below breaks on its first line.
+    ({ signals, rereads } = await rereadWhileTheFormCouldStillAppear(session, signals));
   }
   // Unconditional, and not only on the branch that navigated. The `goto` above
   // is the redirect this catches most often, but the branch that skips it is
@@ -1623,6 +1841,12 @@ async function reachApplicationForm(
         `${signals.textLength} characters of text) with no application form on screen ` +
         `(password fields: ${signals.passwordFieldCount}, file inputs: ${signals.fileInputCount}, ` +
         `iframes: ${signals.iframeCount}). ` +
+        // JOB-021. Says whether the page was given time, because without it this
+        // sentence reads identically for "the board has no form we can use" and
+        // "we read a careers SPA before it had mounted one", and those want
+        // opposite responses from whoever picks this up.
+        `The page was read ${rereads + 1} time${rereads === 0 ? "" : "s"} after its content ` +
+        `attached and its DOM stopped changing. ` +
         (clickedApplyControl
           ? `A control was clicked while trying to reach the form, and its effect on the board is ` +
             `unconfirmed — this is NOT the same as "nothing happened". If that control's label ` +
