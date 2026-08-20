@@ -574,8 +574,11 @@ function stillBuilding(current: StructuralFloor, next: StructuralFloor): boolean
  *
  * ── Why this exists ─────────────────────────────────────────────────────────
  * `page.goto` in this SDK defaults to `waitUntil: "domcontentloaded"` (verified
- * in `@browserbasehq/stagehand`'s own `goto`, which reads
- * `options?.waitUntil ?? "domcontentloaded"`), and none of this module's three
+ * in `@browserbasehq/stagehand`'s bundled driver,
+ * `dist/extension/service-worker.js`, whose `goto` reads
+ * `options?.waitUntil ?? "domcontentloaded"` — the package's main entry,
+ * `dist/index.mjs`, only forwards options over RPC and has no default of its
+ * own), and none of this module's three
  * navigations passes one. On a server rendered board that is fine. On an Ashby
  * or SmartRecruiters careers page it returns while the document is still a
  * shell: the framework has not fetched its data and has mounted nothing, so the
