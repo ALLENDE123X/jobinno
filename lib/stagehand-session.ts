@@ -60,14 +60,31 @@ import {
 export const STAGEHAND_MODEL = "openai/gpt-5.6-luna" as const;
 
 /**
- * How long Stagehand waits for the DOM to stop changing before it reads the
- * page. Stagehand's own default is 5s; this is raised because the boards that
- * matter here are the slow ones — Workday's careers SPA fetches its data and
- * mounts the application well after the HTML is parsed.
+ * How long Stagehand waits for the DOM to stop changing before it **acts** on
+ * the page. Stagehand's own default is 5s; this is raised because the boards
+ * that matter here are the slow ones — Workday's careers SPA fetches its data
+ * and mounts the application well after the HTML is parsed.
+ *
+ * JOB-021 corrected what this comment claims, because the original wording said
+ * "before it reads the page" and that was wrong in a way that cost a production
+ * run. In `@browserbasehq/stagehand` 4.0.1 this value reaches exactly one
+ * function, `act()`, which awaits `waitForDomNetworkQuiet` before doing
+ * anything at all. `extract()` and `observe()` accept no settle parameter and
+ * call no such thing. So a click is followed by a settled page and a `goto` is
+ * not, and anything that navigates and then reads has to wait for the page
+ * itself. See `settleBeforeReading` in `lib/fill-application-form.ts`.
  */
 export const DOM_SETTLE_TIMEOUT_MS = 30_000;
 
-/** Navigation lifecycle to wait for. */
+/**
+ * How long a navigation may take.
+ *
+ * Not a lifecycle. `page.goto` in this SDK defaults to
+ * `waitUntil: "domcontentloaded"` and no caller here overrides it, so a
+ * navigation returns as soon as the HTML is parsed however long this is set to.
+ * Waiting for a client rendered board to become a page is a separate job and
+ * belongs to whoever is about to read it.
+ */
 export const NAVIGATION_TIMEOUT_MS = 60_000;
 
 export type BrowserSession = {

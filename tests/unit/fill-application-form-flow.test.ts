@@ -1,13 +1,12 @@
 // @vitest-environment node
 /**
- * JOB-006. Two orderings the shared form action cache depends on, exercised
- * through `fillApplicationForm` itself rather than through the cache module's
- * pure functions.
+ * Properties of `fillApplicationForm`'s *sequence*, exercised through the real
+ * function rather than through the pure helpers underneath it. None of them is
+ * visible from inside any single module, which is what puts them at this level.
  *
- * `tests/unit/form-action-cache.test.ts` covers the cache in isolation, and that
- * is the right level for a fingerprint or a plan lookup. It is the wrong level
- * for the two things below, because both are properties of the *sequence* the
- * flow runs in and neither is visible from inside the module:
+ * `tests/unit/form-action-cache.test.ts` covers the shared cache in isolation,
+ * and that is the right level for a fingerprint or a plan lookup. It is the
+ * wrong level for the first two below, which JOB-006 contributed:
  *
  *  1. The fingerprint is taken after the cover letter has been switched to
  *     manual entry, so the key describes the form that is about to be filled
@@ -18,6 +17,11 @@
  *  2. A replayed selector with nothing in the DOM to corroborate it sends the
  *     run back to a live observation instead of being typed into.
  *
+ * The apply URL blocks came next, and JOB-021 added the last block in the file:
+ * the page is never read before it exists. That is the bug which failed 16 of 21
+ * real applications on the first production run, and its fixture is a page that
+ * arrives in pieces, which is what a client hydrated careers SPA is.
+ *
  * Nothing here opens a browser, calls a model or touches a database. The browser
  * is a plain object whose page answers whatever the test wants the DOM to say,
  * and the module boundaries around the flow are mocked so that the flow itself
@@ -27,6 +31,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => {
   type Resolution = { selector: string; description: string; replayed: boolean } | null;
+
+  /** What `STRUCTURAL_FLOOR_SCRIPT` answers with. Mirrors the module's own type. */
+  type StructuralFloor = {
+    passwordFields: number;
+    fileInputs: number;
+    textAreas: number;
+    iframes: number;
+    ordinaryInputs: number;
+    textLength: number;
+  };
 
   /**
    * A real Greenhouse embed URL rather than an invented careers page, because
@@ -92,6 +106,35 @@ const h = vi.hoisted(() => {
     writes: [] as { table: string; op: "update" | "insert"; values: unknown }[],
     /** How many times a browser was opened. */
     browsersOpened: 0,
+
+    // ── JOB-021: a page that arrives in pieces ────────────────────────────
+    /**
+     * The DOM's own shape, one entry per structural read, last entry repeating
+     * forever. Null means the fixed shape every other test in this file uses.
+     *
+     * A list rather than a timer because `sleep` is stubbed out here: what the
+     * settle step actually does is read the DOM, wait, and read it again until
+     * two reads agree, so "how many times has it been read" is the real clock.
+     */
+    floors: null as StructuralFloor[] | null,
+    /** How many times the structural floor script has been evaluated. */
+    domReads: 0,
+    /** The last structural shape handed back, whatever produced it. */
+    lastFloor: null as StructuralFloor | null,
+    /** The DOM's shape at the moment of each `extract`, in order. */
+    floorsAtExtract: [] as (StructuralFloor | null)[],
+    /** How many structural reads had happened when the first `extract` ran. */
+    domReadsAtFirstExtract: 0,
+    /** How many times the page reader has been asked what is on screen. */
+    extractCalls: 0,
+    /** Every `waitForSelector` the flow made, with what it asked for. */
+    selectorWaits: [] as { selector: string; state?: string; timeout?: number }[],
+    /**
+     * Overrides for what the reader reports, by 1-based `extract` call number.
+     * A board whose form mounts late answers differently on the first call than
+     * on the second, which no fixed fixture can express.
+     */
+    signalsOverride: null as null | ((call: number) => Record<string, unknown>),
   };
 
   const reset = (): void => {
@@ -116,6 +159,14 @@ const h = vi.hoisted(() => {
     state.resumeAttachments = 0;
     state.writes = [];
     state.browsersOpened = 0;
+    state.floors = null;
+    state.domReads = 0;
+    state.lastFloor = null;
+    state.floorsAtExtract = [];
+    state.domReadsAtFirstExtract = 0;
+    state.extractCalls = 0;
+    state.selectorWaits = [];
+    state.signalsOverride = null;
   };
 
   /**
@@ -185,22 +236,50 @@ const h = vi.hoisted(() => {
       : []),
   ];
 
+  /** The fixed shape every test that is not about hydration reads. */
+  const settledFloor = (): StructuralFloor => ({
+    passwordFields: 0,
+    fileInputs: state.fileInputs,
+    textAreas: 1,
+    iframes: 0,
+    ordinaryInputs: 3,
+    textLength: 4000,
+  });
+
+  /**
+   * One structural read. When `state.floors` is set the reads walk that list and
+   * then stay on its last entry, which is a page that finishes arriving; with it
+   * unset every read answers the same thing, which is a page that already had.
+   */
+  const readFloor = (): StructuralFloor => {
+    state.domReads += 1;
+    const scripted = state.floors;
+    const floor =
+      scripted === null
+        ? settledFloor()
+        : scripted[Math.min(state.domReads - 1, scripted.length - 1)]!;
+    state.lastFloor = floor;
+    return floor;
+  };
+
   const page = {
     goto: async () => undefined,
     // Where the browser is, not where it was sent. `goto` follows redirects, so
     // these are two different strings whenever `landedUrl` is set.
     url: async () => state.landedUrl ?? state.applyUrl,
     title: async () => "Careers at Example",
+    /**
+     * Resolves as soon as it is asked, the way the real one does on a page that
+     * has already mounted something. A test that wants the miss branch would
+     * override this; none does, because the miss is only ever logged.
+     */
+    waitForSelector: async (selector: string, options?: { state?: string; timeout?: number }) => {
+      state.selectorWaits.push({ selector, ...options });
+      state.events.push("waited for the page to have content");
+      return true;
+    },
     evaluate: async (script: unknown) =>
-      String(script).includes("passwordFields")
-        ? {
-            passwordFields: 0,
-            fileInputs: state.fileInputs,
-            textAreas: 1,
-            iframes: 0,
-            textLength: 4000,
-          }
-        : state.descriptor,
+      String(script).includes("passwordFields") ? readFloor() : state.descriptor,
     screenshot: async () => new Uint8Array([1, 2, 3]),
     locator: () => ({
       inputValue: async () => state.lastTyped,
@@ -217,7 +296,17 @@ const h = vi.hoisted(() => {
     browser: {},
     page,
     stagehand: {
-      extract: async () => ({ data: readPage() }),
+      extract: async () => {
+        state.extractCalls += 1;
+        // What the DOM looked like at the instant the reader was asked. This is
+        // the whole JOB-021 assertion: on a page that arrives in pieces, a read
+        // taken too early describes a shell nobody could apply through.
+        state.floorsAtExtract.push(state.lastFloor);
+        if (state.extractCalls === 1) state.domReadsAtFirstExtract = state.domReads;
+        state.events.push("read what is on screen");
+        const override = state.signalsOverride?.(state.extractCalls) ?? {};
+        return { data: { ...readPage(), ...override } };
+      },
       act: async (action: { description?: string }) => {
         const description = action.description ?? "";
         if (description.includes("switches the cover letter")) {
@@ -366,6 +455,12 @@ vi.mock("@/lib/stagehand-session", () => ({
     return h.session;
   },
   closeBrowserSession: async () => undefined,
+  /**
+   * Returns at once. The waiting this file cares about is *how many times the
+   * page is read before a verdict is drawn*, and that is asserted by counting
+   * reads rather than by burning the real six seconds of backoff on every case.
+   */
+  sleep: async () => undefined,
   typeInto: async (_session: unknown, _url: string, instruction: string, value: string) => {
     h.state.events.push(`typed into ${instruction}`);
     h.state.lastTyped = value;
@@ -782,5 +877,283 @@ describe("a listing that redirects the browser somewhere else", () => {
     expect(result.blockedReason).toBeNull();
     expect(result.status).toBe("form_filled");
     expect(h.state.resumeAttachments).toBe(1);
+  });
+});
+
+// ───────────────────────────────────
+// JOB-021: a page is not read before it exists
+// ───────────────────────────────────
+
+/** The module's `StructuralFloor`, which is private to it. */
+type StructuralFloorShape = {
+  passwordFields: number;
+  fileInputs: number;
+  textAreas: number;
+  iframes: number;
+  ordinaryInputs: number;
+  textLength: number;
+};
+
+/**
+ * The bug this block exists for, stated as evidence rather than as a theory.
+ *
+ * The first production run against real Ashby-hosted career pages made 21
+ * application attempts and lost 16 of them inside four minutes, across eight
+ * unrelated companies, to one identical message: "Could not reach the job
+ * application form ... no application form on screen". The pages had loaded, and
+ * the failures said so themselves — hundreds to thousands of characters of text,
+ * two file inputs, two iframes each. A board with two file inputs on screen is a
+ * board showing an application form.
+ *
+ * The two halves of that message came from two different moments.
+ * `readFormSignals` asked a model what was on screen and only then counted the
+ * DOM, and an extraction takes seconds. So the model described the shell that
+ * `page.goto` returns at `domcontentloaded`, the DOM count described the page
+ * that had hydrated while the model was thinking, and the run reported the
+ * former. Nothing waited for the page anywhere in the module.
+ *
+ * The fixture below is that page: it arrives in pieces, and the pieces are only
+ * all there by the third structural read.
+ */
+describe("a careers page that is still hydrating when the browser arrives", () => {
+  /** An empty React shell: the document parsed, nothing mounted. */
+  const SHELL: StructuralFloorShape = {
+    passwordFields: 0,
+    fileInputs: 0,
+    textAreas: 0,
+    iframes: 0,
+    ordinaryInputs: 0,
+    textLength: 0,
+  };
+
+  /** Chrome and the first data fetch, still short of the application form. */
+  const PARTIAL: StructuralFloorShape = {
+    passwordFields: 0,
+    fileInputs: 0,
+    textAreas: 0,
+    iframes: 2,
+    ordinaryInputs: 0,
+    textLength: 474,
+  };
+
+  /**
+   * The real page. The iframe and text figures are the ones the production
+   * failures carried; the file input count is one rather than the two they
+   * reported, so that the upload takes the deterministic "the page has exactly
+   * one file input" path. Which control the resume goes into is a different
+   * test's subject, and wiring an observation fixture in here would only add
+   * noise to one about timing.
+   */
+  const HYDRATED: StructuralFloorShape = {
+    passwordFields: 0,
+    fileInputs: 1,
+    textAreas: 1,
+    iframes: 2,
+    ordinaryInputs: 7,
+    textLength: 6141,
+  };
+
+  const arrivesInPieces = (): void => {
+    h.state.floors = [SHELL, PARTIAL, HYDRATED];
+  };
+
+  it("does not ask what is on screen until the DOM has stopped growing", async () => {
+    arrivesInPieces();
+
+    const result = await run();
+
+    expect(result.blockedReason).toBeNull();
+
+    // The assertion the bug fails. Without a settle step the reader is called
+    // straight after `goto`, so the shape at that moment is the SHELL — or, as
+    // it was before this fix, no shape at all, because the DOM had not been read
+    // even once yet.
+    expect(h.state.floorsAtExtract[0]).toEqual(HYDRATED);
+    expect(h.state.floorsAtExtract[0]).not.toEqual(SHELL);
+    expect(h.state.floorsAtExtract[0]).not.toEqual(PARTIAL);
+
+    // And it got there by looking repeatedly rather than by waiting a fixed
+    // time: three reads to see the page arrive, a fourth to see it stand still.
+    expect(h.state.domReadsAtFirstExtract).toBeGreaterThanOrEqual(4);
+  });
+
+  it("keeps waiting when the only thing arriving is plain form inputs", async () => {
+    // The blind spot the other four counts have, and the commonest shape of the
+    // thing this ticket is about. A form mounting a column of text inputs moves
+    // no password, file, textarea or iframe count, and a form whose fields carry
+    // placeholders rather than visible labels does not lengthen `innerText`
+    // either. Without `ordinaryInputs` in the floor this page reads as settled
+    // on the second poll, and the extraction runs against a page with no fields.
+    const bare = { passwordFields: 0, fileInputs: 0, textAreas: 0, iframes: 1, textLength: 900 };
+    h.state.floors = [
+      { ...bare, ordinaryInputs: 0 },
+      { ...bare, ordinaryInputs: 4 },
+      { ...bare, ordinaryInputs: 9 },
+    ];
+
+    const result = await run();
+
+    expect(result.blockedReason).toBeNull();
+    expect(h.state.floorsAtExtract[0]?.ordinaryInputs).toBe(9);
+    // Four reads: three to watch the fields arrive, a fourth to see them stop.
+    expect(h.state.domReadsAtFirstExtract).toBe(4);
+  });
+
+  it("waits for content to attach before it reads anything at all", async () => {
+    arrivesInPieces();
+
+    await run();
+
+    const first = h.state.selectorWaits[0];
+    expect(first).toBeDefined();
+    // `attached`, not `visible`: a selector list resolves to the first match in
+    // document order, so a hidden skip link or collapsed nav button would leave
+    // a visibility wait pending on a page that has in fact rendered.
+    expect(first!.state).toBe("attached");
+    expect(first!.selector).toContain("form");
+    expect(first!.timeout).toBeGreaterThan(0);
+
+    // Ordering, not just occurrence: the wait is what the read is waiting for.
+    expect(h.state.events.indexOf("waited for the page to have content")).toBeLessThan(
+      h.state.events.indexOf("read what is on screen")
+    );
+  });
+
+  it("reads the listing again when the first read came back empty handed", async () => {
+    // The other half of the fix, for a board that mounts its form later than the
+    // settle budget allows. The first read finds neither a form nor an apply
+    // control nor a sign-in wall, which is precisely the state that used to go
+    // straight to "could not reach the job application form".
+    h.state.signalsOverride = (call) =>
+      call === 1 ? { applicationFormPresent: false, applyControlPresent: false } : {};
+
+    const result = await run();
+
+    expect(result.status).toBe("form_filled");
+    expect(result.blockedReason).toBeNull();
+    expect(h.state.extractCalls).toBeGreaterThan(1);
+  });
+
+  it("still fails closed, and bounded, when there really is no form", async () => {
+    // The control. A retry loop that never gives up would turn a listing this
+    // product cannot apply to into a run that never ends, and a guard that can
+    // be waited past is not a guard. Nothing is ever clicked here, so the
+    // message must say so rather than hedging about an unconfirmed click.
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: false,
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("Could not reach the job application form");
+    expect(result.blockedReason).toContain("Nothing was clicked or typed.");
+
+    // One read plus the two bounded re-reads, and no more.
+    expect(h.state.extractCalls).toBe(3);
+
+    // And the message says the page was given its chance, so that whoever reads
+    // this skip row can tell it apart from the failure that started JOB-021.
+    // Phrased as the wait that was made rather than an outcome that was
+    // observed, because a settle that times out still waited.
+    expect(result.blockedReason).toContain("read 3 times");
+    expect(result.blockedReason).toContain("waiting for it to finish arriving");
+  });
+
+  it("counts the reads it made after clicking an apply control", async () => {
+    // The count in that sentence has to be the whole truth or it is worse than
+    // no count at all. Reads happen in three places — the first one, the empty
+    // handed re-reads, and once after every apply click — and a message that
+    // reported only the first two would tell somebody the page was looked at
+    // once when it had in fact been looked at three times, on the very path
+    // where a click has already touched a real employer's site.
+    h.state.resolve = (instruction: string) =>
+      instruction.includes("opens this listing's job application form")
+        ? {
+            selector: "xpath=/html[1]/body[1]/main[1]/a[1]",
+            description: "the Apply for this job button",
+            replayed: false,
+          }
+        : null;
+    // An apply control that is there and never opens anything, which is what a
+    // button whose handler has not been wired up yet looks like.
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: true,
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("Could not reach the job application form");
+
+    // One read on arrival plus one after each of the two clicks. No re-reads:
+    // an apply control on screen is something to act on, so the page was never
+    // empty handed.
+    expect(h.state.extractCalls).toBe(3);
+    expect(result.blockedReason).toContain("read 3 times");
+
+    // And because a click happened, the message says its effect is unconfirmed
+    // rather than claiming nothing happened.
+    expect(result.blockedReason).toContain("A control was clicked");
+    expect(result.blockedReason).not.toContain("Nothing was clicked or typed.");
+  });
+
+  it("does not spend its re-reads on a captcha", async () => {
+    // A challenge is an answer, not an absence. Re-reading it costs a model call
+    // per attempt and tells us nothing we did not already know on the first.
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: false,
+      captchaPresent: true,
+      captchaEvidence: "a Turnstile widget above the application section",
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("captcha_present");
+    expect(h.state.extractCalls).toBe(1);
+  });
+
+  it("does not spend its re-reads on a page that may have already been submitted", async () => {
+    // The captcha's sibling, and the one with teeth. A page reading as a post
+    // submission confirmation means a control may have filed a real application
+    // under this candidate's name, and the correct response is to stop and say
+    // so — not to sit on the board reloading a confirmation page hoping a form
+    // appears on it.
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: false,
+      applicationLikelySubmitted: true,
+      applicationLikelySubmittedEvidence: "Thanks for applying, we will be in touch",
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("possible_unintended_submission");
+    expect(h.state.extractCalls).toBe(1);
+  });
+
+  it("leaves a settled page exactly as it found it", async () => {
+    // The regression guard for the common case. A board that is already there
+    // when the browser arrives must not pay for a second read, or every
+    // application in the fan-out pays for this fix on every page.
+    const result = await run();
+
+    expect(result.status).toBe("form_filled");
+    expect(h.state.floorsAtExtract[0]).toEqual({
+      passwordFields: 0,
+      fileInputs: 0,
+      textAreas: 1,
+      iframes: 0,
+      ordinaryInputs: 3,
+      textLength: 4000,
+    });
+    // Two structural reads to establish that the page is standing still, and no
+    // re-read of the page reader on top of them.
+    expect(h.state.domReadsAtFirstExtract).toBe(2);
   });
 });
