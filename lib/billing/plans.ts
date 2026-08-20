@@ -104,6 +104,20 @@ export type PaidPlanSlug = (typeof PAID_PLAN_SLUGS)[number];
 /** Every value `profiles.plan` can hold. */
 export type PlanSlug = "free" | PaidPlanSlug;
 
+/**
+ * What `applications_cap` becomes the one time a free signup finishes intake.
+ *
+ * Granted by `lib/onboarding/attestation.ts`, in the same statement that stamps
+ * `attested_at`, and nowhere else. `free` has no entry in `PAID_PLANS` because
+ * nothing is bought to get it, but the number still belongs here rather than
+ * inline at the grant site: the landing page's pricing card
+ * (`app/page.tsx`) and `tests/e2e/smoke.spec.ts`'s assertion on "10
+ * applications, total" both promise this exact figure, and JOB-010 already
+ * proved what happens when a number like this lives in two places, which is
+ * that they drift.
+ */
+export const FREE_PLAN_APPLICATIONS_CAP = 10;
+
 export interface PaidPlan {
   slug: PaidPlanSlug;
   /** How the plan is named to a person, matching the landing page copy. */
@@ -141,12 +155,14 @@ export const PAID_PLANS: Record<PaidPlanSlug, PaidPlan> = {
 /**
  * What `applications_cap` becomes when a paid plan goes away.
  *
- * Zero, and not ten. The free tier's ten applications are a one time trial
- * granted at signup, so handing them back to somebody whose subscription just
- * lapsed would mint a fresh trial every time a card expired. `schema.ts` makes
- * the same argument for the column default: an unset cap has to mean "cannot
- * apply yet" rather than "apply without limit", because the failure of a wrong
- * guess here is billable work done for free on somebody else's job board.
+ * Zero, and not `FREE_PLAN_APPLICATIONS_CAP`. The free tier's ten applications
+ * are a one time trial granted the moment intake is first completed (see
+ * `lib/onboarding/attestation.ts`), not something signup itself hands out, so
+ * handing them back to somebody whose subscription just lapsed would mint a
+ * fresh trial every time a card expired. `schema.ts` makes the same argument
+ * for the column default: an unset cap has to mean "cannot apply yet" rather
+ * than "apply without limit", because the failure of a wrong guess here is
+ * billable work done for free on somebody else's job board.
  */
 export const LAPSED_PLAN_CAP = 0;
 

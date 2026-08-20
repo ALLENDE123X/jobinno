@@ -14,6 +14,7 @@ import { describe, expect, it } from "vitest";
 import {
   BILLING_ERROR_CODES,
   BILLING_ERROR_MESSAGES,
+  FREE_PLAN_APPLICATIONS_CAP,
   GENERIC_BILLING_ERROR_MESSAGE,
   LAPSED_PLAN_CAP,
   PAID_PLANS,
@@ -74,6 +75,13 @@ describe("what each plan costs and buys", () => {
     // The free ten are a one time trial. Handing them back every time a card
     // expires would mint a fresh trial on every failed renewal.
     expect(LAPSED_PLAN_CAP).toBe(0);
+  });
+
+  it("promises the same ten applications the landing page and smoke test do", () => {
+    // `app/page.tsx` and `tests/e2e/smoke.spec.ts` both say "10 applications,
+    // total". `lib/onboarding/attestation.ts` is the one place that number is
+    // actually granted, and it reads this constant rather than a literal 10.
+    expect(FREE_PLAN_APPLICATIONS_CAP).toBe(10);
   });
 });
 
