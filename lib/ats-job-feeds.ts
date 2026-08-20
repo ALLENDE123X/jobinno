@@ -294,17 +294,47 @@ export function qualifyExternalId(boardToken: string, nativeId: string): string 
  * "Senior Software Engineer", so a list of whole words alone let several
  * hundred experienced roles through.
  *
- * The exclusions lose to an explicit internship: "Engineering Manager Intern"
- * is an internship whatever else the title says, and dropping it would be the
- * expensive mistake of the two. Everything else about the filter is
+ * The exclusions lose to an explicit internship: "Software Engineering Manager
+ * Intern" is an internship whatever else the title says, and dropping it would
+ * be the expensive mistake of the two. Everything else about the filter is
  * deliberately narrow, on the reasoning `lib/search-job-listings.ts` already
  * sets out for its own title match: a false positive is a real application
  * sent to a job the candidate never asked for.
  *
- * Note what `relevant` does not mean. A plain "Software Engineer" with no
- * seniority word in it is kept, because a title says nothing about whether the
- * role is open to a new graduate, and `is_intern` and `is_new_grad` are what
- * carry that distinction to whoever queries this table.
+ * ── Discipline and seniority are both required, not either ──────────────────
+ * `relevant` used to be `isIntern || isNewGrad || SWE_RE.test(title)`, and that
+ * "or" is the whole reason this section is here. It let a title through on the
+ * seniority word alone, so "Marketing Intern", "Legal Intern", "Investment
+ * Banking Summer Analyst Internship", "University Relations Coordinator" and
+ * "Early Career Sales Associate" were all written to `jobs` as relevant.
+ *
+ * None of those is a hypothetical. On the live table, 289 of the 958 rows
+ * ingested under the old rule carried `is_intern` or `is_new_grad` with a title
+ * naming no software role at all: "Intern - Maintenance Technician", "Finance
+ * Intern - Summer 2027", "Intern, Commodity Sourcing", "Environmental Health &
+ * Safety Intern", "2027 Point72 Academy Investment Analyst Summer Internship".
+ * A further 559 were neither an internship nor a new grad role.
+ *
+ * That is not a cosmetic mislabel. `matchJobsForUser` is title blind whenever
+ * no title is supplied, which is always true of the daily cron, so every one of
+ * those rows was a listing a real browser could be sent to apply to, against a
+ * paying person's finite application allowance, for a job in a discipline this
+ * product does not serve. The product's scope is CS interns and new graduates
+ * in software engineering roles, so the test is both halves: a software title,
+ * AND an internship or a new grad role.
+ *
+ * What that costs, stated rather than hidden. Two classes are now dropped that
+ * were kept before, and both are deliberate:
+ *
+ *  · A plain "Software Engineer" with no seniority word says nothing about
+ *    being open to a new graduate, and hundreds of them are ordinary mid level
+ *    postings. `is_intern` and `is_new_grad` no longer merely annotate the
+ *    table; they are a condition of being in it.
+ *  · A software internship whose title spells the discipline some other way —
+ *    "Software Development Engineer Intern", "New Grad Backend Engineer" —
+ *    fails `SWE_RE` and is dropped. Widening the discipline vocabulary is a
+ *    real improvement to make, and is a deliberate change to `SWE_RE` with its
+ *    own evidence, not a side effect of this one.
  */
 const INTERN_RE = /\bintern(ship|ships|s)?\b/i;
 const NEW_GRAD_RE = /\bnew[\s-]?grad(uate|uates|s)?\b|\bearly[\s-]?career\b|\buniversity\b/i;
@@ -323,7 +353,9 @@ export function classifyTitle(rawTitle: string): TitleRelevance {
 
   const isIntern = INTERN_RE.test(title);
   const isNewGrad = NEW_GRAD_RE.test(title);
-  const matchesInterest = isIntern || isNewGrad || SWE_RE.test(title);
+  // Both, not either: the discipline and the career stage. See above for what
+  // the "or" this replaced actually admitted, and for what the "and" costs.
+  const matchesInterest = SWE_RE.test(title) && (isIntern || isNewGrad);
 
   // An explicit internship outranks every seniority word. See above.
   const relevant = matchesInterest && (isIntern || !SENIORITY_RE.test(title));

@@ -109,17 +109,28 @@ describe("the Inngest serve route", () => {
     expect(route.dynamic).toBe("force-dynamic");
   });
 
-  it("registers the board sync cron and both pipeline functions", () => {
+  it("registers both crons and both pipeline functions", () => {
     // `sync-job-boards` is the one that matters most: it is JOB-003's cron, and
     // before this route existed it was registered nowhere at all.
-    expect(captured.ids).toEqual(["sync-job-boards", "discover-listings", "apply-to-job"]);
+    //
+    // `schedule-job-searches` is JOB-008's, and it has the same property one
+    // layer up: `discover-listings` was registered from the day this route
+    // existed and no event ever reached it, because nothing sent one. A cron
+    // missing from this list has no schedule, so this assertion is the whole of
+    // what makes the daily search real.
+    expect(captured.ids).toEqual([
+      "sync-job-boards",
+      "schedule-job-searches",
+      "discover-listings",
+      "apply-to-job",
+    ]);
   });
 
   it("answers Inngest's introspection request", async () => {
     const { status, body } = await introspect();
 
     expect(status).toBe(200);
-    expect(body.function_count).toBe(3);
+    expect(body.function_count).toBe(4);
     expect(body.mode).toBe("dev");
     // Present, whatever its value: the handler reports the schema it speaks and
     // a reply without one is not an Inngest introspection response.

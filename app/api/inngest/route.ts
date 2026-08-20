@@ -56,6 +56,7 @@ import { serve } from "inngest/next";
 
 import { syncJobBoards } from "@/inngest/board-sync";
 import { applyToJob, discoverListings, inngest } from "@/inngest/job-application-pipeline";
+import { scheduleJobSearches } from "@/inngest/job-search-schedule";
 
 /**
  * Node, not Edge. Non negotiable rather than a preference: the pipeline reaches
@@ -91,7 +92,11 @@ export const { GET, POST, PUT } = serve({
     // JOB-003. The cron that keeps `boards` and `jobs` current. This is the
     // registration that makes its schedule real.
     syncJobBoards,
-    // ACT-009, by way of JOB-004. Search and fan out, then one run per listing.
+    // JOB-008. The daily cron that decides who gets searched. Until it existed
+    // nothing sent `job-search/requested` at all, so the two functions below
+    // were registered, correct, and unreachable.
+    scheduleJobSearches,
+    // ACT-009, by way of JOB-004. Match and fan out, then one run per listing.
     discoverListings,
     applyToJob,
   ],
