@@ -111,7 +111,8 @@ async function main(): Promise<void> {
 
   console.log(
     `[job-003] ${summary.ok} synced, ${summary.deferred} deferred, ${summary.failed} failed; ` +
-      `${summary.kept} listing(s) kept of ${summary.seen} seen`
+      `${summary.kept} listing(s) kept of ${summary.seen} seen` +
+      (summary.rejected > 0 ? `, ${summary.rejected} dropped on an unusable apply URL` : "")
   );
 }
 

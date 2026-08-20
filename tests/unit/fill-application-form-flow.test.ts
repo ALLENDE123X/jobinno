@@ -28,7 +28,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => {
   type Resolution = { selector: string; description: string; replayed: boolean } | null;
 
-  const APPLY_URL = "https://careers.example.com/jobs/42/apply";
+  /**
+   * A real Greenhouse embed URL rather than an invented careers page, because
+   * `loadApplicationState` now refuses to open a listing whose host does not
+   * belong to the board it came from. See `lib/apply-url-guard.ts`.
+   */
+  const APPLY_URL = "https://job-boards.greenhouse.io/embed/job_app?for=example&token=42";
+  const BOARD_TOKEN = "example";
   const JOB_APPLICATION_ID = "11111111-1111-4111-8111-111111111111";
   const CANDIDATE_ID = "22222222-2222-4222-8222-222222222222";
   /** `jobs.id`. The listing is its own row since JOB-004. */
@@ -68,6 +74,12 @@ const h = vi.hoisted(() => {
     events: [] as string[],
     /** The shape each `loadActionPlan` was handed. */
     shapes: [] as { fingerprint: string; slots: string[] }[],
+    /** What the listing row says its URL is. Overridden by the guard tests. */
+    applyUrl: APPLY_URL,
+    /** Every write the module made, so a terminal status can be asserted. */
+    writes: [] as { table: string; op: "update" | "insert"; values: unknown }[],
+    /** How many times a browser was opened. */
+    browsersOpened: 0,
   };
 
   const reset = (): void => {
@@ -85,6 +97,9 @@ const h = vi.hoisted(() => {
     };
     state.events = [];
     state.shapes = [];
+    state.applyUrl = APPLY_URL;
+    state.writes = [];
+    state.browsersOpened = 0;
   };
 
   /**
@@ -156,7 +171,7 @@ const h = vi.hoisted(() => {
 
   const page = {
     goto: async () => undefined,
-    url: async () => APPLY_URL,
+    url: async () => state.applyUrl,
     title: async () => "Careers at Example",
     evaluate: async (script: unknown) =>
       String(script).includes("passwordFields")
@@ -196,6 +211,7 @@ const h = vi.hoisted(() => {
     formControls,
     manualEntryOnly,
     APPLY_URL,
+    BOARD_TOKEN,
     JOB_APPLICATION_ID,
     CANDIDATE_ID,
     JOB_ID,
@@ -232,7 +248,9 @@ vi.mock("node:fs/promises", async (importOriginal) => ({
  * a query changing its filters does not have to change this mock.
  */
 vi.mock("@supabase/supabase-js", () => {
-  const rows: Record<string, unknown[]> = {
+  // Built per query rather than once, so that a test moving `state.applyUrl`
+  // moves what the row says.
+  const tables = (): Record<string, unknown[]> => ({
     applications: [
       {
         id: h.JOB_APPLICATION_ID,
@@ -243,9 +261,9 @@ vi.mock("@supabase/supabase-js", () => {
         // `loadApplicationState` unwraps.
         jobs: {
           title: "Software Engineer Intern",
-          url: h.APPLY_URL,
+          url: h.state.applyUrl,
           ats: "greenhouse",
-          boards: { company: "Example" },
+          boards: { company: "Example", board_token: h.BOARD_TOKEN },
         },
       },
     ],
@@ -264,16 +282,23 @@ vi.mock("@supabase/supabase-js", () => {
     resumes: [
       { storage_path: "resumes/candidate.pdf", created_at: "2026-01-01T00:00:00.000Z" },
     ],
-  };
+  });
 
   const builder = (table: string) => {
+    const rows = tables();
     const result = { data: rows[table] ?? [], error: null };
     const chain: Record<string, unknown> = {
       single: async () => ({ data: rows[table]?.[0] ?? null, error: null }),
       then: (resolve: (value: typeof result) => unknown) => Promise.resolve(result).then(resolve),
     };
-    for (const method of ["select", "eq", "ilike", "in", "gte", "order", "limit", "update", "insert", "upsert"]) {
+    for (const method of ["select", "eq", "ilike", "in", "gte", "order", "limit", "upsert"]) {
       chain[method] = () => chain;
+    }
+    for (const op of ["update", "insert"] as const) {
+      chain[op] = (values: unknown) => {
+        h.state.writes.push({ table, op, values });
+        return chain;
+      };
     }
     return chain;
   };
@@ -309,7 +334,10 @@ vi.mock("@/lib/resume-parser", () => ({
 
 vi.mock("@/lib/stagehand-session", () => ({
   NAVIGATION_TIMEOUT_MS: 30_000,
-  openBrowserSession: async () => h.session,
+  openBrowserSession: async () => {
+    h.state.browsersOpened += 1;
+    return h.session;
+  },
   closeBrowserSession: async () => undefined,
   typeInto: async (_session: unknown, _url: string, instruction: string, value: string) => {
     h.state.events.push(`typed into ${instruction}`);
@@ -354,7 +382,7 @@ vi.mock("@/lib/form-action-cache", async (importOriginal) => {
   };
 });
 
-import { fillApplicationForm } from "@/lib/fill-application-form";
+import { BlockedApplyUrlError, fillApplicationForm } from "@/lib/fill-application-form";
 import { fingerprintFormShape } from "@/lib/form-action-cache";
 import { reResolveLive } from "@/lib/stagehand-session";
 
@@ -487,5 +515,88 @@ describe("a replayed selector with no DOM evidence behind it", () => {
     expect(vi.mocked(reResolveLive)).not.toHaveBeenCalled();
     const email = result.fields.find((entry) => entry.field === "email");
     expect(email?.outcome).toBe("filled");
+  });
+});
+
+// ───────────────────────────────────
+// Where the browser is allowed to go
+// ───────────────────────────────────
+
+/**
+ * The second half of the apply URL fix. `lib/board-ingest.ts` screens a listing
+ * before it is stored, and this is the same rule applied again by the module
+ * that navigates, because two entry points reach it with a row ingest never
+ * saw (`lib/fill-form-cli.ts` and `lib/submit-application-cli.ts`) and because
+ * rows written before the screen existed are still in the table.
+ *
+ * What is asserted is not only that it refuses. It is that it refuses *before*
+ * a browser exists, and that it leaves the row saying so.
+ */
+describe("an apply URL that does not belong to the board it came from", () => {
+  const REFUSED = [
+    // The exfiltration case: a page of the tenant's choosing, which the flow
+    // would otherwise read as an application form and hand a real resume to.
+    "https://example-careers.attacker.example/apply/42",
+    // The same platform, somebody else's board.
+    "https://job-boards.greenhouse.io/embed/job_app?for=attacker&token=42",
+    // A different supported platform than the listing was read from.
+    "https://jobs.lever.co/example/42/apply",
+    // Our own host's metadata endpoint, which the local browser fallback can
+    // genuinely reach.
+    "http://169.254.169.254/latest/meta-data/",
+    "http://localhost:3000/apply",
+    // Right host, wrong scheme.
+    "http://job-boards.greenhouse.io/embed/job_app?for=example&token=42",
+  ];
+
+  it.each(REFUSED)("refuses %s without opening a browser", async (url) => {
+    h.state.applyUrl = url;
+
+    await expect(run()).rejects.toBeInstanceOf(BlockedApplyUrlError);
+    expect(h.state.browsersOpened).toBe(0);
+  });
+
+  it("writes form_fill_blocked on the row and a skip_log row saying why", async () => {
+    h.state.applyUrl = "https://example-careers.attacker.example/apply/42";
+
+    await expect(run()).rejects.toThrow(/Refusing to open the apply URL/);
+
+    // The terminal status, so nothing picks the row up again expecting it to
+    // work this time.
+    const statuses = h.state.writes
+      .filter((write) => write.table === "applications" && write.op === "update")
+      .map((write) => (write.values as { status?: string }).status);
+    expect(statuses).toEqual(["form_fill_blocked"]);
+    // In particular the row never passed through `filling_form`, because nothing
+    // was ever filled.
+    expect(statuses).not.toContain("filling_form");
+
+    // And the reason, in the one place this schema keeps reasons.
+    const skips = h.state.writes.filter(
+      (write) => write.table === "skip_log" && write.op === "insert"
+    );
+    expect(skips).toHaveLength(1);
+    const skip = skips[0]!.values as {
+      application_id: string;
+      job_id: string;
+      ats: string;
+      reason: string;
+      raw_context: { message: string };
+    };
+    expect(skip.application_id).toBe(h.JOB_APPLICATION_ID);
+    expect(skip.job_id).toBe(h.JOB_ID);
+    expect(skip.ats).toBe("greenhouse");
+    expect(skip.reason).toBe("dom_changed");
+    expect(skip.raw_context.message).toContain("attacker.example");
+  });
+
+  it("still runs the ordinary flow for the board's own URL", async () => {
+    // The regression guard. A check this strict is only correct if the real
+    // listing shape still goes through, so the default fixture is asserted
+    // rather than assumed.
+    const result = await run();
+    expect(result.status).toBe("form_filled");
+    expect(result.blockedReason).toBeNull();
+    expect(h.state.browsersOpened).toBe(1);
   });
 });
