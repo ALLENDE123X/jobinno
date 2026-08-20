@@ -9,11 +9,25 @@
  * The page itself is a server component. Only the four pieces that animate or
  * read the theme are client components, so the hero copy and the pricing
  * numbers are in the initial HTML.
+ *
+ * ── Somebody already signed in has no reason to see the marketing pitch
+ *    (JOB-020) ─────────────────────────────────────────────────────────────
+ * The check mirrors the one on `/login`: a session sends the visitor straight
+ * to `/dashboard` instead of the pitch they have already been sold on.
+ *
+ * One case has to skip it. `app/api/billing/checkout/route.ts` sends an
+ * already signed in person back here with `?billing_error=<code>` when their
+ * purchase was refused, for instance somebody who already holds a paid plan
+ * pressing buy again, and `BillingError` below is what shows them why. Firing
+ * the redirect in that case would send them straight past the message and
+ * they would never learn why the purchase did not go through, so the redirect
+ * is skipped whenever that parameter is present, and only then.
  */
 
 import { Suspense } from "react";
 
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { ArrowRight, Check, Clock, Moon, ShieldCheck } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -24,7 +38,12 @@ import { PipelineDiagram } from "@/components/landing/pipeline-diagram";
 import { StatsBand } from "@/components/landing/stats-band";
 import { Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme";
-import { CHECKOUT_PATH, CHECKOUT_PLAN_PARAM } from "@/lib/billing/plans";
+import {
+  BILLING_ERROR_PARAM,
+  CHECKOUT_PATH,
+  CHECKOUT_PLAN_PARAM,
+} from "@/lib/billing/plans";
+import { createServerClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 
 /**
@@ -120,7 +139,24 @@ function Section({
   );
 }
 
-export default function Home() {
+export default async function Home({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const params = await searchParams;
+  const hasBillingError = typeof params[BILLING_ERROR_PARAM] === "string";
+
+  if (!hasBillingError) {
+    const supabase = await createServerClient();
+
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (user) redirect("/dashboard");
+  }
+
   return (
     <div className="flex min-h-screen flex-col">
       <header className="sticky top-0 z-40 border-b bg-background/80 backdrop-blur">
