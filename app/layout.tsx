@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
+import { AnalyticsProvider } from "@/components/analytics";
 import { FeedbackWidget } from "@/components/feedback-widget";
 import { ThemeProvider } from "@/components/theme";
 
@@ -56,12 +57,18 @@ export default function RootLayout({
       suppressHydrationWarning
     >
       <body className="antialiased">
-        <ThemeProvider>
-          {children}
-          {/* Layout level on purpose: the feedback button belongs on every
-              page, not on the ones somebody remembered to add it to. */}
-          <FeedbackWidget />
-        </ThemeProvider>
+        {/* Outermost of the two providers because it is the one that has to see
+            every route change, including the ones that happen before a theme
+            has resolved. It renders nothing and no op's entirely when no
+            PostHog key is configured (JOB-014). */}
+        <AnalyticsProvider>
+          <ThemeProvider>
+            {children}
+            {/* Layout level on purpose: the feedback button belongs on every
+                page, not on the ones somebody remembered to add it to. */}
+            <FeedbackWidget />
+          </ThemeProvider>
+        </AnalyticsProvider>
       </body>
     </html>
   );
