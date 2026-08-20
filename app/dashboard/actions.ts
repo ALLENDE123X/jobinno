@@ -42,6 +42,8 @@
 
 import { revalidatePath } from "next/cache";
 
+import { ANALYTICS_EVENT } from "@/lib/analytics/events";
+import { captureServerEvent } from "@/lib/analytics/posthog-server";
 import { requestJobSearch } from "@/lib/job-search-trigger";
 import { createServerClient } from "@/lib/supabase/server";
 import { DASHBOARD_READ_FAILED, readDashboardProfile } from "@/lib/dashboard/dashboard-data";
@@ -116,6 +118,21 @@ export async function findJobsNow(): Promise<FindJobsResult> {
     logFailure("requestJobSearch", user.id, error);
     return { ok: false, message: COULD_NOT_START };
   }
+
+  // JOB-014. Only on the path where Inngest actually accepted the event, so
+  // that this counts searches that started rather than button presses. The
+  // three refusals above are their own question and are visible on the page.
+  //
+  // `source` is what makes this event worth having: the daily cron in
+  // `inngest/job-search-schedule.ts` sends the identical event for the same
+  // person, and a funnel that cannot tell a search somebody asked for from one
+  // that happened while they slept is measuring the cron rather than the
+  // product.
+  await captureServerEvent({
+    event: ANALYTICS_EVENT.SEARCH_REQUESTED,
+    distinctId: user.id,
+    properties: { source: "dashboard" },
+  });
 
   // The rows this search produces arrive over the next several minutes, so this
   // is not what shows them. It is what makes the allowance and the list on the

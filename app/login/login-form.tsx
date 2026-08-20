@@ -18,6 +18,8 @@
 
 import { useState } from "react";
 
+import { captureClientEvent } from "@/components/analytics";
+import { ANALYTICS_EVENT } from "@/lib/analytics/events";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -61,11 +63,20 @@ export function LoginForm({ initialError }: { initialError?: string }) {
         options: { emailRedirectTo: authCallbackUrlFor(window.location.origin) },
       });
 
+      // JOB-014. The top of the funnel, and the one event that fires before
+      // there is any session to attribute it to, so PostHog files it against
+      // the anonymous id it already gave this browser and stitches it to the
+      // real person when `AnalyticsProvider` identifies them after the link is
+      // opened. `trimmed` is an email address and is never sent: `outcome` is
+      // the whole payload, and `sanitizeProperties` would drop the address
+      // anyway if a later edit tried to add it.
       if (error) {
+        captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, { outcome: "refused" });
         setStatus({ kind: "error", message: error.message });
         return;
       }
 
+      captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, { outcome: "sent" });
       setStatus({ kind: "sent", email: trimmed });
     } catch (error) {
       setStatus({

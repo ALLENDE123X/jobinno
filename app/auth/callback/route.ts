@@ -21,6 +21,8 @@
 
 import { NextResponse, type NextRequest } from "next/server";
 
+import { ANALYTICS_EVENT } from "@/lib/analytics/events";
+import { captureServerEvent } from "@/lib/analytics/posthog-server";
 import { createServerClient, createServiceRoleClient } from "@/lib/supabase/server";
 
 /** Where someone goes once the session exists. */
@@ -38,6 +40,19 @@ function safeDestination(next: string | null): string {
     return DEFAULT_DESTINATION;
   }
   return next;
+}
+
+/**
+ * The destination as an analytics property: one of the routes this app actually
+ * sends people to, or "other".
+ *
+ * `safeDestination` has already refused anything that is not a relative path,
+ * so this is not a security check. It is the difference between a property with
+ * three possible values and one that can be any path a caller invents, and the
+ * second of those is a free text field in a funnel by another name.
+ */
+function knownDestination(destination: string): string {
+  return destination === "/onboarding" || destination === "/dashboard" ? destination : "other";
 }
 
 /**
@@ -119,6 +134,28 @@ export async function GET(request: NextRequest) {
       error: `Signed in, but your profile could not be created: ${profileError.message}`,
     });
   }
+
+  // JOB-014. Fired here rather than in the browser because this route is where
+  // the session actually starts to exist, and the browser is mid redirect with
+  // none of our JavaScript running.
+  //
+  // `user.email` is in scope on this line and is deliberately not sent. The
+  // distinct id is the Supabase `auth.uid()`, which is the same opaque UUID
+  // every table in `lib/db/schema.ts` scopes on.
+  //
+  // There is no "was this a signup" property, and the upsert above cannot
+  // honestly supply one: it affects exactly one row whether it inserted or
+  // updated. PostHog already knows whether it has seen a distinct id before,
+  // which is the same question asked of something that can answer it.
+  await captureServerEvent({
+    event: ANALYTICS_EVENT.SESSION_ESTABLISHED,
+    distinctId: user.id,
+    // Bucketed rather than passed through. `safeDestination` already refuses
+    // anything but a relative path, but a relative path is still a string a
+    // caller chose, and a funnel only needs to know which of the real
+    // destinations somebody landed on.
+    properties: { destination: knownDestination(destination) },
+  });
 
   return redirectTo(request, destination);
 }

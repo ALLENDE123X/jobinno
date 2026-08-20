@@ -52,6 +52,8 @@
 // keeps the ordering that file's header depends on.
 import { inngest } from "./job-application-pipeline";
 
+import { ANALYTICS_EVENT } from "@/lib/analytics/events";
+import { captureServerEvents } from "@/lib/analytics/posthog-server";
 import { listUsersDueForSearch } from "@/lib/job-matching";
 import { jobSearchEvent } from "@/lib/job-search-trigger";
 
@@ -101,6 +103,26 @@ export const scheduleJobSearches = inngest.createFunction(
         slice.map((userId) => jobSearchEvent(userId))
       );
     }
+
+    // JOB-014. The cron half of `search_requested`, and the reason that event
+    // carries a `source` at all: this sends the same event the dashboard button
+    // sends, for people who are asleep, and a funnel that cannot tell the two
+    // apart is measuring this function rather than the product.
+    //
+    // Its own step so that Inngest memoizes it. Without one the whole function
+    // body re-runs on a retry and everybody due today is counted twice.
+    // `captureServerEvents` batches, so a hundred people cost one flush rather
+    // than a hundred round trips inside the step.
+    await step.run("record-searches-requested", async () => {
+      await captureServerEvents(
+        userIds.map((userId) => ({
+          event: ANALYTICS_EVENT.SEARCH_REQUESTED,
+          distinctId: userId,
+          properties: { source: "cron" },
+        }))
+      );
+      return { captured: userIds.length };
+    });
 
     console.log(`[job-008] requested a search for ${userIds.length} profile(s)`);
     return { due: userIds.length, dispatched: userIds.length };

@@ -102,6 +102,8 @@ import "./load-env";
 import { Inngest, NonRetriableError, eventType, staticSchema } from "inngest";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
+import { ANALYTICS_EVENT, applicationOutcomeFor } from "@/lib/analytics/events";
+import { captureServerEvent } from "@/lib/analytics/posthog-server";
 import {
   releaseApplicationSlot,
   reserveApplicationSlot,
@@ -326,6 +328,13 @@ type ListingBrief = {
   title: string;
   applyUrl: string;
   requiresCoverLetter: boolean;
+  /**
+   * `jobs.ats`, denormalized from `boards.ats` by the sync. Read for JOB-014's
+   * `application_outcome` event, which needs to say which platform a run ended
+   * on. It is one of the ten supported platform names and identifies nobody,
+   * which is why it is the only thing about the listing that event carries.
+   */
+  ats: string;
 };
 
 /**
@@ -348,7 +357,7 @@ type ListingBrief = {
 async function loadListing(supabase: SupabaseClient, jobId: string): Promise<ListingBrief> {
   const { data, error } = await supabase
     .from("jobs")
-    .select("id,title,url,raw,boards!inner(company)")
+    .select("id,title,url,raw,ats,boards!inner(company)")
     .eq("id", jobId)
     .limit(1);
   if (error) throw new Error(`jobs lookup failed: ${error.message}`);
@@ -382,6 +391,7 @@ async function loadListing(supabase: SupabaseClient, jobId: string): Promise<Lis
     title: String(row.title ?? "").trim(),
     applyUrl,
     requiresCoverLetter: requiresCoverLetterFromQuestions(raw.questions),
+    ats: String(row.ats ?? "").trim(),
   };
 }
 
@@ -603,6 +613,51 @@ async function settleApplicationSlot(userId: string, applicationId: string) {
 }
 
 // ───────────────────────────────────
+// Analytics (JOB-014)
+// ───────────────────────────────────
+
+/**
+ * `application_outcome`, sent from inside a `step.run`.
+ *
+ * A named function rather than an inline body for one reason: it is called from
+ * two places, the run that finished and the run that threw, and those two have
+ * to agree on the property set. A second inline copy is a second chance for one
+ * of them to start sending a job title.
+ *
+ * Never throws, the same way `settleApplicationSlot` above never throws and for
+ * a weaker version of the same reason. `captureServerEvent` already swallows
+ * everything it can go wrong at, so this adds no handler of its own; what
+ * matters is that a failed capture can never be the thing that fails a run
+ * whose application is already with an employer.
+ *
+ * Returns a plain object because a `step.run` return value is durable state
+ * that Inngest stores and replays. What comes back is the event's own
+ * properties, which are all short enums, and nothing about the listing.
+ */
+async function recordApplicationOutcome(input: {
+  userId: string;
+  ats: string;
+  status: string;
+  submitAttempted: boolean;
+}) {
+  const outcome = applicationOutcomeFor(input.status);
+
+  await captureServerEvent({
+    event: ANALYTICS_EVENT.APPLICATION_OUTCOME,
+    // The Supabase `auth.uid()`, the same id `applications.user_id` holds.
+    distinctId: input.userId,
+    properties: {
+      status: input.status,
+      outcome,
+      ats: input.ats,
+      submit_attempted: input.submitAttempted,
+    },
+  });
+
+  return { outcome, status: input.status };
+}
+
+// ───────────────────────────────────
 // 2. Apply — one listing, one run
 // ───────────────────────────────────
 
@@ -686,6 +741,7 @@ export const applyToJob = inngest.createFunction(
         title: listing.title,
         applyUrl: listing.applyUrl,
         requiresCoverLetter: listing.requiresCoverLetter,
+        ats: listing.ats,
       };
     });
 
@@ -800,6 +856,23 @@ export const applyToJob = inngest.createFunction(
       await step.run("settle-application-slot-after-failure", () =>
         settleApplicationSlot(userId, applicationId)
       );
+      // JOB-014. The bottom of the funnel has two exits and this is the one
+      // that is easy to forget: a run whose submit step threw its way through
+      // every retry never reaches the capture below, and a funnel missing its
+      // failures reads as a product that never fails.
+      //
+      // The error's message is not sent. It is the one string on this path that
+      // can contain anything at all, including a board's own page text and the
+      // questions a form asked, and `skip_log` is already where a reason for a
+      // stop is recorded properly.
+      await step.run("record-application-failed", () =>
+        recordApplicationOutcome({
+          userId,
+          ats: claim.ats,
+          status: APPLICATION_STATUS.ERROR,
+          submitAttempted: false,
+        })
+      );
       throw error;
     }
 
@@ -839,6 +912,26 @@ export const applyToJob = inngest.createFunction(
           (submission.confirmationRef === null ? "" : ` (${submission.confirmationRef})`)
       );
     }
+
+    // JOB-014. The one event that measures whether this product does the thing
+    // it claims to do. Its own step so that Inngest memoizes it: an Inngest
+    // function body re-executes from the top on every step boundary, so a
+    // capture written inline here would fire once per pass rather than once per
+    // application.
+    //
+    // What is not on it, from a scope holding the person's whole application:
+    // no company, no job title, no apply URL, no confirmation reference, no
+    // blocked or unconfirmed reason. `ats` is one of ten fixed platform names
+    // and `status` is one of thirteen; between them they say what happened and
+    // where without describing anybody's job hunt to a third party.
+    await step.run("record-application-outcome", () =>
+      recordApplicationOutcome({
+        userId,
+        ats: claim.ats,
+        status: submission.status,
+        submitAttempted: clicked,
+      })
+    );
 
     return {
       applicationId,

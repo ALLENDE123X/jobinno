@@ -29,6 +29,8 @@
 
 import { revalidatePath } from "next/cache";
 
+import { ANALYTICS_EVENT } from "@/lib/analytics/events";
+import { captureServerEvent } from "@/lib/analytics/posthog-server";
 import { intakeFieldErrors, intakeSchema } from "@/lib/onboarding/intake-schema";
 import {
   RESUMES_BUCKET,
@@ -126,6 +128,28 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
       message: `Could not record your confirmation: ${attestationError.message}`,
     };
   }
+
+  // JOB-014. The end of onboarding, and fired only now: every earlier return
+  // above is somebody who did not finish, and counting them here would put a
+  // step in the funnel that nothing actually completed.
+  //
+  // `intake` is in scope and holds this person's citizenship status, F1 status,
+  // work authorization, sponsorship need, city, country, graduation date and
+  // the path to their resume. None of it is sent. Two facts about the shape of
+  // the answers go out, neither of which describes the person: whether a
+  // LinkedIn export was attached, and how many locations they named.
+  // `lib/analytics/events.ts` records why the work authorization fields in
+  // particular are excluded rather than merely omitted.
+  await captureServerEvent({
+    event: ANALYTICS_EVENT.INTAKE_COMPLETED,
+    distinctId: user.id,
+    properties: {
+      has_linkedin_pdf: Boolean(intake.linkedinPdfPath),
+      target_location_count: Array.isArray(intake.targetLocations)
+        ? intake.targetLocations.length
+        : 0,
+    },
+  });
 
   revalidatePath("/onboarding");
   return { ok: true };
