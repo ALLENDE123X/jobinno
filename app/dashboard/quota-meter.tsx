@@ -18,6 +18,7 @@
 import Link from "next/link";
 
 import type { DashboardQuota } from "@/lib/dashboard/dashboard-data";
+import { cn } from "@/lib/utils";
 
 export function QuotaMeter({ quota }: { quota: DashboardQuota }) {
   const { used, cap, remaining, atCap } = quota;
@@ -40,10 +41,13 @@ export function QuotaMeter({ quota }: { quota: DashboardQuota }) {
         aria-valuemax={cap}
         aria-valuenow={used}
         aria-label="Applications used"
-        className="bg-muted h-2 w-full overflow-hidden rounded-full"
+        className="bg-muted h-2.5 w-full overflow-hidden rounded-full"
       >
         <div
-          className={atCap && !unprovisioned ? "bg-destructive h-full" : "bg-primary h-full"}
+          className={cn(
+            "h-full rounded-full transition-[width] duration-700 ease-out",
+            atCap && !unprovisioned ? "bg-destructive" : "bg-primary"
+          )}
           style={{ width: `${filledPercent}%` }}
         />
       </div>

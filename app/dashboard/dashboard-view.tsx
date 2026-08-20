@@ -15,6 +15,7 @@
 
 import Link from "next/link";
 
+import { PageShell } from "@/components/page-shell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { DashboardApplication, DashboardQuota } from "@/lib/dashboard/dashboard-data";
 import { describeSkipReason, describeStatus, type StatusTone } from "@/lib/dashboard/plain-language";
@@ -50,7 +51,7 @@ function ApplicationRow({ application }: { application: DashboardApplication }) 
   const submitted = application.submittedAt ? formatDate(application.submittedAt) : null;
 
   return (
-    <Card size="sm" className="gap-2">
+    <Card size="sm" className="gap-2 transition-shadow hover:shadow-md">
       <CardHeader className="grid-cols-[1fr_auto] items-start gap-3">
         <CardTitle className="min-w-0">
           <span className="block truncate">{application.title}</span>
@@ -115,9 +116,9 @@ function EmptyState({ quota }: { quota: DashboardQuota }) {
   const unprovisioned = quota.cap === 0;
 
   return (
-    <Card>
+    <Card className="rounded-2xl">
       <CardHeader>
-        <CardTitle>
+        <CardTitle className="text-xl">
           {unprovisioned
             ? "Nothing here yet"
             : quota.atCap
@@ -163,37 +164,61 @@ export function DashboardView({
   applications: DashboardApplication[];
 }) {
   return (
-    <main className="mx-auto w-full max-w-3xl space-y-8 p-6">
-      <header className="space-y-1">
-        <h1 className="text-2xl font-semibold">Your applications</h1>
-        <p className="text-muted-foreground text-sm">
-          Everything Jobinno has done for {email}, newest first.
-        </p>
-      </header>
+    <PageShell>
+      <main className="relative mx-auto w-full max-w-3xl flex-1 space-y-8 px-4 py-12 sm:px-6 sm:py-16">
+        <header className="space-y-2">
+          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
+            Your applications
+          </h1>
+          <p className="text-muted-foreground text-base">
+            Everything Jobinno has done for {email}, newest first.
+          </p>
+        </header>
 
-      <div className="space-y-6">
-        <QuotaMeter quota={quota} />
-        <FindJobsButton
-          disabled={quota.atCap}
-          disabledReason={
-            quota.cap === 0
-              ? "Choose a plan and this button starts your first search."
-              : "You have used every application on your plan, so a new search has nothing to spend."
-          }
-        />
-      </div>
+        <div className="space-y-6 rounded-2xl border bg-card/40 p-6 sm:p-8">
+          <QuotaMeter quota={quota} />
+          <FindJobsButton
+            disabled={quota.atCap}
+            disabledReason={
+              quota.cap === 0
+                ? "Choose a plan and this button starts your first search."
+                : "You have used every application on your plan, so a new search has nothing to spend."
+            }
+          />
+        </div>
 
-      {applications.length === 0 ? (
-        <EmptyState quota={quota} />
-      ) : (
-        <ul className="space-y-3">
-          {applications.map((application) => (
-            <li key={application.id}>
-              <ApplicationRow application={application} />
-            </li>
-          ))}
-        </ul>
-      )}
-    </main>
+        {applications.length === 0 ? (
+          <EmptyState quota={quota} />
+        ) : (
+          // A quick staggered entrance, the same idea as the `AnimatedList`
+          // the landing hero uses in `components/landing/application-feed.tsx`,
+          // adapted rather than reused directly. `AnimatedList` gates each row
+          // behind a real, running timer and swaps the `<ul>`/`<li>` markup for
+          // plain `div`s, which is right for a marketing feed pretending to be
+          // live and wrong here: this list is someone's own finite, already
+          // loaded history, and `tests/unit/dashboard-view.test.tsx` asserts on
+          // the `list`/`listitem` roles that only real `<ul>`/`<li>` elements
+          // carry. `animate-in` (from `tw-animate-css`, already used by
+          // `components/ui/dialog.tsx`) gets the same cascade with every row
+          // present from the first paint, just fading and sliding in with a
+          // short per row delay capped at ten rows so a long history does not
+          // draw out the animation.
+          <ul className="space-y-3">
+            {applications.map((application, index) => (
+              <li
+                key={application.id}
+                className="animate-in fade-in slide-in-from-bottom-2 duration-500 ease-out"
+                style={{
+                  animationDelay: `${Math.min(index, 10) * 60}ms`,
+                  animationFillMode: "backwards",
+                }}
+              >
+                <ApplicationRow application={application} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </main>
+    </PageShell>
   );
 }

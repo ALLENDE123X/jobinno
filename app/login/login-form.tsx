@@ -90,10 +90,10 @@ export function LoginForm({ initialError }: { initialError?: string }) {
   }
 
   return (
-    <Card className="w-full max-w-md">
+    <Card className="w-full max-w-md rounded-2xl shadow-xl">
       <CardHeader>
-        <CardTitle>Sign in to Jobinno</CardTitle>
-        <CardDescription>
+        <CardTitle className="text-2xl">Sign in to Jobinno</CardTitle>
+        <CardDescription className="text-base">
           We email you a link that signs you in. There is no password to
           remember.
         </CardDescription>
@@ -115,7 +115,7 @@ export function LoginForm({ initialError }: { initialError?: string }) {
             </Button>
           </div>
         ) : (
-          <form onSubmit={onSubmit} className="space-y-4" noValidate>
+          <form onSubmit={onSubmit} className="space-y-5" noValidate>
             <div className="space-y-2">
               <Label htmlFor="email">Email</Label>
               <Input
@@ -139,7 +139,8 @@ export function LoginForm({ initialError }: { initialError?: string }) {
 
             <Button
               type="submit"
-              className="w-full"
+              size="lg"
+              className="h-10 w-full text-sm"
               disabled={status.kind === "sending"}
             >
               {status.kind === "sending" ? "Sending" : "Email me a link"}
