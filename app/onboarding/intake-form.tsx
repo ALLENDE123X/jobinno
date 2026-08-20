@@ -23,6 +23,7 @@
  * here and no setting that adds one.
  */
 
+import Link from "next/link";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -222,8 +223,11 @@ export function IntakeForm({ userId }: { userId: string }) {
       <div className="space-y-2" role="status">
         <p className="font-medium">Thanks, that is everything.</p>
         <p className="text-muted-foreground text-sm">
-          We have your resume and your answers. You can close this page.
+          We have your resume and your answers.
         </p>
+        <Button asChild>
+          <Link href="/dashboard">Go to your applications</Link>
+        </Button>
       </div>
     );
   }

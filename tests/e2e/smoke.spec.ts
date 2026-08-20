@@ -42,3 +42,24 @@ test("the feedback widget is reachable from the page", async ({ page }) => {
   ).toBeVisible();
   await expect(page.getByLabel("What happened")).toBeVisible();
 });
+
+/**
+ * JOB-009. The dashboard's gate, from the outside.
+ *
+ * The page checks the session itself rather than leaving it to middleware, and
+ * this is the assertion that says so from a browser with no cookies. A
+ * dashboard that renders for a signed out visitor would be a dashboard that
+ * renders somebody's application history to a stranger.
+ *
+ * The timeout is raised deliberately. CI points the app at a Supabase URL with
+ * nothing behind it, so `getUser()` spends its retry budget before answering
+ * that there is no session, and the answer is still the right one.
+ */
+test("the dashboard sends a signed out visitor to sign in", async ({ page }) => {
+  test.setTimeout(120_000);
+
+  await page.goto("/dashboard");
+
+  await expect(page).toHaveURL(/\/login$/);
+  await expect(page.getByText("Sign in to Jobinno")).toBeVisible();
+});

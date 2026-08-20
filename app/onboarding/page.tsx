@@ -7,10 +7,13 @@
  * session fresh; deciding who may see a page is a page's own business.
  */
 
+import Link from "next/link";
 import { redirect } from "next/navigation";
 
+import { Button } from "@/components/ui/button";
 import {
   Card,
+  CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
@@ -51,6 +54,16 @@ export default async function OnboardingPage() {
               get in touch and we will sort it out.
             </CardDescription>
           </CardHeader>
+          {/*
+            JOB-009. Without this there is no route to the dashboard anywhere in
+            the app: sign in lands here, and an onboarded person saw a card with
+            nothing after it.
+          */}
+          <CardContent>
+            <Button asChild>
+              <Link href="/dashboard">Go to your applications</Link>
+            </Button>
+          </CardContent>
         </Card>
       ) : (
         <>
