@@ -16,6 +16,7 @@
     "db:storage-bucket": "tsx scripts/setup-storage-bucket.ts",
     "supabase:auth-config": "npx --yes supabase@2.115.0 config push --project-ref efyubrtiptcsrhfakbwc",
     "bench:form-cache": "tsx scripts/form-action-cache-benchmark.ts",
+    "check:cli-resolution": "node scripts/check-tsx-cli-resolution.mjs",
     "intake": "tsx lib/intake-cli.ts",
     "fill-form": "tsx lib/fill-form-cli.ts",
     "submit-application": "tsx lib/submit-application-cli.ts",
