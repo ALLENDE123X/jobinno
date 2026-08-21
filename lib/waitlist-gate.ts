@@ -8,18 +8,21 @@
  * jobinno.app is live and still has open bugs being fixed on `v1`. Rather than
  * leave the full application reachable while that work continues, the
  * waitlist becomes the front page and every other URL leads there until `v1`
- * merges and this gate is removed. See `app/waitlist/page.tsx`.
+ * merges and this gate is removed. See `app/page.tsx`.
  *
- * ── Two paths, not one, for the waitlist itself ──────────────────────────────
- * `WAITLIST_PATH` (`/`) is what a visitor sees and what everything redirects
- * to — the actual "no other URL path" surface. `WAITLIST_CONTENT_PATH`
- * (`/waitlist`) is where the page component actually lives on disk; `/` is
- * rewritten to it in `middleware.ts` rather than the waitlist page being moved
- * into `app/page.tsx`, so the real marketing site (JOB-016) stays exactly
- * where it is and is never overwritten. A direct request for
- * `WAITLIST_CONTENT_PATH` itself is not exempt — it redirects to
- * `WAITLIST_PATH` like everything else, so there is genuinely one reachable
- * URL, not two that happen to show the same thing.
+ * ── One path, not two, for the waitlist itself (JOB-032) ─────────────────────
+ * JOB-031 originally kept the real marketing site (JOB-016) at `app/page.tsx`
+ * untouched by rewriting `WAITLIST_PATH` (`/`) to a separate, shorter page at
+ * `/waitlist` instead. That traded a real problem, a visitor could never see
+ * the actual landing page while the gate was active, for a smaller one.
+ * JOB-032 fixed it properly: the waitlist form and its copy now live at the
+ * top of `app/page.tsx` itself, above the untouched marketing content, so `/`
+ * renders that file directly for every visitor and there is nothing left to
+ * rewrite it to. `WAITLIST_PATH` stays in `EXEMPT_PATHS` below for exactly
+ * that reason: it is not exempt from the gate in the sense of being
+ * unrestricted, it is the one destination the gate sends everyone to, so
+ * middleware has to let a request for it render rather than redirect it to
+ * itself.
  *
  * `/api/inngest` and `/api/webhooks/stripe` are service to service endpoints,
  * not pages. Inngest calls the first on its own schedule and Stripe calls the
@@ -52,19 +55,36 @@
  * Nothing above deletes or restructures a route; it only stops middleware
  * sending traffic to it. Reverting the check in `middleware.ts` that calls
  * `isExemptFromWaitlistGate` is enough to put every page back within reach,
- * this module and `app/waitlist/` can be left in place afterwards without
- * affecting anything.
+ * this module can be left in place afterwards without affecting anything.
+ *
+ * Also flip `WAITLIST_GATE_ACTIVE` below back to `false` (or delete it and
+ * the check in `app/page.tsx` that reads it). That check exists only to
+ * suppress JOB-020's signed in redirect while this gate makes `/dashboard`
+ * redirect back to `/`; leaving `WAITLIST_GATE_ACTIVE` on after the rest of
+ * the gate is gone would not loop anything, `/dashboard` would render
+ * normally again, but a signed in visitor would see the marketing pitch
+ * instead of being sent straight to their dashboard, which is not the
+ * intended behaviour either.
  */
+
+/** Where the gate sends everyone who is not already headed somewhere exempt.
+ * Renders its own content directly (JOB-032); nothing rewrites to it. */
+export const WAITLIST_PATH = "/";
+
 const EXEMPT_PATHS: ReadonlySet<string> = new Set([
+  WAITLIST_PATH,
   "/api/inngest",
   "/api/webhooks/stripe",
 ]);
 
-/** Where the gate sends everyone who is not already headed somewhere exempt. */
-export const WAITLIST_PATH = "/";
-
-/** Where `app/waitlist/page.tsx` actually lives — `WAITLIST_PATH` rewrites here. */
-export const WAITLIST_CONTENT_PATH = "/waitlist";
+/**
+ * Whether JOB-031's waitlist gate is active. `app/page.tsx` reads this to
+ * skip its JOB-020 signed in redirect while the gate is on: `/dashboard` is
+ * itself gated and redirects back to `/`, so firing that redirect here while
+ * the gate is active would send a signed in visitor back and forth between
+ * the two routes forever. See "How to remove the gate later" above.
+ */
+export const WAITLIST_GATE_ACTIVE = true;
 
 export function isExemptFromWaitlistGate(pathname: string): boolean {
   return EXEMPT_PATHS.has(pathname);

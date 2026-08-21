@@ -1,11 +1,15 @@
 "use client";
 
 /**
- * The waitlist form itself (JOB-031). `page.tsx` is the server half: the hero
- * copy, the value bullets, everything that does not need to run in the
- * browser. This file is the one piece that does, on the same split
- * `app/login/login-form.tsx` and `components/feedback-widget.tsx` already use
- * for the same reason.
+ * The waitlist form itself (JOB-031). Originally paired with its own
+ * `app/waitlist/page.tsx`, the server half: the hero copy, the value bullets,
+ * everything that did not need to run in the browser. JOB-032 folded that
+ * copy into `app/page.tsx` and removed the standalone page, and moved this
+ * file here since it is now part of the landing page rather than its own
+ * route, alongside the other client pieces in `components/landing/`. This
+ * file is still the one piece that has to run in the browser, on the same
+ * split `app/login/login-form.tsx` and `components/feedback-widget.tsx`
+ * already use for the same reason.
  *
  * The insert is a direct client side call to Supabase through
  * `lib/waitlist.ts`, on the same reasoning `lib/feedback.ts` documents: RLS on
