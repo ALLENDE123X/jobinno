@@ -64,6 +64,13 @@
       "when": 1787284000000,
       "tag": "0008_bot_detected_skip_reason",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1787297622864,
+      "tag": "0009_waitlist",
+      "breakpoints": true
     }
   ]
 }

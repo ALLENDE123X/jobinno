@@ -159,6 +159,23 @@ export const FEEDBACK_CATEGORIES = ["bug", "feature", "other"] as const;
 export type FeedbackCategory = (typeof FEEDBACK_CATEGORIES)[number];
 
 /**
+ * Roughly how many applications a waitlist signup submits in a typical week,
+ * self reported on the waitlist form (JOB-031). Coarse buckets rather than a
+ * raw number: nobody knows their own count to the application, a dropdown is
+ * one tap on a form that is trying to lose as little of its conversion as
+ * possible, and the only use this ever gets is segmenting power users from
+ * casual ones later, which four buckets already supports.
+ */
+export const WAITLIST_WEEKLY_VOLUME_BUCKETS = [
+  "under_5",
+  "5_to_15",
+  "16_to_30",
+  "30_plus",
+] as const;
+export type WaitlistWeeklyVolumeBucket =
+  (typeof WAITLIST_WEEKLY_VOLUME_BUCKETS)[number];
+
+/**
  * The ATS platforms V1 targets, per CLAUDE.md. Not a database constraint, see
  * the header. Validate against this in application code.
  */
@@ -602,6 +619,76 @@ export const feedback = pgTable(
       for: "select",
       to: authenticatedRole,
       using: sql`${authUid} = ${table.userId}`,
+    }),
+  ]
+);
+
+// ───────────────────────────────────
+// waitlist
+// ───────────────────────────────────
+
+/**
+ * Signups collected while the live site is gated behind the waitlist landing
+ * page (JOB-031). See `middleware.ts` for the gate itself.
+ *
+ * Nothing here references `profiles`. The gate exists precisely because
+ * signing in is gated too, so there is no account for a row to belong to yet,
+ * and unlike `feedback` there is no later state where one appears: a waitlist
+ * signup either becomes a real signup after the gate lifts, in which case
+ * `profiles` gets its own row the ordinary way, or it never does.
+ *
+ * `email` is the only required column, on purpose. A waitlist form loses real
+ * signups for every field it insists on, and the one fact this table has to
+ * hold to be useful at all is an address to write to when the product is
+ * ready. `name`, `biggest_frustration` and `weekly_application_volume` are
+ * all nullable, all optional on the form, and answered by nobody who does not
+ * want to bother.
+ */
+export const waitlist = pgTable(
+  "waitlist",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    /**
+     * Trimmed and lowercased before it ever reaches this column, see
+     * `lib/waitlist.ts`. The unique constraint below is what a second signup
+     * from the same address actually hits, so the normalisation has to happen
+     * before the insert and not be trusted to Postgres.
+     */
+    email: text("email").notNull(),
+    name: text("name"),
+    /** Free text answer to "what is the most frustrating part of job hunting right now". */
+    biggestFrustration: text("biggest_frustration"),
+    /** One of `WAITLIST_WEEKLY_VOLUME_BUCKETS`, or null if the question was skipped. */
+    weeklyApplicationVolume: text("weekly_application_volume"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique("waitlist_email_key").on(table.email),
+    check(
+      "waitlist_weekly_application_volume_check",
+      inList("weekly_application_volume", WAITLIST_WEEKLY_VOLUME_BUCKETS)
+    ),
+    /**
+     * Anyone may insert, anonymous included, since the whole point of this
+     * table is to collect signups from people who by definition hold no
+     * session. `with check` is unconditional because there is no `user_id`
+     * column here for it to guard.
+     *
+     * There is no select policy at all, matching the posture
+     * `cached_form_actions` takes below and for the same reason: RLS enabled
+     * with no policy for a verb is PostgREST refusing that verb outright for
+     * `anon` and `authenticated`, and nobody holding the public anon key has
+     * any business reading back a list of email addresses other people
+     * submitted, including their own, since there is no session to prove which
+     * row that even is. The service role bypasses RLS for whoever reads the
+     * list back for real.
+     */
+    pgPolicy("waitlist_insert_any", {
+      for: "insert",
+      to: [anonRole, authenticatedRole],
+      withCheck: sql`true`,
     }),
   ]
 );
