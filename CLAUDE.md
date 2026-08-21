@@ -1,5 +1,7 @@
 # Jobinno: Agent Operating Guide
 
+MEMORY_PROJECT: startup
+
 Read this file at the start of every session, before touching anything.
 
 Jobinno is built by a fleet of agents working in parallel, one ticket each, coordinated by Pranav's orchestrating session. You are almost certainly an implementation agent. That means you pick up one ticket, work it on one branch, open one PR, and stop. You do not merge. An independent review agent does the review, and its verdict goes back to Pranav's session, not to you.
@@ -27,6 +29,8 @@ Violating any of these is a critical failure, not a style problem.
 **9. Never let the LLM invent a fact that is not in the user's intake data.** This applies to every free text answer generated for an application form: cover letters, "why do you want to work here", "describe a project", salary expectations, graduation dates, anything. Submitting an application is the user attesting that what is on it is true. A fabricated answer breaks that attestation, and the person who wears the consequence is the applicant, not us. If the intake data does not support an honest answer, the correct behavior is to stop the run and surface the question, never to fill the gap plausibly. Any prompt that generates free text must be grounded in retrieved intake fields, and any response must be validated against them before it reaches a form.
 
 **10. EEO and demographic fields are always answered "decline to self identify" in V1.** Race, gender, veteran status, and disability status are never stored, never inferred from anything, and never transmitted. There is no configuration option for this and no ticket should add one without an explicit product decision from Pranav.
+
+**11. Never use Claude Code's own built in per directory auto memory system for this project.** Cross session memory for Jobinno, and for its prior chapters Actinno, Meminno, and Propinno, all lives at `/Users/pranavlende/claude-memory/projects/startup/`. Read `MEMORY.md` there before assuming no history exists, and route anything checkpoint or lesson worthy there, in the existing format, never to `~/.claude/projects/*/memory/`, which is the harness's own automatic location, scoped by a hash of the working directory and with no relationship to this project's real history. This has already misfired twice silently: once for the Propinno chapter and once on this exact repo on 2026-08-21, both caught and fixed after the fact rather than prevented. If a `/checkpoint` or `/restore` invocation is available, prefer passing `--project startup` explicitly over relying on auto detection, since the detection script the generic skill documents itself does not exist on this machine.
 
 ## What Jobinno is
 
@@ -99,4 +103,5 @@ Four modules that implement the emailed security code flow. Nothing in the runni
 * Repository: `ALLENDE123X/jobinno`, private.
 * Ported from: `/Users/pranavlende/code/actinno`. Read only, always.
 * Sibling project whose conventions this file adapts: `ALLENDE123X/propinno`.
+* Cross session memory: `/Users/pranavlende/claude-memory/projects/startup/`. See HARD STOP 11.
 * Env: see `.env.example`, which splits variables into the ones code reads today and the ones provisioned ahead of the tickets that need them.
