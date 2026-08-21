@@ -21,6 +21,19 @@
  * the only thing that tells the two cases apart, and only so the copy can say
  * "you are already on the list" instead of "you are on the list" when it is
  * true.
+ *
+ * ── Creator referral attribution (JOB-041) ──────────────────────────────────
+ * `?ref=<code>` on the marketing site names the creator whose link brought a
+ * visitor here. `middleware.ts` is what writes it into `WAITLIST_REFERRAL_COOKIE`
+ * on every request that carries the param, because a Server Component cannot
+ * set a cookie itself, and a visit today has to survive until a submission
+ * tomorrow without losing attribution. `resolveWaitlistReferral` below is the
+ * one place the precedence between a live query param and that cookie is
+ * decided, so `app/page.tsx` and any test exercising this rule read it the
+ * same way. The resolved value flows into `WaitlistInput.referredBy`, and
+ * `buildWaitlistRow` copies it into `referred_by` unvalidated: there is no
+ * `creators` table yet to check it against, and this ships without needing
+ * one. JOB-043 reads the column back later to decide who gets credit.
  */
 
 /** Roughly how many applications a signup submits in a typical week. */
@@ -40,6 +53,7 @@ export interface WaitlistRow {
   name: string | null;
   biggest_frustration: string | null;
   weekly_application_volume: WaitlistWeeklyVolume | null;
+  referred_by: string | null;
 }
 
 export interface WaitlistInput {
@@ -48,6 +62,13 @@ export interface WaitlistInput {
   biggestFrustration?: string;
   /** Empty string is treated the same as undefined: the question was skipped. */
   weeklyApplicationVolume?: WaitlistWeeklyVolume | "";
+  /**
+   * The creator referral code this signup arrived with, already resolved by
+   * `resolveWaitlistReferral`. Not a form field: nobody types this, it comes
+   * from the URL or the cookie `middleware.ts` set from an earlier one. See
+   * the file header for why it is unvalidated.
+   */
+  referredBy?: string | null;
 }
 
 /**
@@ -59,6 +80,10 @@ export interface WaitlistInput {
 export function buildWaitlistRow(input: WaitlistInput): WaitlistRow {
   const name = input.name?.trim() ?? "";
   const frustration = input.biggestFrustration?.trim() ?? "";
+  // Trimmed like the other optional fields, but otherwise left exactly as
+  // given: JOB-041 stores whatever string was in the link, not a normalized
+  // or validated form of it.
+  const referredBy = input.referredBy?.trim() ?? "";
 
   return {
     // Lowercased so that "Jane@example.com" and "jane@example.com" collide on
@@ -69,7 +94,47 @@ export function buildWaitlistRow(input: WaitlistInput): WaitlistRow {
     weekly_application_volume: input.weeklyApplicationVolume
       ? input.weeklyApplicationVolume
       : null,
+    referred_by: referredBy.length > 0 ? referredBy : null,
   };
+}
+
+/**
+ * Query param and cookie name for creator referral attribution (JOB-041).
+ * `middleware.ts` writes the cookie, `app/page.tsx` reads both back through
+ * `resolveWaitlistReferral`. One place for both names so the two files
+ * cannot drift apart.
+ */
+export const WAITLIST_REFERRAL_QUERY_PARAM = "ref";
+export const WAITLIST_REFERRAL_COOKIE = "jobinno_ref";
+
+/**
+ * ~30 days, in seconds, for the cookie's `Max-Age`. Long enough that someone
+ * who browses today and joins next week still gets attributed correctly;
+ * short enough that a link shared once does not go on crediting a creator
+ * indefinitely for a browser that never comes back.
+ */
+export const WAITLIST_REFERRAL_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30;
+
+/**
+ * The query-param-then-cookie-then-null rule for `WaitlistInput.referredBy`.
+ * The live query param wins when present, because a visitor who just followed
+ * a link is the freshest signal available and should not be overridden by a
+ * cookie an older link left behind; the cookie is the fallback for exactly
+ * that older-visit case, since a person who browses today and submits the
+ * form tomorrow no longer carries `?ref=` in the URL at all. Blank strings
+ * from either source are treated as absent, not as a code.
+ */
+export function resolveWaitlistReferral(
+  queryParam: string | null | undefined,
+  cookieValue: string | null | undefined
+): string | null {
+  const fromQuery = queryParam?.trim();
+  if (fromQuery) return fromQuery;
+
+  const fromCookie = cookieValue?.trim();
+  if (fromCookie) return fromCookie;
+
+  return null;
 }
 
 /**

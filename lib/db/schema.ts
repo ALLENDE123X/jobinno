@@ -642,7 +642,8 @@ export const feedback = pgTable(
  * hold to be useful at all is an address to write to when the product is
  * ready. `name`, `biggest_frustration` and `weekly_application_volume` are
  * all nullable, all optional on the form, and answered by nobody who does not
- * want to bother.
+ * want to bother. `referred_by` is nullable too, but for a different reason:
+ * it is never asked on the form at all, see its own comment below.
  */
 export const waitlist = pgTable(
   "waitlist",
@@ -660,6 +661,20 @@ export const waitlist = pgTable(
     biggestFrustration: text("biggest_frustration"),
     /** One of `WAITLIST_WEEKLY_VOLUME_BUCKETS`, or null if the question was skipped. */
     weeklyApplicationVolume: text("weekly_application_volume"),
+    /**
+     * The creator referral code a signup arrived with, if any (JOB-041).
+     * `?ref=<code>` on the marketing site names a creator whose link brought
+     * the visitor here; `middleware.ts` copies it into a cookie so a visit
+     * today and a submission tomorrow still get attributed, and `app/page.tsx`
+     * resolves the two into the value `lib/waitlist.ts` writes here. See
+     * `resolveWaitlistReferral` there for the query-param-then-cookie rule.
+     *
+     * Stored as-is and never validated against a real creator: there is no
+     * `creators` table yet for it to check against, and this column does not
+     * need one to exist in order to start capturing attribution now. JOB-043
+     * is what will later read this column back to decide who gets credit.
+     */
+    referredBy: text("referred_by"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

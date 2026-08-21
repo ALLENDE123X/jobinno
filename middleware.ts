@@ -22,6 +22,11 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
+import {
+  WAITLIST_REFERRAL_COOKIE,
+  WAITLIST_REFERRAL_COOKIE_MAX_AGE_SECONDS,
+  WAITLIST_REFERRAL_QUERY_PARAM,
+} from "@/lib/waitlist";
 import { isExemptFromWaitlistGate, WAITLIST_PATH } from "@/lib/waitlist-gate";
 
 export async function middleware(request: NextRequest) {
@@ -47,12 +52,41 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(url);
   }
 
+  // ── JOB-041: capture a creator referral code ────────────────────────────
+  // A Server Component cannot set a cookie, so `app/page.tsx` cannot do this
+  // itself even though it is the one that reads `?ref=` for a live request.
+  // Read up here, ahead of the Supabase configuration check below, so a
+  // deploy with no project configured still captures it. `stampReferralCookie`
+  // is what actually applies it, called right before every return in this
+  // function rather than once on `response` the moment it is created: `setAll`
+  // further down reassigns `response` to a brand new `NextResponse` whenever
+  // the Supabase session needs refreshing, which would silently drop a cookie
+  // set on the response object that exists right now. Only overwrites the
+  // cookie when `?ref=` is actually present on this request, so a later
+  // navigation with no param at all leaves an earlier attribution alone
+  // instead of clobbering it with nothing.
+  const referralCode = request.nextUrl.searchParams
+    .get(WAITLIST_REFERRAL_QUERY_PARAM)
+    ?.trim();
+  function stampReferralCookie(res: NextResponse) {
+    if (referralCode) {
+      res.cookies.set(WAITLIST_REFERRAL_COOKIE, referralCode, {
+        maxAge: WAITLIST_REFERRAL_COOKIE_MAX_AGE_SECONDS,
+        path: "/",
+        sameSite: "lax",
+      });
+    }
+    return res;
+  }
+
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
   // Nothing to refresh without a configured project. Failing open here is safe
   // because no page trusts middleware to have run; they check for themselves.
-  if (!url || !anonKey) return NextResponse.next({ request });
+  if (!url || !anonKey) {
+    return stampReferralCookie(NextResponse.next({ request }));
+  }
 
   let response = NextResponse.next({ request });
 
@@ -90,10 +124,10 @@ export async function middleware(request: NextRequest) {
   try {
     await supabase.auth.getUser();
   } catch {
-    return response;
+    return stampReferralCookie(response);
   }
 
-  return response;
+  return stampReferralCookie(response);
 }
 
 export const config = {
