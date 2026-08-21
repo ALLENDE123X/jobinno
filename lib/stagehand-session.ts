@@ -313,22 +313,35 @@ export function browserConcurrencyLimit(env: EnvSource = process.env): number {
  * Browserbase", with the pipeline's own `concurrency.limit` nominated as the
  * thing that holds the line.
  *
- * It does not hold the line, and a real run proved it. On 2026-08-21 a fan-out
- * of 17 applications for one candidate lost 9 of them to `internal_error` with
- * `"Failed to create a Browserbase session"`, which is the bare string
- * Stagehand throws when `sessions.create` is refused (it discards the cause, so
- * the reason never reaches our logs). The project's own
- * `GET /v1/projects/{id}` reports `"concurrency": 3`, the same 3 that
- * `BROWSERBASE_DEFAULT_CONCURRENCY` and `applyToJob`'s `concurrency.limit` both
- * carry. The cap and the configuration agreed. What disagreed was the count:
- * `applyToJob` frees a run slot the instant its step returns, this module freed
- * its slot the instant a session was up, and Browserbase frees the real slot
- * only once the released session has been reaped. Running 3 wide against a cap
- * of 3, every handover between one application and the next puts a
- * `sessions.create` in the window where the outgoing session still holds its
- * slot, and once enough of those land the rest of the fan-out fails one after
- * another. The run shows exactly that shape: applications land normally for two
- * and a half minutes and then every remaining one errors.
+ * It does not hold the line in principle: a caller whose continuation was
+ * already queued when a release fired could read the lowered count before the
+ * woken waiter resumed, and take a slot meant for whoever was already waiting.
+ * That defect was real and confirmed against the old code (a brute force of
+ * every interleaving overshoots to 3 sessions against a cap of 1), but it is
+ * not what caused the incident below — nothing in that incident ever crossed
+ * paths with it.
+ *
+ * On 2026-08-21, ten applications in one run failed to `internal_error` with
+ * `"Failed to create a Browserbase session"`, the bare string Stagehand throws
+ * when `sessions.create` is refused (it discards the cause, so the reason
+ * never reached our logs). All ten refusals fell inside one four-minute
+ * window, and the project's session history shows zero live sessions at the
+ * moment each one fired — peak concurrent sessions across this project's
+ * entire history never exceeded 3, the same 3 both the provider's cap and
+ * this module's own limit carry. The cap was never approached, so this was
+ * never an overshoot. Calling `POST /v1/sessions` directly, bypassing
+ * Stagehand, reproduced the refusal and returned the reason it had been
+ * discarding: `402 Payment Required — "Free plan browser minutes limit
+ * reached."` The incident was a billing wall, not a concurrency race, and
+ * nothing below fixes that; the account needs a plan upgrade before another
+ * fan-out this size runs clean.
+ *
+ * What the incident did surface correctly is that the old release-then-
+ * hand-off ordering could not be trusted to stay unreachable forever, and
+ * that this module's real defect — a slot released the instant a session was
+ * up rather than when it actually closed, against a resource Browserbase
+ * meters by session lifetime, not by launch — was worth fixing regardless of
+ * which failure mode found it first.
  *
  * ── What it is now ──────────────────────────────────────────────────────────
  *
@@ -411,10 +424,12 @@ function takeSlot(logTag: string): SessionSlot {
  */
 function reclaimLeakedSlots(): void {
   const cutoff = Date.now() - SESSION_SLOT_MAX_HOLD_MS;
+  let reclaimed = false;
   for (const slot of heldSlots) {
     if (slot.acquiredAt > cutoff) continue;
     slot.released = true;
     heldSlots.delete(slot);
+    reclaimed = true;
     console.error(
       `${slot.logTag} a browser session slot was held for over ` +
         `${Math.round(SESSION_SLOT_MAX_HOLD_MS / 1000)}s and has been reclaimed. That is ` +
@@ -423,6 +438,11 @@ function reclaimLeakedSlots(): void {
         `that skipped closeBrowserSession.`
     );
   }
+  // A reclaim frees capacity the same way a normal release does, and a waiter
+  // parked before the reclaim has no other way to learn about it: nothing here
+  // otherwise wakes `slotWaiters`, so freed capacity would sit idle while a
+  // caller waits on it, potentially forever if every slot leaked this way.
+  if (reclaimed) grantWaitingSlots();
 }
 
 /**
@@ -437,7 +457,11 @@ async function acquireSessionSlot(logTag: string): Promise<SessionSlot> {
   reclaimLeakedSlots();
 
   const limit = sessionSlotLimit();
-  if (heldSlots.size < limit) return takeSlot(logTag);
+  // Also requires an empty queue: without it, a slot freed by the reclaim
+  // above (or any release whose `grantWaitingSlots` hand-off has not yet run)
+  // could let this caller take it out of turn, ahead of whoever has been
+  // waiting longest.
+  if (slotWaiters.length === 0 && heldSlots.size < limit) return takeSlot(logTag);
 
   console.log(
     `${logTag} waiting for a browser session slot (${heldSlots.size} of ${limit} in use, ` +

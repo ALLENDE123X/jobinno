@@ -3,15 +3,24 @@
  * JOB-025. The limiter that decides how many browser sessions this process may
  * hold against the provider's cap at once.
  *
- * There is a real run behind every assertion here. A fan-out of 17 applications
- * lost 9 of them to `"Failed to create a Browserbase session"`, which is the
- * bare string Stagehand throws when `sessions.create` is refused, against a
- * project whose own API reports `"concurrency": 3` and against code that
- * configures 3 in two places. The cap and the configuration agreed. What
- * disagreed was the count: the limiter took a slot before `launch()` and gave
- * it back the moment `Stagehand.create()` returned, so it bounded how many
- * sessions were *starting* and placed no bound at all on how many were alive.
- * Browserbase counts the second number.
+ * The defect below is real and independently confirmed (a brute force of every
+ * interleaving of the old limiter overshoots to 3 live sessions against a cap
+ * of 1: it took a slot before `launch()` and gave it back the moment
+ * `Stagehand.create()` returned, bounding how many sessions were *starting*
+ * rather than how many were alive, which is the number Browserbase counts).
+ *
+ * It is not, however, what caused the incident that prompted this file. Ten
+ * applications in one run failed to `"Failed to create a Browserbase
+ * session"`, the bare string Stagehand throws when `sessions.create` is
+ * refused, but the project's session history shows zero live sessions at the
+ * moment of every refusal — peak concurrency never exceeded 3 across the
+ * project's entire history. Calling the provider directly, bypassing
+ * Stagehand, reproduced the refusal and surfaced the reason Stagehand had
+ * been discarding: `402 Payment Required — "Free plan browser minutes limit
+ * reached."` That incident was a billing wall, not this race; the fix below
+ * is worth having regardless, since a caller whose continuation was already
+ * queued when a release fired could still read a stale count and take a slot
+ * meant for a waiter, whatever eventually triggers it.
  *
  * Nothing below launches a browser or reaches the network. The whole provider
  * is the `provider` object: a live-session counter, a peak watermark, and a way
