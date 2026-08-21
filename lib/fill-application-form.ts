@@ -2566,7 +2566,7 @@ function matchAdditionalAnswer(
  * anywhere in the string — the check exists precisely so that naming a fact
  * cannot license clicking an unrelated option.
  */
-function optionSupportsFact(option: string, factValue: string): boolean {
+function optionSupportsFact(option: string, factValue: string, factKey: string): boolean {
   const chosen = normalizeText(option);
   const known = normalizeText(factValue);
   if (chosen === known) return true;
@@ -2576,8 +2576,17 @@ function optionSupportsFact(option: string, factValue: string): boolean {
   // exact pair stopped a real application with the message "the option
   // \"Bachelor's Degree\" does not say what the stored fact \"degree\" says
   // (\"B.S.\")", which is a spelling complaint dressed up as a truthfulness one.
-  const chosenDegree = degreeLevel(chosen);
-  if (chosenDegree !== null && chosenDegree === degreeLevel(known)) return true;
+  //
+  // Gated on the fact being a degree, which is the second half of a fix that
+  // review caught twice. Degree abbreviations are short and overloaded: "MA" is
+  // both a master's and Massachusetts, so a rule that fires on any field lets a
+  // location dropdown offering a bare "MA" be satisfied by a stored
+  // "Master's Degree". Asking the fact what it is settles it, and this function
+  // is the only place that knows, so it is the only place that can.
+  if (DEGREE_FACT_KEY_RE.test(factKey)) {
+    const chosenDegree = degreeLevel(chosen);
+    if (chosenDegree !== null && chosenDegree === degreeLevel(known)) return true;
+  }
   if (known.length <= 3) {
     return chosen.startsWith(`${known} `) || chosen.startsWith(`${known},`);
   }
@@ -2590,6 +2599,12 @@ function optionSupportsFact(option: string, factValue: string): boolean {
   // typo.
   return containsAtWordBoundary(chosen, known) || containsAtWordBoundary(known, chosen);
 }
+
+/**
+ * The fact keys that hold a degree, and the only ones degree equivalence runs
+ * for. `buildFactCatalog` writes `degree` and `educationN.degree`.
+ */
+const DEGREE_FACT_KEY_RE = /(?:^|\.)degree$/;
 
 /**
  * Which level of degree a string names, or null when it names none.
@@ -3020,7 +3035,7 @@ export function resolveDecision(
               decision.question
             );
           }
-          if (!optionSupportsFact(match, fact.value)) {
+          if (!optionSupportsFact(match, fact.value, fact.key)) {
             return contradict(
               `the option ${JSON.stringify(match)} does not say what the stored fact ` +
                 `"${fact.key}" says (${JSON.stringify(fact.value)}), so choosing it would be a ` +

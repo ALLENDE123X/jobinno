@@ -417,6 +417,19 @@ describe("a US state abbreviation is not a degree", () => {
     expect(resolution.kind).toBe("ask");
   });
 
+  it("does not let a degree fact satisfy a bare state code on a location menu", () => {
+    // The residual case review flagged after the first fix: "MA" is a master's
+    // and it is Massachusetts, so degree equivalence now runs only when the
+    // fact being cited is itself a degree. A location menu of bare state codes
+    // can no longer be satisfied by a stored "B.S.".
+    const resolution = resolveDecision(
+      field({ label: "Which state are you based in?", kind: "select", options: ["MA", "CA", "NY"], optionsKnown: true }),
+      decision({ fieldKey: "which state are you based in?", decision: "answer", value: "MA", sourceFact: "degree" }),
+      facts()
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+
   it("still reads a dropdown offering a bare abbreviation as the degree it is", () => {
     const resolution = resolveDecision(
       field({ label: "Degree", kind: "select", options: ["BS", "MS", "PhD"], optionsKnown: true }),
