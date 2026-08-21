@@ -2243,6 +2243,84 @@ export const LEGAL_ATTESTATION_RE =
   /\b(?:work(?:ing)?\s+authoriz\w*|authoriz\w*\s+to\s+work|right\s+to\s+work|legally\s+(?:authoriz\w*|entitled|permitted|eligible)|citizen\w*|nationality|permanent\s+resident\w*|green\s+card|visa|sponsor\w*|immigration|work\s+permit|security\s+clearance|clearance\s+eligib\w*|clearance|export\s+control\w*|itar|u\.?\s?s\.?\s+person|felony|felonies|misdemean\w*|convict\w*|criminal\s+(?:history|record|background|conviction\w*)|background\s+check)\b/i;
 
 /**
+ * The only facts allowed to answer a legal attestation.
+ *
+ * ── Added after review on this PR, and it is the most important line here ───
+ * The ladder above was written as though naming a fact were the same as citing a
+ * relevant one. It is not. `optionSupportsFact` compares the fact's VALUE to the
+ * option's TEXT and never looks at the question, so every Yes/No fact in the
+ * catalogue licensed every Yes/No attestation on the form. Both of these were
+ * reproduced against this module before the allow-list existed:
+ *
+ *   "Are you a U.S. Person as defined by ITAR?"      → Yes, citing willingToRelocate
+ *   "Have you ever been convicted of a felony?"      → No,  citing requiresSponsorship
+ *
+ * Neither fact says anything whatsoever about the question asked. The first is a
+ * false statement to a defence contractor about export-control status; the
+ * second is a criminal-history declaration backed by a visa answer. That the
+ * second happens to be true of this candidate is luck, not correctness, and luck
+ * is not a property a form filler may rely on.
+ *
+ * So the gate is on the fact KEY, checked before the value is ever compared.
+ *
+ * It is scoped per topic rather than being one flat list, and that distinction
+ * is load bearing. A flat list of "the status facts" fixes the ITAR case and
+ * leaves the felony one standing, because `requiresSponsorship` is a perfectly
+ * legitimate attestation fact, just not for THAT question. Only a table that
+ * knows which questions a fact is about can say so. The topics below are the
+ * categories named in the carve-out, and each lists the facts that genuinely
+ * bear on it:
+ *
+ *  · Work authorization and sponsorship have four facts that answer them.
+ *  · Citizenship, nationality, residency and export control have the citizenship
+ *    status and the yes/no restatements derived from it.
+ *  · Security clearance and criminal history have NONE. Intake does not collect
+ *    either, nothing in the catalogue implies either, and so nothing may back
+ *    one except the candidate's own typed answer. That is not an oversight to be
+ *    filled in later with a guess; it is the correct answer to "what do we know
+ *    about this person's criminal record", which is nothing.
+ *
+ * `answer:*` is allowed everywhere: it is the candidate answering the question
+ * themselves in a previous `needsInput` round, the highest-quality fact in the
+ * catalogue and the whole point of that loop.
+ *
+ * A label matching more than one topic gets the union, not the intersection.
+ * Anduril really does ask "U.S. Person status and/or U.S. clearance eligibility
+ * ... are you eligible to meet this requirement?" as one Yes/No, and a stored
+ * export-control status is a truthful answer to it. Requiring a fact to satisfy
+ * every topic a compound label touches would decline that one, and declining a
+ * question the candidate's own data answers is the failure this ticket exists to
+ * fix.
+ *
+ * A fact outside the list does not fail the field. It drops to step 2 of the
+ * ladder, the control's own decline option, exactly as a missing fact would.
+ */
+const ATTESTATION_FACT_SCOPES: readonly [RegExp, RegExp][] = [
+  [
+    /\b(?:work(?:ing)?\s+authoriz\w*|authoriz\w*\s+to\s+work|right\s+to\s+work|legally\s+(?:authoriz\w*|entitled|permitted|eligible)|sponsor\w*|visa|work\s+permit|immigration)\b/i,
+    /^(?:workAuthorizedUs|requiresSponsorship|citizenshipStatus|f1Status|isUs(?:Citizen|PermanentResident|PersonForExportControl))$/,
+  ],
+  [
+    /\b(?:citizen\w*|nationality|permanent\s+resident\w*|green\s+card|export\s+control\w*|itar|u\.?\s?s\.?\s+person)\b/i,
+    /^(?:citizenshipStatus|f1Status|isUs(?:Citizen|PermanentResident|PersonForExportControl))$/,
+  ],
+  // Clearance and criminal history deliberately admit nothing. See above.
+  [/\b(?:security\s+clearance|clearance\s+eligib\w*|clearance)\b/i, /^$/],
+  [
+    /\b(?:felony|felonies|misdemean\w*|convict\w*|criminal\s+(?:history|record|background|conviction\w*)|background\s+check)\b/i,
+    /^$/,
+  ],
+];
+
+/** Whether `factKey` is one this attestation question may be answered from. */
+function attestationFactAllowed(label: string, factKey: string): boolean {
+  if (factKey.startsWith("answer:")) return true;
+  return ATTESTATION_FACT_SCOPES.some(
+    ([topic, allowed]) => topic.test(label) && allowed.test(factKey)
+  );
+}
+
+/**
  * Whether a field is one of the two categories that are never best guessed.
  *
  * Kept as one predicate so that the fill loop, the policy function and the tests
@@ -2337,6 +2415,19 @@ export function buildFactCatalog(
   // ── JOB-022: the intake columns nobody was reading ───────────────────────
   add("citizenshipStatus", "Citizenship or immigration status they stated at intake",
     describeCitizenship(answers.citizenshipStatus, answers.f1Status));
+  // The same stored status, projected onto the yes/no shape half these questions
+  // are actually drawn with. Without this the flagship fix did not reach them:
+  // "Are you a citizen or national of the United States?" with Yes/No options
+  // could not be answered, because the sentence "A United States citizen or
+  // national" does not say what the option "Yes" says, and the attestation
+  // ladder has nothing else to try. Review caught that the correct fact bailed
+  // while a wrong one passed, which is the worst possible pairing.
+  //
+  // Every arm is a restatement of one enum value, and a status the enum records
+  // as "other" produces nothing at all rather than a guessed "No".
+  for (const [key, label, value] of citizenshipYesNo(answers.citizenshipStatus)) {
+    add(key, label, value);
+  }
   add("earliestStartDate", "Earliest date they can start work (ISO)", answers.earliestStart);
   add("graduationDate", "Graduation date (ISO)", answers.gradDate);
   const gradParts = splitIsoDate(answers.gradDate);
@@ -2466,6 +2557,45 @@ function describeCitizenship(status: string | undefined, f1: string | undefined)
   }
 }
 
+/**
+ * The yes/no facts that follow directly from one `citizenship_status` value.
+ *
+ * A lookup table, not an inference. "Other" is deliberately absent from every
+ * arm: it means the person told us their status is none of the four, which
+ * settles nothing about any of these questions, and answering "No" on their
+ * behalf would be the invention this whole design exists to prevent.
+ *
+ * `isUsPersonForExportControl` covers citizens and lawful permanent residents.
+ * A refugee or asylee is also a US person under the regulation and is not one of
+ * the values intake collects, which is why "other" yields nothing here rather
+ * than a "No" that could be materially wrong.
+ */
+function citizenshipYesNo(status: string | undefined): [string, string, string][] {
+  switch ((status ?? "").trim()) {
+    case "us_citizen":
+      return [
+        ["isUsCitizen", "Is a United States citizen or national", "Yes"],
+        ["isUsPermanentResident", "Is a United States lawful permanent resident", "No"],
+        ["isUsPersonForExportControl", "Is a US person for export control purposes", "Yes"],
+      ];
+    case "permanent_resident":
+      return [
+        ["isUsCitizen", "Is a United States citizen or national", "No"],
+        ["isUsPermanentResident", "Is a United States lawful permanent resident", "Yes"],
+        ["isUsPersonForExportControl", "Is a US person for export control purposes", "Yes"],
+      ];
+    case "f1":
+    case "h1b":
+      return [
+        ["isUsCitizen", "Is a United States citizen or national", "No"],
+        ["isUsPermanentResident", "Is a United States lawful permanent resident", "No"],
+        ["isUsPersonForExportControl", "Is a US person for export control purposes", "No"],
+      ];
+    default:
+      return [];
+  }
+}
+
 /** An ISO date as the two pieces a form's month and year dropdowns want. */
 function splitIsoDate(iso: string | undefined): { year: string; monthName: string } | null {
   const match = /^(\d{4})-(\d{2})(?:-(\d{2}))?$/.exec((iso ?? "").trim());
@@ -2492,13 +2622,27 @@ function joinDates(start: string | null, end: string | null): string | null {
  * "How many years of industry experience do you have?" was a required field on
  * three separate forms in the 2026 08 20 run and stopped all three, against a
  * resume that lists the jobs it would be counted from. Counting it here rather
- * than letting a model estimate it keeps it a report of the resume: the span
- * from the earliest year any job started to the latest year any job ended,
- * rounded down, with "present" read as this year.
+ * than letting a model estimate it keeps it a report of the resume.
  *
- * Deliberately coarse. It is an approximation of an approximation, since every
- * candidate answering this box is estimating too, and the number only has to be
- * defensible against the dates printed on their own resume.
+ * ── Rewritten after review on this PR ───────────────────────────────────────
+ * The first version measured the SPAN: earliest start to latest end. A span
+ * counts the gaps between jobs as though they were jobs. The resume this feature
+ * exists for is a student's, and a student's resume is mostly gaps: two summer
+ * internships, June to September 2019 and June 2025 to present, produced "7"
+ * for someone with roughly nine months of work. Seven years of industry
+ * experience is not a rounding error on a real application, it is a different
+ * person, and it would have been typed into three forms as a stated fact.
+ *
+ * So this sums the intervals instead, merging any that overlap so that two
+ * concurrent jobs are one stretch of time rather than two. Same two internships
+ * now give "0", which is the truthful answer for a new grad and the one they
+ * would write themselves.
+ *
+ * Still deliberately coarse: resume dates are years, months are not parsed, and
+ * a job listed only as "2019" counts as that one year. It is an approximation of
+ * an approximation, since every candidate answering this box is estimating too,
+ * and the number only has to be defensible against the dates on their own
+ * resume. Undercounting slightly is the right direction for the error to run.
  */
 function totalYearsOfExperience(history: readonly { startDate: string | null; endDate: string | null }[]): string | null {
   const thisYear = new Date().getUTCFullYear();
@@ -2510,19 +2654,34 @@ function totalYearsOfExperience(history: readonly { startDate: string | null; en
     return found === null ? null : Number(found[0]);
   };
 
-  let earliest: number | null = null;
-  let latest: number | null = null;
+  // An entry with no readable start contributes nothing. A missing end is read
+  // as still going, which is what an ongoing role on a resume means.
+  const spans: [number, number][] = [];
   for (const entry of history) {
     const start = yearIn(entry.startDate, null);
-    const end = yearIn(entry.endDate, thisYear);
-    if (start !== null && (earliest === null || start < earliest)) earliest = start;
-    for (const year of [start, end]) {
-      if (year !== null && (latest === null || year > latest)) latest = year;
-    }
+    if (start === null) continue;
+    const end = Math.min(yearIn(entry.endDate, thisYear) ?? thisYear, thisYear);
+    if (end < start) continue;
+    spans.push([start, end]);
   }
-  if (earliest === null || latest === null) return null;
-  const years = Math.max(0, Math.min(latest, thisYear) - earliest);
-  return String(years);
+  if (spans.length === 0) return null;
+
+  // Merge overlapping and touching spans, then add up what is left. Touching
+  // counts as overlapping: 2019-2021 and 2021-2023 is one four year stretch and
+  // not two, because the shared year is one year of somebody's life either way.
+  spans.sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  let [from, to] = spans[0]!;
+  for (const [start, end] of spans.slice(1)) {
+    if (start <= to) {
+      to = Math.max(to, end);
+      continue;
+    }
+    total += to - from;
+    [from, to] = [start, end];
+  }
+  total += to - from;
+  return String(Math.max(0, total));
 }
 
 /**
@@ -2566,7 +2725,12 @@ function matchAdditionalAnswer(
  * anywhere in the string — the check exists precisely so that naming a fact
  * cannot license clicking an unrelated option.
  */
-function optionSupportsFact(option: string, factValue: string, factKey: string): boolean {
+function optionSupportsFact(
+  option: string,
+  factValue: string,
+  factKey: string,
+  fieldLabel: string
+): boolean {
   const chosen = normalizeText(option);
   const known = normalizeText(factValue);
   if (chosen === known) return true;
@@ -2577,13 +2741,16 @@ function optionSupportsFact(option: string, factValue: string, factKey: string):
   // \"Bachelor's Degree\" does not say what the stored fact \"degree\" says
   // (\"B.S.\")", which is a spelling complaint dressed up as a truthfulness one.
   //
-  // Gated on the fact being a degree, which is the second half of a fix that
-  // review caught twice. Degree abbreviations are short and overloaded: "MA" is
-  // both a master's and Massachusetts, so a rule that fires on any field lets a
-  // location dropdown offering a bare "MA" be satisfied by a stored
-  // "Master's Degree". Asking the fact what it is settles it, and this function
-  // is the only place that knows, so it is the only place that can.
-  if (DEGREE_FACT_KEY_RE.test(factKey)) {
+  // Gated on BOTH ends, which is the third pass review took at this. Gating the
+  // fact key alone was still not enough: a genuine `degree` = "Master's Degree"
+  // against a state dropdown offering a bare "MA" is a real fact and a real
+  // degree key, and `degreeLevel` reads "MA" as a master's, so the state of
+  // Massachusetts counted as saying what the degree said. Both the fact and the
+  // FIELD have to be about education before two-letter degree equivalence is
+  // allowed to decide anything. Anduril's own "What is your top location
+  // preference?" list offers "Boston, MA", which is exactly the shape of menu
+  // this protects.
+  if (DEGREE_FACT_KEY_RE.test(factKey) && DEGREE_FIELD_LABEL_RE.test(fieldLabel)) {
     const chosenDegree = degreeLevel(chosen);
     if (chosenDegree !== null && chosenDegree === degreeLevel(known)) return true;
   }
@@ -2605,6 +2772,17 @@ function optionSupportsFact(option: string, factValue: string, factKey: string):
  * for. `buildFactCatalog` writes `degree` and `educationN.degree`.
  */
 const DEGREE_FACT_KEY_RE = /(?:^|\.)degree$/;
+
+/**
+ * The field labels a degree question is drawn with, and the only ones two-letter
+ * degree equivalence may run for.
+ *
+ * Deliberately narrow. A label naming a degree, a qualification or a level of
+ * study is one; "What is your top location preference?" is not, and neither is
+ * anything else on the form.
+ */
+const DEGREE_FIELD_LABEL_RE =
+  /\b(degree|qualification|education\s+level|level\s+of\s+(?:education|study)|highest\s+(?:degree|education|level))\b/i;
 
 /**
  * Which level of degree a string names, or null when it names none.
@@ -2654,54 +2832,93 @@ function degreeLevel(text: string): string | null {
 /**
  * The option on this menu that a proposed value names, or null.
  *
- * Exact first, then exactly one option that spells the value out more fully.
- * That second pass is what a real Greenhouse city picker needs: it offers
- * "San Francisco, California, United States" and the stored city is
- * "San Francisco", and on 2026 08 20 the exact only match declared that
- * unanswerable and stopped the application, quoting six near identical options
- * back at the user as though they were the problem.
+ * ── Rewritten after review on this PR, because the first version was wrong ──
+ * It matched any option starting with the value and broke ties by picking the
+ * shortest. Run against the six options quoted verbatim in the Virtu `skip_log`
+ * row from 2026 08 20, "San Francisco" resolved to "San Francisco, Cebu,
+ * Philippines" (32 characters) over "San Francisco, California, United States"
+ * (40), and applied it as a fact the candidate had stated. Shortest is not least
+ * qualified; it is just shortest. The test that was supposed to catch this used
+ * a hand written three option subset that happened to omit the shorter ones,
+ * which is exactly how the bug survived, so the fixture now comes from the
+ * logged list.
  *
- * "Exactly one" is the whole safety property. That same picker also offers
- * "South San Francisco, California, United States", so a value matching two
- * options is ambiguous and falls through rather than picking the first, and
- * a menu of countries cannot resolve "Guinea" to "Papua New Guinea" here for
- * the same reason.
+ * The rule now has three parts, and each is doing specific work:
+ *
+ *  1. **Exact wins.** A country menu offering both "Guinea" and "Guinea-Bissau"
+ *     resolves "Guinea" here and never reaches the rest.
+ *
+ *  2. **Only a qualified prefix counts.** The text after the matched prefix has
+ *     to begin with a comma or an opening parenthesis, which is what
+ *     qualification looks like: "San Francisco, California, United States" and
+ *     "Costa Mesa, CA (HQ)" are the value said in full. A prefix followed by
+ *     anything else is a *different name that happens to start the same way*:
+ *     "Guinea-Bissau" is not Guinea, and "San Francisco de Macorís" is not San
+ *     Francisco. The old rule treated a hyphen as a word boundary and accepted
+ *     both.
+ *
+ *  3. **Ambiguity is resolved by a second fact, or not at all.** Three of the
+ *     Virtu options are qualified prefixes, so the tie is broken by asking which
+ *     remainder agrees with something else known about this person: their
+ *     country. Exactly one does. When none does, or several do, nothing is
+ *     chosen and the field goes back to the ordinary path, because picking a
+ *     city on the wrong continent is worse than not picking one.
+ *
+ * The old "contained in exactly one option" fallback is gone with it. A single
+ * option list containing "Papua New Guinea" and nothing else would have resolved
+ * a bare "Guinea" to it, and no rule that can do that is worth its coverage.
  */
-function matchOption(options: readonly string[], value: string): string | null {
+function matchOption(
+  options: readonly string[],
+  value: string,
+  corroborants: readonly string[] = []
+): string | null {
   const wanted = normalizeText(value);
   if (wanted === "") return null;
 
   const exact = options.find((option) => normalizeText(option) === wanted);
   if (exact !== undefined) return exact;
 
-  // An option that *begins* with the value is the value plus qualification:
-  // "San Francisco, California, United States" is that city, said in full.
-  // Where several qualify, the shortest is the least qualified and so the
-  // closest reading of what was asked for, which picks the city over
-  // "San Francisco de Macorís, Duarte, Dominican Republic".
-  //
-  // This tiebreak is a judgement call and worth naming as one. It is here
-  // because the alternative, refusing to choose, is what stopped a real Virtu
-  // application on 2026 08 20 while quoting six near identical options back at
-  // the user as though the list were the problem.
-  const prefixed = options.filter((option) => {
+  const qualified = options.filter((option) => {
     const text = normalizeText(option);
     if (!text.startsWith(wanted)) return false;
-    const after = text[wanted.length];
-    return after === undefined || !/[a-z0-9]/i.test(after);
+    const rest = text.slice(wanted.length).replace(/^\s+/, "");
+    return rest.startsWith(",") || rest.startsWith("(");
   });
-  if (prefixed.length > 0) {
-    return prefixed.reduce((best, option) => (option.length < best.length ? option : best));
-  }
+  if (qualified.length === 1) return qualified[0]!;
+  if (qualified.length === 0) return null;
 
-  // Last resort: the value appears somewhere inside exactly one option. "Exactly
-  // one" is the safety property and it is not negotiable. A country menu offers
-  // "Papua New Guinea" and "Equatorial Guinea", and nothing here may resolve a
-  // bare "Guinea" to either of them.
-  const contained = options.filter((option) =>
-    containsAtWordBoundary(normalizeText(option), wanted)
-  );
-  return contained.length === 1 ? contained[0]! : null;
+  const backed = qualified.filter((option) => {
+    const rest = normalizeText(option).slice(wanted.length);
+    return corroborants.some((hint) => {
+      const clean = normalizeText(hint);
+      return clean !== "" && containsAtWordBoundary(rest, clean);
+    });
+  });
+  return backed.length === 1 ? backed[0]! : null;
+}
+
+/**
+ * The other things known about where this person is, for breaking a tie between
+ * two options that both spell out the same place name.
+ *
+ * Only ever used to *choose between* options the menu already offers, never to
+ * justify one on its own.
+ */
+function geographyHints(facts: ReadonlyMap<string, CandidateFact>): string[] {
+  const hints: string[] = [];
+  const country = facts.get("currentCountry")?.value ?? "";
+  if (country.trim() !== "") {
+    hints.push(country);
+    // A menu writes "United States" where intake may have recorded "USA", and
+    // the tie break is worthless if the two spellings cannot see each other.
+    if (US_COUNTRY_RE.test(country.trim())) hints.push("United States", "USA");
+  }
+  const resumeLocation = facts.get("resumeLocation")?.value ?? "";
+  for (const piece of resumeLocation.split(",").slice(1)) {
+    if (piece.trim() !== "") hints.push(piece);
+  }
+  return hints;
 }
 
 /** Whether `needle` appears in `haystack` delimited by non-word characters. */
@@ -2816,17 +3033,23 @@ function inferOrAsk(
   field: EnumeratedField,
   decision: FieldDecision | undefined,
   why: string,
-  question?: string | null
+  question: string | null | undefined,
+  hints: readonly string[]
 ): Resolution {
   if (!field.required) return { kind: "skip", why };
 
   const proposed = decision?.value?.trim() ?? "";
   if (proposed !== "") {
     if (OPTION_KINDS.has(field.kind) && field.optionsKnown && field.options.length > 0) {
-      const match = field.options.find(
-        (option) => normalizeText(option) === normalizeText(proposed)
-      );
-      if (match !== undefined) {
+      // Through `matchOption` rather than an exact compare of its own, which is
+      // what this did before review caught it. The two had drifted apart, so a
+      // best effort answer was held to a stricter rule than a fact backed one:
+      // "How did you hear about us?" offering "LinkedIn (Job Post)" rejected an
+      // inferred "LinkedIn" and stopped the application. `matchOption` only ever
+      // returns an option the menu actually offers, so routing through it is no
+      // less safe and considerably less silly.
+      const match = matchOption(field.options, proposed, hints);
+      if (match !== null) {
         return {
           kind: "apply",
           value: match,
@@ -2898,10 +3121,11 @@ export function resolveDecision(
   // Where a failed check goes. Bound once, at the top, so that no branch below
   // can accidentally keep the old unconditional stop: every `refuse` in this
   // function routes by category rather than by which line noticed the problem.
+  const hints = geographyHints(facts);
   const refuse = (why: string, question?: string | null): Resolution =>
     LEGAL_ATTESTATION_RE.test(field.label)
       ? declineOrAsk(field, why, question)
-      : inferOrAsk(field, decision, why, question);
+      : inferOrAsk(field, decision, why, question, hints);
 
   // A gap and a contradiction are not the same failure, and only the first one
   // is best guessed.
@@ -2919,7 +3143,7 @@ export function resolveDecision(
   const contradict = (why: string, question?: string | null): Resolution =>
     LEGAL_ATTESTATION_RE.test(field.label)
       ? declineOrAsk(field, why, question)
-      : inferOrAsk(field, undefined, why, question);
+      : inferOrAsk(field, undefined, why, question, hints);
 
   // ── Demographic and self-identification questions ────────────────────────
   if (EEO_FIELD_RE.test(field.label)) {
@@ -2955,13 +3179,51 @@ export function resolveDecision(
   }
 
   // ── Agreements, consents and certifications ──────────────────────────────
-  if (field.kind === "checkbox" && CONSENT_FIELD_RE.test(field.label)) {
-    return askAbout(
-      field,
-      "this box records an agreement or a certification, which is a commitment made in the " +
-        "candidate's name and is never ticked on their behalf",
-      `The form has a box to tick: "${field.label}". Do you agree to it?`
-    );
+  //
+  // Rewritten after review on this PR. This branch used to stop the run for
+  // every box matching `CONSENT_FIELD_RE`, before any ladder, without even
+  // looking at `required`. "I certify that the information provided is true and
+  // complete" and "I have read and agree to the Privacy Policy" are on a large
+  // share of application forms and are required on most of them, so the old
+  // behaviour meant those forms could not be finished at all, whatever else was
+  // fixed. That is precisely the bail-instead-of-fill outcome this ticket is
+  // about, and consent boxes are NOT in the stated carve-out, which is
+  // specifically legal attestations.
+  //
+  // Two branches now, and the split is on required rather than on wording:
+  //
+  //  · Required: tick it. The candidate asked this system to submit applications
+  //    on their behalf; a form that will not submit without an agreement box is
+  //    a term of doing the thing they asked for. Certifying that the information
+  //    is true is also a claim this system is in an unusually good position to
+  //    make, since every value on the form came from what the candidate stated.
+  //  · Optional: leave it. An optional consent box is almost always a marketing
+  //    opt-in or a talent-pool subscription, and nobody asked for either.
+  //
+  // An agreement that is ALSO a legal attestation, "I certify I am authorized to
+  // work in the United States", is not covered by either branch and falls
+  // through to the ordinary ladder below, which is where it belongs.
+  if (
+    field.kind === "checkbox" &&
+    CONSENT_FIELD_RE.test(field.label) &&
+    !isAttestationField(field.label)
+  ) {
+    if (!field.required) {
+      return {
+        kind: "skip",
+        why:
+          "an optional agreement box, which is an opt-in nobody asked for rather than a " +
+          "condition of applying",
+      };
+    }
+    return {
+      kind: "apply",
+      value: "Yes",
+      declined: false,
+      note:
+        "a required agreement the form will not submit without, ticked on the candidate's " +
+        "instruction to submit applications on their behalf",
+    };
   }
 
   if (decision === undefined) {
@@ -3026,16 +3288,38 @@ export function resolveDecision(
         );
       }
 
+      // The attestation ladder, on the one path that used to skip it entirely.
+      // `refuse` and `contradict` both consult `LEGAL_ATTESTATION_RE`, so every
+      // FAILING check routed an attestation correctly, and a PASSING one walked
+      // straight past, because nothing on the success path asked whether the
+      // named fact had anything to do with the question. That is what let a
+      // relocation preference answer an ITAR question. Checked here, above the
+      // value comparison, because by the time `optionSupportsFact` runs the only
+      // thing left to compare is text against text.
+      if (
+        LEGAL_ATTESTATION_RE.test(field.label) &&
+        !attestationFactAllowed(field.label, fact.key)
+      ) {
+        return declineOrAsk(
+          field,
+          `a legal attestation, and the stored fact "${fact.key}" offered to back it is not ` +
+            `about what this question asks: a fact that happens to read ` +
+            `${JSON.stringify(fact.value)} is not an answer to a question nobody checked it ` +
+            `against`,
+          decision.question
+        );
+      }
+
       if (OPTION_KINDS.has(field.kind)) {
         if (field.optionsKnown && field.options.length > 0) {
-          const match = matchOption(field.options, value);
+          const match = matchOption(field.options, value, hints);
           if (match === null) {
             return refuse(
               `"${value}" is not one of the options this control offers`,
               decision.question
             );
           }
-          if (!optionSupportsFact(match, fact.value, fact.key)) {
+          if (!optionSupportsFact(match, fact.value, fact.key, field.label)) {
             return contradict(
               `the option ${JSON.stringify(match)} does not say what the stored fact ` +
                 `"${fact.key}" says (${JSON.stringify(fact.value)}), so choosing it would be a ` +
