@@ -31,6 +31,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  blockedForAnswers,
   buildFactCatalog,
   isAttestationField,
   resolveDecision,
@@ -387,6 +388,47 @@ describe("a legal attestation is never best guessed", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+describe("a US state abbreviation is not a degree", () => {
+  // Caught in review on this PR. `degreeLevel` is consulted by
+  // `optionSupportsFact` for every field, not only for a degree dropdown, and it
+  // matched a bare "ma"/"ms"/"ba" anywhere inside a string. So "Boston, MA" read
+  // as a master's degree, and a location option could count as backed by a
+  // stored location fact naming a different city in the same state.
+  it("does not accept a different city in the same state as backed by the stored one", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Which office are you closest to?",
+        kind: "select",
+        options: ["Boston, MA"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "which office are you closest to?",
+        decision: "answer",
+        value: "Boston, MA",
+        sourceFact: "resumeLocation",
+      }),
+      new Map(
+        buildFactCatalog({ ...PROFILE, location: "Cambridge, MA" }, ANSWERS, {}).map((f) => [f.key, f])
+      )
+    );
+    // The stored location says Cambridge. Boston is a different place, and
+    // nothing may report it as what the candidate stated.
+    expect(resolution.kind).toBe("ask");
+  });
+
+  it("still reads a dropdown offering a bare abbreviation as the degree it is", () => {
+    const resolution = resolveDecision(
+      field({ label: "Degree", kind: "select", options: ["BS", "MS", "PhD"], optionsKnown: true }),
+      decision({ fieldKey: "degree", decision: "answer", value: "BS", sourceFact: "degree" }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("BS");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 describe("what a best effort answer may not do", () => {
   it("does not put a value on a menu that does not offer it", () => {
     const resolution = resolveDecision(
@@ -412,5 +454,49 @@ describe("what a best effort answer may not do", () => {
     // chosen on this person's behalf. This is the property that keeps the looser
     // city match from turning a country picker into a hazard.
     expect(resolution.kind).not.toBe("apply");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+describe("the message a blocked run leaves behind", () => {
+  const item = (fieldLabel: string) => ({
+    key: fieldLabel.toLowerCase(),
+    fieldLabel,
+    question: `What about "${fieldLabel}"?`,
+    why: "nothing supplies this",
+    required: true,
+    kind: "select" as const,
+  });
+
+  it("tags a legal attestation so skipReasonFor can file it as one", () => {
+    const message = blockedForAnswers([item("Are you eligible for a U.S. security clearance?")], "https://x.example").message;
+    expect(message).toContain("needs_attestation:");
+    expect(message).toContain("legal attestation");
+  });
+
+  it("does not describe a demographic block as a work authorization question", () => {
+    // Caught in review on this PR. `isAttestationField` is true for both
+    // categories, so a run stopped only by a required "Gender" select was told
+    // its form asked about work authorization and criminal history. It did not.
+    const message = blockedForAnswers([item("Gender")], "https://x.example").message;
+    expect(message).toContain("needs_attestation:");
+    expect(message).toContain("self-identification");
+    expect(message).not.toContain("criminal history");
+    expect(message).not.toContain("Work authorization");
+  });
+
+  it("counts the two categories separately when a form asks both", () => {
+    const message = blockedForAnswers(
+      [item("Gender"), item("Have you ever been convicted of a felony?")],
+      "https://x.example"
+    ).message;
+    expect(message).toContain("1 required legal attestation(s)");
+    expect(message).toContain("1 required self-identification question(s)");
+  });
+
+  it("uses the ordinary tag when nothing that stopped it was either category", () => {
+    const message = blockedForAnswers([item("Referral code")], "https://x.example").message;
+    expect(message).toContain("needs_candidate_input:");
+    expect(message).not.toContain("needs_attestation");
   });
 });

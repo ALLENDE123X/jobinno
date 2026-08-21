@@ -2602,18 +2602,36 @@ function optionSupportsFact(option: string, factValue: string): boolean {
  */
 function degreeLevel(text: string): string | null {
   const flat = normalizeText(text).replace(/[.’']+/g, " ").replace(/\s+/g, " ").trim();
-  if (/\b(doctorate|doctoral|doctor of philosophy|ph d|phd|d phil|dphil|sc d)\b/.test(flat)) {
-    return "doctorate";
-  }
-  // Ahead of bachelor's on purpose: "Master of Business Administration" and
-  // "M.S." must never fall through to an arm that also accepts "B.S.".
-  if (/\b(master s|masters|master of|m s|ms|m a|ma|m eng|meng|msc|mba|m b a)\b/.test(flat)) {
-    return "masters";
-  }
-  if (/\b(bachelor s|bachelors|bachelor of|b s|bs|b a|ba|bsc|b eng|beng|undergraduate)\b/.test(flat)) {
-    return "bachelors";
-  }
-  if (/\b(associate s|associates|associate degree|a a|a s)\b/.test(flat)) return "associates";
+
+  // The bare two letter forms are matched against the WHOLE string and never
+  // inside one, because they are not only degrees. "MA" is Massachusetts, "MS"
+  // is Mississippi and "BA" is Buenos Aires, so an embedded match reads
+  // "Boston, MA" as a master's degree. That is not a cosmetic problem:
+  // `degreeLevel` is consulted by `optionSupportsFact` for every field and not
+  // just for a degree dropdown, so it would have let a location option
+  // "Boston, MA" count as backed by a stored location fact "Cambridge, MA",
+  // meaning the wrong city reported as a fact the candidate stated. Caught in
+  // review on this PR before it shipped.
+  //
+  // A dropdown offering a bare "BS" or "MS" as its entire option text is still
+  // handled, which is the only case the short forms were there for.
+  const BARE: Record<string, string> = {
+    "phd": "doctorate", "ph d": "doctorate", "sc d": "doctorate",
+    "ms": "masters", "m s": "masters", "ma": "masters", "m a": "masters",
+    "msc": "masters", "mba": "masters", "m b a": "masters", "meng": "masters", "m eng": "masters",
+    "bs": "bachelors", "b s": "bachelors", "ba": "bachelors", "b a": "bachelors",
+    "bsc": "bachelors", "beng": "bachelors", "b eng": "bachelors",
+    "aa": "associates", "a a": "associates", "as": "associates", "a s": "associates",
+  };
+  const bare = BARE[flat];
+  if (bare !== undefined) return bare;
+
+  if (/\b(doctorate|doctoral|doctor of philosophy|d phil|dphil)\b/.test(flat)) return "doctorate";
+  // Ahead of bachelor's on purpose: "Master of Business Administration" must
+  // never fall through to an arm that also accepts "Bachelor of Arts".
+  if (/\b(master s|masters|master of)\b/.test(flat)) return "masters";
+  if (/\b(bachelor s|bachelors|bachelor of|undergraduate)\b/.test(flat)) return "bachelors";
+  if (/\b(associate s|associates|associate degree)\b/.test(flat)) return "associates";
   if (/\b(high school|secondary school|ged|diploma)\b/.test(flat)) return "high school";
   return null;
 }
@@ -3428,25 +3446,48 @@ function assertNoMismatches(fields: readonly FieldOutcome[], url: string): void 
  * three sentences from the candidate rather than a retry. `needsInput` carries
  * the questions; this carries the sentence a person reads.
  */
-function blockedForAnswers(needsInput: readonly NeedsInputItem[], url: string): FormFillBlockedError {
+export function blockedForAnswers(needsInput: readonly NeedsInputItem[], url: string): FormFillBlockedError {
   const required = needsInput.filter((item) => item.required);
   // JOB-022. Which of the two tags this message carries decides which
   // `skip_log.reason` it lands under, so the classification is made here, from
   // the labels, rather than guessed at from wording in `skipReasonFor`.
   //
   // A form is filed as `needs_attestation` when any of the fields that stopped
-  // it is a legal attestation, because that is the one a person can close by
-  // answering a single question and it should not be buried under whatever else
-  // happened to be blank on the same form.
-  const attestations = required.filter((item) => isAttestationField(item.fieldLabel));
-  const tag = attestations.length > 0 ? "needs_attestation" : "needs_candidate_input";
+  // it is one of the two categories that are never guessed at, because that is
+  // the one a person can close by answering a single question and it should not
+  // be buried under whatever else happened to be blank on the same form.
+  //
+  // The two categories are counted separately even though they share a reason
+  // code, because the sentence has to match the field that actually stopped the
+  // run. `isAttestationField` is true for a demographic question as well as a
+  // legal one, so describing every stop as a work authorization or criminal
+  // history question would tell somebody blocked by a required "Gender" select
+  // something plainly untrue about their own application. Caught in review on
+  // this PR.
+  const legal = required.filter((item) => LEGAL_ATTESTATION_RE.test(item.fieldLabel));
+  const demographic = required.filter(
+    (item) => !LEGAL_ATTESTATION_RE.test(item.fieldLabel) && EEO_FIELD_RE.test(item.fieldLabel)
+  );
+  const tag = legal.length + demographic.length > 0 ? "needs_attestation" : "needs_candidate_input";
+  const clauses: string[] = [];
+  if (legal.length > 0) {
+    clauses.push(
+      `${legal.length} required legal attestation(s) that the candidate's stored answers do ` +
+        `not cover and that offer no way to decline. Work authorization, citizenship, visa ` +
+        `status, security clearance, export control status and criminal history are never ` +
+        `guessed at, because a wrong answer to one of them can cost this person an offer long ` +
+        `after the form was filled`
+    );
+  }
+  if (demographic.length > 0) {
+    clauses.push(
+      `${demographic.length} required self-identification question(s) offering no way to ` +
+        `decline. A demographic identity is never invented for a real person`
+    );
+  }
   const preamble =
-    attestations.length > 0
-      ? `has ${attestations.length} required legal attestation(s) that the candidate's stored ` +
-        `answers do not cover and that offer no way to decline. Work authorization, ` +
-        `citizenship, visa status, security clearance, export control status and criminal ` +
-        `history are never guessed at, because a wrong answer to one of them can cost this ` +
-        `person an offer long after the form was filled.`
+    clauses.length > 0
+      ? `has ${clauses.join(", and ")}.`
       : `has ${required.length} required field(s) that could not be filled, even on a best ` +
         `effort basis, from what is known about this candidate.`;
   return new FormFillBlockedError(
