@@ -30,6 +30,7 @@ import {
   AUTH_REDIRECT_ALLOWLIST,
   LOCAL_DEV_ORIGIN,
   PRODUCTION_ORIGIN,
+  WWW_PRODUCTION_ORIGIN,
   authCallbackUrlFor,
 } from "@/lib/auth/redirect-urls";
 
@@ -55,12 +56,27 @@ function tomlString(key: string): string {
 }
 
 describe("Supabase Auth redirect allowlist", () => {
-  it("covers both the local dev origin and production", () => {
+  it("covers the local dev origin and every production hostname", () => {
     expect(AUTH_REDIRECT_ALLOWLIST).toContain(
       `${LOCAL_DEV_ORIGIN}${AUTH_CALLBACK_PATH}`
     );
     expect(AUTH_REDIRECT_ALLOWLIST).toContain(
       `${PRODUCTION_ORIGIN}${AUTH_CALLBACK_PATH}`
+    );
+    // JOB-023. Both hostnames serve the deployment, so both have to be here.
+    // A person who reaches the app on one of them and cannot sign in has no
+    // way of knowing the subdomain was the problem.
+    expect(AUTH_REDIRECT_ALLOWLIST).toContain(
+      `${WWW_PRODUCTION_ORIGIN}${AUTH_CALLBACK_PATH}`
+    );
+  });
+
+  it("keeps the two production hostnames as the same site spelled twice", () => {
+    // Guards a plausible bad fix for JOB-023: pointing the `www` constant at
+    // some other host would satisfy every other assertion in this file while
+    // sending magic links somewhere Jobinno does not control.
+    expect(WWW_PRODUCTION_ORIGIN).toBe(
+      PRODUCTION_ORIGIN.replace("https://", "https://www.")
     );
   });
 
@@ -88,6 +104,9 @@ describe("Supabase Auth redirect allowlist", () => {
       );
       expect(authCallbackUrlFor(`${PRODUCTION_ORIGIN}/`)).toBe(
         `${PRODUCTION_ORIGIN}${AUTH_CALLBACK_PATH}`
+      );
+      expect(authCallbackUrlFor(WWW_PRODUCTION_ORIGIN)).toBe(
+        `${WWW_PRODUCTION_ORIGIN}${AUTH_CALLBACK_PATH}`
       );
     });
 

@@ -30,6 +30,23 @@ export const AUTH_CALLBACK_PATH = "/auth/callback";
 /** The deployed origin. Matches `site_url` in `supabase/config.toml`. */
 export const PRODUCTION_ORIGIN = "https://jobinno.app";
 
+/**
+ * The same deployment reached through the `www` subdomain (JOB-023).
+ *
+ * Both hostnames are real and both serve the app. `www.jobinno.app` is a CNAME
+ * to Vercel and answers `/login` with a 200, so a typed address, an old
+ * bookmark or a link carrying the subdomain lands on a working sign in form.
+ * The form then asks for a magic link from the one origin the allowlist did not
+ * cover, and the person gets an error instead of an email.
+ *
+ * Allowlisting it is the fix rather than dropping it, because the domain
+ * already resolves and real people are already arriving on it. Sending `www` to
+ * the apex at the Vercel domain level is the tidier long term shape and is
+ * worth doing, but that is a production domain change and sign in should not
+ * wait on it.
+ */
+export const WWW_PRODUCTION_ORIGIN = "https://www.jobinno.app";
+
 /** `next dev` serves here, and only here, unless someone passes a port. */
 export const LOCAL_DEV_ORIGIN = "http://localhost:3000";
 
@@ -41,6 +58,7 @@ export const LOCAL_DEV_ORIGIN = "http://localhost:3000";
 export const AUTH_REDIRECT_ALLOWLIST = [
   `${LOCAL_DEV_ORIGIN}${AUTH_CALLBACK_PATH}`,
   `${PRODUCTION_ORIGIN}${AUTH_CALLBACK_PATH}`,
+  `${WWW_PRODUCTION_ORIGIN}${AUTH_CALLBACK_PATH}`,
 ] as const;
 
 /**
@@ -50,6 +68,16 @@ export const AUTH_REDIRECT_ALLOWLIST = [
  * does not recognise and letting it silently redirect somewhere else, so the
  * developer who started the dev server on port 3001 finds out here, in a
  * message that says what to do, instead of finding out from a dead link.
+ *
+ * ── The message below is for a developer and for nobody else (JOB-023) ───────
+ * It names a constant, a config file and a shell command, which is the right
+ * amount of detail for whoever has to fix the allowlist and the wrong amount
+ * for a person who typed their email address into a sign in form. It was
+ * rendered verbatim to real people on `www.jobinno.app` before JOB-023, because
+ * the caller caught this error and put `error.message` straight on the page.
+ *
+ * Callers must therefore treat what this throws as a log line, never as copy.
+ * `app/login/login-form.tsx` is the one caller and it does exactly that.
  */
 export function authCallbackUrlFor(origin: string): string {
   const candidate = `${origin.replace(/\/+$/, "")}${AUTH_CALLBACK_PATH}`;
