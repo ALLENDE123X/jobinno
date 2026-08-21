@@ -14,6 +14,10 @@
  * The redirect URL comes from `authCallbackUrlFor`, which throws on an origin
  * that is not allowlisted rather than letting Supabase quietly substitute the
  * project Site URL. See `lib/auth/redirect-urls.ts` for why that matters.
+ *
+ * What that function throws is a developer's message, and this component is the
+ * boundary that has to stop it becoming a user's message. See
+ * `SEND_FAILURE_MESSAGE` below.
  */
 
 import { useState } from "react";
@@ -32,6 +36,31 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { authCallbackUrlFor } from "@/lib/auth/redirect-urls";
 import { createClient } from "@/lib/supabase/client";
+
+/**
+ * The one thing a person is shown when a sign in link cannot be sent, whatever
+ * the reason it could not be sent (JOB-023).
+ *
+ * ── Why every failure collapses to one sentence ─────────────────────────────
+ * The reasons are accurate and none of them are for the reader.
+ * `authCallbackUrlFor` throws a paragraph naming `AUTH_REDIRECT_ALLOWLIST`,
+ * `supabase/config.toml` and the command that pushes it. Supabase returns
+ * strings like "email rate limit exceeded", which describes our mail provider
+ * and not anything the person did. Both used to be rendered here verbatim,
+ * because this component put `error.message` straight into the markup, and both
+ * were seen by real people on the live site.
+ *
+ * That is a professionalism problem and a small disclosure one: an error string
+ * assembled for an operator names internal constants, file paths and commands,
+ * and a sign in form is reachable by anyone. So the flow is one way. The
+ * message goes to the console for whoever is debugging, and the reader gets a
+ * sentence written for them.
+ *
+ * "Enter your email address." is not routed through here on purpose. That one
+ * is about something the reader can actually act on.
+ */
+const SEND_FAILURE_MESSAGE =
+  "Something went wrong sending your sign in link. Please try again in a moment.";
 
 type Status =
   | { kind: "idle" }
@@ -72,20 +101,20 @@ export function LoginForm({ initialError }: { initialError?: string }) {
       // anyway if a later edit tried to add it.
       if (error) {
         captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, { outcome: "refused" });
-        setStatus({ kind: "error", message: error.message });
+        console.error("Jobinno could not send a sign in link.", error);
+        setStatus({ kind: "error", message: SEND_FAILURE_MESSAGE });
         return;
       }
 
       captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, { outcome: "sent" });
       setStatus({ kind: "sent", email: trimmed });
     } catch (error) {
-      setStatus({
-        kind: "error",
-        message:
-          error instanceof Error
-            ? error.message
-            : "Something went wrong sending that link.",
-      });
+      // Where the allowlist safeguard lands. `authCallbackUrlFor` throws before
+      // `signInWithOtp` is ever called, so this branch is reached with nothing
+      // captured yet, and the funnel would otherwise lose the failure entirely.
+      captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, { outcome: "refused" });
+      console.error("Jobinno could not send a sign in link.", error);
+      setStatus({ kind: "error", message: SEND_FAILURE_MESSAGE });
     }
   }
 
