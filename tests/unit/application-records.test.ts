@@ -160,10 +160,14 @@ describe("loadCandidate", () => {
     expect(calls.map((call) => call.table)).not.toContain("candidates");
     expect(calls.map((call) => call.table)).not.toContain("job_applications");
 
-    // The exact column list, because a typo in it is the whole bug class.
+    // The exact column list, because a typo in it is the whole bug class. The
+    // trailing four are JOB-022's, and a column missing from here is not a typo
+    // sized problem: intake wrote all four of them and this list not naming them
+    // is why the form filler had no graduation date, no start date and no
+    // citizenship status to answer a form with.
     expect(callTo("profiles").columns).toBe(
       "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country," +
-        "current_city,willing_to_relocate"
+        "current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start"
     );
     expect(callTo("profiles").filters).toContainEqual(["eq", "id", USER_ID]);
 
@@ -246,9 +250,40 @@ describe("skipReasonFor", () => {
     ["submission_blocked: no control found", "submission_blocked", "submit_failed"],
     ["Jobinno holds no account on this board", "form_fill_blocked", "verification_required"],
     ["page.title timed out after 30000ms", "error", "timeout"],
-    ["something nobody has seen before", "error", "dom_changed"],
+    // JOB-022. This used to expect `dom_changed`, and that expectation was the
+    // bug written down: an unrecognised message is not evidence that a page
+    // changed, and filing it as though it were is what made 16 unrelated
+    // failures read as one cause on 2026 08 20.
+    ["something nobody has seen before", "error", "internal_error"],
+    // The two reasons that came out of `dom_changed`, each keyed off the tag its
+    // own writer puts on the message.
+    ["blocked_apply_url: the browser is at https://elsewhere.example/x", "form_fill_blocked", "blocked_redirect"],
+    ["needs_attestation: the form at ... has 1 required legal attestation(s)", "form_fill_blocked", "needs_attestation"],
   ])("reads %j as %s", (message, status, expected) => {
     expect(skipReasonFor(status as never, message)).toBe(expected);
+  });
+
+  // The trap PR #36 documented, kept as a live check rather than a comment. The
+  // timeout tag matches the whole message, so a reason whose own tag sits below
+  // it in `REASON_TAGS` is silently rerouted the moment its wording happens to
+  // contain "timed out", and an export control question quoting a form label is
+  // exactly the kind of message that could.
+  it("files an attestation stop as an attestation even when its wording says timed out", () => {
+    expect(
+      skipReasonFor(
+        "form_fill_blocked" as never,
+        'needs_attestation: the form asks "have you ever held a clearance that timed out?"'
+      )
+    ).toBe("needs_attestation");
+  });
+
+  it("files a redirect as a redirect even when the URL it quotes spells captcha", () => {
+    expect(
+      skipReasonFor(
+        "form_fill_blocked" as never,
+        'blocked_apply_url: the browser is at "https://elsewhere.example/verify-captcha/1"'
+      )
+    ).toBe("blocked_redirect");
   });
 });
 

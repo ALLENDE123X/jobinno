@@ -77,7 +77,7 @@ describe("the dashboard view", () => {
     );
 
     expect(screen.getByText("needs your attention")).toBeInTheDocument();
-    expect(screen.getByText(/asked a required question your intake does not answer/)).toBeInTheDocument();
+    expect(screen.getByText(/required field we could not fill in/)).toBeInTheDocument();
     expect(screen.getByText(/Not sent yet/)).toBeInTheDocument();
   });
 

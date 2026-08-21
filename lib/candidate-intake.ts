@@ -120,6 +120,45 @@ export type CandidateApplicationAnswers = {
   currentCity?: string;
   /** "Are you willing to relocate for this role?" */
   willingToRelocate?: boolean;
+  /**
+   * ── JOB-022: four columns intake wrote and nothing ever read ──────────────
+   *
+   * `app/onboarding/actions.ts` has written `citizenship_status`, `f1_status`,
+   * `grad_date` and `earliest_start` onto `profiles` since JOB-007. None of the
+   * four was named in `CANDIDATE_COLUMNS`, so none of them ever reached the form
+   * filler, so the filler had no answer to the questions they exist to answer.
+   *
+   * That was not a small omission. In the production run of 2026 08 20 the
+   * filler declared 18 of 21 applications unanswerable, and the most common
+   * cause by far was a required field asking for exactly one of these four: an
+   * export control status (`citizenship_status` said "us_citizen"), a current
+   * visa status (the same column), a degree completion month and year
+   * (`grad_date` said 2025 12 31), and a start date (`earliest_start` said
+   * 2026 08 20). The person had answered every one of those at intake. Nothing
+   * asked the database for the answers.
+   *
+   * These are also the highest stakes answers on any application form, which is
+   * why they are read from what the person stated rather than inferred from
+   * anything. See `LEGAL_ATTESTATION_RE` in `lib/fill-application-form.ts` for
+   * the rule that governs them once they arrive.
+   */
+  /** `profiles.citizenship_status`, one of the `citizenship_status` enum values. */
+  citizenshipStatus?: string;
+  /** `profiles.f1_status`. Only meaningful when citizenship is `f1`. */
+  f1Status?: string;
+  /** `profiles.grad_date`, an ISO date. Answers "when do you graduate?". */
+  gradDate?: string;
+  /** `profiles.earliest_start`, an ISO date. Answers "when can you start?". */
+  earliestStart?: string;
+  /**
+   * `profiles.target_locations`, folded in here so the fill layer sees it.
+   *
+   * It was already on `CandidateRecord.locations` and was already loaded; it
+   * simply never crossed into the fact catalogue, so "what is your top location
+   * preference?" was an unanswerable question against a person who had listed
+   * four of them.
+   */
+  targetLocations?: string[];
 };
 
 /** `CandidateApplicationAnswers` → the row shape, dropping anything unstated. */
@@ -143,6 +182,19 @@ function applicationAnswerColumns(
   if (country !== null) row.current_country = country;
   const city = normalizeOptionalText(answers.currentCity);
   if (city !== null) row.current_city = city;
+  // JOB-022. `app/onboarding/actions.ts` is the ordinary writer of these four
+  // and writes them directly; they are accepted here too so that the type is not
+  // half readable and half writable, which is the shape a caller trips over.
+  // `targetLocations` is deliberately absent: `CandidateIntakeInput.locations`
+  // already owns `profiles.target_locations`, and one column wants one writer.
+  const citizenship = normalizeOptionalText(answers.citizenshipStatus);
+  if (citizenship !== null) row.citizenship_status = citizenship;
+  const f1 = normalizeOptionalText(answers.f1Status);
+  if (f1 !== null) row.f1_status = f1;
+  const grad = normalizeOptionalText(answers.gradDate);
+  if (grad !== null) row.grad_date = grad;
+  const start = normalizeOptionalText(answers.earliestStart);
+  if (start !== null) row.earliest_start = start;
   return row;
 }
 
@@ -547,7 +599,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * is a row in another table, read by `loadActiveResume`.
  */
 const CANDIDATE_COLUMNS =
-  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate";
+  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start";
 
 /**
  * Row → the answers that were actually recorded.
@@ -570,6 +622,21 @@ export function toApplicationAnswers(row: Record<string, unknown>): CandidateApp
   if (country !== "") answers.currentCountry = country;
   const city = typeof row.current_city === "string" ? row.current_city.trim() : "";
   if (city !== "") answers.currentCity = city;
+  // JOB-022. Same rule for the four late arrivals: a NULL column is left out,
+  // never mapped to a placeholder. The difference from the five above is only
+  // that these were being dropped one layer earlier, in the SELECT.
+  const citizenship = typeof row.citizenship_status === "string" ? row.citizenship_status.trim() : "";
+  if (citizenship !== "") answers.citizenshipStatus = citizenship;
+  const f1 = typeof row.f1_status === "string" ? row.f1_status.trim() : "";
+  if (f1 !== "") answers.f1Status = f1;
+  const grad = typeof row.grad_date === "string" ? row.grad_date.trim() : "";
+  if (grad !== "") answers.gradDate = grad;
+  const start = typeof row.earliest_start === "string" ? row.earliest_start.trim() : "";
+  if (start !== "") answers.earliestStart = start;
+  const locations = Array.isArray(row.target_locations)
+    ? row.target_locations.map(String).filter((entry) => entry.trim() !== "")
+    : [];
+  if (locations.length > 0) answers.targetLocations = locations;
   return answers;
 }
 

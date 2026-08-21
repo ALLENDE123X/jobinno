@@ -161,7 +161,7 @@ export function describeStatus(status: string): StatusPresentation {
  */
 export const SKIP_REASON_TEXT: Record<SkipReason, string> = {
   unanswerable_required:
-    "The form asked a required question your intake does not answer, and we will not invent an answer on your behalf.",
+    "The form had a required field we could not fill in from anything we know about you.",
   verification_required:
     "The board wanted an account or an emailed confirmation before it would show the application form.",
   captcha: "The board put a robot check in the way, which we are not allowed to work around.",
@@ -169,6 +169,11 @@ export const SKIP_REASON_TEXT: Record<SkipReason, string> = {
     "The page did not look the way we expected, so we stopped rather than click something we could not identify.",
   timeout: "The board stopped responding while we were working through it.",
   submit_failed: "Something went wrong at the submit step, so the outcome could not be confirmed.",
+  blocked_redirect:
+    "This listing sent us to a page that does not belong to the company's own job board, so we stopped before typing anything.",
+  needs_attestation:
+    "The form required an answer about work authorization, citizenship, a security clearance or a similar legal question, your intake does not answer it, and the form offered no way to skip it. We will never guess at one of those for you.",
+  internal_error: "Something on our side went wrong. This one is on us and we are looking at it.",
 };
 
 /** Why a run stopped, or null when the reason code is not one we know. */

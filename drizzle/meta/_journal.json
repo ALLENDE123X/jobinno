@@ -50,6 +50,13 @@
       "when": 1787210646192,
       "tag": "0006_profiles_stripe_customer_id",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1787270000000,
+      "tag": "0007_skip_reason_taxonomy",
+      "breakpoints": true
     }
   ]
 }

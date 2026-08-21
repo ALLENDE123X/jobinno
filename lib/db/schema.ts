@@ -89,10 +89,16 @@ export const f1StatusEnum = pgEnum("f1_status", ["opt", "cpt", "none"]);
  * Why a listing was abandoned. The pipeline writes one of these and nothing
  * else, so the set is closed and enforced.
  *
- * `unanswerable_required` is the one that matters most: a required question the
- * intake data cannot honestly answer. HARD STOP 9 says the run stops and the
- * question is surfaced rather than guessed at, and this is the row that records
- * that it happened.
+ * `needs_attestation` is the one that matters most: a required work
+ * authorization, citizenship, clearance, export control or criminal history
+ * question that the intake data does not answer, on a control offering no way to
+ * decline. HARD STOP 9 says the run stops and the question is surfaced rather
+ * than guessed at, and this is the row that records that it happened.
+ *
+ * JOB-022 narrowed that rule to those questions alone. `unanswerable_required`
+ * is what is left of it: a required field of any other kind that the run could
+ * not put an answer in. It should now be uncommon, because most of the form is
+ * answered on a best effort basis rather than escalated.
  */
 export const SKIP_REASONS = [
   "unanswerable_required",
@@ -101,6 +107,31 @@ export const SKIP_REASONS = [
   "dom_changed",
   "timeout",
   "submit_failed",
+  // ── JOB-022: three values, because six were not enough to debug with ──────
+  //
+  // `skipReasonFor` fell back to `dom_changed` for any message none of its tags
+  // recognised, and the comment defending that argued that a bucket naming
+  // nothing is where unfixed bugs accumulate quietly. It was right about the
+  // principle and the fallback did the opposite of it. On 2026 08 20 that
+  // fallback filed 16 failures under `dom_changed`; an operator read that as one
+  // broken selector across eight unrelated companies, and a day went into a page
+  // structure theory of a problem that had nothing to do with page structure.
+  //
+  // `blocked_redirect` is the specific case that was hiding inside
+  // `dom_changed`: the browser followed a listing and arrived somewhere the
+  // board does not own. Nothing typed, nothing uploaded, and nothing wrong with
+  // the form. That is a stale or rehosted listing, and the fix belongs in the
+  // board registry rather than in the automation.
+  "blocked_redirect",
+  // A required legal attestation with no stored answer and no decline option.
+  // Split out from `unanswerable_required` because the two now mean different
+  // things and want different fixes: this one is closed by asking the person a
+  // question once and keeping the answer.
+  "needs_attestation",
+  // The honest fallback. A run that failed in a way no tag recognises is a bug
+  // in this system until somebody shows otherwise, and it should read as one
+  // rather than borrow the name of a real and diagnosable failure mode.
+  "internal_error",
 ] as const;
 export type SkipReason = (typeof SKIP_REASONS)[number];
 
