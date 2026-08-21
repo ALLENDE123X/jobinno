@@ -1,0 +1,31 @@
+-- JOB-026: one more value for `skip_log.reason`, `bot_detected`.
+--
+-- The column's CHECK constraint is built from `SKIP_REASONS` in
+-- `lib/db/schema.ts`, so the two have to move together, exactly as they did in
+-- `drizzle/0007_skip_reason_taxonomy.sql`. See the comment beside the array for
+-- what the value names and why neither `captcha` nor `submit_failed` covered it.
+--
+-- Nothing in this migration rewrites an existing row. The five
+-- `submission_unconfirmed` applications from the run of 2026 08 21 keep their
+-- `submit_failed` skip rows, for the reason 0007 gave about its own sixteen:
+-- reclassifying them afterwards would invent a history the pipeline did not
+-- record. The evidence for what they actually were is in the pull request.
+--
+-- ── Read this before merging ────────────────────────────────────────────────
+-- `recordSkip` refuses a reason outside the array, and Postgres refuses one
+-- outside the constraint. If the code ships and this migration has not been
+-- applied, a run that a board flags as automated writes `submission_unconfirmed`
+-- onto the `applications` row and then fails to write its `skip_log` row, and
+-- the reason survives only in a Vercel log line. That degrades loudly rather
+-- than silently, but it still loses the one signal this ticket exists to
+-- capture, so apply this before or with the deploy rather than after it.
+--
+-- CLAUDE.md documents how to apply it: `drizzle-kit migrate` against the direct
+-- `db.<ref>.supabase.co` host exits 1 with no output on a machine with no IPv6
+-- route, which looks exactly like success. Go through the IPv4 session mode
+-- pooler instead, then confirm against the live database that the constraint
+-- really changed rather than trusting the command's exit.
+
+ALTER TABLE "skip_log" DROP CONSTRAINT IF EXISTS "skip_log_reason_check";
+--> statement-breakpoint
+ALTER TABLE "skip_log" ADD CONSTRAINT "skip_log_reason_check" CHECK ("reason" in ('unanswerable_required', 'verification_required', 'captcha', 'dom_changed', 'timeout', 'submit_failed', 'blocked_redirect', 'needs_attestation', 'internal_error', 'bot_detected'));

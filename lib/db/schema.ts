@@ -132,6 +132,25 @@ export const SKIP_REASONS = [
   // in this system until somebody shows otherwise, and it should read as one
   // rather than borrow the name of a real and diagnosable failure mode.
   "internal_error",
+  // ── JOB-026: the board said, in its own words, that it thinks this is a bot ─
+  //
+  // Distinct from `captcha`, and the distinction is the whole point of the
+  // value. `captcha` is a challenge standing in front of the form: it is
+  // visible, it is found before anything is submitted, and the run stops
+  // without clicking. This one is the opposite end of the run. There is no
+  // visible challenge anywhere on the page, the form fills normally, the submit
+  // control is clicked, and the board then replies that it scored the
+  // submission as automated and threw it away.
+  //
+  // Distinct from `submit_failed` too, which is where all five of these landed
+  // on 2026 08 21 and is why they were unreadable. `submit_failed` means the
+  // submit leg died and nobody knows what the board did with it. This means the
+  // board answered, and the answer was no. Those want opposite responses: one
+  // wants a human to go and check the employer's side in case an application is
+  // sitting there, and this one wants the fingerprint of the browser doing the
+  // submitting to change, because nothing on the employer's side is going to
+  // improve on its own.
+  "bot_detected",
 ] as const;
 export type SkipReason = (typeof SKIP_REASONS)[number];
 

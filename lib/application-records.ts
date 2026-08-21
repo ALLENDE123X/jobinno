@@ -149,6 +149,22 @@ const REASON_TAGS: ReadonlyArray<readonly [RegExp, SkipReason]> = [
   // "verification" while a clearance question containing "timed out" would be
   // unlucky but is entirely possible. Ahead of `unanswerable_required` too,
   // since both messages share the `needs_` prefix and this is the narrower one.
+  // `submission_flagged_as_automated:` is written by `submit-application.ts`
+  // when the page, after the click, says in its own words that it scored the
+  // submission as spam or as a bot. It is first because that message quotes the
+  // board's refusal back verbatim, and a refusal is exactly the kind of text
+  // that contains other reasons' words: Ashby's own version of this page tells
+  // the reader to turn off their VPN and check their browser, and a board that
+  // spelled it "failed our captcha check" would file itself under `captcha`
+  // from three entries down. The tag this module wrote wins over the prose the
+  // board wrote, every time.
+  //
+  // JOB-026. Before it existed these landed on `submit_failed`, alongside every
+  // genuinely unknown outcome, and that is why five real applications on
+  // 2026 08 21 read as "the submit leg died somehow" when the page on screen
+  // said "your application submission was flagged as possible spam". Those are
+  // not the same finding and they do not have the same fix.
+  [/submission_flagged_as_automated/i, "bot_detected"],
   [/needs_attestation/i, "needs_attestation"],
   // `blocked_apply_url:` is written by `fill-application-form.ts` when the
   // browser has ended up somewhere the listing's own board does not own, and it

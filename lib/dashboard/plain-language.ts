@@ -174,6 +174,8 @@ export const SKIP_REASON_TEXT: Record<SkipReason, string> = {
   needs_attestation:
     "The form required an answer about work authorization, citizenship, a security clearance or a similar legal question, your intake does not answer it, and the form offered no way to skip it. We will never guess at one of those for you.",
   internal_error: "Something on our side went wrong. This one is on us and we are looking at it.",
+  bot_detected:
+    "We filled this application in and pressed submit, and the job board turned it down because it thought a robot was filling it in. That is about us and how we reach the board, not about you or anything you wrote. Nothing you can do at your end will change it, and we are working on it. If you want this job, the surest fix today is to apply once yourself.",
 };
 
 /** Why a run stopped, or null when the reason code is not one we know. */
