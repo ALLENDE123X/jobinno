@@ -4,13 +4,15 @@ MEMORY_PROJECT: startup
 
 Read this file at the start of every session, before touching anything.
 
-Jobinno is built by a fleet of agents working in parallel, one ticket each, coordinated by Pranav's orchestrating session. You are almost certainly an implementation agent. That means you pick up one ticket, work it on one branch, open one PR, and stop. You do not merge. An independent review agent does the review, and its verdict goes back to Pranav's session, not to you.
+Jobinno is built by a fleet of agents working in parallel, one ticket each, coordinated by Pranav's orchestrating session. You are almost certainly an implementation agent. That means you pick up one ticket, work it on one branch, open one PR, and stop. You do not merge. Either an independent review agent reviews it and its verdict goes back to Pranav's session, or that orchestrating session reviews it directly and merges once it has. Either way, the merge is never yours to make.
 
 ## HARD STOPS
 
 Violating any of these is a critical failure, not a style problem.
 
-**1. Never merge your own PR.** Do not run `gh pr merge`, and do not call the merge tool. Every merge requires an independent review agent's approval, communicated back to Pranav's orchestrating session. Implementation agents open the PR and stop there. This is not a formality you can shortcut when the change looks obviously fine, and it is not waived by CI being green.
+**1. An implementation agent never merges its own PR.** If you are a dispatched agent working one ticket in your own worktree, do not run `gh pr merge` and do not call the merge tool. You have no way to independently verify your own change is safe to ship, since you are the one who might be wrong about it. Open the PR and stop there. This is not a formality you can shortcut when the change looks obviously fine, and it is not waived by CI being green.
+
+Pranav's orchestrating session is the exception, not a second instance of this rule. It merges directly once it has actually done the independent verification itself: reading the real diff, rerunning whatever check is in question rather than trusting the agent's report of it, and confirming any surviving test failures or lint warnings are pre-existing on the target branch rather than introduced. That review has to be real, not a formality either, but once it has happened there is no one else to hand the merge to.
 
 **2. Never commit debugging artifacts.** Before every commit, check for and exclude `ci_log*.txt`, `review.md`, `*.log`, `pr_body.md`, `CONTEXT.md`, `output.txt`, and anything else that exists only because you were debugging or reviewing. Use explicit file paths in `git add`. Never `git add -A` and never `git add .`. Those two commands are how every one of the file names listed above got committed somewhere before.
 
