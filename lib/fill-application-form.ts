@@ -239,7 +239,8 @@ const LOG = "[act-007]";
 const INSTRUCTIONS = Object.freeze({
   APPLY_START:
     "the button or link that opens this listing's job application form, labelled something " +
-    "like \"Apply\", \"Apply Now\" or \"Apply for this job\"",
+    "like \"Apply\", \"Apply Now\", \"Apply for this job\" or \"I'm Interested\" " +
+    "(SmartRecruiters' own wording for the same control)",
   SIGN_IN_EMAIL: "the email or username input on the sign-in form",
   SIGN_IN_PASSWORD: "the password input on the sign-in form",
   SIGN_IN_SUBMIT: "the button that signs in to an existing account on the sign-in form",
@@ -326,7 +327,8 @@ const FormSignalsSchema = z.object({
     .boolean()
     .describe(
       "True if there is a visible button or link that would open the application form, " +
-        "labelled something like \"Apply\", \"Apply Now\" or \"Apply for this job\". False if " +
+        "labelled something like \"Apply\", \"Apply Now\", \"Apply for this job\" or " +
+        "\"I'm Interested\" (SmartRecruiters' own wording for the same control). False if " +
         "the only apply-ish control submits an application that is already filled in."
     ),
   signInFormPresent: z
@@ -1005,14 +1007,17 @@ export function corroborate(
   }
 
   // Selector did not resolve at the top level. Common and legitimate: the form
-  // is inside an iframe. The reader's description is all there is.
+  // is inside an iframe — or, as JOB-036 found on a real SmartRecruiters form,
+  // inside a web component's shadow DOM, which a plain `document.querySelector`
+  // or XPath evaluation cannot cross any more than it can cross into an iframe.
+  // Either way the reader's description is all there is.
   if (replayed) {
     return replayNeedsDomEvidence("the selector does not resolve in the top level document");
   }
   return self.test(observedDescription)
     ? {
         ok: true,
-        via: "the reader's description only — the selector does not resolve in the top-level document (the form is probably inside an iframe)",
+        via: "the reader's description only — the selector does not resolve in the top-level document (the form is probably inside an iframe or a web component's shadow DOM)",
       }
     : {
         ok: false,
@@ -1867,7 +1872,13 @@ async function reachApplicationForm(
       signals.url,
       "the control that opens the application form",
       INSTRUCTIONS.APPLY_START,
-      /(apply|application|start|begin|continue)/i
+      // JOB-036. SmartRecruiters never says "Apply" anywhere on a listing page —
+      // its own call to action reads "I'm Interested" — so this accept pattern
+      // has to recognise that wording too, or a correctly-resolved control is
+      // refused as unidentified and the run gives up having clicked nothing. See
+      // `INSTRUCTIONS.APPLY_START` and `FormSignalsSchema.applyControlPresent`
+      // above, which needed the same widening for the same reason.
+      /(apply|application|start|begin|continue|interest)/i
     );
     if (clicked === null) break;
     clickedApplyControl = true;
@@ -4024,7 +4035,7 @@ async function attachResume(
       after.attachedFiles > 0
         ? `attached via ${via}; the control confirms ${after.attachedFiles} file(s)`
         : `attached via ${via}; the control could not be re-read to confirm (the form is ` +
-          `probably inside an iframe)`,
+          `probably inside an iframe or a web component's shadow DOM)`,
     readBack: after.attachedFiles > 0 ? `${after.attachedFiles} file(s)` : null,
   };
 }
