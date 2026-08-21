@@ -2716,6 +2716,91 @@ function matchAdditionalAnswer(
 }
 
 /**
+ * What `matchAdditionalAnswer` found for this field, decided against.
+ *
+ *  · `"apply"` — a supplied answer was found and this field may be filled
+ *    from it.
+ *  · `"refused"` — a supplied answer was found, but this field is one of the
+ *    categories `additionalAnswers` is never allowed to decide on its own;
+ *    `category` and `why` are for the caller's own warning message.
+ *  · `"none"` — nothing in `additionalAnswers` matched this field at all.
+ */
+export type AdditionalAnswerResolution =
+  | { kind: "apply"; value: string }
+  | { kind: "refused"; category: string; why: string }
+  | { kind: "none" };
+
+/**
+ * Whether a caller-supplied `additionalAnswers` entry that fuzzy-matched this
+ * field (`matchAdditionalAnswer` above — substring containment either
+ * direction, for a key 10+ characters) may actually be typed into it, or must
+ * be refused and left to fall through to `resolveDecision`'s own policy
+ * instead.
+ *
+ * `additionalAnswers` is meant to be the candidate's own words, relayed after
+ * a previous run asked them something. But it arrives through the
+ * orchestrating model (see `toAdditionalAnswers` in `mcp-server/index.ts`),
+ * which could equally volunteer an entry nobody was asked for — and this step
+ * runs BEFORE `resolveDecision`, so neither of that function's own guards
+ * governs it by default. Two carve-outs exist here for exactly that reason,
+ * one per guard:
+ *
+ *  · A demographic self-identification question (`EEO_FIELD_RE`) that offers
+ *    a decline option. Mirrors `resolveDecision`'s own EEO branch: a required
+ *    question with no decline option is the only one ever escalated to the
+ *    candidate, so a supplied answer for a question that DOES offer one was
+ *    never responsive to something this system actually asked, and typing it
+ *    in would be stating a demographic identity nobody gave.
+ *
+ *  · A consent, agreement or certification field (`CONSENT_FIELD_RE` —
+ *    imported from `lib/form-fields.ts`, the exact pattern `resolveDecision`
+ *    itself tests against, never redefined here). `resolveDecision` never
+ *    lets even a model's own proposal tick one of these; it decides required
+ *    vs. optional itself, deterministically, precisely because ticking one is
+ *    a commitment made in the candidate's name rather than a fact about them.
+ *    A supplied `additionalAnswers` entry has no better claim to make that
+ *    commitment than a model's proposal did — if anything a weaker one, since
+ *    the fuzzy match above means the entry need not even have been meant for
+ *    this field.
+ *
+ * Refusing does not leave the field unanswered. It falls through to the
+ * ordinary ladder, and `resolveDecision`'s own consent branch already ticks a
+ * REQUIRED, non-attestation agreement box deterministically — so a real
+ * "I agree to the Terms" checkbox still gets ticked. It is just never ticked
+ * FROM `additionalAnswers`.
+ */
+export function resolveAdditionalAnswer(
+  field: EnumeratedField,
+  additionalAnswers: Record<string, string>
+): AdditionalAnswerResolution {
+  const supplied = matchAdditionalAnswer(field, additionalAnswers);
+  if (supplied === null) return { kind: "none" };
+
+  if (EEO_FIELD_RE.test(field.label) && findDeclineOption(field.options) !== null) {
+    return {
+      kind: "refused",
+      category: "demographic field",
+      why:
+        "it offers a decline option, so it was never asked about, and an unsolicited answer " +
+        "here would be stating an identity nobody gave",
+    };
+  }
+
+  if (CONSENT_FIELD_RE.test(field.label)) {
+    return {
+      kind: "refused",
+      category: "consent, agreement or certification field",
+      why:
+        "ticking or filling one of these is a commitment made in the candidate's name, decided " +
+        "only by resolveDecision's own deterministic policy for this exact pattern, never by " +
+        "an unverified supplied answer",
+    };
+  }
+
+  return { kind: "apply", value: supplied };
+}
+
+/**
  * Does choosing this option say what the stored fact says?
  *
  * Boards word their options and this system words its facts, and the two rarely
@@ -3540,36 +3625,25 @@ async function fillRemainingFields(
   };
 
   // ── Step 3: the user's own answers, applied without a model ──────────────
+  // `resolveAdditionalAnswer` above carries the full reasoning for what gets
+  // refused here and why: a demographic field with a decline option, and a
+  // consent/agreement/certification field, are never decided by a
+  // caller-supplied answer, however well it fuzzy-matched — both fall through
+  // to `undecided` and are left to `resolveDecision`'s own policy instead.
   const undecided: EnumeratedField[] = [];
   for (const field of empty) {
-    const supplied = matchAdditionalAnswer(field, additionalAnswers);
-    if (supplied === null) {
+    const decision = resolveAdditionalAnswer(field, additionalAnswers);
+    if (decision.kind !== "apply") {
       undecided.push(field);
+      if (decision.kind === "refused") {
+        console.warn(
+          `${LOG} ignoring a supplied answer for the ${decision.category} "${field.label}" — ` +
+            decision.why
+        );
+      }
       continue;
     }
-
-    // `additionalAnswers` is meant to be the candidate's own words, relayed
-    // after a previous run asked them something. But it arrives through the
-    // orchestrating model (see `toAdditionalAnswers` in `mcp-server/index.ts`),
-    // which could equally volunteer an entry nobody was asked for — and this
-    // step runs before `resolveDecision`, so the EEO rule that governs the
-    // model-decision path does not cover it.
-    //
-    // A demographic field is only ever escalated when it is required AND offers
-    // no way to decline; anything else auto-declines and is never asked about.
-    // So an answer supplied for a demographic field that *does* offer a decline
-    // option was not responsive to a question this system asked, and is
-    // therefore not something to state about a real person's identity. Let the
-    // decline path below handle it instead.
-    if (EEO_FIELD_RE.test(field.label) && findDeclineOption(field.options) !== null) {
-      undecided.push(field);
-      console.warn(
-        `${LOG} ignoring a supplied answer for the demographic field "${field.label}" — it ` +
-          `offers a decline option, so it was never asked about, and an unsolicited answer ` +
-          `here would be stating an identity nobody gave`
-      );
-      continue;
-    }
+    const supplied = decision.value;
     // `allowContains` for a dropdown here, unlike on the decided path: a person
     // answering "Yes" in chat should land on an option worded "Yes, I am
     // authorized to work in the US". Still only when exactly one option contains

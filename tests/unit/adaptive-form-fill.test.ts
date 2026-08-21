@@ -34,6 +34,7 @@ import {
   blockedForAnswers,
   buildFactCatalog,
   isAttestationField,
+  resolveAdditionalAnswer,
   resolveDecision,
   LEGAL_ATTESTATION_RE,
 } from "@/lib/fill-application-form";
@@ -562,6 +563,110 @@ describe("a legal attestation is never best guessed", () => {
       facts()
     );
     expect(resolution.kind).toBe("ask");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+describe("additionalAnswers may never decide a demographic or consent field", () => {
+  // Issue #20, found in the security audit of 2026 08 19. `additionalAnswers`
+  // is applied to the form BEFORE `resolveDecision` ever runs, and its key
+  // matching is deliberately fuzzy (substring containment either direction,
+  // for a key 10+ characters — see `matchAdditionalAnswer`). That combination
+  // meant a caller-supplied entry that was never meant for a given field could
+  // still land on it, and for a consent or certification checkbox, get ticked
+  // directly from that unverified string — bypassing `resolveDecision`'s own
+  // `CONSENT_FIELD_RE` guard entirely, since this step runs first and never
+  // reaches it. Ticking one of these on the candidate's behalf is a
+  // commitment made in their name, the same posture that already kept the EEO
+  // carve-out just above from ever letting a demographic field go this way.
+  //
+  // `resolveAdditionalAnswer` is the fix: the exact `CONSENT_FIELD_RE` pattern
+  // `resolveDecision` itself tests against (imported, not redefined), applied
+  // as a mirror of the existing EEO carve-out, before either check gets a
+  // chance to be bypassed by the fuzzy match.
+
+  it("refuses a fuzzy-matched answer for a certification checkbox worded like the issue's own example", () => {
+    // "I certify that the information provided is true and complete" is the
+    // literal example from the audit. The supplied key is deliberately not a
+    // verbatim match for the field's label — it only overlaps by substring —
+    // which is exactly the fuzzy path the audit flagged as exploitable.
+    const consentField = field({
+      label: "I certify that the information provided in this application is true and complete",
+      kind: "checkbox",
+      required: true,
+    });
+    const resolution = resolveAdditionalAnswer(consentField, {
+      "certify that the information provided": "Yes",
+    });
+    expect(resolution.kind).toBe("refused");
+    if (resolution.kind === "refused") {
+      expect(resolution.category).toBe("consent, agreement or certification field");
+    }
+  });
+
+  it("refuses a fuzzy-matched answer even when the checkbox is also a legal attestation", () => {
+    // Same label `resolveDecision` itself is tested against just above ("still
+    // refuses an agreement that is also a legal attestation"). This guard does
+    // not carve out an exception for that overlap the way `resolveDecision`'s
+    // own auto-tick branch does with `isAttestationField` — every consent
+    // pattern match is refused here, which is the more conservative choice for
+    // the box that would otherwise assert an immigration status from a string
+    // nobody verified.
+    const attestationCheckbox = field({
+      label: "I certify that I am authorized to work in the United States without sponsorship",
+      kind: "checkbox",
+      required: true,
+    });
+    const resolution = resolveAdditionalAnswer(attestationCheckbox, {
+      "certify that i am authorized to work": "Yes",
+    });
+    expect(resolution.kind).toBe("refused");
+  });
+
+  it("still refuses a fuzzy-matched answer for a demographic field with a decline option", () => {
+    // The pre-existing EEO carve-out, now covered directly rather than only
+    // through the flow it sits inside — the same protection this test file
+    // already gives `resolveDecision` itself.
+    const eeoField = field({
+      label: "What is your gender identity?",
+      kind: "select",
+      options: ["Male", "Female", "Non-binary", "Prefer not to say"],
+      optionsKnown: true,
+    });
+    const resolution = resolveAdditionalAnswer(eeoField, {
+      "what is your gender identity": "Male",
+    });
+    expect(resolution.kind).toBe("refused");
+    if (resolution.kind === "refused") {
+      expect(resolution.category).toBe("demographic field");
+    }
+  });
+
+  it("still applies a fuzzy-matched answer to an ordinary required field", () => {
+    // The common case this whole pass exists for. A real additionalAnswers
+    // entry, keyed close to but not identical to the field's own label, still
+    // reaches and fills an ordinary text field after this change.
+    const linkedin = field({
+      label: "What is your LinkedIn profile URL?",
+      kind: "text",
+      required: true,
+    });
+    const resolution = resolveAdditionalAnswer(linkedin, {
+      "linkedin profile url": "https://www.linkedin.com/in/pat-example",
+    });
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("https://www.linkedin.com/in/pat-example");
+    }
+  });
+
+  it("reports no match at all as \"none\", not a refusal", () => {
+    // A refusal and a plain miss are different outcomes for the caller
+    // (`fillRemainingFields` only warns for the former), so the two must stay
+    // distinguishable.
+    const linkedin = field({ label: "What is your LinkedIn profile URL?", kind: "text", required: true });
+    const resolution = resolveAdditionalAnswer(linkedin, { "favorite editor": "vim" });
+    expect(resolution.kind).toBe("none");
   });
 });
 
