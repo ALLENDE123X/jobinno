@@ -1,10 +1,17 @@
 name: CI
 
+# `v1` (JOB-032 era) is a second long-lived integration branch alongside
+# `main` while the live site is gated behind a waitlist — every pre-launch
+# fix lands there first, tested via Vercel preview, before eventually
+# merging back into `main`. Without `v1` in these branch lists this workflow
+# silently never runs on any PR targeting it: not caught for several PRs
+# (JOB-024, JOB-027 through JOB-030) before this was noticed. Drop `v1` here
+# once it has merged back into `main` and the branch is retired.
 on:
   push:
-    branches: [main]
+    branches: [main, v1]
   pull_request:
-    branches: [main]
+    branches: [main, v1]
 
 jobs:
   test:
