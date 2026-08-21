@@ -696,9 +696,25 @@ export const applyToJob = inngest.createFunction(
     // usage once there is some: 3 is the ceiling the plan imposes, not
     // necessarily the width this pipeline wants to run at.
     //
-    // The launch semaphore in `stagehand-session.ts` reads the same number but
-    // solves a different problem — simultaneous cold starts — and does not help
-    // once the browsers are all resident. This is the limit that holds the line.
+    // ── JOB-025: what this limit does and does not hold ─────────────────────
+    //
+    // The previous version of this comment said the semaphore in
+    // `stagehand-session.ts` solved a different problem and that "this is the
+    // limit that holds the line". The first half was true and the second was
+    // not, which cost a production run: 9 of 17 applications lost to "Failed to
+    // create a Browserbase session" against a project cap of exactly this 3.
+    // What this limit counts is *runs*, and Inngest frees a run's slot the
+    // moment its step returns. What Browserbase counts is *sessions*, and a
+    // released session holds its slot until the provider reaps it. Two counters
+    // that let go at different moments cannot between them hold one cap.
+    //
+    // JOB-025 made that semaphore count sessions for their whole life, so it
+    // now holds the line for every caller inside one process, including the
+    // CLIs that never reach Inngest. This limit is what bounds the fan-out
+    // across processes, and the two read the same number so they cannot drift
+    // apart. Neither can see a session belonging to some other process, so
+    // `BROWSERBASE_CONCURRENCY` is the knob that buys headroom under the plan
+    // cap for anyone who does not want the pipeline running level with it.
     concurrency: { limit: browserConcurrencyLimit() },
     // Below Inngest's default of 4, because a retry here is not free: each one
     // relaunches a browser against a real employer's site. Two is enough for the
