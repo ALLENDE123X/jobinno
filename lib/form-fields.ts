@@ -864,6 +864,39 @@ async function scrollIntoView(page: Page, selector: string): Promise<void> {
 }
 
 /**
+ * Focuses an element directly, without a click.
+ *
+ * JOB-044. `chooseFromMenuOnce` used to click the option it wanted; committing
+ * one by keyboard instead needs the control itself focused first, and there is
+ * no `Locator.focus()` on Stagehand's `Page` to ask for that with — see the
+ * class's own type. In practice the control is already focused by the time
+ * this runs, either from typing into it (`narrow()`'s `.fill()`) or from the
+ * click that opened its menu in the first place (`openMenu`'s own
+ * `activateSelectors` click), but neither of those is guaranteed for every
+ * path that reaches here, so this makes it true rather than assuming it.
+ */
+async function focusElement(page: Page, selector: string): Promise<void> {
+  const script = `(() => {
+    const sel = ${jsLiteral(selector)};
+    const path = sel.startsWith("xpath=") ? sel.slice(6) : sel;
+    let el = null;
+    try {
+      el = (path.startsWith("/") || path.startsWith("("))
+        ? document.evaluate(path, document, null, 9, null).singleNodeValue
+        : document.querySelector(sel);
+    } catch { return false; }
+    if (!el || !el.focus) return false;
+    el.focus();
+    return true;
+  })()`;
+  try {
+    await page.evaluate(script);
+  } catch {
+    // Not worth a line in any report.
+  }
+}
+
+/**
  * Scrolls an element into view **only if it is not already there**.
  *
  * Used for menu options, where the unconditional `scrollIntoView` above is
@@ -1111,7 +1144,8 @@ async function chooseFromMenu(
   page: Page,
   field: EnumeratedField,
   value: string,
-  allowContains: boolean
+  allowContains: boolean,
+  allowFreeText: boolean
 ): Promise<ApplyOutcome> {
   // Choosing an option is idempotent — the same option chosen twice is the same
   // form — so one retry is free, and it is worth having: on a live Greenhouse
@@ -1119,11 +1153,11 @@ async function chooseFromMenu(
   // from the *previous* field and selects nothing at all. A retry is allowed
   // only when the control came back **empty**; a control holding a *different*
   // value is a real mismatch and is escalated, never clicked at again.
-  let outcome = await chooseFromMenuOnce(page, field, value, allowContains);
+  let outcome = await chooseFromMenuOnce(page, field, value, allowContains, allowFreeText);
   if (!outcome.ok && outcome.readBack === "") {
     await closeMenu(page);
     await page.waitForTimeout(400);
-    outcome = await chooseFromMenuOnce(page, field, value, allowContains);
+    outcome = await chooseFromMenuOnce(page, field, value, allowContains, allowFreeText);
   }
   return outcome;
 }
@@ -1132,7 +1166,8 @@ async function chooseFromMenuOnce(
   page: Page,
   field: EnumeratedField,
   value: string,
-  allowContains: boolean
+  allowContains: boolean,
+  allowFreeText: boolean
 ): Promise<ApplyOutcome> {
   const wanted = normalizeText(value);
 
@@ -1189,6 +1224,34 @@ async function chooseFromMenuOnce(
   if (index === -1) index = await narrow();
 
   if (index === -1) {
+    // JOB-044. `allowFreeText` is only ever true for a control the caller has
+    // already decided accepts typed text as an answer in its own right —
+    // Greenhouse's "School" combobox is the one this was written for, see
+    // `SCHOOL_FIELD_LABEL_RE` in `lib/fill-application-form.ts`. `narrow()`
+    // above has already typed `value` into the field with `.fill()`; the read
+    // back here is what confirms that stuck rather than assuming it did,
+    // because a control that does NOT actually accept free text clears an
+    // unmatched search back to empty on its own; leaving that as a false
+    // "filled" would be worse than asking.
+    if (allowFreeText) {
+      const typed = await readFieldValue(page, field);
+      if (normalizeText(typed) === wanted) {
+        await closeMenu(page);
+        return {
+          ok: true,
+          readBack: typed,
+          detail:
+            `no dropdown option matched "${value}"` +
+            (menu.texts.length === 0
+              ? " (the dropdown offered none)"
+              : ` (offered: ${menu.texts
+                  .slice(0, 8)
+                  .map((text) => JSON.stringify(text))
+                  .join(", ")}${menu.count > 8 ? ", …" : ""})`) +
+            `; left as typed free text, which this control accepts`,
+        };
+      }
+    }
     await closeMenu(page);
     return {
       ok: false,
@@ -1230,14 +1293,36 @@ async function chooseFromMenuOnce(
     };
   }
 
+  // JOB-044. Committed by keyboard rather than by clicking `optionSelector`.
+  // Video review of a real skipped application (Greenhouse's "Location"
+  // combobox) showed the agent typing a city, a suggestion appearing, the
+  // click on it not registering, and the raw unmatched text left sitting in
+  // the field — a mouse click dispatches at the element's centroid over CDP
+  // with no confirmation it landed on the widget's own hit target, and a
+  // freshly re-rendered suggestion list is exactly where that gap shows up.
+  // The `stillReads` check just above already proves the option at `index`
+  // is still the one this chose; walking there by arrow key uses that same
+  // index against the widget's own list order instead of a screen position,
+  // which is what a real keyboard user does and what this control was built
+  // to answer to.
+  //
+  // WAI-ARIA's combobox pattern starts with nothing highlighted, so the first
+  // `ArrowDown` selects option 0 and the (index + 1)th selects option `index`.
+  // Every combobox this file has been run against follows that convention;
+  // one that does not would report a bare mismatch below rather than a wrong
+  // silent choice, because `readBack` is still checked against `chosen`.
   try {
-    await page.locator(optionSelector).click();
+    await focusElement(page, field.selector);
+    for (let step = 0; step <= index; step++) {
+      await page.keyPress("ArrowDown");
+    }
+    await page.keyPress("Enter");
   } catch (err) {
     await closeMenu(page);
     return {
       ok: false,
       readBack: "",
-      detail: `could not click the option: ${err instanceof Error ? err.message : String(err)}`,
+      detail: `could not select the option with the keyboard: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
 
@@ -1349,7 +1434,7 @@ export async function applyFieldValue(
   page: Page,
   field: EnumeratedField,
   value: string,
-  options: { allowContains?: boolean } = {}
+  options: { allowContains?: boolean; allowFreeText?: boolean } = {}
 ): Promise<ApplyOutcome> {
   switch (field.kind) {
     case "text":
@@ -1359,7 +1444,13 @@ export async function applyFieldValue(
     case "select":
       return await selectNative(page, field, value);
     case "combobox":
-      return await chooseFromMenu(page, field, value, options.allowContains === true);
+      return await chooseFromMenu(
+        page,
+        field,
+        value,
+        options.allowContains === true,
+        options.allowFreeText === true
+      );
     case "radio":
       return await chooseRadio(page, field, value);
     case "checkbox":

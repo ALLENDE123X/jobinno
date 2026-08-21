@@ -69,6 +69,11 @@ const PROFILE: ResumeProfile = {
   location: "San Francisco, CA",
   linkedinUrl: "https://www.linkedin.com/in/pat-example",
   websiteUrl: "https://github.com/pat-example",
+  // Null, deliberately: this fixture is the one used by "names the GitHub URL
+  // that four separate forms asked for by name" below, which exists to prove
+  // the *inference* off websiteUrl still works for a candidate who has not
+  // stated a real githubUrl. A separate fixture covers the stated case.
+  githubUrl: null,
   workHistory: [
     { company: "Northwind", title: "Software Engineering Intern", startDate: "Jun 2024", endDate: "Sep 2024", summary: "Built an ingest pipeline." },
     { company: "Contoso", title: "Student Researcher", startDate: "Jan 2023", endDate: "May 2023", summary: "Wrote evaluation tooling." },
@@ -257,6 +262,21 @@ describe("the fact catalogue carries what the person actually told us", () => {
 
   it("names the GitHub URL that four separate forms asked for by name", () => {
     expect(facts().get("githubUrl")?.value).toBe("https://github.com/pat-example");
+  });
+
+  it("prefers a stated githubUrl over one inferred from websiteUrl or linkedinUrl", () => {
+    // JOB-044. `profile.githubUrl` is the candidate's own stated answer
+    // (`profiles.github_url`, read through `CandidateRecord`), and it must win
+    // even when the inferred URL below points somewhere real too — the stated
+    // one is the one the candidate actually meant.
+    const stated = buildFactCatalog(
+      { ...PROFILE, githubUrl: "https://github.com/pat-real-account" },
+      ANSWERS,
+      {}
+    );
+    expect(new Map(stated.map((f) => [f.key, f])).get("githubUrl")?.value).toBe(
+      "https://github.com/pat-real-account"
+    );
   });
 
   it("carries every education entry, not only the first", () => {
@@ -749,6 +769,84 @@ describe("what a best effort answer may not do", () => {
     // Neither option begins with the value and both contain it, so nothing is
     // chosen on this person's behalf. This is the property that keeps the looser
     // city match from turning a country picker into a hazard.
+    expect(resolution.kind).not.toBe("apply");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+describe("a school combobox with no matching option is answered as free text", () => {
+  // JOB-044. The 2026 08 21 failure analysis found the agent giving up on
+  // Greenhouse's "School" field entirely whenever the candidate's own school
+  // was not one of the dropdown's own suggestions, even though that combobox
+  // is a text input that accepts whatever is typed into it. `lib/form-fields.ts`'s
+  // `chooseFromMenu` is what actually leaves the typed text in place; this file
+  // covers the policy half, which is deciding that a school-labelled combobox
+  // gets to try that at all.
+  it("types the candidate's own school when the dropdown does not offer it", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "School",
+        kind: "combobox",
+        options: ["Georgia State University", "Georgia Southern University"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "school",
+        decision: "answer",
+        value: "Georgia Institute of Technology",
+        sourceFact: "school",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Georgia Institute of Technology");
+    }
+  });
+
+  it("still asks about a non-school combobox with no matching option", () => {
+    // The same gap on a "Location" combobox is not a licence to leave typed,
+    // unselected text sitting where a chosen suggestion belongs — that is
+    // exactly the failure `chooseFromMenu`'s keyboard selection exists to fix
+    // instead. See `SCHOOL_FIELD_LABEL_RE`'s own comment for why this stays
+    // scoped by label.
+    const resolution = resolveDecision(
+      field({
+        label: "Location (City)",
+        kind: "combobox",
+        options: ["Atlanta, GA", "Boston, MA"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "location (city)",
+        decision: "answer",
+        value: "Georgia Institute of Technology",
+        sourceFact: "school",
+      }),
+      facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("does not type free text into a native select labelled School", () => {
+    // A native <select> cannot hold a value nobody chose from its own list, so
+    // the fallback stays scoped to `kind: "combobox"` even when the label says
+    // "School".
+    const resolution = resolveDecision(
+      field({
+        label: "School",
+        kind: "select",
+        options: ["Georgia State University", "Georgia Southern University"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "school",
+        decision: "answer",
+        value: "Georgia Institute of Technology",
+        sourceFact: "school",
+      }),
+      facts()
+    );
     expect(resolution.kind).not.toBe("apply");
   });
 });

@@ -105,6 +105,15 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0003_profiles_column_privileges.sql
 
+      - name: Apply the profiles.github_url privilege migration
+        # JOB-044. Same reasoning as the step above, and the same rule: this one
+        # grants `github_url`, which `0010_profiles_github_url.sql`'s ALTER TABLE
+        # (picked up by the `drizzle-kit push` step) already added by the time
+        # this runs.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0011_profiles_github_url_privileges.sql
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -190,6 +199,15 @@ jobs:
         run: >-
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0003_profiles_column_privileges.sql
+
+      - name: Apply the profiles.github_url privilege migration
+        # JOB-044. Same reasoning as the step above, and the same rule: this one
+        # grants `github_url`, which `0010_profiles_github_url.sql`'s ALTER TABLE
+        # (picked up by the `drizzle-kit push` step) already added by the time
+        # this runs.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0011_profiles_github_url_privileges.sql
 
       - name: Build
         run: npm run build

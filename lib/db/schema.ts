@@ -281,6 +281,24 @@ export const profiles = pgTable(
     earliestStart: date("earliest_start"),
 
     /**
+     * Added by JOB-044. "Github Link" is a required field on a real share of
+     * engineering application forms, and until this column existed nothing
+     * answered it except a GitHub URL that happened to be sitting in
+     * `websiteUrl` or `linkedinUrl` — which is most candidates' resumes not at
+     * all. See `CandidateRecord.githubUrl` in `lib/candidate-intake.ts` for how
+     * this is read, and `lib/fill-application-form.ts`'s `buildFactCatalog` for
+     * how the two still-inferred URLs remain the fallback for a candidate who
+     * has not filled this in yet.
+     *
+     * Owned by the person, not by us, so it is granted to `authenticated` in
+     * `drizzle/0010_profiles_github_url.sql` alongside the column itself,
+     * following the rule `drizzle/0003_profiles_column_privileges.sql` states:
+     * a new column is not writable by a user session until the migration that
+     * adds it grants it by name.
+     */
+    githubUrl: text("github_url"),
+
+    /**
      * When the person confirmed their intake is accurate and authorized us to
      * apply on their behalf. Added by JOB-007.
      *

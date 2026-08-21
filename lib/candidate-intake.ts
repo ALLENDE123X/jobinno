@@ -87,6 +87,22 @@ export type CandidateIntakeInput = {
    */
   locations?: string[];
   /**
+   * JOB-044. Written to `profiles.github_url`. Trimmed to `null` when blank,
+   * exactly like `locations` above: saying nothing must never blank a column
+   * that already holds an answer, so this key is left out of the update
+   * entirely rather than written as an empty string.
+   *
+   * A GitHub URL was one of `linkedinUrl`'s two siblings that JOB-004 dropped
+   * for having no column — see `CandidateRecord.linkedinUrl` for that gap,
+   * which this is not: unlike LinkedIn, GitHub gets a real column and a real
+   * writer here, because the "Github Link" field it answers is asked for by
+   * name on a large share of engineering applications and nothing before this
+   * ticket ever collected a stated answer for it. `lib/fill-application-form.ts`
+   * still falls back to a GitHub URL spotted in `websiteUrl` or `linkedinUrl`
+   * for candidates who have not filled this in yet.
+   */
+  githubUrl?: string;
+  /**
    * ACT-015. The facts an ATS application form asks for on almost every listing.
    *
    * All optional, and all meaning "we were never told" when absent — which is
@@ -407,6 +423,7 @@ export async function intakeCandidate(
   const locations = input.locations
     ?.map((l) => l.trim())
     .filter((l) => l.length > 0);
+  const githubUrl = normalizeOptionalText(input.githubUrl);
 
   let resumeId: string;
   try {
@@ -457,6 +474,7 @@ export async function intakeCandidate(
     const profilePatch: Record<string, unknown> = {
       ...applicationAnswerColumns(input.applicationAnswers),
       ...(locations && locations.length > 0 ? { target_locations: locations } : {}),
+      ...(githubUrl !== null ? { github_url: githubUrl } : {}),
     };
     if (Object.keys(profilePatch).length > 0) {
       const { error: profileError } = await supabase
@@ -552,6 +570,15 @@ export type CandidateRecord = {
    * ticket's to add.
    */
   linkedinUrl: string | null;
+  /**
+   * `profiles.github_url`, stated at intake. Added by JOB-044, and unlike
+   * `linkedinUrl` above this one is not a gap: `intakeCandidate` writes it for
+   * real when a caller supplies `CandidateIntakeInput.githubUrl`, so null here
+   * means the candidate genuinely has not given one, not that the column does
+   * not exist. `lib/fill-application-form.ts` still falls back to a GitHub URL
+   * spotted in `websiteUrl` or `linkedinUrl` when this is null.
+   */
+  githubUrl: string | null;
   /** Bucket-qualified path, NOT a fetchable URL. */
   resumeUrl: string;
   /**
@@ -596,10 +623,13 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * because JOB-007 spelled its columns the way actinno already had; `id` is now
  * `auth.users.id`, `application_email` is now plain `email`, and `locations` is
  * now `target_locations`. The resume is not in this list at all any more — it
- * is a row in another table, read by `loadActiveResume`.
+ * is a row in another table, read by `loadActiveResume`. `github_url` is
+ * JOB-044's, and is read straight onto `CandidateRecord.githubUrl` rather than
+ * through `toApplicationAnswers`, since it is a stated fact about the
+ * candidate rather than an answer collected for a specific form question.
  */
 const CANDIDATE_COLUMNS =
-  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start";
+  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start,github_url";
 
 /**
  * Row → the answers that were actually recorded.
@@ -660,11 +690,16 @@ export function toCandidateRecord(
     throw new Error(`profiles ${userId} has no email.`);
   }
 
+  const githubUrl = typeof row.github_url === "string" ? row.github_url.trim() : "";
+
   return {
     userId,
     applicationEmail,
     // See the type. There is no column to read this from yet.
     linkedinUrl: null,
+    // JOB-044. Unlike linkedinUrl above, this one has a column and is read
+    // from it directly.
+    githubUrl: githubUrl !== "" ? githubUrl : null,
     resumeUrl,
     locations: Array.isArray(row.target_locations) ? row.target_locations.map(String) : null,
     applicationAnswers: toApplicationAnswers(row),
