@@ -23,7 +23,8 @@
     "verification-listener": "tsx lib/future-gmail/verification-listener-cli.ts",
     "sync-boards": "tsx lib/board-sync-cli.ts",
     "skip-rollup": "tsx lib/skip-rollup-cli.ts",
-    "analyze-failures": "tsx lib/failure-recordings-cli.ts"
+    "analyze-failures": "tsx lib/failure-recordings-cli.ts",
+    "measure:reap-lag": "tsx scripts/browserbase-reap-lag.ts"
   },
   "dependencies": {
     "@browserbasehq/stagehand": "^4.0.1",
