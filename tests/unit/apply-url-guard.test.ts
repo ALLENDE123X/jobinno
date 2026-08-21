@@ -113,6 +113,34 @@ describe("the listing shapes real ingestion produces", () => {
   });
 });
 
+describe("a SmartRecruiters listing after its apply control has been clicked", () => {
+  // JOB-036. `fill-application-form.ts` runs this same check a second time
+  // against wherever the browser actually ends up, not only against the URL a
+  // listing started from — see `assertStillOnTheBoard`. A SmartRecruiters
+  // listing's apply control ("I'm Interested") always lands the browser on
+  // this `/oneclick-ui/company/{token}/...` shape rather than on another
+  // `jobs.smartrecruiters.com/{token}/{id}` listing page, so that landing has
+  // to pass the same board check the original listing URL did.
+  it("accepts the Easy Apply page the listing's own apply control leads to", () => {
+    const verdict = checkApplyUrl(
+      "https://jobs.smartrecruiters.com/oneclick-ui/company/RRSGroup/publication/717ebb95-99c1-424a-bc1c-f2c2ac7c76f2?dcr_ci=RRSGroup",
+      { ats: "smartrecruiters", boardToken: "rrsgroup" }
+    );
+    expect(verdict).toEqual({ ok: true, host: "jobs.smartrecruiters.com" });
+  });
+
+  it("still refuses that shape when it names a different employer's company", () => {
+    // Same vendor, wrong employer — exactly what this whole module exists to
+    // catch, and the new path-position for the tenant must not create a hole
+    // in it.
+    const verdict = checkApplyUrl(
+      "https://jobs.smartrecruiters.com/oneclick-ui/company/SomeoneElse/publication/717ebb95-99c1-424a-bc1c-f2c2ac7c76f2",
+      { ats: "smartrecruiters", boardToken: "rrsgroup" }
+    );
+    expect(verdict.ok).toBe(false);
+  });
+});
+
 describe("a URL the tenant chose that points away from its own board", () => {
   /** The attack in one line: a Lever tenant whose `applyUrl` is somewhere else. */
   const asLever = (url: string) => checkApplyUrl(url, { ats: "lever", boardToken: "acmecorp" });

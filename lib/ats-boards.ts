@@ -40,6 +40,9 @@
  *    host, verified with `imc`), and an embedded application form carries the
  *    tenant in `?for=` instead of in the path, the same special case
  *    `lib/search-job-listings.ts` and the Gmail listener both already make.
+ *    SmartRecruiters has one of its own (JOB-036): clicking a listing's apply
+ *    control lands on `/oneclick-ui/company/{token}/publication/{uuid}`, whose
+ *    tenant is the segment after `company` rather than the first segment.
  *
  *  · **Leftmost hostname label.** BambooHR, Breezy, JazzHR, Recruitee,
  *    Teamtailor. `specteraerospace.bamboohr.com/careers/122` is the tenant
@@ -215,6 +218,20 @@ export function classifyApplicationUrl(rawUrl: string): BoardRef | null {
     // in the query string rather than in the path.
     if (match.ats === "greenhouse" && first === "embed") {
       return board(match.ats, url.searchParams.get("for"));
+    }
+
+    // JOB-036. jobs.smartrecruiters.com/oneclick-ui/company/{token}/publication/{uuid}
+    // is SmartRecruiters' own application form — where a listing's "I'm
+    // Interested" control (SmartRecruiters' name for what every other board
+    // here calls "Apply") actually leads. It is the same kind of exception as
+    // Greenhouse's `embed` case just above: a real, applyable page whose tenant
+    // sits somewhere other than the first path segment. Confirmed against a
+    // real RRS Group listing (job-060) — the browser lands on exactly this
+    // shape after the apply click, and without this case that click was
+    // refused a step later as having wandered onto an unrelated board named
+    // "oneclick-ui".
+    if (match.ats === "smartrecruiters" && first === "oneclick-ui") {
+      return segments[1] === "company" ? board(match.ats, segments[2]) : null;
     }
 
     return NOT_A_TOKEN.has(first) ? null : board(match.ats, first);

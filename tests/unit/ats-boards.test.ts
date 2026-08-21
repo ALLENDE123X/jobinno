@@ -88,6 +88,20 @@ describe("classifyApplicationUrl, tenant in the first path segment", () => {
       classifyApplicationUrl("https://jobs.smartrecruiters.com/AveryDennison/744000144153141")
     ).toEqual({ ats: "smartrecruiters", boardToken: "averydennison" });
   });
+
+  it("takes a SmartRecruiters Easy Apply URL's tenant from after 'company', not the first segment", () => {
+    // JOB-036. The exact URL a real RRS Group listing's "I'm Interested"
+    // control lands the browser on. Its first path segment is "oneclick-ui" —
+    // SmartRecruiters' own application-form app, not a tenant — so reading the
+    // tenant the same way an ordinary `jobs.smartrecruiters.com/{company}/{id}`
+    // listing does would produce the board "oneclick-ui" and fail the check
+    // that the browser is still on the board the listing came from.
+    expect(
+      classifyApplicationUrl(
+        "https://jobs.smartrecruiters.com/oneclick-ui/company/RRSGroup/publication/717ebb95-99c1-424a-bc1c-f2c2ac7c76f2?dcr_ci=RRSGroup"
+      )
+    ).toEqual({ ats: "smartrecruiters", boardToken: "rrsgroup" });
+  });
 });
 
 describe("classifyApplicationUrl, tenant in the leftmost hostname label", () => {
@@ -155,6 +169,12 @@ describe("classifyApplicationUrl, what it declines", () => {
 
   it("declines a Greenhouse embed with no tenant in the query string", () => {
     expect(classifyApplicationUrl("https://job-boards.greenhouse.io/embed/job_app?token=1")).toBeNull();
+  });
+
+  it("declines a SmartRecruiters oneclick-ui URL with no 'company' segment to read a tenant from", () => {
+    expect(
+      classifyApplicationUrl("https://jobs.smartrecruiters.com/oneclick-ui/maintenance")
+    ).toBeNull();
   });
 
   it("declines input that is not a URL at all", () => {
