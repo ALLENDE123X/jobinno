@@ -243,6 +243,8 @@ export type SkipInput = {
   fieldLabel?: string | null;
   fieldKind?: string | null;
   required?: boolean | null;
+  /** The Browserbase session this stop happened in, when one existed. Lands in `raw_context`. */
+  browserbaseSessionId?: string | null;
 };
 
 /**
@@ -282,7 +284,7 @@ export async function recordSkip(supabase: SupabaseClient, input: SkipInput): Pr
     required: input.required ?? null,
     // Never a screenshot and never resume text, per the schema's own note on
     // this column. The message is the pipeline's own prose about its own stop.
-    raw_context: { message },
+    raw_context: { message, browserbaseSessionId: input.browserbaseSessionId ?? null },
   });
 
   if (error) {

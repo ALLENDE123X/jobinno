@@ -1266,6 +1266,8 @@ export type FillApplicationFormResult = {
   pageTitle: string;
   screenshotPath: string | null;
   blockedReason: string | null;
+  /** The Browserbase session this run used, when it ran remotely. Null on the local Chromium path. */
+  browserbaseSessionId: string | null;
 };
 
 // ───────────────────────────────────
@@ -4143,6 +4145,7 @@ async function runFill(
         ats: state.ats,
         status: APPLICATION_STATUS.FORM_FILL_BLOCKED,
         message: report.blockedReason,
+        browserbaseSessionId: report.browserbaseSessionId,
         log: LOG,
       });
       // `session` is null on every blocked path — `runBrowserFlow` closed it.
@@ -4213,6 +4216,7 @@ async function runBrowserFlow(
 ): Promise<BrowserFlowOutcome> {
   const headless = input.headless !== false;
   const session = await openBrowserSession({ headless, logTag: LOG });
+  const browserbaseSessionId = session.browser.sessionId ?? null;
   console.log(`${LOG} local browser session opened (headless=${headless}) — dedicated to this run`);
 
   /**
@@ -4388,6 +4392,7 @@ async function runBrowserFlow(
         pageTitle: final.title,
         screenshotPath,
         blockedReason: null,
+        browserbaseSessionId,
       },
       session: retainSession ? session : null,
     };
@@ -4422,6 +4427,7 @@ async function runBrowserFlow(
         pageTitle,
         screenshotPath,
         blockedReason: err.message,
+        browserbaseSessionId,
       },
       session: null,
     };
