@@ -18,6 +18,12 @@
  * reading `digest` is therefore the direct way to prove a redirect fired and
  * where it went, and a resolved call with no throw is the direct way to prove
  * one did not.
+ *
+ * ── JOB-032 ───────────────────────────────────────────────────────────────
+ * The `/` redirect below is suppressed while JOB-031's waitlist gate is
+ * active, see `WAITLIST_GATE_ACTIVE` in `lib/waitlist-gate.ts` and the
+ * comment on the redirect itself in `app/page.tsx`. The `/login` assertions
+ * are untouched, that redirect has nothing to do with the gate.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -141,19 +147,55 @@ describe("a signed in visitor is sent to /dashboard instead of shown /login or /
   });
 
   describe("/ (the landing page)", () => {
-    it("redirects a signed in visitor to /dashboard instead of the marketing pitch", async () => {
+    /**
+     * JOB-032: skipped while the waitlist gate (JOB-031) is active.
+     * `/dashboard` is itself gated and redirects back to `/`, so firing this
+     * redirect while the gate is on would send a signed in visitor back and
+     * forth between the two routes forever. `WAITLIST_GATE_ACTIVE` in
+     * `lib/waitlist-gate.ts` is what suppresses it, see the test right below
+     * this one for the current behaviour. Right again the moment that flag
+     * flips back to false, which is also when this should be unskipped.
+     */
+    it.skip(
+      "redirects a signed in visitor to /dashboard instead of the marketing pitch",
+      async () => {
+        createServerClient.mockResolvedValue(supabaseStub(true));
+
+        const { default: Home } = await import("@/app/page");
+
+        let caught: unknown;
+        try {
+          await Home({ searchParams: Promise.resolve({}) });
+        } catch (error) {
+          caught = error;
+        }
+
+        expect(redirectDestination(caught)).toBe("/dashboard");
+      }
+    );
+
+    /**
+     * The counterpart to the skipped test above, and the assertion that
+     * actually matters while the gate is active: a signed in visitor must
+     * not be redirected at all, since the only place this redirect could
+     * send them, `/dashboard`, is itself gated and would send them straight
+     * back here.
+     */
+    it("does not redirect a signed in visitor while the waitlist gate is active", async () => {
       createServerClient.mockResolvedValue(supabaseStub(true));
 
       const { default: Home } = await import("@/app/page");
 
       let caught: unknown;
+      let element: unknown;
       try {
-        await Home({ searchParams: Promise.resolve({}) });
+        element = await Home({ searchParams: Promise.resolve({}) });
       } catch (error) {
         caught = error;
       }
 
-      expect(redirectDestination(caught)).toBe("/dashboard");
+      expect(caught).toBeUndefined();
+      expect(element).toBeTruthy();
     });
 
     it("renders the landing page for a signed out visitor, unaffected by this change", async () => {
