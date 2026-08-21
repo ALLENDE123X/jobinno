@@ -98,7 +98,7 @@ import { createGmailClient } from "@/lib/future-gmail/gmail-client";
 // JOB-004. `updateApplication` used to be a private copy of the one in
 // `fill-application-form.ts`; both now come from here, along with the skip
 // logging that replaced actinno's `error_message` column.
-import { recordSkipQuietly, skipReasonFor, updateApplication } from "@/lib/application-records";
+import { recordSkipQuietly, updateApplication } from "@/lib/application-records";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 const LOG = "[act-008]";
@@ -720,7 +720,7 @@ const BLOCK_TAG = "submission_blocked";
 const UNCONFIRMED_TAG = "submit_clicked_outcome_unknown";
 /**
  * JOB-026. Written into the message when the board itself said it scored the
- * submission as automated, and matched by `skipReasonFor` to file the stop as
+ * submission as automated, and checked directly below to file the stop as
  * `bot_detected` rather than as one more unreadable `submit_failed`.
  *
  * It is a tag this module writes rather than a pattern read off the board's
@@ -1421,16 +1421,24 @@ async function runSubmitPhase(
     // was just handed, so only the skip half is called here: this path has
     // already decided what the status must be and why nothing may change it.
     //
-    // JOB-026 replaced a hardcoded `submit_failed` with the shared classifier.
-    // Every message built here still begins `submit_clicked_outcome_unknown:`,
-    // which `skipReasonFor` maps to `submit_failed`, so nothing that used to
-    // land there has moved. What it buys is the one message that now carries
-    // `AUTOMATION_TAG` as well, and files itself under `bot_detected` instead.
+    // JOB-026: this status only ever carries two real reasons, and the shared,
+    // ordered classifier in `application-records.ts` is the wrong tool for
+    // choosing between them here. `message` embeds `capture.validationErrorText`
+    // verbatim (via `errors`, built above from the page's own words), and a
+    // board's validation copy can contain any word it likes — including
+    // "captcha" — which that classifier's `REASON_TAGS` matches ahead of
+    // `submit_clicked_outcome_unknown`. Going through it would let a genuinely
+    // unknown outcome whose validation text happened to mention a challenge get
+    // filed as `captcha`, which in that taxonomy means "stopped before the
+    // click" — the opposite of what happened here. `AUTOMATION_TAG` is written
+    // by this function alone, only when `capture.automationRejection` was
+    // non-null above, so testing for it directly is exact where the ordered
+    // list is not.
     await recordSkipQuietly(supabase, {
       applicationId: jobApplicationId,
       jobId: row.jobId,
       ats: row.ats,
-      reason: skipReasonFor(APPLICATION_STATUS.SUBMISSION_UNCONFIRMED, message),
+      reason: message.includes(AUTOMATION_TAG) ? "bot_detected" : "submit_failed",
       message,
     });
     console.error(
