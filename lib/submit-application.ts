@@ -1339,6 +1339,7 @@ async function runSubmitPhase(
       ats: row.ats,
       reason: "submit_failed",
       message,
+      browserbaseSessionId: session.browser.sessionId ?? null,
     });
     console.error(
       `${LOG} ══ SUBMIT CLICKED, OUTCOME UNKNOWN ═══════════════════════════════\n` +
@@ -1392,6 +1393,7 @@ async function runSubmitPhase(
       ats: row.ats,
       reason: "submit_failed",
       message,
+      browserbaseSessionId: session.browser.sessionId ?? null,
     });
     console.warn(`${LOG} ${APPLICATION_STATUS.SUBMISSION_BLOCKED}: ${why}`);
     return await finish({

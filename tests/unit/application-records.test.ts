@@ -275,7 +275,7 @@ describe("recordSkip", () => {
       field_label: "Are you legally authorized to work in the United States?",
       field_kind: "radio",
       required: true,
-      raw_context: { message: "needs_candidate_input: 3 required field(s)" },
+      raw_context: { message: "needs_candidate_input: 3 required field(s)", browserbaseSessionId: null },
     });
   });
 
