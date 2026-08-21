@@ -1160,3 +1160,71 @@ describe("a careers page that is still hydrating when the browser arrives", () =
     expect(h.state.domReadsAtFirstExtract).toBe(2);
   });
 });
+
+// ───────────────────────────────────
+// JOB-036: SmartRecruiters says "I'm Interested", not "Apply"
+// ───────────────────────────────────
+
+describe("an apply control labelled the way SmartRecruiters labels it", () => {
+  // A real RRS Group listing (job-060) never says "Apply" anywhere on the
+  // page — its own call to action reads "I'm Interested" — and the run ended
+  // with "no application form on screen ... Nothing was clicked or typed":
+  // the apply-control vocabulary was written around Greenhouse/Ashby's
+  // "Apply"/"Apply Now" wording and never recognized it, so the click loop in
+  // `reachApplicationForm` never even attempted a click.
+  it("is recognized and clicked, and the run reaches and fills the form", async () => {
+    h.state.resolve = (instruction: string) =>
+      instruction.includes("opens this listing's job application form")
+        ? {
+            selector: "xpath=/html[1]/body[1]/div[1]/a[1]",
+            description:
+              "The “I'm interested” link that opens this listing's job application form.",
+            replayed: false,
+          }
+        : // Every other control (the cover letter's "Enter manually" switch, in
+          // particular — `run()` always asks for one) resolves the ordinary way.
+          h.manualEntryOnly(instruction);
+    // The first read is the listing page: no form yet, but its own "I'm
+    // Interested" control is on screen. Every read after the click sees
+    // whatever page that click led to, which the default fixture reads as a
+    // filled-in application form.
+    h.state.signalsOverride = (call) =>
+      call === 1 ? { applicationFormPresent: false, applyControlPresent: true } : {};
+
+    const result = await run();
+
+    // `readPage()` reports no form until the second (post-click) read, so
+    // reaching "form_filled" at all is only possible if the click loop
+    // recognized the "I'm Interested" control, actually clicked it (rather
+    // than refusing it as unidentified), and picked up the resulting page.
+    expect(result.status).toBe("form_filled");
+    expect(result.blockedReason).toBeNull();
+    expect(h.state.extractCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  it("still refuses a control that reads as the application SUBMIT, even one whose wording also matches \"interested\"", async () => {
+    // The safety property the widened match must not cost: recognizing "I'm
+    // Interested" as an apply control must not open a path for a control that
+    // actually submits the application to slip past `assertNotAnApplicationSubmit`
+    // merely because its own description happens to share that word too.
+    h.state.resolve = (instruction: string) =>
+      instruction.includes("opens this listing's job application form")
+        ? {
+            selector: "xpath=/html[1]/body[1]/div[1]/button[1]",
+            description:
+              "the button that submits the application on behalf of a candidate who is interested",
+            replayed: false,
+          }
+        : null;
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: true,
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("Refusing to click");
+    expect(result.blockedReason).toContain("SUBMITS the application");
+  });
+});
