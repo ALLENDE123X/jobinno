@@ -94,7 +94,33 @@ verify_enabled = true
 # the CLI resolves from the environment, so the repository carries the shape and
 # never the secret.
 #
+# ── The section below looked complete and was not (JOB-024, 2026-08-21) ─────
+# host/port/user/pass/admin_email/sender_name were filled in and pushed with
+# `npm run supabase:auth-config`. The CLI reported "Remote Auth config is up to
+# date" and exited 0. A real magic link sent right after still arrived branded
+# as Supabase's own built-in mailer, not Resend.
+#
+# Root cause, confirmed by reading supabase-cli 2.115.0's own source
+# (`packages/config/src/auth/email.ts` and
+# `apps/cli/src/legacy/commands/config/push/config-sync/auth.sync.ts`):
+# `auth.email.smtp` has its own `enabled` boolean, independent of whether
+# host/port/user/pass/admin_email are filled in, and it defaults to `false`
+# when the key is simply absent — which it was, in every version of this
+# section up to this comment. The CLI's own required-field checks only run
+# `requiredWhenEnabled`, so a fully-populated section with no `enabled = true`
+# parses as valid; nothing warns you the block is inert. And `enabled` is
+# exactly what decides whether the CLI ever sends host/port/user/pass/
+# admin_email/sender_name to the Management API at all — with it unset, the
+# CLI's local-vs-remote diff resolves both sides to "disabled" (this project's
+# SMTP had never been turned on before), finds no difference, and never issues
+# the update. "Up to date" was true and useless at the same time: true of a
+# config that was never actually sent.
+#
+# So: `enabled = true` is not optional decoration, it is the field that makes
+# every other line in this table do anything. Set it explicitly.
+#
 [auth.email.smtp]
+enabled = true
 host = "smtp.resend.com"
 port = 587
 user = "resend"
