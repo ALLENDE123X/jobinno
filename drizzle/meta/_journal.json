@@ -57,6 +57,13 @@
       "when": 1787270000000,
       "tag": "0007_skip_reason_taxonomy",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1787284000000,
+      "tag": "0008_bot_detected_skip_reason",
+      "breakpoints": true
     }
   ]
 }

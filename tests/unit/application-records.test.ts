@@ -259,6 +259,34 @@ describe("skipReasonFor", () => {
     // own writer puts on the message.
     ["blocked_apply_url: the browser is at https://elsewhere.example/x", "form_fill_blocked", "blocked_redirect"],
     ["needs_attestation: the form at ... has 1 required legal attestation(s)", "form_fill_blocked", "needs_attestation"],
+    // JOB-026. The tag is written by `submit-application.ts` after the click,
+    // when the page itself said it scored the submission as automated. Before
+    // this entry existed the message landed on `submit_failed` with every
+    // genuinely unknown outcome, which is how five real applications on
+    // 2026 08 21 read as "the submit leg died somehow".
+    [
+      'submission_flagged_as_automated: "Submit Application" was clicked and the board refused ' +
+        'it as automated traffic, in its own words: "flagged as possible spam"',
+      "submission_unconfirmed",
+      "bot_detected",
+    ],
+    // Ordering, and the reason the tag exists at all. These messages quote the
+    // board's refusal verbatim, and Ashby's own version of this page tells the
+    // reader to check their browser. A board that worded it around the word
+    // "captcha" would file itself under somebody else's reason without this.
+    [
+      'submission_flagged_as_automated: the board said "your submission failed our captcha ' +
+        'check and was flagged as a bot", and the page timed out afterwards',
+      "submission_unconfirmed",
+      "bot_detected",
+    ],
+    // The other direction, unchanged: an unknown outcome with no such tag is
+    // still `submit_failed`, and must stay there.
+    [
+      'submit_clicked_outcome_unknown: "Submit" was clicked, but the form is still on screen',
+      "submission_unconfirmed",
+      "submit_failed",
+    ],
   ])("reads %j as %s", (message, status, expected) => {
     expect(skipReasonFor(status as never, message)).toBe(expected);
   });

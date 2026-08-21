@@ -98,7 +98,7 @@ import { createGmailClient } from "@/lib/future-gmail/gmail-client";
 // JOB-004. `updateApplication` used to be a private copy of the one in
 // `fill-application-form.ts`; both now come from here, along with the skip
 // logging that replaced actinno's `error_message` column.
-import { recordSkipQuietly, updateApplication } from "@/lib/application-records";
+import { recordSkipQuietly, skipReasonFor, updateApplication } from "@/lib/application-records";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 const LOG = "[act-008]";
@@ -202,6 +202,12 @@ export type ConfirmationCapture = z.infer<typeof ConfirmationSignalsSchema> & {
    * reading of the same page.
    */
   codePromptInText: boolean;
+  /**
+   * The board's own sentence saying it scored this submission as automated and
+   * refused it, sanitised and capped, or null when the page says no such thing.
+   * See `boardRejectedAsAutomated`.
+   */
+  automationRejection: string | null;
 };
 
 const PAGE_TEXT_LENGTH_SCRIPT = `((document.body && document.body.innerText) || '').trim().length`;
@@ -231,6 +237,68 @@ const PAGE_TEXT_SCRIPT = `((document.body && document.body.innerText) || '').tri
 const CODE_PROMPT_RE =
   /\b(?:verification|security|confirmation)\s+code\b[\s\S]{0,200}?\b(?:sent|emailed|e-mailed)\b|\b(?:sent|emailed|e-mailed)\b[\s\S]{0,200}?\b(?:verification|security|confirmation)\s+code\b|\benter\s+the\s+\d+[-\s]?character\s+code\b/i;
 
+/**
+ * The board saying, in its own words, that it scored this submission as
+ * automated and threw it away.
+ *
+ * ── Why this is read off `innerText` and not asked of a model (JOB-026) ─────
+ * Same reasoning as `CODE_PROMPT_RE` directly above, and it applies harder
+ * here. Whether a page contains a sentence is not a judgement call, and this
+ * particular sentence decides how the run is filed and what an operator is told
+ * to go and fix. A model's summary of the page is a fine second opinion and a
+ * bad primary one, and there is no second opinion to want: the wording below is
+ * quoted from five real captures rather than imagined.
+ *
+ * ── What it is matched against ─────────────────────────────────────────────
+ * Every one of the five `submission_unconfirmed` applications from the run of
+ * 2026 08 21 ended on an Ashby page reading, verbatim:
+ *
+ *   "We couldn't submit your application. Your application submission was
+ *    flagged as possible spam. If you believe this was a mistake, please submit
+ *    your application again."
+ *
+ * across three unrelated companies, so this is Ashby's platform wide anti bot
+ * check rather than one employer's setting. The run captured that text, tested
+ * it for a security code prompt, and discarded it. That is the bug this fixes:
+ * the words were in memory and the pipeline recorded "outcome unknown" anyway.
+ *
+ * ── Why the pattern is the narrow half of the page and not the obvious half ──
+ * The obvious half is "couldn't submit your application", and it is deliberately
+ * NOT what this matches on its own. A board prints that sentence for a failed
+ * upload and for a required field too, and filing a validation error as bot
+ * detection would send somebody off to rebuild browser fingerprinting over a
+ * missing phone number. What is matched instead is the accusation itself: spam,
+ * a bot, automation. That phrase is not something a board prints by accident,
+ * and a false positive on it costs a mislabelled log row while a false negative
+ * costs only the status quo.
+ *
+ * Kept deliberately loose across the wording of the accusation, because the
+ * next board to do this will not copy Ashby's phrasing, and tight around what
+ * the accusation has to be about.
+ */
+const AUTOMATION_REJECTION_RE =
+  /\bflagged\s+as\s+(?:possible\s+|potential\s+|suspected\s+|likely\s+)?(?:spam|a\s+bot|bot|automated)\b|\b(?:detected|identified|classified)\s+as\s+(?:a\s+)?(?:bot|automated|spam)\b|\bautomated\s+(?:traffic|submissions?|activity)\b|\bsuspected\s+(?:bot|automation|spam)\b|\bbot\s+(?:traffic|activity)\b/i;
+
+/** How much of the board's refusal is quoted back into the skip message. */
+const MAX_REJECTION_QUOTE_CHARS = 300;
+
+/**
+ * The matched accusation plus enough of what surrounds it to read as a
+ * sentence, sanitised, or null when the page never made one.
+ *
+ * A window rather than a sentence split on purpose. `innerText` from a real
+ * board is headings and layout with barely a full stop in it — the Ashby page
+ * above has none before the accusation at all — so splitting on punctuation
+ * returns either three words or the entire page.
+ */
+export function boardRejectedAsAutomated(pageText: string): string | null {
+  const match = AUTOMATION_REJECTION_RE.exec(pageText);
+  if (match === null) return null;
+  const from = Math.max(0, match.index - 120);
+  const to = Math.min(pageText.length, match.index + match[0].length + 180);
+  return sanitizePageText(pageText.slice(from, to), MAX_REJECTION_QUOTE_CHARS);
+}
+
 async function readConfirmation(session: BrowserSession): Promise<ConfirmationCapture> {
   const { stagehand, page } = session;
   const { data } = await stagehand.extract(
@@ -250,7 +318,14 @@ async function readConfirmation(session: BrowserSession): Promise<ConfirmationCa
       () => ""
     ),
   ]);
-  return { ...data, url, title, textLength, codePromptInText: CODE_PROMPT_RE.test(pageText) };
+  return {
+    ...data,
+    url,
+    title,
+    textLength,
+    codePromptInText: CODE_PROMPT_RE.test(pageText),
+    automationRejection: boardRejectedAsAutomated(pageText),
+  };
 }
 
 // ───────────────────────────────────
@@ -643,6 +718,18 @@ export function chooseSubmitControlLabel(raw: readonly string[]): SubmitLabelCho
 /** Tags in `error_message` that make each class of ACT-008 stop greppable. */
 const BLOCK_TAG = "submission_blocked";
 const UNCONFIRMED_TAG = "submit_clicked_outcome_unknown";
+/**
+ * JOB-026. Written into the message when the board itself said it scored the
+ * submission as automated, and matched by `skipReasonFor` to file the stop as
+ * `bot_detected` rather than as one more unreadable `submit_failed`.
+ *
+ * It is a tag this module writes rather than a pattern read off the board's
+ * prose, for the reason the `blocked_apply_url` comment in
+ * `lib/application-records.ts` gives: the quoted page text in these messages is
+ * chosen by whoever wrote the page, and a board wording its refusal around the
+ * word "captcha" would otherwise file the stop under somebody else's reason.
+ */
+const AUTOMATION_TAG = "submission_flagged_as_automated";
 
 /** Elements that are plausibly a button. Anything else is not clicked. */
 const CLICKABLE_TAGS: ReadonlySet<string> = new Set(["button", "a"]);
@@ -1333,11 +1420,17 @@ async function runSubmitPhase(
     // The reason, in the log table. `recordFailure` would rewrite the status it
     // was just handed, so only the skip half is called here: this path has
     // already decided what the status must be and why nothing may change it.
+    //
+    // JOB-026 replaced a hardcoded `submit_failed` with the shared classifier.
+    // Every message built here still begins `submit_clicked_outcome_unknown:`,
+    // which `skipReasonFor` maps to `submit_failed`, so nothing that used to
+    // land there has moved. What it buys is the one message that now carries
+    // `AUTOMATION_TAG` as well, and files itself under `bot_detected` instead.
     await recordSkipQuietly(supabase, {
       applicationId: jobApplicationId,
       jobId: row.jobId,
       ats: row.ats,
-      reason: "submit_failed",
+      reason: skipReasonFor(APPLICATION_STATUS.SUBMISSION_UNCONFIRMED, message),
       message,
     });
     console.error(
@@ -1635,6 +1728,32 @@ async function runSubmitPhase(
         )}.`
       : "";
 
+    // ══ JOB-026: the board sometimes says why, and it used to go unread ══════
+    // Checked before the code prompt reads below, and ahead of them on purpose:
+    // a board that has just called this submission spam is not also asking for
+    // a one-time code, and the two reads underneath are a DOM sweep and a page
+    // evaluate against a page that has already given its answer. Everything
+    // below is written in the language of "most likely"; this is the one branch
+    // here that knows rather than guesses, so it goes first.
+    //
+    // The status stays `submission_unconfirmed` and nothing is retried. That is
+    // not hedging about what happened on the page, which is not in doubt: it is
+    // that the submit control was clicked, and no wording on a page is evidence
+    // about what the employer's own system did with the click before rendering
+    // it. What changes is the reason filed against it, which is now the true
+    // one, and the sentence the person reads on their dashboard.
+    if (capture.automationRejection !== null) {
+      return await unconfirmed(
+        `${AUTOMATION_TAG}: "${choice.label}" was clicked at "${capture.url}" and the board ` +
+          `refused the submission as automated traffic, in its own words: ` +
+          `${JSON.stringify(capture.automationRejection)}.${errors} This is not an ambiguous ` +
+          `outcome and it is not a form the candidate got wrong. The board scored the browser ` +
+          `doing the submitting and declined it, so clicking again from the same browser would ` +
+          `be refused the same way. Nothing is retried and no second click is issued. What ` +
+          `wants fixing is on this side: how the submitting browser presents itself.`
+      );
+    }
+
     // Two independent readings have to agree before a code is even looked for:
     // the page saying it emailed one, and a `document.querySelectorAll` sweep
     // finding something to type it into. Either alone is a reason to stop, not
@@ -1850,6 +1969,15 @@ async function runSubmitPhase(
           sanitizePageText(resubmitCapture.validationErrorText, 300)
         )}.`
       : "";
+    if (resubmitCapture.automationRejection !== null) {
+      return await unconfirmed(
+        `${AUTOMATION_TAG}: "${choice.label}" was clicked a second time with the emailed ` +
+          `security code entered, and the board refused the submission as automated traffic, in ` +
+          `its own words: ${JSON.stringify(resubmitCapture.automationRejection)}.` +
+          `${resubmitErrors} The code was not the problem. There is no third click.`
+      );
+    }
+
     return await unconfirmed(
       `"${choice.label}" was clicked a second time with the emailed security code entered, and ` +
         `the application form is STILL on screen at "${resubmitCapture.url}" with no ` +
