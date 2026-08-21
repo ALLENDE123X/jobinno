@@ -275,75 +275,252 @@ export function browserConcurrencyLimit(env: EnvSource = process.env): number {
  * when they are absent; pinning either would make concurrent runs collide on
  * the debug port or on Chrome's profile lock.
  */
+// ───────────────────────────────────
+// The session slot limiter (JOB-025)
+// ───────────────────────────────────
+
 /**
- * How many browsers may be *starting* at once. Not how many may be running.
+ * How many browser sessions this process may hold open at once, and why the
+ * thing being counted is a live session rather than a start.
  *
- * Stagehand enforces a hard-coded, non-configurable 60s ceiling on
- * `create()` — launch plus init. Chrome's cold start is the expensive part of
- * that and it is almost entirely CPU: five processes racing through startup on
- * one machine take far longer each than five started in sequence, and past a
- * point they simply do not make the ceiling.
+ * ── What this was, and the production run that disproved it ─────────────────
  *
- * That is not hypothetical. A live 5-wide fan-out lost three of five runs to
- * "Stagehand initialization timed out after 60000ms" and a
- * `connect ECONNREFUSED`, on an 8-core / 8 GB machine whose 15-minute load
- * average was 23 at the time. The two that survived went on to fill forms
- * normally.
+ * Until JOB-025 the queue below gated *launches*. It took a slot before
+ * `launch()` and gave it straight back once `Stagehand.create()` returned, on
+ * the reasoning that the expensive, contended part of a local Chromium is its
+ * cold start. That reasoning is still true of a local Chromium and is kept
+ * verbatim below, because it is why the queue exists at all:
  *
- * The fix is not fewer applications. Once a browser is up it spends nearly all
- * its time idle, waiting on the network and on model calls, so five *running*
- * browsers cost little — it is five *starting* browsers that do. Queueing the
- * starts keeps `concurrency: { limit: 5 }` in
- * `inngest/job-application-pipeline.ts` meaning what it says, while never
- * putting more than this many launches in flight at once.
+ *   Stagehand enforces a hard-coded, non-configurable 60s ceiling on
+ *   `create()`, covering launch plus init. Chrome's cold start is the expensive
+ *   part of that and it is almost entirely CPU: five processes racing through
+ *   startup on one machine take far longer each than five started in sequence,
+ *   and past a point they simply do not make the ceiling. A live 5-wide fan-out
+ *   lost three of five runs to "Stagehand initialization timed out after
+ *   60000ms" and a `connect ECONNREFUSED`, on an 8-core / 8 GB machine whose
+ *   15-minute load average was 23 at the time. The two that survived went on to
+ *   fill forms normally. Once a browser is up it spends nearly all its time
+ *   idle, waiting on the network and on model calls, so five *running* browsers
+ *   cost little. It is five *starting* browsers that do.
  *
- * ── JOB-005: the limit is now the active provider's, not a constant ──────────
+ * None of that was ever true of the resource Browserbase meters. Browserbase
+ * caps concurrent sessions per project, counts a session from the moment
+ * `sessions.create` is accepted until the session is released and reaped, and
+ * refuses the one over the line rather than queueing it. A limiter that lets go
+ * as soon as a session is up therefore places no bound whatsoever on the number
+ * that matters. The old header said exactly that and treated it as acceptable:
+ * "three live sessions plus a fourth start is still a refusal from
+ * Browserbase", with the pipeline's own `concurrency.limit` nominated as the
+ * thing that holds the line.
  *
- * Every word above is about a Chrome process starting on this machine, so none
- * of it applies to a Browserbase session. There `launch()` is one HTTPS call
- * that creates a session on someone else's fleet, it costs this process no CPU,
- * and starts do not contend with each other at all.
+ * It does not hold the line, and a real run proved it. On 2026-08-21 a fan-out
+ * of 17 applications for one candidate lost 9 of them to `internal_error` with
+ * `"Failed to create a Browserbase session"`, which is the bare string
+ * Stagehand throws when `sessions.create` is refused (it discards the cause, so
+ * the reason never reaches our logs). The project's own
+ * `GET /v1/projects/{id}` reports `"concurrency": 3`, the same 3 that
+ * `BROWSERBASE_DEFAULT_CONCURRENCY` and `applyToJob`'s `concurrency.limit` both
+ * carry. The cap and the configuration agreed. What disagreed was the count:
+ * `applyToJob` frees a run slot the instant its step returns, this module freed
+ * its slot the instant a session was up, and Browserbase frees the real slot
+ * only once the released session has been reaped. Running 3 wide against a cap
+ * of 3, every handover between one application and the next puts a
+ * `sessions.create` in the window where the outgoing session still holds its
+ * slot, and once enough of those land the rest of the fan-out fails one after
+ * another. The run shows exactly that shape: applications land normally for two
+ * and a half minutes and then every remaining one errors.
  *
- * The queue is kept rather than skipped for the remote path, for one reason
- * that is worth being precise about. Browserbase caps concurrent sessions per
- * project and refuses the one over the line instead of queueing it, so a bound
- * is still wanted. Set to the plan's cap it is close to a no op underneath
- * `applyToJob`'s own `concurrency.limit`, which reads the same number. It earns
- * its place on the entry points that never touch Inngest, `npm run fill-form`
- * and `npm run submit-application`, where nothing else is counting.
+ * ── What it is now ──────────────────────────────────────────────────────────
  *
- * What it deliberately does not claim to be is an enforcement of that cap. It
- * gates starts, not runs, and releases as soon as a session is up, so three
- * live sessions plus a fourth start is still a refusal from Browserbase. The
- * pipeline's `concurrency.limit` is what actually holds the line.
+ * A slot is taken before the provider is asked for a session and given back
+ * only after `closeBrowserSession` has finished tearing that session down. The
+ * number of slots held is therefore the number of sessions this process is
+ * responsible for at the provider, counting one that is still being created and
+ * one that is still being closed. That is the quantity Browserbase counts, so
+ * it is now the quantity this module counts.
+ *
+ * What it still cannot see is a session belonging to some other process. This
+ * limiter is module state, so it binds every caller inside one Node process
+ * (the CLIs in `lib/`, and every Inngest run that a warm host executes in the
+ * same instance) and nothing outside it. Across processes `applyToJob`'s
+ * `concurrency.limit` is the only bound, and it counts runs rather than
+ * sessions. Both read `browserConcurrencyLimit()` so the two numbers cannot
+ * drift apart, and `BROWSERBASE_CONCURRENCY` lowers both together for anyone
+ * who wants headroom under the plan cap rather than a pipeline that runs
+ * permanently level with it.
  */
-function maxConcurrentLaunches(): number {
+function sessionSlotLimit(): number {
   return browserConcurrencyLimit();
 }
 
-/** Resolves when a launch slot is free; the returned function gives it back. */
-const launchQueue: Array<() => void> = [];
-let launchesInFlight = 0;
+/**
+ * One session's claim on the provider's cap, held from before the session is
+ * created until after it is closed.
+ *
+ * The object identity is the handle. `releaseSessionSlot` takes the slot it was
+ * handed rather than a count to subtract, which is what makes a double release
+ * a no op instead of a hole in the limit.
+ */
+type SessionSlot = {
+  readonly logTag: string;
+  readonly acquiredAt: number;
+  released: boolean;
+};
 
-async function acquireLaunchSlot(logTag: string): Promise<() => void> {
-  if (launchesInFlight >= maxConcurrentLaunches()) {
-    console.log(
-      `${logTag} waiting for a browser-launch slot (${launchesInFlight} starting, ` +
-        `${launchQueue.length} already queued) — starts are serialised so none of them ` +
-        `misses Stagehand's fixed 60s init ceiling`
+/** A caller parked until a slot frees, in the order it arrived. */
+type SlotWaiter = {
+  readonly logTag: string;
+  readonly queuedAt: number;
+  readonly grant: (slot: SessionSlot) => void;
+};
+
+const heldSlots = new Set<SessionSlot>();
+const slotWaiters: SlotWaiter[] = [];
+
+/**
+ * How long a slot may be held before it is treated as leaked rather than live.
+ *
+ * A ceiling is wanted because a slot is now released by a
+ * `closeBrowserSession` that some caller has to reach, and a caller that never
+ * reaches it would park a slot forever and eventually stop this process opening
+ * any session at all. Every path in this repository closes in a `finally`, so
+ * this should never fire, and it is loud when it does.
+ *
+ * The number is not a guess. `BROWSERBASE_SESSION_TIMEOUT_S` is passed on every
+ * remote launch, so a session older than that has already been ended by
+ * Browserbase and its slot freed on the provider's side, which makes it the
+ * first moment at which reclaiming cannot overshoot the cap. The extra minute
+ * is margin for the clock skew between the two. Reclaiming any earlier would
+ * reintroduce the bug this file exists to fix.
+ */
+const SESSION_SLOT_MAX_HOLD_MS = (BROWSERBASE_SESSION_TIMEOUT_S + 60) * 1000;
+
+/** Adds a slot to the held set. The only place that set ever grows. */
+function takeSlot(logTag: string): SessionSlot {
+  const slot: SessionSlot = { logTag, acquiredAt: Date.now(), released: false };
+  heldSlots.add(slot);
+  return slot;
+}
+
+/**
+ * Drops slots held for longer than any session can still be alive.
+ *
+ * Runs on acquire rather than on a timer, so it costs nothing when nobody is
+ * asking for a session and there is no interval keeping a CLI process alive
+ * after its work is done.
+ */
+function reclaimLeakedSlots(): void {
+  const cutoff = Date.now() - SESSION_SLOT_MAX_HOLD_MS;
+  for (const slot of heldSlots) {
+    if (slot.acquiredAt > cutoff) continue;
+    slot.released = true;
+    heldSlots.delete(slot);
+    console.error(
+      `${slot.logTag} a browser session slot was held for over ` +
+        `${Math.round(SESSION_SLOT_MAX_HOLD_MS / 1000)}s and has been reclaimed. That is ` +
+        `longer than a session can live, so the provider has already ended it, but a slot ` +
+        `only reaches this state when a session was opened and never closed. Find the path ` +
+        `that skipped closeBrowserSession.`
     );
-    await new Promise<void>((resolve) => launchQueue.push(resolve));
   }
-  launchesInFlight++;
-  let released = false;
-  return () => {
-    // Idempotent: the caller releases on both the success and failure paths,
-    // and double-releasing would let the queue outgrow the limit.
-    if (released) return;
-    released = true;
-    launchesInFlight--;
-    launchQueue.shift()?.();
-  };
+}
+
+/**
+ * Waits for a slot under the active provider's cap and returns the claim on it.
+ *
+ * The test and the take are both synchronous with no `await` between them, so
+ * no other caller can run in the gap and two callers cannot pass the same test
+ * on the same free slot. The interesting case is not this one though. It is the
+ * hand-off in `grantWaitingSlots`.
+ */
+async function acquireSessionSlot(logTag: string): Promise<SessionSlot> {
+  reclaimLeakedSlots();
+
+  const limit = sessionSlotLimit();
+  if (heldSlots.size < limit) return takeSlot(logTag);
+
+  console.log(
+    `${logTag} waiting for a browser session slot (${heldSlots.size} of ${limit} in use, ` +
+      `${slotWaiters.length} already waiting). The provider counts a session from creation ` +
+      `until it is closed and refuses the one over its cap, so waiting here is what stops a ` +
+      `refusal there.`
+  );
+
+  return await new Promise<SessionSlot>((grant) => {
+    slotWaiters.push({ logTag, queuedAt: Date.now(), grant });
+  });
+}
+
+/** Gives a slot back. Idempotent, because callers release on every exit path. */
+function releaseSessionSlot(slot: SessionSlot): void {
+  if (slot.released) return;
+  slot.released = true;
+  heldSlots.delete(slot);
+  grantWaitingSlots();
+}
+
+/**
+ * Hands freed slots to whoever has been waiting longest.
+ *
+ * The order of the two statements in the loop body is worth stating plainly,
+ * and worth being honest about. The old release decremented a counter and then
+ * resolved a waiter's promise, which leaves the count one below the limit for
+ * as long as it takes that waiter to resume. Reading the old code that looks
+ * like an open window: a caller arriving in it would read the lowered count,
+ * skip the queue and take the slot, and the woken waiter would then increment
+ * on top of it. It is not actually reachable, and the reason it is not is worth
+ * knowing rather than relying on. `resolve` schedules the waiter's continuation
+ * as a microtask, the wait path is exactly one continuation deep, and microtask
+ * order is FIFO, so the waiter always resumes before any caller that arrives
+ * after the release. The old limiter was safe there by scheduling accident, and
+ * it would have stopped being safe the first time anyone put a second `await`
+ * on that path.
+ *
+ * Below it is safe by construction instead. `takeSlot` puts the replacement
+ * slot in `heldSlots` *before* `grant` is called, and `grant` only resolves a
+ * promise, so the set is never observably smaller than the limit while a waiter
+ * is owed a slot. A caller arriving at any moment, through any number of
+ * continuations, sees the true size and queues behind the waiter rather than in
+ * front of it.
+ *
+ * The limit is re-read each pass rather than captured, so lowering
+ * `BROWSERBASE_CONCURRENCY` takes effect as slots come back instead of being
+ * fixed at whatever it was when this process started.
+ */
+function grantWaitingSlots(): void {
+  while (slotWaiters.length > 0 && heldSlots.size < sessionSlotLimit()) {
+    const waiter = slotWaiters.shift();
+    if (waiter === undefined) return;
+    const slot = takeSlot(waiter.logTag);
+    console.log(
+      `${waiter.logTag} took a browser session slot after ${Date.now() - waiter.queuedAt}ms ` +
+        `(${heldSlots.size} of ${sessionSlotLimit()} in use)`
+    );
+    waiter.grant(slot);
+  }
+}
+
+/**
+ * Which slot each open session is holding.
+ *
+ * A `WeakMap` rather than a field on `BrowserSession`, for two reasons. The
+ * slot is bookkeeping this module owns outright and no caller has any business
+ * reading or replacing it, and a session built by a test fixture rather than by
+ * `openBrowserSession` has no entry at all, so `closeBrowserSession` on one
+ * stays the plain teardown it always was.
+ */
+const slotForSession = new WeakMap<BrowserSession, SessionSlot>();
+
+/**
+ * How many sessions this process currently holds against the provider's cap,
+ * and what the cap is.
+ *
+ * Exported for the tests, which is the only honest reason: a limiter whose
+ * whole job is a number nobody can see is a limiter nobody can prove. Reading
+ * it changes nothing.
+ */
+export function browserSessionSlotsInUse(): { held: number; waiting: number; limit: number } {
+  return { held: heldSlots.size, waiting: slotWaiters.length, limit: sessionSlotLimit() };
 }
 
 /**
@@ -425,9 +602,11 @@ export async function openBrowserSession(
     );
   }
 
-  // Held across launch *and* `Stagehand.create()`, because the 60s ceiling
-  // covers both and init is not the cheap half.
-  const releaseLaunchSlot = await acquireLaunchSlot(options.logTag);
+  // Taken before the provider is asked for anything, and given back only once
+  // `closeBrowserSession` has finished, so this session occupies a slot here
+  // for as long as it occupies one there. See the limiter's header for the
+  // production run that made the difference between the two matter.
+  const slot = await acquireSessionSlot(options.logTag);
   let browser: StagehandBrowser;
   try {
     browser =
@@ -442,7 +621,11 @@ export async function openBrowserSession(
           })
         : await localBrowser.launch({ headless: options.headless });
   } catch (err) {
-    releaseLaunchSlot();
+    // Nothing was created, or Stagehand already cleaned up what was. Either
+    // way this process is holding no session, so the slot goes back before the
+    // error does and the next caller in the queue gets it.
+    logSessionOpenFailure(options.logTag, err);
+    releaseSessionSlot(slot);
     throw err;
   }
 
@@ -470,16 +653,43 @@ export async function openBrowserSession(
     const context = stagehand.browser.context;
     await blockUnroutableDomains(context, options.logTag);
     const page = (await context.activePage()) ?? (await context.newPage());
-    return { stagehand, browser, page, logTag: options.logTag };
+    const session: BrowserSession = { stagehand, browser, page, logTag: options.logTag };
+    // The last statement before the return, so a session only ever becomes the
+    // holder of a slot once it is a session the caller actually has and can
+    // close. Everything above this line releases the slot on its own way out.
+    slotForSession.set(session, slot);
+    return session;
   } catch (err) {
-    // The browser is ours and nothing else will ever close it.
+    // The browser is ours and nothing else will ever close it. `close()` on the
+    // remote provider is what releases the session, so this is also what keeps
+    // a failed init from parking a slot on Browserbase for the full
+    // `api_timeout`, and the local slot only goes back once it has run.
     await browser.close().catch(() => undefined);
+    logSessionOpenFailure(options.logTag, err);
+    releaseSessionSlot(slot);
     throw err;
-  } finally {
-    // The slot covers starting, not running: the next launch may begin as soon
-    // as this one is up, however long the flow that owns it then runs for.
-    releaseLaunchSlot();
   }
+}
+
+/**
+ * Says what this process was holding when a session could not be opened.
+ *
+ * The error itself is rethrown untouched, because callers classify on it and
+ * `skip_log` records its message. This is the context that message cannot
+ * carry: Stagehand catches the provider's response with a bare `catch {}` and
+ * throws the fixed string "Failed to create a Browserbase session", discarding
+ * the cause, so nine of those in a row say nothing at all about whether the
+ * project was at its cap. The counts do.
+ */
+function logSessionOpenFailure(logTag: string, err: unknown): void {
+  const inUse = browserSessionSlotsInUse();
+  const reason = err instanceof Error ? err.message : String(err);
+  console.error(
+    `${logTag} could not open a browser session: ${reason}. This process was holding ` +
+      `${inUse.held} of its ${inUse.limit} session slots with ${inUse.waiting} caller(s) ` +
+      `waiting. A refusal while that first number is below the limit means the sessions ` +
+      `over the cap belong to another process or have not been reaped by the provider yet.`
+  );
 }
 
 /**
@@ -498,17 +708,45 @@ export async function openBrowserSession(
  */
 export async function closeBrowserSession(session: BrowserSession): Promise<void> {
   try {
-    await session.stagehand.close();
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    console.warn(`${session.logTag} closing Stagehand failed (ignored): ${reason}`);
-  }
-  try {
-    await session.browser.close();
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    const what = session.browser.provider === "browserbase" ? "Browserbase" : "local";
-    console.warn(`${session.logTag} closing the ${what} browser failed (ignored): ${reason}`);
+    try {
+      await session.stagehand.close();
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(`${session.logTag} closing Stagehand failed (ignored): ${reason}`);
+    }
+    try {
+      await session.browser.close();
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      const what = session.browser.provider === "browserbase" ? "Browserbase" : "local";
+      // JOB-025 raised the remote half of this from a warning to an error, and
+      // only the remote half. A local Chrome that will not die costs this
+      // machine some memory. A Browserbase session that was never released goes
+      // on holding one of the project's concurrency slots until `api_timeout`
+      // expires, which is twenty minutes during which the limiter below thinks
+      // the slot is free and the provider does not, and that is precisely the
+      // disagreement this ticket exists to stop.
+      const say = session.browser.provider === "browserbase" ? console.error : console.warn;
+      say(
+        `${session.logTag} closing the ${what} browser failed (ignored): ${reason}` +
+          (session.browser.provider === "browserbase"
+            ? `. The session may still be holding one of the project's concurrency slots ` +
+              `until its ${BROWSERBASE_SESSION_TIMEOUT_S}s timeout expires, so a run that ` +
+              `is refused a session shortly after this line has its reason here.`
+            : "")
+      );
+    }
+  } finally {
+    // In the `finally` and after both closes, in that order and for one reason
+    // each. After, because the slot stands for a session at the provider and
+    // that session is only gone once `close()` has returned. In the `finally`,
+    // because neither `close()` above can throw past this point but a future
+    // edit to them must not be able to strand a slot either.
+    const slot = slotForSession.get(session);
+    if (slot !== undefined) {
+      slotForSession.delete(session);
+      releaseSessionSlot(slot);
+    }
   }
 }
 
