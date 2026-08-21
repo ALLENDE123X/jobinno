@@ -107,6 +107,13 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      - name: tsx CLI resolution smoke check (JOB-029)
+        # Type check, lint and the unit tests above never actually run a
+        # `lib/*-cli.ts` entrypoint through `tsx` — that gap is exactly how
+        # ERR_PACKAGE_PATH_NOT_EXPORTED (issue #47) went unnoticed in CI. See
+        # `scripts/check-tsx-cli-resolution.mjs` for the full explanation.
+        run: npm run check:cli-resolution
+
   e2e:
     runs-on: ubuntu-latest
     needs: test

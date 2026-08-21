@@ -35,13 +35,12 @@
  * attached every function below behaves exactly as it did before.
  */
 
-import {
-  Stagehand,
-  browserbase,
-  localBrowser,
-  type Page,
-  type StagehandBrowser,
-} from "@browserbasehq/stagehand";
+// Type-only: erased before runtime, so this half of the package is never
+// actually resolved by `require()` and is unaffected by the JOB-029 issue
+// below. The runtime values (`Stagehand`, `browserbase`, `localBrowser`) come
+// from `loadStagehandRuntime()` instead of a top-level import — see the
+// comment on that function for why.
+import type { Page, Stagehand, StagehandBrowser } from "@browserbasehq/stagehand";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,6 +50,45 @@ import {
   planRecord,
   type ActionPlan,
 } from "@/lib/form-action-cache";
+
+/**
+ * JOB-029 (issue #47): `@browserbasehq/stagehand`'s package.json declares
+ * only an `"import"` export condition — it ships pure ESM (`dist/index.mjs`)
+ * and has no `"require"` condition at all. This file has no
+ * `"type": "module"` ancestor in package.json, so when it's run through
+ * `tsx <file>` (as every `lib/*-cli.ts` entrypoint is) tsx transpiles it to
+ * CommonJS and a top-level `import ... from "@browserbasehq/stagehand"` here
+ * becomes a plain `require()` at runtime — which fails outright with
+ * `ERR_PACKAGE_PATH_NOT_EXPORTED`, because Node's `require()` matches a
+ * package's exports map against the "require"/"node"/"default" conditions
+ * only and never falls back to "import". That happens for a bare
+ * `import { Stagehand } from "@browserbasehq/stagehand"` all on its own —
+ * it is not a tsx version regression (reproduces identically on tsx 4.7.0
+ * through the pinned 4.23.12) and has nothing to do with any other import
+ * sharing the file.
+ *
+ * A dynamic `import()`, by contrast, always goes through Node's real ESM
+ * resolver, which does honor the "import" condition, regardless of whether
+ * the calling file itself is CJS or ESM — so that's what loads the runtime
+ * values here instead. Deliberately called once and memoized, rather than
+ * inline at each call site: `openBrowserSession` can run many times
+ * concurrently (see `tests/unit/browser-session-concurrency.test.ts`), and
+ * routing every one of those calls through its own fresh `import()` call
+ * turned out to matter under Vitest specifically — concurrent first-time
+ * `import()` calls for the same specifier could race ahead of `vi.mock`'s
+ * module-registry substitution and load the real package instead of the
+ * mock. A single shared promise means only the first caller ever triggers a
+ * resolution at all; every later call, concurrent or not, awaits that same
+ * settled promise instead of starting a new one.
+ */
+type StagehandRuntime = typeof import("@browserbasehq/stagehand");
+let stagehandRuntimePromise: Promise<StagehandRuntime> | undefined;
+function loadStagehandRuntime(): Promise<StagehandRuntime> {
+  if (!stagehandRuntimePromise) {
+    stagehandRuntimePromise = import("@browserbasehq/stagehand");
+  }
+  return stagehandRuntimePromise;
+}
 
 /**
  * Model driving `act`/`extract`/`observe`. Stagehand validates this string
@@ -637,6 +675,10 @@ export async function openBrowserSession(
         `pipeline; do not point it at another project's key.`
     );
   }
+
+  // See `loadStagehandRuntime` above (JOB-029) for why this isn't a
+  // top-level import.
+  const { Stagehand, browserbase, localBrowser } = await loadStagehandRuntime();
 
   // Resolved before a slot is taken, so a half configured environment fails
   // immediately and without ever occupying the queue.
