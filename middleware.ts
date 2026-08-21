@@ -22,35 +22,25 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
-import {
-  isExemptFromWaitlistGate,
-  WAITLIST_CONTENT_PATH,
-  WAITLIST_PATH,
-} from "@/lib/waitlist-gate";
+import { isExemptFromWaitlistGate, WAITLIST_PATH } from "@/lib/waitlist-gate";
 
 export async function middleware(request: NextRequest) {
   // ── JOB-031: the waitlist gate ────────────────────────────────────────────
   // Checked first, and before anything async, so a request that is about to be
   // redirected anyway never pays for a Supabase Auth round trip below. See
-  // lib/waitlist-gate.ts for the exact exempt list and why each entry is on
-  // it. Removing this block, and the import above, is the whole revert.
+  // lib/waitlist-gate.ts for the exact exempt list, why each entry is on it,
+  // and how to revert this. Removing this block, and the import above, is
+  // most of the revert.
   //
-  // Two different responses, not one, because "the waitlist is the front
-  // page" and "every other URL leads there" are different operations. `/`
-  // itself is rewritten — the browser's address bar stays on `/`, but the
-  // actual page rendered is `app/waitlist/page.tsx`, at `WAITLIST_CONTENT_PATH`
-  // — so the real `app/page.tsx` (JOB-016's marketing site) is never touched,
-  // reachable again the instant this block is removed. Everything else,
-  // `/login`, `/dashboard`, a stray `/waitlist` visited directly, whatever a
-  // future route adds, is redirected: the browser's address bar changes to
-  // `/`, which is what makes "no other URL path" actually true rather than
-  // just true of the content.
+  // One response, not two (JOB-032 simplified this from the rewrite based
+  // design JOB-031 shipped first): `/` is on the exempt list and falls
+  // through to render normally, `app/page.tsx` itself carries the waitlist
+  // form now, so there is nothing left to rewrite it to. Everything else,
+  // `/login`, `/dashboard`, a stray `/waitlist` link left over from before
+  // this change, whatever a future route adds, is redirected: the browser's
+  // address bar changes to `/`, which is what makes "no other URL path"
+  // actually true rather than just true of the content.
   if (!isExemptFromWaitlistGate(request.nextUrl.pathname)) {
-    if (request.nextUrl.pathname === WAITLIST_PATH) {
-      const url = request.nextUrl.clone();
-      url.pathname = WAITLIST_CONTENT_PATH;
-      return NextResponse.rewrite(url);
-    }
     const url = request.nextUrl.clone();
     url.pathname = WAITLIST_PATH;
     url.search = "";

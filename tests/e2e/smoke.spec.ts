@@ -9,17 +9,16 @@ import { expect, test } from "@playwright/test";
  * from anywhere, and a wrong one on a public page is a promise we did not mean
  * to make. Everything else here is a smoke check.
  *
- * ── JOB-031 ───────────────────────────────────────────────────────────────
- * Both tests below assert on `app/page.tsx`, and while the waitlist gate is
- * active every request to `/` is rewritten to the waitlist page instead —
- * that is the gate working correctly, not a regression in either test. They
- * stay in the file rather than being deleted because the marketing page
- * itself is untouched and both assertions are exactly right again the moment
- * `lib/waitlist-gate.ts`'s gate is reverted; deleting them now would just
- * mean rewriting them from scratch later. `test.skip` records why, in the one
- * place someone reverting the gate would already be looking.
+ * ── JOB-031 / JOB-032 ────────────────────────────────────────────────────────
+ * JOB-031 first gated the site by rewriting every request to `/` to a
+ * separate, much shorter waitlist page, which made the two tests below false:
+ * `app/page.tsx` was unreachable. They were skipped rather than deleted
+ * because the marketing page itself was untouched underneath, and JOB-032
+ * proves that out: it folded the waitlist form into the top of `app/page.tsx`
+ * instead of rewriting away from it, so `/` renders this file directly again
+ * and both assertions are back to being exactly right, unskipped below.
  */
-test.skip(
+test(
   "the app serves its home page",
   async ({ page }) => {
     const response = await page.goto("/");
@@ -30,7 +29,7 @@ test.skip(
   }
 );
 
-test.skip(
+test(
   "the landing page states the three real plans",
   async ({ page }) => {
     await page.goto("/#pricing");
@@ -49,25 +48,31 @@ test.skip(
 );
 
 /**
- * JOB-031's gate, from the outside — the counterpart to the two skipped tests
- * above. Same reasoning as `the dashboard sends a signed out visitor to sign
- * in` below: checked from a real browser hitting the real routes, not by
- * reading the middleware source.
+ * JOB-031's gate, from the outside, updated for JOB-032's redesign — checked
+ * from a real browser hitting the real routes, not by reading the middleware
+ * source. `/` now renders the real landing page with the waitlist form added
+ * at the top rather than a separate page replacing it entirely, so this
+ * checks for both: the new banner, and that the original page underneath is
+ * still exactly what it was. `/dashboard` still redirects to `/`, same as
+ * before, and lands on that same combined page.
  */
-test("the waitlist gate serves the waitlist at / and redirects everything else there", async ({
+test("the waitlist gate adds the waitlist form to / and redirects everything else there", async ({
   page,
 }) => {
   const response = await page.goto("/");
   expect(response?.status()).toBeLessThan(400);
   await expect(page).toHaveURL(/\/$/);
   await expect(
-    page.getByRole("heading", { name: "An AI agent that applies to jobs for you." })
+    page.getByRole("heading", { name: "Join the waitlist" })
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { level: 1, name: "You sleep. AI applies." })
   ).toBeVisible();
 
   await page.goto("/dashboard");
   await expect(page).toHaveURL(/\/$/);
   await expect(
-    page.getByRole("heading", { name: "An AI agent that applies to jobs for you." })
+    page.getByRole("heading", { name: "Join the waitlist" })
   ).toBeVisible();
 });
 
