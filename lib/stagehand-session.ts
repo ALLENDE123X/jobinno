@@ -131,11 +131,34 @@ export const BROWSERBASE_CONCURRENCY_ENV_VAR = "BROWSERBASE_CONCURRENCY";
  * Sessions this Browserbase project may run at once, when
  * `BROWSERBASE_CONCURRENCY` does not say otherwise.
  *
- * Not a guess. `GET /v1/projects/{id}` on the live Jobinno project reports
- * `"concurrency": 3`, which is the plan's own cap: ask for a fourth session and
- * Browserbase refuses it rather than queueing it. The number is therefore a
- * property of the billing plan, so it lives in an env var and this constant is
- * only the fallback for an environment that has not set one.
+ * Not a guess, but no longer the account's hard cap either. `GET
+ * /v1/projects/{id}` on the live Jobinno project originally reported
+ * `"concurrency": 3`, which was the plan's own ceiling at the time — ask for a
+ * fourth session and Browserbase refused it rather than queueing it. A plan
+ * upgrade on 2026-08-21 raised that ceiling to 25 (`GET /v1/projects/{id}`
+ * re-checked the same way). `3` stays the default here anyway: it is now a
+ * deliberate fan-out width rather than a number forced by the account, and
+ * widening it is a throughput decision for whoever wants the extra headroom,
+ * not a side effect of this comment.
+ *
+ * ── JOB-028: does the gap between "this process is done with a session" and
+ * "Browserbase has actually freed the slot" eat into that headroom? ─────────
+ * `closeBrowserSession`'s `browser.close()` sends Browserbase a
+ * `sessions.update(id, {status: "REQUEST_RELEASE"})` — a request, not a
+ * confirmation — so in principle the provider could keep counting a session
+ * against the cap for a while after this process has moved on and its own
+ * in-process slot (JOB-025) is free again. Measured directly rather than
+ * assumed: 8 real sessions, opened and closed exactly the way
+ * `closeBrowserSession` does it (`stagehand.close()` then `browser.close()`),
+ * polling `GET /v1/sessions/{id}` immediately after `browser.close()` resolved
+ * locally. All 8 read back `COMPLETED` — never `RUNNING` — on the very first
+ * poll, and the provider's own `updatedAt` for that transition was *before*
+ * the local `browser.close()` call had even resolved in every trial (-275ms to
+ * -442ms, mean -372ms). The provider is not lagging behind this process; if
+ * anything the reverse. There is no measured reap lag to budget headroom for,
+ * so no reduction to `BROWSERBASE_CONCURRENCY` is warranted on that basis —
+ * see `scripts/browserbase-reap-lag.ts` to re-run this if Browserbase's own
+ * infrastructure ever changes that answer.
  */
 export const BROWSERBASE_DEFAULT_CONCURRENCY = 3;
 
