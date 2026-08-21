@@ -813,9 +813,12 @@ describe("a listing that redirects the browser somewhere else", () => {
     expect(h.state.events).not.toContain("uploaded the resume");
 
     // Terminal, and logged under the reason the pre navigation refusal uses.
+    // JOB-022 gave that refusal a reason of its own: nothing about this says the
+    // page changed, and sharing `dom_changed` with real DOM failures is what
+    // buried this case among fifteen unrelated ones on 2026 08 20.
     expect(statuses()).toEqual(["filling_form", "form_fill_blocked"]);
     expect(skipRows()).toHaveLength(1);
-    expect(skipRows()[0]!.reason).toBe("dom_changed");
+    expect(skipRows()[0]!.reason).toBe("blocked_redirect");
     expect(skipRows()[0]!.ats).toBe("greenhouse");
     expect(skipRows()[0]!.job_id).toBe(h.JOB_ID);
     expect(skipRows()[0]!.raw_context.message).toContain("attacker.example");
@@ -843,7 +846,7 @@ describe("a listing that redirects the browser somewhere else", () => {
     // And the file never went anywhere.
     expect(h.state.resumeAttachments).toBe(0);
     expect(skipRows()).toHaveLength(1);
-    expect(skipRows()[0]!.reason).toBe("dom_changed");
+    expect(skipRows()[0]!.reason).toBe("blocked_redirect");
   });
 
   it("types the email and uploads the resume when nothing moves the browser", async () => {

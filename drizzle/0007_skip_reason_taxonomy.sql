@@ -1,0 +1,31 @@
+-- JOB-022: three more values for `skip_log.reason`.
+--
+-- The column's CHECK constraint is built from `SKIP_REASONS` in
+-- `lib/db/schema.ts`, so the two have to move together. The array grew by
+-- `blocked_redirect`, `needs_attestation` and `internal_error`; see the comments
+-- beside it for what each one names and why six values were not enough.
+--
+-- Nothing in this migration rewrites an existing row. Every `dom_changed` row
+-- already in the table stays `dom_changed`, including the 16 from the run of
+-- 2026 08 20 that this ticket diagnosed. Reclassifying them after the fact would
+-- be inventing a history the pipeline did not record, and the run itself is
+-- written up in the pull request instead.
+--
+-- ── Read this before merging ────────────────────────────────────────────────
+-- `recordSkip` refuses a reason outside the array, and Postgres refuses one
+-- outside the constraint. If the code ships and this migration has not been
+-- applied, a run that stops for one of the three new reasons writes its status
+-- onto the `applications` row and then fails to write its `skip_log` row, and
+-- the reason survives only in a Vercel log line. That degrades loudly rather
+-- than silently, but it still loses data, so apply this before or with the
+-- deploy rather than after it.
+--
+-- CLAUDE.md documents how to apply it: `drizzle-kit migrate` against the direct
+-- `db.<ref>.supabase.co` host exits 1 with no output on a machine with no IPv6
+-- route, which looks exactly like success. Go through the IPv4 session mode
+-- pooler instead, then confirm against the live database that the constraint
+-- really changed rather than trusting the command's exit.
+
+ALTER TABLE "skip_log" DROP CONSTRAINT IF EXISTS "skip_log_reason_check";
+--> statement-breakpoint
+ALTER TABLE "skip_log" ADD CONSTRAINT "skip_log_reason_check" CHECK ("reason" in ('unanswerable_required', 'verification_required', 'captcha', 'dom_changed', 'timeout', 'submit_failed', 'blocked_redirect', 'needs_attestation', 'internal_error'));

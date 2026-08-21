@@ -2193,27 +2193,96 @@ const OPTION_KINDS: ReadonlySet<FormFieldKind> = new Set(["select", "combobox", 
 /**
  * How many free-text answers one form may have written for it.
  *
- * A bound rather than a policy: each one is a paid model call, and a form asking
- * for more than three essays is a form a human should be looking at anyway.
+ * A bound rather than a policy: each one is a paid model call. It was three,
+ * which is fewer than a real application form asks for. The Netic and Deepgram
+ * forms in the 2026 08 20 run each asked two or three short answer questions on
+ * top of a cover letter, and a form that runs out of budget halfway leaves the
+ * board's own validation to reject what is left. Twelve is still a bound and is
+ * comfortably above what any of the observed forms wanted.
  */
-const MAX_GENERATED_ANSWERS = 3;
+const MAX_GENERATED_ANSWERS = 12;
 
 /** Countries whose name means "the US" for the purpose of a derived fact. */
 const US_COUNTRY_RE = /^(the\s+)?(united\s+states(\s+of\s+america)?|u\.?s\.?a?\.?|america)$/i;
 
 /**
- * Everything this system is willing to state about the candidate, as a closed
- * list, with a key per entry.
+ * ── JOB-022: where "answer it as best you can" stops ─────────────────────────
  *
- * This is the mechanical form of "never guess". The decision call may only
- * `answer` a field by naming one of these keys, and the value it returns is then
- * checked against that entry's value here — so an answer that is not traceable
- * to something a human told us, or to something the resume actually said and
- * `sanitize*()` accepted, cannot reach a real employer's form. A short
- * catalogue is therefore a *feature*: it is the exact set of assertions we are
- * entitled to make, and everything outside it becomes a question.
+ * The product decision this ticket implements is that a filled application with
+ * a slightly imperfect answer beats a blocked application, every time. A form
+ * asking which school somebody attends, when they graduate, how many years of
+ * experience they have, how they heard about the company or what their top
+ * office preference is gets the best answer the profile and resume support, and
+ * the run keeps going. Being a little off on any of those costs nothing.
+ *
+ * These do not work that way. Every question this pattern matches is a legal
+ * attestation on an employment application, and a wrong answer to one of them
+ * is the kind of thing that gets an offer rescinded or a clearance denied months
+ * later, long after nobody remembers a form was filled automatically. Work
+ * authorization, citizenship, visa and sponsorship, security clearance, export
+ * control status and criminal history all sit here; demographic questions are
+ * handled one step earlier by `EEO_FIELD_RE` and never reach this.
+ *
+ * The rule for a match is a strict ladder, in this order:
+ *
+ *  1. If the candidate's own stored answer covers it, use that. This is the
+ *     common case now that `citizenship_status`, `f1_status`, `work_authorized_us`
+ *     and `requires_sponsorship` actually reach the fact catalogue, and it is
+ *     the whole reason those four columns were plumbed through in this ticket.
+ *  2. Otherwise, if the control offers a way to decline, decline. Forms almost
+ *     always offer one, and declining is truthful.
+ *  3. Only if it is required, offers no decline option, and the stored data does
+ *     not answer it does the run stop. That is the narrow, well labelled
+ *     `needs_attestation` outcome, and it should be rare.
+ *
+ * Nothing here is ever inferred, generated or best guessed, whatever the model
+ * proposes. That is enforced in `resolveDecision` in TypeScript rather than
+ * asked for in a prompt.
  */
-function buildFactCatalog(
+export const LEGAL_ATTESTATION_RE =
+  /\b(?:work(?:ing)?\s+authoriz\w*|authoriz\w*\s+to\s+work|right\s+to\s+work|legally\s+(?:authoriz\w*|entitled|permitted|eligible)|citizen\w*|nationality|permanent\s+resident\w*|green\s+card|visa|sponsor\w*|immigration|work\s+permit|security\s+clearance|clearance\s+eligib\w*|clearance|export\s+control\w*|itar|u\.?\s?s\.?\s+person|felony|felonies|misdemean\w*|convict\w*|criminal\s+(?:history|record|background|conviction\w*)|background\s+check)\b/i;
+
+/**
+ * Whether a field is one of the two categories that are never best guessed.
+ *
+ * Kept as one predicate so that the fill loop, the policy function and the tests
+ * all ask the same question, rather than three places each remembering to check
+ * both regexes.
+ */
+export function isAttestationField(label: string): boolean {
+  return EEO_FIELD_RE.test(label) || LEGAL_ATTESTATION_RE.test(label);
+}
+
+/**
+ * Everything this system knows about the candidate, as a keyed catalogue.
+ *
+ * ── What JOB-022 changed, and why ───────────────────────────────────────────
+ * This used to be seventeen entries, and the header above it argued that a short
+ * catalogue was a feature: the exact set of assertions the system is entitled to
+ * make, with everything outside it becoming a question to the candidate.
+ *
+ * The argument was right about attestations and wrong about everything else, and
+ * production settled it. On 2026 08 20 the pipeline reached the application form
+ * on 20 of 21 listings and then refused to finish 18 of them, and the log line
+ * for each names the fact it did not have: a graduation month and year, a start
+ * date, a school, a degree, a GitHub link, a years of experience count, a top
+ * location preference, a visa status, an export control status. Every single one
+ * of those was already sitting in `profiles` or in the parsed resume. The
+ * catalogue was not the set of things known about the candidate; it was a
+ * seventeen item subset of it, and everything outside the subset was reported to
+ * the user as something the system could not truthfully answer, which was false.
+ *
+ * So the catalogue now carries what is actually known: every education entry
+ * rather than the first, every job rather than the first, the skills list, the
+ * links, the four intake columns nobody was reading, the stated target
+ * locations, and a handful of facts derived in TypeScript from those (a
+ * graduation year out of a graduation date, a years of experience count out of
+ * the work history). It is still a closed catalogue, still keyed, and an
+ * attestation field still may not be answered from anything outside it. What
+ * changed is that it stopped being a list of the questions the system was
+ * willing to answer and went back to being a description of the person.
+ */
+export function buildFactCatalog(
   profile: ResumeProfile,
   answers: CandidateApplicationAnswers,
   additionalAnswers: Record<string, string>
@@ -2265,17 +2334,87 @@ function buildFactCatalog(
     );
   }
 
-  const job = profile.workHistory[0];
-  if (job !== undefined) {
-    add("mostRecentEmployer", "Most recent employer", job.company);
-    add("mostRecentTitle", "Most recent job title", job.title);
+  // ── JOB-022: the intake columns nobody was reading ───────────────────────
+  add("citizenshipStatus", "Citizenship or immigration status they stated at intake",
+    describeCitizenship(answers.citizenshipStatus, answers.f1Status));
+  add("earliestStartDate", "Earliest date they can start work (ISO)", answers.earliestStart);
+  add("graduationDate", "Graduation date (ISO)", answers.gradDate);
+  const gradParts = splitIsoDate(answers.gradDate);
+  if (gradParts !== null) {
+    add("graduationYear", "Year they graduate or graduated", gradParts.year);
+    add("graduationMonth", "Month they graduate or graduated", gradParts.monthName);
   }
+  const startParts = splitIsoDate(answers.earliestStart);
+  if (startParts !== null) {
+    add("earliestStartYear", "Year they can start work", startParts.year);
+    add("earliestStartMonth", "Month they can start work", startParts.monthName);
+  }
+  if (answers.targetLocations !== undefined && answers.targetLocations.length > 0) {
+    add(
+      "targetLocations",
+      "Places they said they want to work, most preferred first",
+      answers.targetLocations.join(", ")
+    );
+    add("topLocationPreference", "Their most preferred work location", answers.targetLocations[0]);
+  }
+
+  // ── JOB-022: the whole resume, not its first row ─────────────────────────
+  // `workHistory[0]` and `education[0]` were the only two entries that ever
+  // reached a form. A form asking "which university are you currently
+  // attending?" against a candidate whose current school is their second
+  // education entry got nothing, and so did anything asking about a previous
+  // employer. Both lists are validated and length capped by `resume-parser.ts`
+  // before they get here, so exposing all of them costs nothing but prompt.
+  profile.workHistory.forEach((entry, index) => {
+    const where = index === 0 ? "Most recent" : `Job ${index + 1} (older)`;
+    add(`work${index}.employer`, `${where}: employer`, entry.company);
+    add(`work${index}.title`, `${where}: job title`, entry.title);
+    add(`work${index}.dates`, `${where}: dates`, joinDates(entry.startDate, entry.endDate));
+    add(`work${index}.summary`, `${where}: what they did`, entry.summary);
+  });
+  const experience = totalYearsOfExperience(profile.workHistory);
+  if (experience !== null) {
+    add(
+      "yearsOfExperience",
+      "Total years of work experience, counted from the dates on their resume",
+      experience
+    );
+  }
+  profile.education.forEach((entry, index) => {
+    const where = index === 0 ? "Most recent" : `Education ${index + 1} (older)`;
+    add(`education${index}.school`, `${where}: school`, entry.school);
+    add(`education${index}.degree`, `${where}: degree`, entry.degree);
+    add(`education${index}.discipline`, `${where}: field of study`, entry.discipline);
+    add(`education${index}.endDate`, `${where}: end date`, entry.endDate);
+  });
+  // Kept under their historical keys as well as the indexed ones above, because
+  // these three are what every previous run's cache and every existing test
+  // names, and renaming a fact key is a silent behaviour change.
   const school = profile.education[0];
   if (school !== undefined) {
     add("school", "Most recent school", school.school);
     add("degree", "Most recent degree", school.degree);
     add("discipline", "Field of study", school.discipline);
   }
+  const job = profile.workHistory[0];
+  if (job !== undefined) {
+    add("mostRecentEmployer", "Most recent employer", job.company);
+    add("mostRecentTitle", "Most recent job title", job.title);
+  }
+  if (profile.skills.length > 0) {
+    add("skills", "Skills and technologies listed on their resume", profile.skills.join(", "));
+  }
+  // A GitHub URL is asked for by name on a large share of engineering forms and
+  // was reported unanswerable four times in one run. The resume parse already
+  // validates and sanitises both URL fields; this only says which one is GitHub.
+  const github = [profile.websiteUrl, profile.linkedinUrl].find(
+    // Anchored at the scheme and matched against the host, so that a path
+    // spelling `/github.com/` on some other origin cannot claim to be one.
+    // `sanitizeUrl` has already confirmed both of these are https and on the
+    // host they claim; this only says which of the two is the GitHub one.
+    (url) => typeof url === "string" && /^https:\/\/([a-z0-9-]+\.)*github\.(com|io)(\/|$)/i.test(url)
+  );
+  add("githubUrl", "Their GitHub URL, as printed on their resume", github ?? null);
 
   // The user's own answers from a previous `needsInput` round. Highest-quality
   // facts in the catalogue — they came from the person themselves — and keyed by
@@ -2286,6 +2425,104 @@ function buildFactCatalog(
   }
 
   return facts;
+}
+
+/** The month names a form's own dropdown uses, indexed the way a date is. */
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+] as const;
+
+/**
+ * `profiles.citizenship_status` and `f1_status` as a sentence a form can be
+ * answered from.
+ *
+ * The enum values are database spellings and mean nothing to a model reading a
+ * form that says "A United States citizen or national". This is a lookup table,
+ * not an inference: each arm restates the one value the person selected at
+ * intake, and an unrecognised value is passed through rather than guessed at.
+ */
+function describeCitizenship(status: string | undefined, f1: string | undefined): string | null {
+  if (status === undefined || status.trim() === "") return null;
+  switch (status.trim()) {
+    case "us_citizen":
+      return "A United States citizen or national";
+    case "permanent_resident":
+      return "A lawful permanent resident of the United States, that is a Green Card holder";
+    case "f1": {
+      const kind = (f1 ?? "").trim();
+      const suffix =
+        kind === "opt"
+          ? " currently on OPT"
+          : kind === "cpt"
+            ? " currently on CPT"
+            : "";
+      return `An international student in the United States on an F-1 student visa${suffix}`;
+    }
+    case "h1b":
+      return "In the United States on an H-1B work visa";
+    default:
+      return status.trim();
+  }
+}
+
+/** An ISO date as the two pieces a form's month and year dropdowns want. */
+function splitIsoDate(iso: string | undefined): { year: string; monthName: string } | null {
+  const match = /^(\d{4})-(\d{2})(?:-(\d{2}))?$/.exec((iso ?? "").trim());
+  if (match === null) return null;
+  const monthIndex = Number(match[2]) - 1;
+  const monthName = MONTH_NAMES[monthIndex];
+  if (monthName === undefined) return null;
+  return { year: match[1]!, monthName };
+}
+
+/** "Jan 2024" and "Present" as the one string a resume prints. */
+function joinDates(start: string | null, end: string | null): string | null {
+  const from = (start ?? "").trim();
+  const to = (end ?? "").trim();
+  if (from === "" && to === "") return null;
+  if (from === "") return to;
+  if (to === "") return from;
+  return `${from} to ${to}`;
+}
+
+/**
+ * Years of work experience, counted rather than asked for.
+ *
+ * "How many years of industry experience do you have?" was a required field on
+ * three separate forms in the 2026 08 20 run and stopped all three, against a
+ * resume that lists the jobs it would be counted from. Counting it here rather
+ * than letting a model estimate it keeps it a report of the resume: the span
+ * from the earliest year any job started to the latest year any job ended,
+ * rounded down, with "present" read as this year.
+ *
+ * Deliberately coarse. It is an approximation of an approximation, since every
+ * candidate answering this box is estimating too, and the number only has to be
+ * defensible against the dates printed on their own resume.
+ */
+function totalYearsOfExperience(history: readonly { startDate: string | null; endDate: string | null }[]): string | null {
+  const thisYear = new Date().getUTCFullYear();
+  const yearIn = (value: string | null, whenPresent: number | null): number | null => {
+    const text = (value ?? "").trim();
+    if (text === "") return null;
+    if (/^(present|current|now|ongoing)$/i.test(text)) return whenPresent;
+    const found = /\b(19|20)\d{2}\b/.exec(text);
+    return found === null ? null : Number(found[0]);
+  };
+
+  let earliest: number | null = null;
+  let latest: number | null = null;
+  for (const entry of history) {
+    const start = yearIn(entry.startDate, null);
+    const end = yearIn(entry.endDate, thisYear);
+    if (start !== null && (earliest === null || start < earliest)) earliest = start;
+    for (const year of [start, end]) {
+      if (year !== null && (latest === null || year > latest)) latest = year;
+    }
+  }
+  if (earliest === null || latest === null) return null;
+  const years = Math.max(0, Math.min(latest, thisYear) - earliest);
+  return String(years);
 }
 
 /**
@@ -2333,6 +2570,14 @@ function optionSupportsFact(option: string, factValue: string): boolean {
   const chosen = normalizeText(option);
   const known = normalizeText(factValue);
   if (chosen === known) return true;
+  // JOB-022. A resume prints "B.S." and a Greenhouse degree dropdown offers
+  // "Bachelor's Degree". Those are the same statement, and the word boundary
+  // test below cannot see it because they share no words. On 2026 08 20 that
+  // exact pair stopped a real application with the message "the option
+  // \"Bachelor's Degree\" does not say what the stored fact \"degree\" says
+  // (\"B.S.\")", which is a spelling complaint dressed up as a truthfulness one.
+  const chosenDegree = degreeLevel(chosen);
+  if (chosenDegree !== null && chosenDegree === degreeLevel(known)) return true;
   if (known.length <= 3) {
     return chosen.startsWith(`${known} `) || chosen.startsWith(`${known},`);
   }
@@ -2344,6 +2589,86 @@ function optionSupportsFact(option: string, factValue: string): boolean {
   // the wrong country on a work-authorization form is a false statement, not a
   // typo.
   return containsAtWordBoundary(chosen, known) || containsAtWordBoundary(known, chosen);
+}
+
+/**
+ * Which level of degree a string names, or null when it names none.
+ *
+ * A closed lookup rather than a similarity score. Abbreviation and long form are
+ * the same statement; "Bachelor's" and "Master's" are not, and nothing here may
+ * ever collapse those two, so each arm lists only spellings of one level. The
+ * dots are collapsed before matching because a resume writes "B.S." and a
+ * dropdown writes "BS".
+ */
+function degreeLevel(text: string): string | null {
+  const flat = normalizeText(text).replace(/[.’']+/g, " ").replace(/\s+/g, " ").trim();
+  if (/\b(doctorate|doctoral|doctor of philosophy|ph d|phd|d phil|dphil|sc d)\b/.test(flat)) {
+    return "doctorate";
+  }
+  // Ahead of bachelor's on purpose: "Master of Business Administration" and
+  // "M.S." must never fall through to an arm that also accepts "B.S.".
+  if (/\b(master s|masters|master of|m s|ms|m a|ma|m eng|meng|msc|mba|m b a)\b/.test(flat)) {
+    return "masters";
+  }
+  if (/\b(bachelor s|bachelors|bachelor of|b s|bs|b a|ba|bsc|b eng|beng|undergraduate)\b/.test(flat)) {
+    return "bachelors";
+  }
+  if (/\b(associate s|associates|associate degree|a a|a s)\b/.test(flat)) return "associates";
+  if (/\b(high school|secondary school|ged|diploma)\b/.test(flat)) return "high school";
+  return null;
+}
+
+/**
+ * The option on this menu that a proposed value names, or null.
+ *
+ * Exact first, then exactly one option that spells the value out more fully.
+ * That second pass is what a real Greenhouse city picker needs: it offers
+ * "San Francisco, California, United States" and the stored city is
+ * "San Francisco", and on 2026 08 20 the exact only match declared that
+ * unanswerable and stopped the application, quoting six near identical options
+ * back at the user as though they were the problem.
+ *
+ * "Exactly one" is the whole safety property. That same picker also offers
+ * "South San Francisco, California, United States", so a value matching two
+ * options is ambiguous and falls through rather than picking the first, and
+ * a menu of countries cannot resolve "Guinea" to "Papua New Guinea" here for
+ * the same reason.
+ */
+function matchOption(options: readonly string[], value: string): string | null {
+  const wanted = normalizeText(value);
+  if (wanted === "") return null;
+
+  const exact = options.find((option) => normalizeText(option) === wanted);
+  if (exact !== undefined) return exact;
+
+  // An option that *begins* with the value is the value plus qualification:
+  // "San Francisco, California, United States" is that city, said in full.
+  // Where several qualify, the shortest is the least qualified and so the
+  // closest reading of what was asked for, which picks the city over
+  // "San Francisco de Macorís, Duarte, Dominican Republic".
+  //
+  // This tiebreak is a judgement call and worth naming as one. It is here
+  // because the alternative, refusing to choose, is what stopped a real Virtu
+  // application on 2026 08 20 while quoting six near identical options back at
+  // the user as though the list were the problem.
+  const prefixed = options.filter((option) => {
+    const text = normalizeText(option);
+    if (!text.startsWith(wanted)) return false;
+    const after = text[wanted.length];
+    return after === undefined || !/[a-z0-9]/i.test(after);
+  });
+  if (prefixed.length > 0) {
+    return prefixed.reduce((best, option) => (option.length < best.length ? option : best));
+  }
+
+  // Last resort: the value appears somewhere inside exactly one option. "Exactly
+  // one" is the safety property and it is not negotiable. A country menu offers
+  // "Papua New Guinea" and "Equatorial Guinea", and nothing here may resolve a
+  // bare "Guinea" to either of them.
+  const contained = options.filter((option) =>
+    containsAtWordBoundary(normalizeText(option), wanted)
+  );
+  return contained.length === 1 ? contained[0]! : null;
 }
 
 /** Whether `needle` appears in `haystack` delimited by non-word characters. */
@@ -2401,6 +2726,112 @@ function askOrSkip(field: EnumeratedField, why: string, question?: string | null
 }
 
 /**
+ * JOB-022: what a legal attestation does when the stored data does not answer it.
+ *
+ * Step 2 of the ladder in `LEGAL_ATTESTATION_RE`. Declining is a truthful answer
+ * and forms offer it far more often than the old code assumed, so a clearance or
+ * export control question with a "prefer not to answer" choice is answered by
+ * choosing it rather than by stopping the run. Only a required attestation whose
+ * control offers no way out reaches step 3 and actually blocks.
+ */
+function declineOrAsk(
+  field: EnumeratedField,
+  why: string,
+  question?: string | null
+): Resolution {
+  const decline = findDeclineOption(field.options);
+  if (decline !== null) {
+    return {
+      kind: "apply",
+      value: decline,
+      declined: true,
+      note:
+        `a legal attestation the candidate's stored answers do not cover, answered by ` +
+        `declining, using the control's own decline option: ${why}`,
+    };
+  }
+  return askOrSkip(field, why, question);
+}
+
+/**
+ * JOB-022: what everything that is not an attestation does instead of stopping.
+ *
+ * This is the behaviour change the whole ticket is about, so it is worth being
+ * blunt about what it does: it puts the model's best reasonable answer on the
+ * form and carries on, where the old code put nothing on the form and ended the
+ * run. A form asking a graduation month, a top office preference, a years of
+ * experience count or how somebody heard about the company gets answered. Being
+ * a little off on one of those is a worse outcome than a perfect answer and a
+ * far better outcome than no application at all, which is the trade the product
+ * has explicitly chosen.
+ *
+ * Two things still bound it, and both are structural rather than advisory:
+ *
+ *  · An option based control may only receive an option the DOM itself offered.
+ *    `applyFieldValue` will not click something that is not on the menu, so the
+ *    worst case for a dropdown is the wrong choice from the real list, never an
+ *    invented one.
+ *  · A field with nothing proposed for it and nowhere to write prose still asks.
+ *    Inventing a value out of nothing at all is not "best effort", it is noise,
+ *    and it would put a string on an employer's form that no part of this system
+ *    ever considered.
+ *
+ * Attestations never reach here. `resolveDecision` routes them to `declineOrAsk`
+ * instead, in TypeScript, before any of this is consulted.
+ */
+function inferOrAsk(
+  field: EnumeratedField,
+  decision: FieldDecision | undefined,
+  why: string,
+  question?: string | null
+): Resolution {
+  if (!field.required) return { kind: "skip", why };
+
+  const proposed = decision?.value?.trim() ?? "";
+  if (proposed !== "") {
+    if (OPTION_KINDS.has(field.kind) && field.optionsKnown && field.options.length > 0) {
+      const match = field.options.find(
+        (option) => normalizeText(option) === normalizeText(proposed)
+      );
+      if (match !== undefined) {
+        return {
+          kind: "apply",
+          value: match,
+          declined: false,
+          note: `a best effort answer chosen from the control's own options: ${why}`,
+        };
+      }
+    } else {
+      return {
+        kind: "apply",
+        value: proposed,
+        declined: false,
+        note: `a best effort answer: ${why}`,
+      };
+    }
+  }
+
+  // Nothing usable was proposed. A box that takes prose can still have an answer
+  // written for it from the candidate's validated profile, which is the same
+  // path a cover letter takes and is grounded in the same facts.
+  //
+  // A `text` control only qualifies when its label reads like a question. That
+  // distinction is doing real work: Ashby draws "Have you worked with any
+  // startups previously? If so, list and describe." as a single line input, and
+  // so is "End date year". Writing prose into the first is the fix; writing
+  // prose into the second would put a sentence where a year goes.
+  if (field.kind === "textarea" || (field.kind === "text" && asksAQuestion(field.label))) {
+    return { kind: "generate", note: `no usable value was proposed, so this is written: ${why}` };
+  }
+  return askAbout(field, why, question);
+}
+
+/** A label that reads as a question to answer rather than as the name of a box. */
+function asksAQuestion(label: string): boolean {
+  return label.includes("?") || label.trim().split(/\s+/).length >= 7;
+}
+
+/**
  * The answering policy, enforced.
  *
  * `decideFieldAnswers` states the same rules to the model in English; this
@@ -2409,12 +2840,54 @@ function askOrSkip(field: EnumeratedField, why: string, question?: string | null
  * *first* and unconditionally, before the model's own decision is even read, so
  * a "Gender" select can only ever be declined, asked about, or left alone — no
  * output from any model can put an identity in it.
+ *
+ * ── JOB-022: what happens when a check fails ────────────────────────────────
+ * Every rule below still runs and still fails exactly where it used to. What
+ * changed is what failing means, and it now depends entirely on which kind of
+ * question failed:
+ *
+ *  · A demographic question is unchanged. Declined, asked about, or left alone.
+ *  · A legal attestation goes to `declineOrAsk`: the stored answer if there is
+ *    one, otherwise the control's own decline option, otherwise it stops.
+ *  · Everything else goes to `inferOrAsk` and gets the best answer available
+ *    rather than ending the run.
+ *
+ * That third line is the ticket. Before it, a check failing for any reason at
+ * all, whether a degree abbreviation spelled differently from a dropdown, a
+ * date field with no matching fact key, or a question about office preference,
+ * ended the application. It ended 18 of 21 of them on 2026 08 20.
  */
-function resolveDecision(
+export function resolveDecision(
   field: EnumeratedField,
   decision: FieldDecision | undefined,
   facts: ReadonlyMap<string, CandidateFact>
 ): Resolution {
+  // Where a failed check goes. Bound once, at the top, so that no branch below
+  // can accidentally keep the old unconditional stop: every `refuse` in this
+  // function routes by category rather than by which line noticed the problem.
+  const refuse = (why: string, question?: string | null): Resolution =>
+    LEGAL_ATTESTATION_RE.test(field.label)
+      ? declineOrAsk(field, why, question)
+      : inferOrAsk(field, decision, why, question);
+
+  // A gap and a contradiction are not the same failure, and only the first one
+  // is best guessed.
+  //
+  // `refuse` handles a gap: nothing known answers this, so the model's best
+  // answer goes in. `contradict` handles the other case, where the model named a
+  // stored fact and then proposed something that fact positively disagrees with
+  // such as a resume saying "B.S." against an option saying "Master's Degree".
+  // to "apply it anyway" there would let a wrong claim through the exact check
+  // written to catch it, and a degree nobody holds is not a small inaccuracy.
+  //
+  // So the value that was just disproved is dropped, and only then does the
+  // ordinary path run. For a dropdown that means asking. For a prose box it
+  // means writing an answer from the facts instead of from the bad proposal.
+  const contradict = (why: string, question?: string | null): Resolution =>
+    LEGAL_ATTESTATION_RE.test(field.label)
+      ? declineOrAsk(field, why, question)
+      : inferOrAsk(field, undefined, why, question);
+
   // ── Demographic and self-identification questions ────────────────────────
   if (EEO_FIELD_RE.test(field.label)) {
     if (!field.required) {
@@ -2459,16 +2932,32 @@ function resolveDecision(
   }
 
   if (decision === undefined) {
-    return askOrSkip(field, "no decision was returned for this field");
+    return refuse("no decision was returned for this field");
   }
 
   switch (decision.decision) {
     case "generate": {
-      if (field.kind !== "textarea") {
-        return askOrSkip(
-          field,
+      // JOB-022: `text` joins `textarea`. Ashby and Greenhouse both render short
+      // answer questions ("What is your current visa status?", "Have you worked
+      // with any startups previously?") as single line inputs, and refusing to
+      // write into one meant a question that had an answer went unanswered
+      // because of the control it happened to be drawn with.
+      if (field.kind !== "textarea" && field.kind !== "text") {
+        return refuse(
           `a written answer was proposed for a ${field.kind} control, which is not somewhere ` +
             `prose belongs`,
+          decision.question
+        );
+      }
+      // Prose is composed from the candidate's facts, and a legal attestation is
+      // not a thing to compose. "What is your current visa status?" is drawn as
+      // a plain text box on Ashby, and writing a paragraph into it would be
+      // stating an immigration status in somebody's name. Same ladder as every
+      // other attestation: the stored answer, then a decline option, then stop.
+      if (LEGAL_ATTESTATION_RE.test(field.label)) {
+        return declineOrAsk(
+          field,
+          "a legal attestation, which is answered from what the candidate stated or not at all",
           decision.question
         );
       }
@@ -2481,14 +2970,22 @@ function resolveDecision(
       return { kind: "generate", note: decision.why };
     }
 
+    // JOB-022. The model's explicit "I am not certain, but this is the best
+    // answer the profile supports" verdict. It carries no `sourceFact`, so it
+    // cannot go down the `answer` path, and that is the point: it is recorded as
+    // a best effort in the field outcome rather than as a report of a fact.
+    // `inferOrAsk` is what decides whether it is allowed, and it is never
+    // allowed for an attestation.
+    case "infer":
+      return refuse(decision.why || "answered as best the profile supports");
+
     case "answer": {
       const value = decision.value?.trim() ?? "";
-      if (value === "") return askOrSkip(field, "an answer was proposed with no value in it");
+      if (value === "") return refuse("an answer was proposed with no value in it");
 
       const fact = decision.sourceFact === null ? undefined : facts.get(decision.sourceFact);
       if (fact === undefined) {
-        return askOrSkip(
-          field,
+        return refuse(
           `an answer was proposed without naming a known fact to back it ` +
             `(${JSON.stringify(decision.sourceFact ?? "none")}), and nothing factual about a ` +
             `real person is asserted on a real application without one`,
@@ -2498,17 +2995,15 @@ function resolveDecision(
 
       if (OPTION_KINDS.has(field.kind)) {
         if (field.optionsKnown && field.options.length > 0) {
-          const match = field.options.find((option) => normalizeText(option) === normalizeText(value));
-          if (match === undefined) {
-            return askOrSkip(
-              field,
+          const match = matchOption(field.options, value);
+          if (match === null) {
+            return refuse(
               `"${value}" is not one of the options this control offers`,
               decision.question
             );
           }
           if (!optionSupportsFact(match, fact.value)) {
-            return askOrSkip(
-              field,
+            return contradict(
               `the option ${JSON.stringify(match)} does not say what the stored fact ` +
                 `"${fact.key}" says (${JSON.stringify(fact.value)}), so choosing it would be a ` +
                 `different statement from the one this system was told`,
@@ -2548,24 +3043,21 @@ function resolveDecision(
         const proposed = booleanAnswer(value);
         const backed = booleanAnswer(fact.value);
         if (proposed === null) {
-          return askOrSkip(
-            field,
+          return refuse(
             `${JSON.stringify(value.slice(0, 40))} is neither a yes nor a no, and a checkbox ` +
               `can only state one or the other`,
             decision.question
           );
         }
         if (backed === null) {
-          return askOrSkip(
-            field,
+          return refuse(
             `the stored fact "${fact.key}" (${JSON.stringify(fact.value.slice(0, 40))}) is not a ` +
               `yes or a no, so it cannot say whether this box should be ticked`,
             decision.question
           );
         }
         if (proposed !== backed) {
-          return askOrSkip(
-            field,
+          return contradict(
             `ticking this box would state ${proposed ? '"yes"' : '"no"'}, but the stored fact ` +
               `"${fact.key}" says ${JSON.stringify(fact.value.slice(0, 40))} — the opposite of ` +
               `what this system was told, and not something to assert on a real application`,
@@ -2586,8 +3078,7 @@ function resolveDecision(
       const wanted = normalizeText(value);
       const known = normalizeText(fact.value);
       if (wanted !== known && !known.includes(wanted)) {
-        return askOrSkip(
-          field,
+        return contradict(
           `the proposed answer ${JSON.stringify(value.slice(0, 80))} is not what the stored ` +
             `fact "${fact.key}" says (${JSON.stringify(fact.value.slice(0, 80))}), so it would ` +
             `be new information about the candidate rather than a report of it`,
@@ -2613,8 +3104,7 @@ function resolveDecision(
       // refusal, it is an assertion about a real person, and it is exactly the
       // kind of thing this system must never make on their behalf.
       if (match === undefined || !DECLINE_OPTION_RE.test(match)) {
-        return askOrSkip(
-          field,
+        return refuse(
           `a "prefer not to answer" option was proposed but the control does not offer one ` +
             `matching ${JSON.stringify(value.slice(0, 60))}`,
           decision.question
@@ -2628,16 +3118,21 @@ function resolveDecision(
       };
     }
 
+    // JOB-022. `ask` used to be final, and it is now a request rather than a
+    // verdict: the model saying "I would rather the candidate answered this" is
+    // honoured for an attestation and overruled for everything else, because for
+    // everything else stopping the run is the more expensive mistake. The
+    // model's own question survives either way, so if this does end up blocking,
+    // the person still sees the sentence the model wrote for them.
     case "ask":
-      return askAbout(
-        field,
+      return refuse(
         decision.why || "nothing known about the candidate answers this",
         decision.question
       );
 
     case "skip":
     default:
-      return askOrSkip(field, decision.why || "nothing known about the candidate answers this");
+      return refuse(decision.why || "nothing known about the candidate answers this");
   }
 }
 
@@ -2935,11 +3430,28 @@ function assertNoMismatches(fields: readonly FieldOutcome[], url: string): void 
  */
 function blockedForAnswers(needsInput: readonly NeedsInputItem[], url: string): FormFillBlockedError {
   const required = needsInput.filter((item) => item.required);
+  // JOB-022. Which of the two tags this message carries decides which
+  // `skip_log.reason` it lands under, so the classification is made here, from
+  // the labels, rather than guessed at from wording in `skipReasonFor`.
+  //
+  // A form is filed as `needs_attestation` when any of the fields that stopped
+  // it is a legal attestation, because that is the one a person can close by
+  // answering a single question and it should not be buried under whatever else
+  // happened to be blank on the same form.
+  const attestations = required.filter((item) => isAttestationField(item.fieldLabel));
+  const tag = attestations.length > 0 ? "needs_attestation" : "needs_candidate_input";
+  const preamble =
+    attestations.length > 0
+      ? `has ${attestations.length} required legal attestation(s) that the candidate's stored ` +
+        `answers do not cover and that offer no way to decline. Work authorization, ` +
+        `citizenship, visa status, security clearance, export control status and criminal ` +
+        `history are never guessed at, because a wrong answer to one of them can cost this ` +
+        `person an offer long after the form was filled.`
+      : `has ${required.length} required field(s) that could not be filled, even on a best ` +
+        `effort basis, from what is known about this candidate.`;
   return new FormFillBlockedError(
-    `needs_candidate_input: the form at "${url}" has ${required.length} required field(s) ` +
-      `that cannot be answered truthfully from what is known about this candidate, and this ` +
-      `will not guess at a statement made to a real employer under their name. Everything ` +
-      `else on the form is filled and nothing was submitted.\n\n` +
+    `${tag}: the form at "${url}" ${preamble} Everything else on the form is filled and ` +
+      `nothing was submitted.\n\n` +
       required
         .map((item, index) => {
           // Trimmed hard: a country picker offers 250 choices and a person

@@ -134,16 +134,35 @@ export async function updateApplication(
  * the logs and classifiable in the database from the same string.
  */
 const REASON_TAGS: ReadonlyArray<readonly [RegExp, SkipReason]> = [
+  // ── A note for whoever adds the next tag (JOB-022) ───────────────────────
+  // This list is ordered and the last entry matches
+  // `/\btimed? ?out\b|timeout|etimedout/i` against the *whole* message, so a new
+  // message worded "the form timed out waiting for X" is filed as a timeout no
+  // matter which tag was written for it. PR #36 documented that trap after
+  // walking into it. Put anything that could collide with it above that line,
+  // and read a new message back against this list before settling its wording.
+
+  // `needs_attestation:` is written by `blockedForAnswers` when what stopped the
+  // run was a work authorization, citizenship, clearance, export control or
+  // criminal history question. First, because that message quotes the form's own
+  // labels back, and an export control question routinely contains the word
+  // "verification" while a clearance question containing "timed out" would be
+  // unlucky but is entirely possible. Ahead of `unanswerable_required` too,
+  // since both messages share the `needs_` prefix and this is the narrower one.
+  [/needs_attestation/i, "needs_attestation"],
   // `blocked_apply_url:` is written by `fill-application-form.ts` when the
   // browser has ended up somewhere the listing's own board does not own, and it
-  // is first in this list on purpose. That message quotes the URL the browser
-  // landed on, and the URL is chosen by whoever sent the browser there. A path
-  // spelling `/verify-captcha/` would otherwise file the stop under somebody
-  // else's reason and hide it from anyone reading the log for this one.
-  // `dom_changed` matches what the pre navigation refusal names explicitly, and
-  // for the same stated reason: a listing pointing somewhere the board does not
-  // own is a page that is not what the automation expected.
-  [/blocked_apply_url/i, "dom_changed"],
+  // is near the top of this list on purpose. That message quotes the URL the
+  // browser landed on, and the URL is chosen by whoever sent the browser there.
+  // A path spelling `/verify-captcha/` would otherwise file the stop under
+  // somebody else's reason and hide it from anyone reading the log for this one.
+  //
+  // JOB-022 moved it off `dom_changed` and onto a reason of its own. It was
+  // never a changed page: the form was never reached, nothing was typed and no
+  // resume was uploaded, and the thing to go and fix is the listing in the board
+  // registry rather than a selector. Sharing a reason with real DOM failures is
+  // what let 16 of them read as one cause on 2026 08 20.
+  [/blocked_apply_url/i, "blocked_redirect"],
   [/needs_candidate_input|cannot be answered truthfully/i, "unanswerable_required"],
   [/captcha_present|\bcaptcha\b|hcaptcha|turnstile|recaptcha/i, "captcha"],
   [/submit_clicked_outcome_unknown|submission_blocked/i, "submit_failed"],
@@ -160,13 +179,26 @@ const REASON_TAGS: ReadonlyArray<readonly [RegExp, SkipReason]> = [
 /**
  * Which `skip_log.reason` a stop belongs under.
  *
- * The message is consulted first and the status second, on the reasoning above.
- * The fallback is `dom_changed` rather than a general purpose "other", because
- * `SKIP_REASONS` has no "other" and should not grow one: every value in that
- * set names something a person could go and fix, and a bucket that names
- * nothing is where unfixed bugs accumulate quietly. A run that failed for a
- * reason none of the tags recognise, against a page the automation expected to
- * look different, is a page that changed until proven otherwise.
+ * The message is consulted first and the status second.
+ *
+ * ── JOB-022: the fallback was the bug ───────────────────────────────────────
+ * This used to end in `return "dom_changed"`, defended on the reasoning that
+ * `SKIP_REASONS` had no general purpose "other" and should not grow one, because
+ * a bucket that names nothing is where unfixed bugs accumulate quietly.
+ *
+ * The reasoning was sound and the conclusion inverted it. Sending every
+ * unrecognised message to `dom_changed` did not avoid a bucket that names
+ * nothing; it made a bucket that names something *else* and put unrelated
+ * failures in it, which is worse, because now the pile has a plausible label on
+ * it and nobody looks twice. On 2026 08 20 that is exactly what happened: 16
+ * failures filed as `dom_changed`, read as one broken selector across eight
+ * unrelated companies, and a day spent on a page structure theory of something
+ * that was not a page structure problem.
+ *
+ * The fallback is now `internal_error`, which claims nothing about the page and
+ * says plainly that this system stopped for a reason it cannot name. That is a
+ * bucket worth watching rather than one worth explaining away, and anything
+ * landing in it either wants a tag or wants fixing.
  */
 export function skipReasonFor(status: ApplicationStatus, message: string): SkipReason {
   for (const [pattern, reason] of REASON_TAGS) {
@@ -180,7 +212,7 @@ export function skipReasonFor(status: ApplicationStatus, message: string): SkipR
   if (status === "account_gate_blocked" || status === "awaiting_verification") {
     return "verification_required";
   }
-  return "dom_changed";
+  return "internal_error";
 }
 
 export type SkipInput = {
