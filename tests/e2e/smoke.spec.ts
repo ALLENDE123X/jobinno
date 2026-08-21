@@ -14,9 +14,11 @@ import { expect, test } from "@playwright/test";
  * separate, much shorter waitlist page, which made the two tests below false:
  * `app/page.tsx` was unreachable. They were skipped rather than deleted
  * because the marketing page itself was untouched underneath, and JOB-032
- * proves that out: it folded the waitlist form into the top of `app/page.tsx`
- * instead of rewriting away from it, so `/` renders this file directly again
- * and both assertions are back to being exactly right, unskipped below.
+ * proves that out: it folded the waitlist form into `app/page.tsx` instead of
+ * rewriting away from it, so `/` renders this file directly again and both
+ * assertions are back to being exactly right, unskipped below. (JOB-038
+ * later moved where in that file the waitlist form renders; see the comment
+ * on the third test below.)
  */
 test(
   "the app serves its home page",
@@ -50,10 +52,12 @@ test(
 /**
  * JOB-031's gate, from the outside, updated for JOB-032's redesign — checked
  * from a real browser hitting the real routes, not by reading the middleware
- * source. `/` now renders the real landing page with the waitlist form added
- * at the top rather than a separate page replacing it entirely, so this
- * checks for both: the new banner, and that the original page underneath is
- * still exactly what it was. `/dashboard` still redirects to `/`, same as
+ * source. `/` now renders the real landing page with the waitlist form folded
+ * into it rather than a separate page replacing it entirely, so this checks
+ * for both: the banner, and that the original page underneath is still
+ * exactly what it was. JOB-038 moved the banner from the top of the page to
+ * the bottom, which is why this checks for both headings without asserting
+ * an order between them. `/dashboard` still redirects to `/`, same as
  * before, and lands on that same combined page.
  */
 test("the waitlist gate adds the waitlist form to / and redirects everything else there", async ({

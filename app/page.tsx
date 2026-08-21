@@ -10,14 +10,17 @@
  * read the theme are client components, so the hero copy and the pricing
  * numbers are in the initial HTML.
  *
- * ── The waitlist banner at the top (JOB-031, JOB-032) ────────────────────────
+ * ── The waitlist banner, now at the bottom (JOB-031, JOB-032, JOB-038) ──────
  * jobinno.app is gated behind a waitlist while known bugs are fixed on `v1`;
  * see `lib/waitlist-gate.ts`. JOB-031 first shipped this by rewriting `/`
  * entirely to a separate, much shorter page, which meant nobody could see the
  * real pitch below, the very thing this file exists for. JOB-032 replaced
- * that: `WaitlistBanner` here is the same form and copy that page used, now
- * the first thing rendered in `<main>`, everything below it unchanged from
- * what JOB-016 shipped.
+ * that: `WaitlistBanner` here is the same form and copy that page used.
+ * JOB-032 originally called it as the first thing rendered in `<main>`;
+ * JOB-038 moved that call down to the last thing in `<main>`, right before
+ * the footer, on real user feedback that the pitch should lead and the
+ * waitlist ask should come after it. The component itself and every other
+ * section are unchanged; only where `WaitlistBanner` is called moved.
  *
  * ── Somebody already signed in has no reason to see the marketing pitch
  *    (JOB-020), except while the gate is active ─────────────────────────────
@@ -139,10 +142,14 @@ const PROMISES = [
 ] as const;
 
 /** The waitlist form and its surrounding copy (JOB-031), moved here from the
- * page it used to have to itself (JOB-032). See the file header for why. */
+ * page it used to have to itself (JOB-032). See the file header for why.
+ * `border-t`, not `border-b`: every section on this page gets its divider
+ * from its own top border rather than the section above it, and that only
+ * holds if this one follows the same rule now that JOB-038 made it the last
+ * section instead of the first. */
 function WaitlistBanner() {
   return (
-    <Section className="border-b bg-muted/30">
+    <Section className="border-t bg-muted/30">
       <div className="mx-auto flex w-full max-w-2xl flex-col items-center gap-6 text-center">
         <Badge
           variant="secondary"
@@ -243,8 +250,6 @@ export default async function Home({
       </header>
 
       <main className="flex-1">
-        <WaitlistBanner />
-
         {/* Hero. The feed on the right is the demo, see application-feed.tsx. */}
         <div className="relative overflow-hidden">
           <DotPattern className="opacity-60 [mask-image:radial-gradient(520px_circle_at_center,white,transparent)]" />
@@ -452,6 +457,8 @@ export default async function Home({
             answered as decline to self identify, and never stored.
           </p>
         </Section>
+
+        <WaitlistBanner />
       </main>
 
       <footer className="border-t px-4 py-10 sm:px-6">
