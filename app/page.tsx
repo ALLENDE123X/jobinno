@@ -10,18 +10,35 @@
  * read the theme are client components, so the hero copy and the pricing
  * numbers are in the initial HTML.
  *
- * ── Somebody already signed in has no reason to see the marketing pitch
- *    (JOB-020) ─────────────────────────────────────────────────────────────
- * The check mirrors the one on `/login`: a session sends the visitor straight
- * to `/dashboard` instead of the pitch they have already been sold on.
+ * ── The waitlist banner at the top (JOB-031, JOB-032) ────────────────────────
+ * jobinno.app is gated behind a waitlist while known bugs are fixed on `v1`;
+ * see `lib/waitlist-gate.ts`. JOB-031 first shipped this by rewriting `/`
+ * entirely to a separate, much shorter page, which meant nobody could see the
+ * real pitch below, the very thing this file exists for. JOB-032 replaced
+ * that: `WaitlistBanner` here is the same form and copy that page used, now
+ * the first thing rendered in `<main>`, everything below it unchanged from
+ * what JOB-016 shipped.
  *
- * One case has to skip it. `app/api/billing/checkout/route.ts` sends an
- * already signed in person back here with `?billing_error=<code>` when their
- * purchase was refused, for instance somebody who already holds a paid plan
- * pressing buy again, and `BillingError` below is what shows them why. Firing
- * the redirect in that case would send them straight past the message and
- * they would never learn why the purchase did not go through, so the redirect
- * is skipped whenever that parameter is present, and only then.
+ * ── Somebody already signed in has no reason to see the marketing pitch
+ *    (JOB-020), except while the gate is active ─────────────────────────────
+ * The check mirrors the one on `/login`: a session sends the visitor straight
+ * to `/dashboard` instead of the pitch they have already been sold on. But
+ * `/dashboard` is itself gated while `WAITLIST_GATE_ACTIVE` is true and
+ * redirects back here, so firing this redirect while the gate is active would
+ * send a signed in visitor back and forth between the two routes forever.
+ * `WAITLIST_GATE_ACTIVE` (see `lib/waitlist-gate.ts`) suppresses the redirect
+ * for exactly as long as the gate is active, and only that; the redirect
+ * itself is untouched, so it needs no work to start firing again the moment
+ * that flag flips back to false.
+ *
+ * One case has to skip it regardless of the flag above.
+ * `app/api/billing/checkout/route.ts` sends an already signed in person back
+ * here with `?billing_error=<code>` when their purchase was refused, for
+ * instance somebody who already holds a paid plan pressing buy again, and
+ * `BillingError` below is what shows them why. Firing the redirect in that
+ * case would send them straight past the message and they would never learn
+ * why the purchase did not go through, so the redirect is skipped whenever
+ * that parameter is present, and only then.
  */
 
 import { Suspense } from "react";
@@ -30,12 +47,14 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { ArrowRight, Check, Clock, Moon, ShieldCheck } from "lucide-react";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DotPattern } from "@/components/ui/dot-pattern";
 import { ApplicationFeed } from "@/components/landing/application-feed";
 import { BillingError } from "@/components/landing/billing-error";
 import { PipelineDiagram } from "@/components/landing/pipeline-diagram";
 import { StatsBand } from "@/components/landing/stats-band";
+import { WaitlistForm } from "@/components/landing/waitlist-form";
 import { Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme";
 import {
@@ -45,6 +64,7 @@ import {
 } from "@/lib/billing/plans";
 import { createServerClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
+import { WAITLIST_GATE_ACTIVE } from "@/lib/waitlist-gate";
 
 /**
  * The two paid plans are the real ones. Do not adjust a number here without the
@@ -118,6 +138,35 @@ const PROMISES = [
   },
 ] as const;
 
+/** The waitlist form and its surrounding copy (JOB-031), moved here from the
+ * page it used to have to itself (JOB-032). See the file header for why. */
+function WaitlistBanner() {
+  return (
+    <Section className="border-b bg-muted/30">
+      <div className="mx-auto flex w-full max-w-2xl flex-col items-center gap-6 text-center">
+        <Badge
+          variant="secondary"
+          className="rounded-full px-3 py-1 text-xs font-medium"
+        >
+          Private beta, opening back up soon
+        </Badge>
+
+        <div className="flex flex-col items-center gap-3">
+          <h2 className="text-3xl font-semibold tracking-tight text-balance sm:text-4xl">
+            Join the waitlist
+          </h2>
+          <p className="text-base text-pretty text-muted-foreground sm:text-lg">
+            We are putting the finishing touches on Jobinno. Leave your email
+            and we will let you know the moment it opens back up.
+          </p>
+        </div>
+
+        <WaitlistForm />
+      </div>
+    </Section>
+  );
+}
+
 function Section({
   id,
   className,
@@ -147,7 +196,7 @@ export default async function Home({
   const params = await searchParams;
   const hasBillingError = typeof params[BILLING_ERROR_PARAM] === "string";
 
-  if (!hasBillingError) {
+  if (!hasBillingError && !WAITLIST_GATE_ACTIVE) {
     const supabase = await createServerClient();
 
     const {
@@ -194,6 +243,8 @@ export default async function Home({
       </header>
 
       <main className="flex-1">
+        <WaitlistBanner />
+
         {/* Hero. The feed on the right is the demo, see application-feed.tsx. */}
         <div className="relative overflow-hidden">
           <DotPattern className="opacity-60 [mask-image:radial-gradient(520px_circle_at_center,white,transparent)]" />

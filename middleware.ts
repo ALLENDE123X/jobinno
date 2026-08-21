@@ -1,5 +1,7 @@
 /**
- * Refreshes the Supabase session on every request that could render a page.
+ * Refreshes the Supabase session on every request that could render a page,
+ * and, while JOB-031's waitlist gate is active, makes the waitlist the only
+ * thing a visitor can reach: every path serves it, at `/`.
  *
  * A Server Component cannot set a cookie. That is a Next.js rule, not a
  * Supabase one, and it means the usual "read the session, notice the access
@@ -11,15 +13,40 @@
  * Middleware runs before rendering and can set cookies, so the refresh happens
  * here and every page downstream reads an already current session.
  *
- * This file does not authorise anything. Deciding who may see a page is done by
- * the page, where a redirect can carry a reason and where the check sits next to
- * the thing it protects.
+ * This file does not authorise anything beyond the waitlist gate below.
+ * Deciding who may see a page that does render is done by the page, where a
+ * redirect can carry a reason and where the check sits next to the thing it
+ * protects.
  */
 
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
+import { isExemptFromWaitlistGate, WAITLIST_PATH } from "@/lib/waitlist-gate";
+
 export async function middleware(request: NextRequest) {
+  // ── JOB-031: the waitlist gate ────────────────────────────────────────────
+  // Checked first, and before anything async, so a request that is about to be
+  // redirected anyway never pays for a Supabase Auth round trip below. See
+  // lib/waitlist-gate.ts for the exact exempt list, why each entry is on it,
+  // and how to revert this. Removing this block, and the import above, is
+  // most of the revert.
+  //
+  // One response, not two (JOB-032 simplified this from the rewrite based
+  // design JOB-031 shipped first): `/` is on the exempt list and falls
+  // through to render normally, `app/page.tsx` itself carries the waitlist
+  // form now, so there is nothing left to rewrite it to. Everything else,
+  // `/login`, `/dashboard`, a stray `/waitlist` link left over from before
+  // this change, whatever a future route adds, is redirected: the browser's
+  // address bar changes to `/`, which is what makes "no other URL path"
+  // actually true rather than just true of the content.
+  if (!isExemptFromWaitlistGate(request.nextUrl.pathname)) {
+    const url = request.nextUrl.clone();
+    url.pathname = WAITLIST_PATH;
+    url.search = "";
+    return NextResponse.redirect(url);
+  }
+
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
