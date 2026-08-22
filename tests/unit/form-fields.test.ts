@@ -371,3 +371,138 @@ describe("a search combobox with no matching suggestion", () => {
     expect(outcome.ok).toBe(false);
   });
 });
+
+/**
+ * JOB-051. Every one of these six suggestions was read off the live Virtu
+ * Greenhouse posting on 2026-08-22 by typing "San Francisco" into its
+ * "Location (City)" control, in the order the board returned them. They are the
+ * reason "exactly one option contains the query" was not a workable rule: all
+ * six contain it, so the field stayed empty for a whole run and the board
+ * answered the submit click with "Please enter your location".
+ */
+const SAN_FRANCISCO_SUGGESTIONS = [
+  "San Francisco, California, United States",
+  "San Francisco de Macorís, Duarte, Dominican Republic",
+  "San Francisco, Agusan del Sur, Philippines",
+  "San Francisco De Borja, Lima, Peru",
+  "San Francisco, Cebu, Philippines",
+  "South San Francisco, California, United States",
+];
+
+/** A menu whose options only exist once something has been typed, as a real one is. */
+function searchMenu(texts: readonly string[]) {
+  return fakePage(
+    { texts: [...texts], selectors: texts.map((_, i) => `#opt-${i}`), count: texts.length, expanded: true },
+    { exposesHighlight: true, initialHighlight: 0 }
+  );
+}
+
+describe("a location search whose suggestions all contain the query", () => {
+  const locationField = () =>
+    field({
+      label: "Location (City)",
+      selector: '[id="candidate-location"]',
+      options: [],
+      optionsKnown: false,
+    });
+
+  it("resolves the city the candidate attested to, using the country they attested to", async () => {
+    const { page } = searchMenu(SAN_FRANCISCO_SUGGESTIONS);
+
+    const outcome = await applyFieldValue(page as never, locationField(), "San Francisco", {
+      allowContains: true,
+      contextTerms: ["United States"],
+    });
+
+    // The Californian one, not the Peruvian one and not South San Francisco.
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("San Francisco, California, United States");
+  });
+
+  it("refuses when the country is not known, rather than taking the first suggestion", async () => {
+    // Three of the six lead with exactly "San Francisco" (California,
+    // Agusan del Sur, Cebu). Without a country to separate them this is a real
+    // ambiguity, and the first suggestion being the right one on this
+    // particular board is luck rather than a reason.
+    const { page } = searchMenu(SAN_FRANCISCO_SUGGESTIONS);
+
+    const outcome = await applyFieldValue(page as never, locationField(), "San Francisco", {
+      allowContains: true,
+    });
+
+    expect(outcome.ok).toBe(false);
+    // Nothing was committed. What the control holds is the query `narrow()`
+    // typed into it, which is exactly the "looks filled, submits empty" state
+    // the caller escalates on `ok: false` rather than trusting.
+    expect(SAN_FRANCISCO_SUGGESTIONS).not.toContain(outcome.readBack);
+  });
+
+  it("does not settle for a city whose name merely starts the same way", async () => {
+    // "South San Francisco, California, United States" contains the query and
+    // contains the country, so only the leading-segment rule excludes it. Here
+    // it is the *sole* remaining candidate and the answer still has to be no:
+    // South San Francisco is a different city.
+    const { page } = searchMenu([
+      "South San Francisco, California, United States",
+      "San Francisco, Cebu, Philippines",
+    ]);
+
+    const outcome = await applyFieldValue(page as never, locationField(), "San Francisco", {
+      allowContains: true,
+      contextTerms: ["United States"],
+    });
+
+    expect(outcome.ok).toBe(false);
+  });
+
+  it("still takes a lone containing suggestion with no country to help", async () => {
+    // The pre-existing rule, which this widens rather than replaces.
+    const { page } = searchMenu(["Atlanta, Georgia, United States", "Boston, Massachusetts, United States"]);
+
+    const outcome = await applyFieldValue(page as never, locationField(), "Atlanta", {
+      allowContains: true,
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("Atlanta, Georgia, United States");
+  });
+
+  it("never lets a context term introduce an answer of its own", async () => {
+    // The country matches two suggestions and the city matches neither. A
+    // context term is only ever a tie-break among options that already contain
+    // the value, so this stays a refusal.
+    const { page } = searchMenu([
+      "Austin, Texas, United States",
+      "Boston, Massachusetts, United States",
+    ]);
+
+    const outcome = await applyFieldValue(page as never, locationField(), "San Francisco", {
+      allowContains: true,
+      contextTerms: ["United States"],
+    });
+
+    expect(outcome.ok).toBe(false);
+  });
+
+  it("leaves a fixed-list dropdown alone, where a near match is still a wrong answer", async () => {
+    // `allowContains` is off for any combobox that already offered options, so
+    // the tie-break cannot reach a menu like this one. "Georgia Tech" is on the
+    // live Virtu form's university list and "Georgia" is not, and picking the
+    // former for the latter would be a guess.
+    const { page } = searchMenu(["Georgia Tech", "Georgia State"]);
+
+    const outcome = await applyFieldValue(
+      page as never,
+      field({
+        label: "Which university are you currently attending?",
+        selector: '[id="question_37228963002"]',
+        options: ["Georgia Tech", "Georgia State"],
+        optionsKnown: true,
+      }),
+      "Georgia",
+      { contextTerms: ["United States"] }
+    );
+
+    expect(outcome.ok).toBe(false);
+  });
+});
