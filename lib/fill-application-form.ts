@@ -201,7 +201,11 @@ import {
 import {
   applyFieldValue,
   enumerateFormFields,
+  enumerateRepeatingSections,
   findDeclineOption,
+  pressAddEntry,
+  pressCommitEntry,
+  sectionStillUnsatisfied,
   DECLINE_OPTION_RE,
   harvestOptions,
   inPageError,
@@ -308,6 +312,74 @@ const CACHEABLE_INSTRUCTIONS: ReadonlyMap<string, CoreSlot> = new Map<string, Co
 
 /** Exported for the test that pins it against `classifyCoreSlot`. */
 export const CACHEABLE_INSTRUCTION_SLOTS = CACHEABLE_INSTRUCTIONS;
+
+/**
+ * Whether the page is showing this file name anywhere a person could read it,
+ * shadow roots included.
+ *
+ * The second, independent confirmation that a resume actually attached, and it
+ * exists because the first one stopped being sufficient. `attachedFiles` reads
+ * `input.files.length`, which is the right question for a plain `<input
+ * type="file">` and the wrong one for a component that reads the File, uploads
+ * it itself and resets the input — SmartRecruiters does exactly that, then
+ * renders a chip with the file name and a delete button beside it. Its input
+ * honestly reports zero files while the applicant is plainly looking at their
+ * attached resume.
+ *
+ * This is deliberately positive evidence and not a relaxation: the board has to
+ * be showing the exact file name that was just uploaded. "The input says zero"
+ * still fails the attachment when nothing on the page says otherwise.
+ */
+function pageShowsFileNameInPage(needle: string): boolean {
+  const wanted = needle.replace(/\s+/g, " ").trim().toLowerCase();
+  if (wanted === "") return false;
+
+  const seen = new Set<Document | ShadowRoot>();
+  const stack: (Document | ShadowRoot)[] = [document];
+  let budget = 6000;
+  while (stack.length > 0 && budget > 0) {
+    const root = stack.pop();
+    if (root === undefined || seen.has(root)) continue;
+    seen.add(root);
+    let all: Element[];
+    try {
+      all = Array.from(root.querySelectorAll("*"));
+    } catch {
+      continue;
+    }
+    for (const element of all) {
+      if (budget-- <= 0) break;
+      const inner = (element as HTMLElement).shadowRoot;
+      if (inner !== null && inner !== undefined) stack.push(inner);
+      if (element.children.length > 0) continue;
+      const text = (element.textContent ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text === "" || !text.includes(wanted)) continue;
+      // Painted, not merely present. A hidden template holding the name is not
+      // the board acknowledging the upload.
+      const box = element.getBoundingClientRect();
+      if (box.width > 0 && box.height > 0) return true;
+      const parent = element.parentElement;
+      if (parent !== null) {
+        const parentBox = parent.getBoundingClientRect();
+        if (parentBox.width > 0 && parentBox.height > 0) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** `pageShowsFileNameInPage`, run in the page. Never throws; unreadable means no. */
+async function pageShowsFileName(page: Page, fileName: string): Promise<boolean> {
+  try {
+    const raw = await page.evaluate(
+      inPageExpression(pageShowsFileNameInPage, jsExpression(fileName))
+    );
+    if (inPageError(raw) !== null) return false;
+    return raw === true;
+  } catch {
+    return false;
+  }
+}
 
 // ───────────────────────────────────
 // Reading the page
@@ -841,14 +913,98 @@ function describeControlInPage(sel: string): ControlDescriptor {
     text: "",
     role: "",
   };
+  /**
+   * JOB-047. Stagehand marks a shadow boundary in its XPath with a double
+   * slash, and `document.evaluate` cannot cross one.
+   *
+   * A selector its `observe()` returns for a web component board looks like
+   * `/html[1]/.../oc-input[1]/spl-input[1]//spl-internal-form-field[1]/div[1]/input[1]`
+   * — the `//` sits exactly where `spl-input`'s shadow root begins. To XPath
+   * that reads as "descendant-or-self", which does not enter a shadow root, so
+   * the evaluation returns null and this function reports `found: false`.
+   *
+   * That is not a cosmetic miss. `corroborateSubmitControl` fails closed on
+   * `found: false` with "Refusing to click a submit button this module cannot
+   * see", so on **every** board built out of web components the submit control
+   * could never be corroborated and therefore could never be clicked. The guard
+   * was doing the safe thing for the wrong reason: not "this control is not what
+   * it claims" but "this module cannot resolve its own driver's selector".
+   *
+   * So each `//` splits the path into a segment, and each segment after the
+   * first is walked inside the previous element's shadow root. The steps are the
+   * simple `tag[n]` form Stagehand emits, walked by hand because XPath over a
+   * `ShadowRoot` is not something every engine supports. A path with no `//` in
+   * it takes the original `document.evaluate` route untouched, so nothing about
+   * an ordinary board changes.
+   */
+  const stepInto = (root: ParentNode, path: string): Element | null => {
+    let current: ParentNode | null = root;
+    for (const step of path.split("/")) {
+      if (step === "" || current === null) continue;
+      const match = /^([A-Za-z0-9_-]+)(?:\[(\d+)\])?$/.exec(step);
+      if (!match) return null;
+      const tag = (match[1] ?? "").toLowerCase();
+      const nth = match[2] === undefined ? 1 : Number(match[2]);
+      let seen = 0;
+      let next: Element | null = null;
+      for (const child of Array.from(current.children)) {
+        if (child.tagName.toLowerCase() !== tag) continue;
+        seen++;
+        if (seen === nth) {
+          next = child;
+          break;
+        }
+      }
+      if (next === null) return null;
+      current = next;
+    }
+    return current === root ? null : (current as Element);
+  };
+
   let element: Element | null = null;
   try {
     const path = sel.startsWith("xpath=") ? sel.slice("xpath=".length) : sel;
-    if (path.startsWith("/") || path.startsWith("(")) {
+    if (path.includes("//") && (path.startsWith("/") || path.startsWith("("))) {
+      const segments = path.split("//");
+      const first = segments.shift() ?? "";
+      // 9 === XPathResult.FIRST_ORDERED_NODE_TYPE
+      let node = document.evaluate(first, document, null, 9, null).singleNodeValue as Element | null;
+      for (const segment of segments) {
+        const inner = node === null ? null : (node as HTMLElement).shadowRoot;
+        if (inner === null || inner === undefined) {
+          node = null;
+          break;
+        }
+        node = stepInto(inner, segment);
+      }
+      element = node;
+    } else if (path.startsWith("/") || path.startsWith("(")) {
       // 9 === XPathResult.FIRST_ORDERED_NODE_TYPE
       element = document.evaluate(path, document, null, 9, null).singleNodeValue as Element | null;
     } else {
       element = document.querySelector(sel);
+      if (element === null) {
+        // A plain CSS selector that matches nothing in the light document is
+        // looked for inside the open shadow roots, deepest last. This is the
+        // branch a `form-fields.ts` stamped handle takes.
+        const stack: (Document | ShadowRoot)[] = [document];
+        const seen = new Set<Document | ShadowRoot>();
+        while (stack.length > 0 && element === null) {
+          const root = stack.pop();
+          if (root === undefined || seen.has(root)) continue;
+          seen.add(root);
+          for (const host of Array.from(root.querySelectorAll("*"))) {
+            const inner = (host as HTMLElement).shadowRoot;
+            if (inner === null || inner === undefined) continue;
+            const hit = inner.querySelector(sel);
+            if (hit !== null) {
+              element = hit;
+              break;
+            }
+            stack.push(inner);
+          }
+        }
+      }
     }
   } catch {
     return empty;
@@ -892,17 +1048,23 @@ function describeControlInPage(sel: string): ControlDescriptor {
   const attributes = ["name", "id", "placeholder", "aria-label", "autocomplete", "data-testid", "title"];
   for (const attribute of attributes) push(element.getAttribute(attribute));
 
+  // Scoped to the control's own root. For a light DOM control that root *is*
+  // the document, so this is unchanged; for a shadow one it stops the lookup
+  // finding a same-id element belonging to some other component entirely.
+  const ownRoot = element.getRootNode();
+  const scope: ParentNode = ownRoot instanceof ShadowRoot ? ownRoot : document;
   const labelledBy = element.getAttribute("aria-labelledby");
   if (labelledBy) {
     for (const id of labelledBy.split(/\s+/)) {
-      const target = document.getElementById(id);
+      const escapedId = id.replace(/["\\]/g, "\\$&");
+      const target = scope.querySelector('[id="' + escapedId + '"]');
       if (target) push(target.textContent);
     }
   }
   const ownId = element.getAttribute("id");
   if (ownId) {
     const escaped = ownId.replace(/["\\]/g, "\\$&");
-    const explicit = document.querySelector('label[for="' + escaped + '"]');
+    const explicit = scope.querySelector('label[for="' + escaped + '"]');
     if (explicit) push(explicit.textContent);
   }
   const wrapping = element.closest("label");
@@ -915,12 +1077,61 @@ function describeControlInPage(sel: string): ControlDescriptor {
     if (blockLabel) push(visibleTextOf(blockLabel));
   }
 
+  // JOB-047. Keep looking on the other side of the shadow boundary.
+  //
+  // Everything above stops at the edge of the control's own root, because
+  // `closest` does. On a web component board that means the walk never reaches
+  // the section the control sits in — and the section is where its name is. A
+  // SmartRecruiters resume dropzone describes itself as "file-input | Choose a
+  // file or drop it here", which is a perfectly accurate description of a file
+  // input and says nothing about a resume; the word "Resume" is the section
+  // heading, one host up and outside the shadow root, exactly where a sighted
+  // applicant reads it.
+  //
+  // Making the resolver see shadow DOM (above) turned that from a silent
+  // bypass — `found: false`, corroboration skipped entirely, control used
+  // anyway — into an active refusal to upload somebody's resume into a control
+  // the module could not identify. The refusal was right on the evidence it
+  // had. This gives it the rest of the evidence rather than lowering the bar:
+  // the host's own identifying attributes, and the nearest heading of the block
+  // the host sits in, which is precisely what the two lookups above already do
+  // for a control that happens to live in the light DOM.
+  const HEADINGS = "label,legend,h1,h2,h3,h4,h5,h6,[data-test*='title' i]";
+  let host: Element = element;
+  for (let depth = 0; depth < 4; depth++) {
+    const hostRoot = host.getRootNode();
+    if (!(hostRoot instanceof ShadowRoot)) break;
+    host = hostRoot.host;
+    for (const attribute of attributes) push(host.getAttribute(attribute));
+    push(host.getAttribute("data-test"));
+    const hostBlock = host.closest("div,fieldset,li,section");
+    if (hostBlock) {
+      const heading = hostBlock.querySelector(HEADINGS);
+      // The heading only, never the block's whole text: a section's prose is
+      // its neighbours' words as much as this control's, and `corroborate`
+      // treats everything in the haystack as evidence about this control.
+      if (heading) push(visibleTextOf(heading).slice(0, 120));
+    }
+  }
+
   const asInput = element as HTMLInputElement;
   const tag = element.tagName.toLowerCase();
   // `<input type="submit" value="Submit Application">` has no text content; its
   // label lives in `value`. Every other control's label is its text.
-  const ownText =
+  let ownText =
     tag === "input" ? (element.getAttribute("value") ?? "") : (element.textContent ?? "");
+  // A web component button is an empty `<button>` in a shadow root with a
+  // `<slot>` in it: the caption ("Submit application", "Next") is declared on
+  // the light DOM host and projected in. Reading only the element itself sees an
+  // unnamed control, and `corroborateSubmitControl` refuses an unnamed control
+  // outright — so without this the words it is meant to check against the
+  // reported label do not exist. Read only as a fallback, so a control that does
+  // carry its own text is described by that exactly as before.
+  if (ownText.trim() === "" && ownRoot instanceof ShadowRoot) {
+    const host = ownRoot.host;
+    ownText = host.textContent ?? "";
+    if (ownText.trim() === "") ownText = host.getAttribute("aria-label") ?? "";
+  }
 
   return {
     found: true,
@@ -2098,15 +2309,6 @@ type FieldPlan = {
    * the instruction is specific enough to trust Stagehand's observe() result directly.
    */
   skipCorroboration?: boolean;
-  /**
-   * Use an unstructured stagehand.act() call (with the value embedded in the instruction)
-   * instead of the observe→corroborate→typeInto pipeline. Required for autocomplete fields
-   * that need a multi-step interaction (type then click suggestion).
-   *
-   * When set, the instruction must be a template where `{value}` is replaced with the
-   * actual value at call time.
-   */
-  useUnstructuredAct?: boolean;
 };
 
 const plainCompare = (value: string): string => value.trim().replace(/\s+/g, " ").toLowerCase();
@@ -2129,7 +2331,7 @@ function buildFieldPlan(
     instruction: string,
     value: string | null,
     present: boolean,
-    options: { multiline?: boolean; normalize?: (v: string) => string; skipCorroboration?: boolean; useUnstructuredAct?: boolean } = {}
+    options: { multiline?: boolean; normalize?: (v: string) => string; skipCorroboration?: boolean } = {}
   ): void => {
     // A field the form does not have and the resume did not fill is not worth a
     // line in the report. A field the form *does* have but the resume could not
@@ -2144,7 +2346,6 @@ function buildFieldPlan(
       multiline: options.multiline === true,
       normalize: options.normalize ?? plainCompare,
       ...(options.skipCorroboration ? { skipCorroboration: true } : {}),
-      ...(options.useUnstructuredAct ? { useUnstructuredAct: true } : {}),
     });
   };
 
@@ -2190,6 +2391,11 @@ function buildFieldPlan(
   // one by the widget's own highlight, and reads back what the control ends up
   // holding. See `contextTerms` at that call site for how one city name shared by
   // four countries is resolved from what the candidate attested.
+  //
+  // JOB-047 reached the same conclusion from the other board: on SmartRecruiters
+  // the same `act()` entry reported "filled via unstructured act()" while the
+  // form showed "Please provide your place of residence" against an empty City.
+  // Two boards, one disproven mechanism, removed rather than left disabled.
   add("phone", INSTRUCTIONS.PHONE, profile.phone, signals.phoneFieldPresent, {
     normalize: phoneCompare,
   });
@@ -2290,34 +2496,6 @@ async function fillFields(
           "the form has this field but nothing was parsed from the resume for it — left blank " +
           "rather than guessed",
       });
-      continue;
-    }
-
-    // Autocomplete fields (e.g. city location pickers) need a multi-step interaction:
-    // type the value and then click the first suggestion. The structured typeInto
-    // path only handles the type step, so these fields use an unstructured act() call
-    // with the value embedded directly in the instruction.
-    if (field.useUnstructuredAct) {
-      await sleep(randomInteractionDelayMs());
-      const actInstruction = field.instruction.replace("{value}", field.value);
-      try {
-        await session.stagehand.act(actInstruction, { page: session.page });
-        outcomes.push({
-          field: field.key,
-          intended: field.value,
-          outcome: "filled",
-          detail: "filled via unstructured act() (autocomplete interaction)",
-        });
-        console.log(`${LOG} ${field.key}: filled via unstructured act()`);
-      } catch (err) {
-        outcomes.push({
-          field: field.key,
-          intended: field.value,
-          outcome: "not-on-form",
-          detail: `unstructured act() found no matching field: ${err instanceof Error ? err.message : String(err)}`,
-        });
-        console.warn(`${LOG} ${field.key}: unstructured act() failed — ${err instanceof Error ? err.message : String(err)}`);
-      }
       continue;
     }
 
@@ -3389,13 +3567,40 @@ function geographyHints(facts: ReadonlyMap<string, CandidateFact>): string[] {
     hints.push(country);
     // A menu writes "United States" where intake may have recorded "USA", and
     // the tie break is worthless if the two spellings cannot see each other.
-    if (US_COUNTRY_RE.test(country.trim())) hints.push("United States", "USA");
+    // "US" is the third spelling and the one a location search actually uses:
+    // SmartRecruiters answers "San Francisco" with "San Francisco, CA, US"
+    // alongside six in the Philippines and one in Argentina, and without this
+    // the tie break found nothing to back the right one with, so the required
+    // City field was left empty on every run. `containsAtWordBoundary` is what
+    // keeps a two-letter hint from matching inside a longer word.
+    if (US_COUNTRY_RE.test(country.trim())) hints.push("United States", "USA", "US");
   }
   const resumeLocation = facts.get("resumeLocation")?.value ?? "";
   for (const piece of resumeLocation.split(",").slice(1)) {
     if (piece.trim() !== "") hints.push(piece);
   }
   return hints;
+}
+
+/**
+ * The country the candidate attested, in the spellings a location menu writes it.
+ *
+ * JOB-047. `contextTerms` is ANDed, so this is deliberately **one** term
+ * carrying its alternatives rather than several terms — see `chooseFromMenuOnce`,
+ * which splits on `|` and is satisfied by any one spelling. It is still one
+ * attested fact and still has to be present for a suggestion to survive.
+ *
+ * The alternatives matter because boards disagree: Greenhouse's location service
+ * answers "San Francisco, California, United States" and SmartRecruiters'
+ * answers "San Francisco, CA, US". A term of only "United States" matches the
+ * first and silently fails the second, which is how the required City field
+ * stayed empty on every SmartRecruiters run.
+ */
+function countryContextTerms(currentCountry: string | undefined): string[] {
+  const country = (currentCountry ?? "").trim();
+  if (country === "") return [];
+  if (!US_COUNTRY_RE.test(country)) return [country];
+  return ["United States|USA|US|U.S."];
 }
 
 /** Whether `needle` appears in `haystack` delimited by non-word characters. */
@@ -4093,6 +4298,375 @@ type RemainingFieldsResult = {
 };
 
 /**
+ * JOB-047. How many entries this puts into one repeating section.
+ *
+ * One, deliberately. Every board that has such a section requires *at least*
+ * one entry, and one is what clears that. Replaying a whole work history into N
+ * entries is a different job with its own questions — which jobs, in what
+ * order, what to do when the resume has six and the form takes three, and what
+ * "Save" means when an entry half fails — and doing it badly would put wrong
+ * employment history on a real application under somebody's name. This fills
+ * the most recent entry, correctly, and stops.
+ */
+const MAX_ENTRIES_PER_REPEATING_SECTION = 1;
+
+/** How long a subform gets to mount its inputs after its add control is pressed. */
+const SUBFORM_MOUNT_TIMEOUT_MS = 8_000;
+const SUBFORM_MOUNT_POLL_MS = 400;
+
+/** How long the form gets to stop re-rendering after the resume was attached. */
+const FORM_STABLE_BUDGET_MS = 12_000;
+const FORM_STABLE_POLL_MS = 900;
+
+/**
+ * Waits for a repeating section's entry to mount, and reports what is new.
+ *
+ * Polling `enumerateFormFields` rather than reusing `settleBeforeReading`: that
+ * helper measures the page through `readStructuralFloor`, which counts light
+ * DOM inputs with `document.querySelectorAll`. On the board this was written
+ * for, every input is inside a shadow root, so that floor reads zero before the
+ * click and zero after it and "the DOM stopped growing" is true the instant it
+ * is asked. Here the thing being waited for is precisely the thing perception
+ * reports, so perception is the right thing to wait on.
+ *
+ * Field selectors are stable between passes (see `FIELD_HANDLE_ATTR`), which is
+ * what makes "not in the previous read" mean "mounted just now".
+ */
+async function awaitMountedEntryFields(
+  session: BrowserSession,
+  before: ReadonlySet<string>
+): Promise<EnumeratedField[]> {
+  const deadline = Date.now() + SUBFORM_MOUNT_TIMEOUT_MS;
+  let fresh: EnumeratedField[] = [];
+  for (;;) {
+    const now = await enumerateFormFields(session.page);
+    fresh = now.filter((field) => !before.has(field.selector));
+    if (fresh.length > 0 || Date.now() >= deadline) break;
+    await sleep(SUBFORM_MOUNT_POLL_MS);
+  }
+  return fresh.filter(
+    (field) =>
+      field.currentValue === "" &&
+      field.kind !== "file" &&
+      field.kind !== "other" &&
+      field.label !== ""
+  );
+}
+
+/**
+ * Waits for the form to stop changing shape under its own steam.
+ *
+ * The resume is attached immediately before this, and a board that reads the
+ * uploaded file re-renders the form when it is done — SmartRecruiters
+ * repopulates from the parse. An entry filled in during that window is filled
+ * into a subtree the framework is about to replace, and the symptom is
+ * peculiarly quiet: every field reads back correctly, Save is found and pressed,
+ * and the entry is simply not there afterwards. That is exactly what happened on
+ * the live RRS Group run to the Experience section and not to Education, which
+ * is the tell — the second section runs late enough that the page has finished.
+ *
+ * Two consecutive reads agreeing is the same test `settleBeforeReading` applies,
+ * measured through this pipeline's own perception pass rather than through
+ * `readStructuralFloor`, whose `document.querySelectorAll` counts nothing at all
+ * on a form built out of web components.
+ */
+async function awaitStableForm(session: BrowserSession): Promise<void> {
+  const deadline = Date.now() + FORM_STABLE_BUDGET_MS;
+  let previous = -1;
+  while (Date.now() < deadline) {
+    const count = (await enumerateFormFields(session.page)).length;
+    if (count === previous) return;
+    previous = count;
+    await sleep(FORM_STABLE_POLL_MS);
+  }
+  console.warn(
+    `${LOG} the form was still changing shape after ${FORM_STABLE_BUDGET_MS}ms ` +
+      `(${previous} readable control(s)); filling it anyway`
+  );
+}
+
+/**
+ * Fills the required repeating sections a form opens with, one entry each.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ * A SmartRecruiters form has "Experience *" and "Education *" sections holding
+ * a heading, an `Add` button and a red "Please provide at least one work
+ * experience entry" — and no inputs of any kind. `fillRemainingFields` below
+ * cannot help, because there is nothing on the page for it to enumerate: those
+ * fields are not skipped or mis-answered, they are structurally invisible. A
+ * run against a real RRS Group listing on 2026-08-22 filled every other field
+ * and still went nowhere, because the board had two complaints that nothing in
+ * this pipeline could have addressed.
+ *
+ * ── What it does, and what it does not ──────────────────────────────────────
+ * It presses `Add` (through the guarded, model-free click in `form-fields.ts`),
+ * waits for the entry's inputs to mount, and hands those inputs to exactly the
+ * same path every other field goes through: `decideFieldAnswers` with no tools,
+ * `resolveDecision` for policy, `applyFieldValue` with a read-back. There is no
+ * second decision mechanism, and nothing read off the page becomes an
+ * instruction anybody executes. The section heading is used to *prefix a label*
+ * so a model can tell an education entry's dates from a work entry's, and that
+ * label travels as data in a typed field of a tool-free call, exactly as every
+ * other form label already does.
+ */
+async function fillRepeatingSections(
+  session: BrowserSession,
+  state: ApplicationState,
+  jobDescription: string | null,
+  facts: readonly CandidateFact[],
+  factsByKey: ReadonlyMap<string, CandidateFact>
+): Promise<RemainingFieldsResult> {
+  const outcomes: FieldOutcome[] = [];
+  const needsInput: NeedsInputItem[] = [];
+
+  await awaitStableForm(session);
+
+  const sections = await enumerateRepeatingSections(session.page);
+  if (sections.length === 0) return { outcomes, needsInput };
+
+  console.log(
+    `${LOG} ${sections.length} required repeating section(s): ` +
+      sections.map((section) => section.heading).join(", ")
+  );
+
+  for (const section of sections) {
+    for (let entry = 0; entry < MAX_ENTRIES_PER_REPEATING_SECTION; entry++) {
+      const before = new Set((await enumerateFormFields(session.page)).map((f) => f.selector));
+
+      await sleep(randomInteractionDelayMs());
+      const added = await pressAddEntry(session.page, section);
+      if (!added.ok) {
+        outcomes.push({
+          field: section.key,
+          intended: null,
+          outcome: "skipped",
+          detail: `required — the "${section.heading}" section could not be opened: ${added.detail}`,
+        });
+        console.warn(`${LOG} ${section.heading}: ${added.detail}`);
+        continue;
+      }
+
+      const fresh = await awaitMountedEntryFields(session, before);
+      if (fresh.length === 0) {
+        outcomes.push({
+          field: section.key,
+          intended: null,
+          outcome: "skipped",
+          detail:
+            `required — the "${section.heading}" section's add control was pressed but no ` +
+            `fields appeared within ${SUBFORM_MOUNT_TIMEOUT_MS}ms`,
+        });
+        continue;
+      }
+      console.log(
+        `${LOG} ${section.heading}: ${fresh.length} field(s) mounted — ` +
+          fresh.map((f) => `${f.label}${f.required ? "*" : ""}`).join(", ")
+      );
+
+      // Same as step 4 of the ordinary pass: open the dropdowns that stand
+      // between this and a satisfied section, so the decision sees real wording.
+      for (const field of fresh) {
+        if (!field.required) continue;
+        if (!OPTION_KINDS.has(field.kind) || field.optionsKnown) continue;
+        const harvested = await harvestOptions(session.page, field);
+        field.options = harvested.options;
+        field.optionsKnown = harvested.options.length > 0;
+        field.optionsTruncated = harvested.truncated;
+      }
+
+      // The heading qualifies the label so "From", "To" and "Description" mean
+      // something. They repeat verbatim between the two sections, and a
+      // decision call that cannot tell an education entry's dates from a work
+      // entry's is being asked an unanswerable question.
+      const decidable: DecidableField[] = fresh.map((field) => ({
+        key: field.key,
+        label: `${section.heading}: ${field.label}`,
+        kind: field.kind,
+        required: field.required,
+        options: field.options,
+        optionsKnown: field.optionsKnown,
+        optionsTruncated: field.optionsTruncated,
+        helpText: field.helpText,
+      }));
+
+      let decisions: FieldDecision[];
+      try {
+        decisions = await decideFieldAnswers({
+          fields: decidable,
+          facts,
+          company: state.company,
+          jobTitle: state.jobTitle,
+          jobDescription,
+        });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        outcomes.push({
+          field: section.key,
+          intended: null,
+          outcome: "skipped",
+          detail: `required — no answers could be decided for the "${section.heading}" entry: ${reason}`,
+        });
+        console.warn(`${LOG} ${section.heading}: decision call failed — ${reason}`);
+        continue;
+      }
+      const byKey = new Map(decisions.map((decision) => [decision.fieldKey, decision]));
+
+      const escalate = (field: EnumeratedField, question: string, why: string): void => {
+        needsInput.push({
+          key: field.key,
+          fieldLabel: `${section.heading}: ${field.label}`,
+          question,
+          why,
+          required: field.required,
+          kind: field.kind,
+          ...(field.optionsKnown && field.options.length > 0 ? { options: field.options } : {}),
+        });
+      };
+
+      for (const field of fresh) {
+        const decision = byKey.get(field.key);
+        const resolution = resolveDecision(field, decision, factsByKey);
+
+        // Nothing in a work or education entry is a prose question, so a
+        // "generate" verdict here means the field was not recognised rather
+        // than that an essay is wanted. Both it and "skip" leave the box blank.
+        if (resolution.kind === "skip" || resolution.kind === "generate") {
+          const why =
+            resolution.kind === "skip"
+              ? resolution.why
+              : "nothing in the candidate's own data answers this entry field";
+          if (field.required) {
+            escalate(
+              field,
+              `The "${section.heading}" section asks for "${field.label}". What should we put?`,
+              why
+            );
+          }
+          outcomes.push({
+            field: field.key,
+            intended: null,
+            outcome: field.required ? "needs-input" : "skipped",
+            detail: `${section.heading} entry — left blank: ${why}`,
+          });
+          continue;
+        }
+        if (resolution.kind === "ask") {
+          escalate(field, resolution.question, resolution.why);
+          outcomes.push({
+            field: field.key,
+            intended: null,
+            outcome: "needs-input",
+            detail: `${section.heading} entry — left blank and escalated: ${resolution.why}`,
+          });
+          continue;
+        }
+
+        await sleep(randomInteractionDelayMs());
+        const value = resolution.value;
+        const outcome = await applyFieldValue(session.page, field, value, {
+          allowContains: OPTION_KINDS.has(field.kind) && field.options.length === 0,
+          // The same double gate the ordinary pass uses: a school-shaped
+          // combobox whose answer came from a school-shaped fact. An employer
+          // name typed into a company picker that does not list it is left
+          // unmatched instead, because an autocomplete holding unmatched text
+          // looks filled and submits empty.
+          allowFreeText:
+            field.kind === "combobox" &&
+            SCHOOL_FIELD_LABEL_RE.test(field.label) &&
+            SCHOOL_FACT_KEY_RE.test(decision?.sourceFact ?? ""),
+          // JOB-051's tie break, on the same footing as the ordinary pass: the
+          // country the candidate attested, used only to choose between
+          // suggestions that already contain the value.
+          ...(OPTION_KINDS.has(field.kind)
+            ? { contextTerms: countryContextTerms(state.applicationAnswers.currentCountry) }
+            : {}),
+        });
+
+        if (outcome.ok) {
+          outcomes.push({
+            field: field.key,
+            intended: value,
+            outcome: "filled",
+            detail: `${section.heading} entry — ${resolution.note}; ${outcome.detail}`,
+            readBack: outcome.readBack,
+          });
+          console.log(`${LOG} ${section.heading}: ${field.label} filled + verified`);
+          continue;
+        }
+        if (outcome.readBack !== "") {
+          // Into the same mismatch channel every other field uses, so that
+          // `assertNoMismatches` refuses to let the run continue. A wrong value
+          // in a real employer's work history is exactly what that guard is for.
+          outcomes.push({
+            field: field.key,
+            intended: value,
+            outcome: "mismatch",
+            detail: `${section.heading} entry — ${outcome.detail}`,
+            readBack: outcome.readBack,
+          });
+          continue;
+        }
+        outcomes.push({
+          field: field.key,
+          intended: value,
+          outcome: field.required ? "needs-input" : "skipped",
+          detail: `${section.heading} entry — ${outcome.detail}`,
+        });
+        if (field.required) {
+          escalate(
+            field,
+            `"${field.label}" in the "${section.heading}" section could not be set to ` +
+              `${JSON.stringify(value.slice(0, 80))}. ${outcome.detail}. What should we put?`,
+            `the value could not be applied — ${outcome.detail}`
+          );
+        }
+      }
+
+      // Commit. SmartRecruiters does not count an entry until its own Save is
+      // pressed: the fields can read back perfectly and the section still
+      // reports itself empty. A board with no such control says so, and that is
+      // not a failure — it commits the entry as it is typed.
+      await sleep(randomInteractionDelayMs());
+      const committed = await pressCommitEntry(session.page, section);
+      console.log(`${LOG} ${section.heading}: commit — ${committed.detail}`);
+
+      // The read-back for the section as a whole. Two ways it can fail and both
+      // count: the board still showing its "at least one entry" complaint, and
+      // the entry's own form still sitting there uncommitted. The second one
+      // does not raise the first — a section in edit mode is not a section
+      // reporting itself empty — so believing only the board's words would have
+      // called an uncommitted entry a filled section, which is precisely the
+      // "status fields lie" failure this project keeps relearning.
+      await sleep(SUBFORM_MOUNT_POLL_MS);
+      const boardComplains = await sectionStillUnsatisfied(session.page, section);
+      const uncommitted = !committed.ok && !/no control that commits an entry/.test(committed.detail);
+      const stillComplaining = boardComplains || uncommitted;
+      outcomes.push({
+        field: section.key,
+        intended: "one entry",
+        outcome: stillComplaining ? "needs-input" : "filled",
+        detail: stillComplaining
+          ? `required — the "${section.heading}" section does not hold a committed entry: ` +
+            `${uncommitted ? committed.detail : "the board still reports it as empty"}`
+          : `required — one entry added to the "${section.heading}" section (${committed.detail})`,
+      });
+      if (stillComplaining) {
+        needsInput.push({
+          key: section.key,
+          fieldLabel: section.heading,
+          question: `The "${section.heading}" section still needs at least one entry. What should we put in it?`,
+          why: `an entry was filled in but ${committed.detail}`,
+          required: true,
+          kind: "other",
+        });
+      }
+    }
+  }
+
+  return { outcomes, needsInput };
+}
+
+/**
  * Perception → decision → action, over every field the named-field pass did not
  * already fill.
  *
@@ -4120,6 +4694,35 @@ async function fillRemainingFields(
   const outcomes: FieldOutcome[] = [];
   const needsInput: NeedsInputItem[] = [];
 
+  const facts = buildFactCatalog(profile, state.applicationAnswers, additionalAnswers);
+  const factsByKey = new Map(facts.map((fact) => [fact.key, fact]));
+
+  // JOB-047. Before anything is enumerated, because a required repeating
+  // section has no fields to enumerate until its add control has been pressed.
+  // Running it first also means the entry's inputs are gone again by the time
+  // the ordinary pass reads the page: a committed entry collapses to a summary
+  // card, and what is left is the form the rest of this function expects.
+  const repeating = await fillRepeatingSections(
+    session,
+    state,
+    jobDescription,
+    facts,
+    factsByKey
+  );
+  outcomes.push(...repeating.outcomes);
+  // Held apart from `needsInput` until the very end of this function, and that
+  // is not a detail. The unknown-required-field fallback near the bottom takes
+  // everything still in `needsInput` and hands it to `act()` with "fill this
+  // with the most appropriate value for a job applicant", which is a licence to
+  // invent — and inventing a school or an employer is precisely what HARD STOP 9
+  // forbids, because the applicant is the one who attests to it. A live run
+  // showed why: an Education "Institution" that this pass could not fill came
+  // back holding "Stanford University", read off the Company box a few
+  // centimetres up the page, for a candidate who attends Georgia Tech. A work
+  // or education entry is only ever filled from the candidate's own facts, or
+  // escalated to them.
+  const repeatingNeedsInput = repeating.needsInput;
+
   const all = await enumerateFormFields(session.page);
   console.log(`${LOG} the form has ${all.length} readable control(s)`);
 
@@ -4131,15 +4734,12 @@ async function fillRemainingFields(
       field.label !== ""
   );
   if (empty.length === 0) {
-    return { outcomes, needsInput };
+    return { outcomes, needsInput: [...needsInput, ...repeatingNeedsInput] };
   }
   console.log(
     `${LOG} ${empty.length} control(s) still empty: ` +
       empty.map((field) => `${field.label}${field.required ? "*" : ""}`).join(", ")
   );
-
-  const facts = buildFactCatalog(profile, state.applicationAnswers, additionalAnswers);
-  const factsByKey = new Map(facts.map((fact) => [fact.key, fact]));
 
   const record = (
     field: EnumeratedField,
@@ -4239,7 +4839,9 @@ async function fillRemainingFields(
     }
   }
 
-  if (undecided.length === 0) return { outcomes, needsInput };
+  if (undecided.length === 0) {
+    return { outcomes, needsInput: [...needsInput, ...repeatingNeedsInput] };
+  }
 
   // ── Step 4: open the dropdowns that stand between this and a submittable
   // form. Optional ones are left shut: opening every menu on a page costs a
@@ -4346,6 +4948,13 @@ async function fillRemainingFields(
       // No fixed option list means this is a search control that answers a
       // query rather than a menu with a fixed set — see `chooseFromMenu`.
       allowContains: OPTION_KINDS.has(field.kind) && field.options.length === 0,
+      // JOB-051's tie break for a search control whose options only exist once
+      // it has been typed into. Without it "San Francisco" comes back as eight
+      // San Franciscos, `chooseFromMenu` correctly refuses to guess between
+      // them, and the required City field stays empty.
+      ...(OPTION_KINDS.has(field.kind)
+        ? { contextTerms: countryContextTerms(state.applicationAnswers.currentCountry) }
+        : {}),
       // JOB-044. Scoped to school-shaped comboboxes by label AND by the fact
       // key that backed `value`, same double gate as the resolution that
       // produced `value` above — see `SCHOOL_FIELD_LABEL_RE`, `SCHOOL_FACT_KEY_RE`,
@@ -4362,9 +4971,7 @@ async function fillRemainingFields(
       // suggestion. `chooseFromMenu` uses it only to break a tie between
       // options that already contain `value`, so it can never introduce an
       // answer of its own.
-      contextTerms: [state.applicationAnswers.currentCountry ?? ""].filter(
-        (term) => term !== ""
-      ),
+      contextTerms: countryContextTerms(state.applicationAnswers.currentCountry),
     });
 
     if (outcome.ok) {
@@ -4423,7 +5030,7 @@ async function fillRemainingFields(
     }
   }
 
-  return { outcomes, needsInput: afterLlmFallback };
+  return { outcomes, needsInput: [...afterLlmFallback, ...repeatingNeedsInput] };
 }
 
 /**
@@ -4640,11 +5247,20 @@ async function attachResume(
   }
 
   const after = await describeControl(session.page, selector);
+  // JOB-047. A component that consumes the file and resets its own input reads
+  // back as zero files however well the upload went, so the board's own
+  // rendering of the file name is asked as a second, independent question
+  // before this is called a failure. Both silent means it failed.
+  let shownOnPage = false;
   if (after.found && after.attachedFiles === 0) {
-    throw new FormFillBlockedError(
-      `The resume was set on the upload control found via ${via}, but the control still ` +
-        `reports no attached file. Nothing was submitted.`
-    );
+    shownOnPage = await pageShowsFileName(session.page, fileName);
+    if (!shownOnPage) {
+      throw new FormFillBlockedError(
+        `The resume was set on the upload control found via ${via}, but the control still ` +
+          `reports no attached file and the page does not show "${fileName}" anywhere. ` +
+          `Nothing was submitted.`
+      );
+    }
   }
 
   console.log(`${LOG} resume attached as "${fileName}" (${bytes.byteLength} bytes) via ${via}`);
@@ -4655,9 +5271,17 @@ async function attachResume(
     detail:
       after.attachedFiles > 0
         ? `attached via ${via}; the control confirms ${after.attachedFiles} file(s)`
-        : `attached via ${via}; the control could not be re-read to confirm (the form is ` +
-          `probably inside an iframe or a web component's shadow DOM)`,
-    readBack: after.attachedFiles > 0 ? `${after.attachedFiles} file(s)` : null,
+        : shownOnPage
+          ? `attached via ${via}; the control reports no file because it hands the upload off ` +
+            `itself, and the page shows "${fileName}"`
+          : `attached via ${via}; the control could not be re-read to confirm (the form is ` +
+            `probably inside an iframe)`,
+    readBack:
+      after.attachedFiles > 0
+        ? `${after.attachedFiles} file(s)`
+        : shownOnPage
+          ? fileName
+          : null,
   };
 }
 
