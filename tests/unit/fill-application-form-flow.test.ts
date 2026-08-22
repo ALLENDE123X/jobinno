@@ -472,6 +472,13 @@ vi.mock("@/lib/stagehand-session", () => ({
   },
   closeBrowserSession: async () => undefined,
   /**
+   * JOB-050. Contexts are a Browserbase hardening measure and this suite opens
+   * no browser at all, so the honest stand in is the answer the real function
+   * gives whenever the feature is switched off: no context, carry on. Its own
+   * fallback behaviour is covered in `stagehand-session.test.ts`.
+   */
+  resolveBrowserbaseContextId: async () => undefined,
+  /**
    * Returns at once. The waiting this file cares about is *how many times the
    * page is read before a verdict is drawn*, and that is asserted by counting
    * reads rather than by burning the real six seconds of backoff on every case.
