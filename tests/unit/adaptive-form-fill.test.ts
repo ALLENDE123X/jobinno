@@ -1232,3 +1232,222 @@ describe("buildFactCatalog minimumAge fact", () => {
     expect(isAttestationField("Are you at least 18 years old?")).toBe(false);
   });
 });
+
+// ── Issue #94: options truncated to a prefix of a longer live list ──────────
+//
+// Lever's university dropdown holds 3,302 options and the enumeration reports
+// its first 60. The decision prompt tells the model it may propose an option
+// beyond a truncated prefix "and it will be checked against the live list";
+// these confirm the policy layer keeps that promise instead of refusing first.
+// The action layer (`selectNative`) still only chooses options the DOM itself
+// offers, covered in form-fields-enumeration.test.ts.
+describe("a fact-backed answer beyond a truncated option prefix", () => {
+  const A_UNIVERSITIES = [
+    "Aalborg University",
+    "Aalto University",
+    "Aarhus University",
+  ];
+
+  it("applies the school for the live list to verify, rather than refusing", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Which university are you currently attending or did you last attend?",
+        kind: "select",
+        options: A_UNIVERSITIES,
+        optionsKnown: true,
+        optionsTruncated: true,
+      }),
+      decision({
+        fieldKey: "which university are you currently attending or did you last attend?",
+        value: "Georgia Institute of Technology",
+        sourceFact: "school",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Georgia Institute of Technology");
+    }
+  });
+
+  it("still checks the proposal against the named fact first", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Which university are you currently attending or did you last attend?",
+        kind: "select",
+        options: A_UNIVERSITIES,
+        optionsKnown: true,
+        optionsTruncated: true,
+      }),
+      decision({
+        fieldKey: "which university are you currently attending or did you last attend?",
+        value: "Stanford University",
+        sourceFact: "school",
+      }),
+      facts()
+    );
+    // The proposed wording contradicts the stored school, so the bad value is
+    // dropped and the question escalates rather than being clicked.
+    expect(resolution.kind).toBe("ask");
+  });
+
+  it("does not loosen the rule for a list that is NOT truncated", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Which university are you currently attending or did you last attend?",
+        kind: "select",
+        options: A_UNIVERSITIES,
+        optionsKnown: true,
+        optionsTruncated: false,
+      }),
+      decision({
+        fieldKey: "which university are you currently attending or did you last attend?",
+        value: "Georgia Institute of Technology",
+        sourceFact: "school",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+
+  it("lets a best-effort proposal past the prefix through to the live check", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Which university are you currently attending or did you last attend?",
+        kind: "select",
+        options: A_UNIVERSITIES,
+        optionsKnown: true,
+        optionsTruncated: true,
+      }),
+      decision({
+        fieldKey: "which university are you currently attending or did you last attend?",
+        decision: "infer",
+        value: "Georgia Institute of Technology",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Georgia Institute of Technology");
+    }
+  });
+});
+
+// ── Issue #94: agreements drawn as radio groups and as typed fields ─────────
+//
+// Lever renders processing consent as a two-option radio group ("Yes, I
+// consent" / "No, I do not consent"); Workable renders digital-signature
+// agreements as a required text input under the full legal paragraph. Both get
+// the same deterministic policy the checkbox form of an agreement already had:
+// required and not an attestation means the consenting option, optional means
+// skip, and a typed signature is never written by a model at all.
+describe("a consent radio group follows the checkbox agreement policy", () => {
+  // The real Palantir card's question, verbatim, not trimmed: the sentence
+  // pointing at the candidate privacy policy is the one CONSENT_FIELD_RE
+  // actually matches, and an earlier draft of this test trimmed it out and
+  // proved nothing.
+  const LEVER_AI_CONSENT_LABEL =
+    "As part of our interview process, we may use AI notetakers to transcribe " +
+    "conversations for accuracy and efficiency. Please see our candidate privacy policy " +
+    "for more information on how we process your data. Your decision to opt in or out " +
+    "of this tooling will not impact your candidacy.";
+
+  it("answers a required group with its own consenting option, deterministically", () => {
+    const resolution = resolveDecision(
+      field({
+        label: LEVER_AI_CONSENT_LABEL,
+        kind: "radio",
+        options: ["Yes, I consent", "No, I do not consent"],
+        optionsKnown: true,
+        required: true,
+      }),
+      undefined,
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("Yes, I consent");
+  });
+
+  it("skips an optional group, which is an opt-in nobody asked for", () => {
+    const resolution = resolveDecision(
+      field({
+        label: LEVER_AI_CONSENT_LABEL,
+        kind: "radio",
+        options: ["Yes, I consent", "No, I do not consent"],
+        optionsKnown: true,
+        required: false,
+      }),
+      undefined,
+      facts()
+    );
+    expect(resolution.kind).toBe("skip");
+  });
+
+  it("escalates a group whose options do not clearly affirm", () => {
+    const resolution = resolveDecision(
+      field({
+        label: LEVER_AI_CONSENT_LABEL,
+        kind: "radio",
+        options: ["I consent to recording", "I consent to transcription only"],
+        optionsKnown: true,
+        required: true,
+      }),
+      undefined,
+      facts()
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+});
+
+describe("a consent statement drawn as a typed field is never model-written", () => {
+  // The first 300 characters of the real TMEIC digital-signature question, as
+  // the enumeration reports it (labels are capped at 300).
+  const TMEIC_SIGNATURE_LABEL =
+    "I understand that TMEIC Corporation Americas, hereinafter referred to as " +
+    "“the Company,” requires certain information about me to evaluate my " +
+    "qualifications for employment and to conduct its business if I become an employee. " +
+    "Therefore, I authorize the Company to investigate my past employment, educat";
+
+  it("escalates a required signature box instead of generating prose for it", () => {
+    const resolution = resolveDecision(
+      field({ label: TMEIC_SIGNATURE_LABEL, kind: "text", required: true }),
+      decision({ fieldKey: TMEIC_SIGNATURE_LABEL.toLowerCase(), decision: "generate", value: null }),
+      facts()
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+
+  it("escalates even when the model proposes a value for it", () => {
+    const resolution = resolveDecision(
+      field({ label: TMEIC_SIGNATURE_LABEL, kind: "text", required: true }),
+      decision({ fieldKey: TMEIC_SIGNATURE_LABEL.toLowerCase(), value: "Pat Example" }),
+      facts()
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+
+  it("skips an optional one", () => {
+    const resolution = resolveDecision(
+      field({ label: TMEIC_SIGNATURE_LABEL, kind: "text", required: false }),
+      decision({ fieldKey: TMEIC_SIGNATURE_LABEL.toLowerCase(), decision: "generate", value: null }),
+      facts()
+    );
+    expect(resolution.kind).toBe("skip");
+  });
+
+  it("leaves a visa-status text box on its existing attestation ladder", () => {
+    // "authorized to work" is a legal attestation, not a consent statement;
+    // the stored answer still applies through the existing path.
+    const resolution = resolveDecision(
+      field({ label: "Are you authorized to work in the United States?", kind: "text", required: true }),
+      decision({
+        fieldKey: "are you authorized to work in the united states?",
+        value: "Yes",
+        sourceFact: "workAuthorizedUs",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("Yes");
+  });
+});

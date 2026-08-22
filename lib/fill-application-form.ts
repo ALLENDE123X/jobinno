@@ -3402,6 +3402,21 @@ function inferOrAsk(
           note: `a best effort answer chosen from the control's own options: ${why}`,
         };
       }
+      // The reported options are a truncated prefix of a longer live list
+      // (issue #94). The action layer only ever chooses an option the DOM
+      // itself offers, so a proposal beyond the reported prefix is checked
+      // against the full live list there instead of refused here, and a
+      // wording that is not really on the list still escalates.
+      if (field.optionsTruncated) {
+        return {
+          kind: "apply",
+          value: proposed,
+          declined: false,
+          note:
+            `a best effort answer matched against the control's full live option list, since ` +
+            `the reported list is a truncated prefix: ${why}`,
+        };
+      }
       // JOB-044. Nothing on the menu says what was proposed, but a combobox
       // asking for a school is a text input first and a suggestion list
       // second — see `SCHOOL_FIELD_LABEL_RE`. Typing the candidate's own
@@ -3576,27 +3591,83 @@ export function resolveDecision(
   // An agreement that is ALSO a legal attestation, "I certify I am authorized to
   // work in the United States", is not covered by either branch and falls
   // through to the ordinary ladder below, which is where it belongs.
-  if (
-    field.kind === "checkbox" &&
-    CONSENT_FIELD_RE.test(field.label) &&
-    !isAttestationField(field.label)
-  ) {
-    if (!field.required) {
+  //
+  // Issue #94 widened the same policy across the three shapes boards actually
+  // draw an agreement as: a checkbox (the original case), a yes/no radio group
+  // ("Yes, I consent" / "No, I do not consent" on Lever's multiple-choice
+  // cards), and a typed digital-signature field (Workable). The first two get
+  // the required-tick/optional-skip split above; the typed form is never
+  // written into by a model and goes to the candidate instead, because a
+  // signature is not a fact anybody can report on someone's behalf.
+  if (CONSENT_FIELD_RE.test(field.label) && !isAttestationField(field.label)) {
+    if (field.kind === "checkbox") {
+      if (!field.required) {
+        return {
+          kind: "skip",
+          why:
+            "an optional agreement box, which is an opt-in nobody asked for rather than a " +
+            "condition of applying",
+        };
+      }
       return {
-        kind: "skip",
-        why:
-          "an optional agreement box, which is an opt-in nobody asked for rather than a " +
-          "condition of applying",
+        kind: "apply",
+        value: "Yes",
+        declined: false,
+        note:
+          "a required agreement the form will not submit without, ticked on the candidate's " +
+          "instruction to submit applications on their behalf",
       };
     }
-    return {
-      kind: "apply",
-      value: "Yes",
-      declined: false,
-      note:
-        "a required agreement the form will not submit without, ticked on the candidate's " +
-        "instruction to submit applications on their behalf",
-    };
+    // The same agreement drawn as a two-option radio group: "Yes, I consent" /
+    // "No, I do not consent" is how Lever renders processing consent on its
+    // multiple-choice cards (issue #94). Same policy as the checkbox form of
+    // it, decided here deterministically rather than left to a model:
+    // required means agreeing is a term of submitting at all, optional means
+    // nobody asked for it. Only when exactly one option clearly affirms —
+    // an ambiguous group falls through to the ordinary ladder below.
+    if (field.kind === "radio" && field.optionsKnown) {
+      const affirming = field.options.filter((option) => /^yes\b/i.test(option.trim()));
+      const chosen = affirming[0];
+      if (affirming.length === 1 && chosen !== undefined) {
+        if (!field.required) {
+          return {
+            kind: "skip",
+            why:
+              "an optional agreement choice, which is an opt-in nobody asked for rather than " +
+              "a condition of applying",
+          };
+        }
+        return {
+          kind: "apply",
+          value: chosen,
+          declined: false,
+          note:
+            "a required agreement the form will not submit without, answered with its own " +
+            "consenting option on the candidate's instruction to submit applications on " +
+            "their behalf",
+        };
+      }
+    }
+  }
+
+  // A consent or agreement statement drawn as a *typed* field rather than a
+  // box. Workable renders digital-signature questions this way: the full
+  // legal paragraph as the label ("...By signing your digital signature
+  // below, you agree...") over a required text input (issue #94). Typing
+  // anything into one signs the agreement in the candidate's name, and
+  // model-written prose in one would be worse: a fabricated signature. Same
+  // rule as every attestation, decided before any model proposal is
+  // consulted: the candidate's own words or nothing.
+  if (
+    (field.kind === "text" || field.kind === "textarea") &&
+    CONSENT_FIELD_RE.test(field.label) &&
+    !LEGAL_ATTESTATION_RE.test(field.label)
+  ) {
+    return declineOrAsk(
+      field,
+      "an agreement or signature statement drawn as a typed field, which is signed by the " +
+        "candidate in their own words or not at all"
+    );
   }
 
   if (decision === undefined) {
@@ -3687,6 +3758,35 @@ export function resolveDecision(
         if (field.optionsKnown && field.options.length > 0) {
           const match = matchOption(field.options, value, hints);
           if (match === null) {
+            // The reported options are a truncated prefix of a longer live
+            // list (issue #94: Lever's university dropdown holds 3,302
+            // options and reports its first 60). The decision prompt
+            // explicitly permits proposing an option beyond the prefix with
+            // the promise that it "will be checked against the live list";
+            // this is where that promise is kept rather than broken. The
+            // action layer (`selectNative`, `chooseFromMenu`) only ever
+            // chooses an option the DOM itself offers, so a wording that is
+            // not really on the list fails there, one step later, with the
+            // same escalation. The fact check still runs here, first.
+            if (field.optionsTruncated) {
+              if (!optionSupportsFact(value, fact.value, fact.key, field.label)) {
+                return contradict(
+                  `the proposed option ${JSON.stringify(value.slice(0, 80))} does not say what ` +
+                    `the stored fact "${fact.key}" says ` +
+                    `(${JSON.stringify(fact.value.slice(0, 80))})`,
+                  decision.question
+                );
+              }
+              return {
+                kind: "apply",
+                value,
+                declined: false,
+                note:
+                  `proposed from the stored fact "${fact.key}"; the control lists more options ` +
+                  `than were read, so this is matched against the live list before anything ` +
+                  `is chosen`,
+              };
+            }
             return refuse(
               `"${value}" is not one of the options this control offers`,
               decision.question
