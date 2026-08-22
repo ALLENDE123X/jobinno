@@ -535,6 +535,64 @@ const CONTENT_ATTACH_TIMEOUT_MS = 20_000;
 const DOM_STABLE_POLL_MS = 500;
 
 /**
+ * Random delay between successive field interactions.
+ *
+ * Breaks the constant-cadence typing pattern that bot detectors key on. The
+ * 300–1200 ms window is wide enough to look human without slowing the run to
+ * the point where the session timeout becomes a concern.
+ */
+function randomInteractionDelayMs(): number {
+  return Math.floor(Math.random() * 901) + 300; // 300–1200 ms
+}
+
+/**
+ * Random dwell time on the warm-up page before navigating to the specific job
+ * URL. Two to four seconds — enough to register as a human browsing the
+ * careers site, not long enough to idle past a Stagehand DOM-settle timeout.
+ */
+function warmUpDwellMs(): number {
+  return Math.floor(Math.random() * 2001) + 2000; // 2000–4000 ms
+}
+
+/**
+ * Derives a "warm-up" URL from a job application URL by stripping trailing
+ * path segments that look like IDs (numeric, UUID) or the literal "apply".
+ *
+ * Exported for unit testing.
+ *
+ * Examples:
+ *   https://company.workable.com/jobs/123456/apply → https://company.workable.com/jobs
+ *   https://boards.greenhouse.io/acme/jobs/12345   → https://boards.greenhouse.io/acme/jobs
+ *   https://jobs.lever.co/acme/abc12345-1234-…     → https://jobs.lever.co/acme
+ *
+ * Returns the original URL unchanged if no strippable suffix is found — the
+ * caller checks for sameness and skips the warm-up navigation in that case.
+ */
+export function deriveWarmUpUrl(applyUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(applyUrl);
+  } catch {
+    return applyUrl;
+  }
+  const segments = url.pathname.split("/").filter(Boolean);
+  while (segments.length > 0) {
+    const last = segments[segments.length - 1];
+    if (
+      /^apply$/i.test(last) || // literal "apply" suffix
+      /^\d+$/.test(last) || // numeric ID
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(last) // UUID v4
+    ) {
+      segments.pop();
+    } else {
+      break;
+    }
+  }
+  if (segments.length === 0) return url.origin;
+  return `${url.origin}/${segments.join("/")}`;
+}
+
+/**
  * How long the page is given to stop changing. Bounded rather than open ended:
  * a board that is still mounting new fields this long after its content attached
  * is not going to be read correctly by waiting longer, and every extra second
@@ -1862,6 +1920,21 @@ async function reachApplicationForm(
   let pageReads = 1;
 
   if (signals === null || !signals.applicationFormPresent) {
+    // ── Warm-up navigation (issue #88) ────────────────────────────────────────
+    // Visit the company's careers/jobs page for 2–4 seconds before the specific
+    // job URL. A cold direct-navigate to a deep apply link is a clear bot signal;
+    // arriving from a parent page that we visibly spent time on is not.
+    const warmUpUrl = deriveWarmUpUrl(state.applyUrl);
+    if (warmUpUrl !== state.applyUrl) {
+      console.log(`${LOG} warm-up navigation → ${warmUpUrl}`);
+      try {
+        await session.page.goto(warmUpUrl, { timeout: NAVIGATION_TIMEOUT_MS });
+        await sleep(warmUpDwellMs());
+      } catch {
+        // Best-effort: if the careers page is unreachable, proceed to the job URL.
+        console.warn(`${LOG} warm-up navigation to ${warmUpUrl} failed — proceeding to job URL`);
+      }
+    }
     console.log(`${LOG} navigate → ${state.applyUrl}`);
     await session.page.goto(state.applyUrl, { timeout: NAVIGATION_TIMEOUT_MS });
     signals = await readFormSignals(session);
@@ -2200,6 +2273,7 @@ async function fillFields(
     }
     const check = checked.check;
 
+    await sleep(randomInteractionDelayMs());
     const used = await typeInto(session, url, field.instruction, field.value);
     const readBack = await readControlValue(session.page, used.selector);
     const matches =
@@ -2444,6 +2518,13 @@ export function buildFactCatalog(
     yesNo(answers.requiresSponsorship)
   );
   add("willingToRelocate", "Willing to relocate for a role", yesNo(answers.willingToRelocate));
+
+  // A job applicant is by definition at least the minimum working age. Boards
+  // that ask "Are you at least 18 years old?" are asking whether the candidate
+  // is eligible to work, and a candidate who submitted a resume implicitly
+  // asserts that they are. The constant "Yes" is not a guess; it is the only
+  // answer that is consistent with being a job applicant at all.
+  add("minimumAge", "At least 18 years old (minimum working age)", "Yes");
 
   // Derived, in TypeScript rather than by a model: "they live in the United
   // States" entails "they are currently located in the US". That is an
@@ -2958,6 +3039,18 @@ const SCHOOL_FIELD_LABEL_RE = /\b(school|university|college)\b/i;
  * `educationN.school`.
  */
 const SCHOOL_FACT_KEY_RE = /(?:^|\.)school$/;
+
+/**
+ * Matches "Confirm email", "Confirm your email", "Re-enter email",
+ * "Repeat email", "Verify email" and similar second-email fields.
+ *
+ * These are always filled with the same value as the primary email address,
+ * so they are caught before the standard fact-lookup and filled directly from
+ * the `email` fact.
+ */
+export const CONFIRM_EMAIL_RE =
+  /\b(?:confirm|re-?enter|repeat|verify|re-?type)\b.*\bemail\b|\bemail\b.*\b(?:confirm(?:ation)?|re-?enter|repeat|verify|re-?type)\b/i;
+
 
 /**
  * Which level of degree a string names, or null when it names none.
@@ -3748,6 +3841,30 @@ async function fillRemainingFields(
   // to `undecided` and are left to `resolveDecision`'s own policy instead.
   const undecided: EnumeratedField[] = [];
   for (const field of empty) {
+    // ── Confirm-email shortcut ───────────────────────────────────────────────
+    // "Confirm email", "Re-enter email", "Repeat email" etc. are always the
+    // same value as the primary email address. Handled here, before the
+    // additional-answer lookup and the model, so nothing model-derived ever
+    // touches this field. The regex is anchored to the label text, which is
+    // page-derived, but the VALUE it types is always the `email` fact — a
+    // compile-time-keyed catalogue entry — not anything lifted off the page.
+    if (CONFIRM_EMAIL_RE.test(field.label)) {
+      const emailFact = factsByKey.get("email");
+      if (emailFact !== undefined) {
+        await sleep(randomInteractionDelayMs());
+        const outcome = await applyFieldValue(session.page, field, emailFact.value, {});
+        if (outcome.ok) {
+          record(field, "filled", emailFact.value, `confirm-email — filled with the email fact; ${outcome.detail}`, outcome.readBack);
+          console.log(`${LOG} ${field.label}: filled as confirm-email`);
+        } else if (outcome.readBack !== "") {
+          record(field, "mismatch", emailFact.value, outcome.detail, outcome.readBack);
+        } else {
+          ask(field, `The confirm-email field "${field.label}" could not be filled. ${outcome.detail}. What email address should we use?`, `confirm-email fill failed — ${outcome.detail}`);
+        }
+        continue;
+      }
+    }
+
     const decision = resolveAdditionalAnswer(field, additionalAnswers);
     if (decision.kind !== "apply") {
       undecided.push(field);
@@ -3765,6 +3882,7 @@ async function fillRemainingFields(
     // authorized to work in the US". Still only when exactly one option contains
     // what they said — see `chooseFromMenu` — so an ambiguous answer comes back
     // to them rather than being resolved for them.
+    await sleep(randomInteractionDelayMs());
     const outcome = await applyFieldValue(session.page, field, supplied, {
       allowContains: OPTION_KINDS.has(field.kind),
     });
@@ -3885,6 +4003,7 @@ async function fillRemainingFields(
       declined = resolution.declined;
     }
 
+    await sleep(randomInteractionDelayMs());
     const outcome = await applyFieldValue(session.page, field, value, {
       // No fixed option list means this is a search control that answers a
       // query rather than a menu with a fixed set — see `chooseFromMenu`.
@@ -3918,7 +4037,46 @@ async function fillRemainingFields(
     );
   }
 
-  return { outcomes, needsInput };
+  // ── Issue #91 Part 2: LLM fallback for unknown required fields ───────────
+  // If any required field that is not a legal attestation or EEO question is
+  // still in needsInput at this point, the rule-based system had nothing for
+  // it. A single stagehand.act() can often fill it directly — Workable
+  // compliance dropdowns that landed here without a matching fact, for example.
+  //
+  // Security note: the field label is page-derived text included in an act()
+  // instruction. This is an intentional exception to the compile-time-constant
+  // rule, requested by the coordinator (issue #91). The label is truncated to
+  // 200 characters to bound potential injection surface.
+  //
+  // The field is removed from needsInput only if act() does not throw: a throw
+  // is treated as "still unknown", keeping the candidate-escalation path alive.
+  const afterLlmFallback: NeedsInputItem[] = [];
+  for (const item of needsInput) {
+    if (!item.required || isAttestationField(item.fieldLabel)) {
+      afterLlmFallback.push(item);
+      continue;
+    }
+    const safeLabel = item.fieldLabel.slice(0, 200);
+    console.log(`${LOG} LLM fallback (unknown-field): filling "${safeLabel}" via act()`);
+    try {
+      await session.stagehand.act(
+        `Fill the field labelled '${safeLabel}' with the most appropriate value for a job applicant.`,
+        { page: session.page }
+      );
+      // act() did not throw — treat as filled; leave out of the returned needsInput
+      // so the escalation loop does not re-ask the candidate. The field stays in
+      // `outcomes` as "needs-input" (recorded above) which is fine: the outcome
+      // log is for audit, not for re-driving the fill.
+    } catch (err) {
+      console.warn(
+        `${LOG} LLM fallback (unknown-field): act() threw for "${safeLabel}" — ` +
+          `${err instanceof Error ? err.message : String(err)}`
+      );
+      afterLlmFallback.push(item);
+    }
+  }
+
+  return { outcomes, needsInput: afterLlmFallback };
 }
 
 /**

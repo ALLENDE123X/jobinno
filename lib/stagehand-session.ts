@@ -147,6 +147,15 @@ export type BrowserSession = {
 export type OpenBrowserSessionOptions = {
   headless: boolean;
   logTag: string;
+  /**
+   * Issue #88. When provided and `BROWSERBASE_CONTEXTS_ENABLED=1`, this
+   * Browserbase Context ID is attached to the session so cookies and
+   * localStorage persist across runs for the same user.
+   *
+   * Obtain it via `createBrowserbaseContext()` and store it in
+   * `profiles.browserbase_context_id`. Ignored for local browser sessions.
+   */
+  contextId?: string;
 };
 
 // ───────────────────────────────────
@@ -164,6 +173,15 @@ export type EnvSource = Readonly<Record<string, string | undefined>>;
 export const BROWSERBASE_API_KEY_ENV_VAR = "BROWSERBASE_API_KEY";
 export const BROWSERBASE_PROJECT_ID_ENV_VAR = "BROWSERBASE_PROJECT_ID";
 export const BROWSERBASE_CONCURRENCY_ENV_VAR = "BROWSERBASE_CONCURRENCY";
+/**
+ * Set to `"1"` to enable Browserbase Contexts (issue #88). When enabled,
+ * `openBrowserSession` passes a persistent Context to the Browserbase session,
+ * carrying cookies and localStorage across runs for the same user.
+ *
+ * Off by default so existing deployments are unaffected until the Context IDs
+ * have been provisioned and stored in `profiles.browserbase_context_id`.
+ */
+export const BROWSERBASE_CONTEXTS_ENABLED_ENV_VAR = "BROWSERBASE_CONTEXTS_ENABLED";
 
 /**
  * Sessions this Browserbase project may run at once, when
@@ -820,6 +838,12 @@ export async function openBrowserSession(
   const slot = await acquireSessionSlot(options.logTag);
   let browser: StagehandBrowser;
   try {
+    // Issue #88: attach a persistent Context when the feature flag is on and
+    // the caller supplied a context ID. Falls back to ephemeral if not.
+    const contextsEnabled =
+      process.env[BROWSERBASE_CONTEXTS_ENABLED_ENV_VAR] === "1";
+    const contextId = contextsEnabled ? options.contextId : undefined;
+
     browser =
       choice.provider === "browserbase"
         ? await browserbase.launch({
@@ -837,6 +861,7 @@ export async function openBrowserSession(
             browserSettings: {
               viewport: BROWSERBASE_VIEWPORT,
               blockAds: true,
+              ...(contextId !== undefined ? { context: { id: contextId, persist: true } } : {}),
             },
           })
         : await localBrowser.launch({ headless: options.headless });
@@ -971,6 +996,71 @@ export async function closeBrowserSession(session: BrowserSession): Promise<void
       releaseSessionSlot(slot);
     }
   }
+}
+
+// ───────────────────────────────────
+// Browserbase Contexts (issue #88)
+// ───────────────────────────────────
+
+/**
+ * In-memory table of per-user context-creation Promises.
+ *
+ * When two runs for the same user start simultaneously, only the first call to
+ * `createBrowserbaseContext` for that user actually hits the Browserbase REST
+ * API. Any subsequent call that arrives while the first is in flight awaits the
+ * same Promise and gets the same result. This prevents duplicate context rows
+ * in a single process; duplicate contexts across processes are not possible
+ * because the second process reads from the database and finds the one the
+ * first process already stored.
+ */
+const contextCreationInFlight: Map<string, Promise<string>> = new Map();
+
+/**
+ * Creates a new Browserbase Context for the given user, returning its ID.
+ *
+ * The returned ID should be stored in `profiles.browserbase_context_id` so
+ * subsequent runs can reuse the same context. Call this at most once per user;
+ * subsequent runs should pass the stored ID directly to `openBrowserSession`.
+ *
+ * Concurrency-safe within a single process: simultaneous calls for the same
+ * userId share one in-flight Promise and receive the same context ID.
+ */
+export async function createBrowserbaseContext(
+  userId: string,
+  apiKey: string,
+  projectId: string
+): Promise<string> {
+  const existing = contextCreationInFlight.get(userId);
+  if (existing !== undefined) return existing;
+
+  const creation = (async (): Promise<string> => {
+    try {
+      const response = await fetch("https://api.browserbase.com/v1/contexts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-BB-API-Key": apiKey,
+        },
+        body: JSON.stringify({ projectId }),
+      });
+      if (!response.ok) {
+        const body = await response.text().catch(() => "(unreadable)");
+        throw new Error(
+          `Browserbase context creation failed with HTTP ${response.status}: ${body}`
+        );
+      }
+      const data = (await response.json()) as { id: string };
+      if (typeof data.id !== "string" || data.id.length === 0) {
+        throw new Error(`Browserbase context creation returned an unexpected body: ${JSON.stringify(data)}`);
+      }
+      return data.id;
+    } finally {
+      contextCreationInFlight.delete(userId);
+    }
+  })();
+
+  contextCreationInFlight.set(userId, creation);
+  return creation;
 }
 
 /** Compares URLs by origin + path — query/hash churn is not a different page. */

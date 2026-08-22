@@ -83,6 +83,7 @@ import {
 import {
   closeBrowserSession,
   samePage,
+  sleep,
   tryResolveAction,
   type BrowserSession,
 } from "@/lib/stagehand-session";
@@ -126,6 +127,17 @@ const INSTRUCTIONS = Object.freeze({
   SUBMIT_APPLICATION:
     "the button that submits the completed job application to the employer, labelled " +
     'something like "Submit Application", "Submit" or "Send Application"',
+  /**
+   * Issue #91: LLM fallback for when the fill phase could not locate a submit
+   * control — e.g. because the form is a multi-step wizard and the current step
+   * shows "Next" rather than "Submit". This instruction tells Stagehand to take
+   * whatever advancing action makes sense given what is on screen.
+   */
+  WIZARD_ADVANCE:
+    "You are on a job application form. No submit button was found by the automated scanner. " +
+    "Look at the page and take the most appropriate action to advance the application toward " +
+    'submission — click Next, Continue, Review, Submit, or whatever control makes sense ' +
+    "given what you see.",
 } as const);
 
 const CONFIRMATION_EXTRACT_INSTRUCTION =
@@ -1675,19 +1687,64 @@ async function runSubmitPhase(
     // ── Which control, according to the form ACT-007 just filled ─────────────
     const choice = chooseSubmitControlLabel(fill.submitControlLabels);
     if (choice.label === null) {
-      // Issue #85: one of the two points that used to stop with nothing but
-      // this sentence. A screenshot and the page's own HTML are the
-      // difference between "a human can see why" and a bare log line.
-      const artifacts = await captureFailurePoint(
-        session,
-        jobApplicationId,
-        "no-submit-control",
-        input.screenshotDir ?? DEFAULT_SCREENSHOT_DIR
+      // Issue #91 Part 1: LLM fallback. The fill phase found no submit control,
+      // which typically means the form is a multi-step wizard still on an
+      // intermediate step (e.g. SmartRecruiters "Next" before "Submit"). Try up
+      // to three times to advance via Stagehand before concluding the application
+      // is blocked. Each attempt calls act() and then checks for a submit button
+      // via tryResolveAction so the check is DOM-based, not re-extracted from the
+      // fill-phase scan (which only runs once, before we get here).
+      let fallbackResolved: Awaited<ReturnType<typeof tryResolveAction>> = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        console.log(
+          `${LOG} LLM fallback (submit-not-found, attempt ${attempt}/3): ` +
+            `no submit control in fill-phase scan — attempting act() to advance`
+        );
+        try {
+          await session.stagehand.act(INSTRUCTIONS.WIZARD_ADVANCE, { page: session.page });
+        } catch (err) {
+          console.log(
+            `${LOG} LLM fallback (submit-not-found, attempt ${attempt}/3): ` +
+              `act() threw — ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+        fallbackResolved = await tryResolveAction(
+          session,
+          await session.page.url(),
+          INSTRUCTIONS.SUBMIT_APPLICATION
+        );
+        if (fallbackResolved !== null) {
+          console.log(
+            `${LOG} LLM fallback (submit-not-found, attempt ${attempt}/3): submit control found`
+          );
+          break;
+        }
+        console.log(
+          `${LOG} LLM fallback (submit-not-found, attempt ${attempt}/3): submit control still not found`
+        );
+      }
+      if (fallbackResolved === null) {
+        // Issue #85: one of the two points that used to stop with nothing but
+        // this sentence. A screenshot and the page's own HTML are the
+        // difference between "a human can see why" and a bare log line.
+        const artifacts = await captureFailurePoint(
+          session,
+          jobApplicationId,
+          "no-submit-control",
+          input.screenshotDir ?? DEFAULT_SCREENSHOT_DIR
+        );
+        return await blocked(withFailureArtifacts(choice.why, artifacts));
+      }
+      const fallbackDescriptor = await describeControl(
+        session.page,
+        fallbackResolved.action.selector
       );
-      return await blocked(withFailureArtifacts(choice.why, artifacts));
+      submitControlLabel = fallbackDescriptor.text.trim() || "Submit Application";
+      console.log(`${LOG} submit control chosen via LLM fallback: "${submitControlLabel}"`);
+    } else {
+      submitControlLabel = choice.label;
+      console.log(`${LOG} submit control chosen: "${choice.label}" — ${choice.note}`);
     }
-    submitControlLabel = choice.label;
-    console.log(`${LOG} submit control chosen: "${choice.label}" — ${choice.note}`);
 
     // ── Where that control is, according to the browser ──────────────────────
     // A constant instruction, so nothing page-derived reaches a model, and
@@ -1725,7 +1782,7 @@ async function runSubmitPhase(
     // So it is still computed, still logged, and still recorded on the review
     // gate — but a failure to corroborate no longer stops the run.
     const descriptor = await describeControl(session.page, selector);
-    const check = corroborateSubmitControl(descriptor, choice.label);
+    const check = corroborateSubmitControl(descriptor, submitControlLabel ?? "");
     const evidence = check.ok ? check.evidence : `not corroborated: ${check.why}`;
     console.log(
       check.ok
@@ -1744,7 +1801,7 @@ async function runSubmitPhase(
       company: row.company,
       jobTitle: row.jobTitle,
       url: fill.finalUrl,
-      submitControlLabel: choice.label,
+      submitControlLabel: submitControlLabel ?? "",
       submitControlEvidence: evidence,
       fill,
     });
@@ -1807,10 +1864,30 @@ async function runSubmitPhase(
       );
     }
 
-    // ── Reading the result. One read; no retry loop on this side either ──────
+    // ── Reading the result ────────────────────────────────────────────────────
+    // Workable's confirmation can arrive asynchronously (overlay appears, URL
+    // changes, or "Thank you" text loads) up to a few seconds after the click.
+    // For Workable we poll for up to 5 s; for all other ATS platforms a single
+    // read is sufficient and avoids unnecessary latency.
+    const WORKABLE_POLL_INTERVAL_MS = 1_000;
+    const WORKABLE_POLL_BUDGET_MS = 5_000;
     let capture: ConfirmationCapture;
     try {
-      capture = await readConfirmation(session);
+      if (row.ats === "workable") {
+        const deadline = Date.now() + WORKABLE_POLL_BUDGET_MS;
+        let lastCapture: ConfirmationCapture | undefined;
+        while (Date.now() < deadline) {
+          const attempt = await readConfirmation(session);
+          lastCapture = attempt;
+          if (looksSubmitted(attempt, fill.finalUrl)) break;
+          if (Date.now() + WORKABLE_POLL_INTERVAL_MS < deadline) {
+            await sleep(WORKABLE_POLL_INTERVAL_MS);
+          }
+        }
+        capture = lastCapture!;
+      } else {
+        capture = await readConfirmation(session);
+      }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return await unconfirmed(
