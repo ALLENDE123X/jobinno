@@ -287,6 +287,43 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
   };
 
   /**
+   * The text a sighted applicant would actually see inside `root`, skipping
+   * any subtree hidden via `display:none`, `visibility:hidden` or
+   * `aria-hidden`.
+   *
+   * `root.textContent` does not draw this line, and a label lookup that reads
+   * a whole wrapping `<label>` (or block) can pull in more than the caption:
+   * a combobox widget's own status chrome — a "No results" panel, a loading
+   * spinner's caption — lives right inside that same label/block and stays in
+   * the DOM the entire time, only ever toggled with `display`. Lever's
+   * location autocomplete is built exactly this way: the visible caption
+   * ("Current location") and the dropdown's hidden "No location found..."
+   * and "Loading" panels all share one `<label>`, so `textContent` on it
+   * reads as one run-on sentence (issue #81). This walk stops descending the
+   * moment it hits a hidden node, so that chrome never contributes text.
+   */
+  const visibleText = (root: Element): string => {
+    if (root.getAttribute("aria-hidden") === "true") return "";
+    const rootStyle = window.getComputedStyle(root);
+    if (rootStyle.display === "none" || rootStyle.visibility === "hidden") return "";
+    const parts: string[] = [];
+    const walk = (node: Node): void => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (node.textContent !== null) parts.push(node.textContent);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const element = node as Element;
+      if (element.getAttribute("aria-hidden") === "true") return;
+      const style = window.getComputedStyle(element);
+      if (style.display === "none" || style.visibility === "hidden") return;
+      for (const child of Array.from(node.childNodes)) walk(child);
+    };
+    for (const child of Array.from(root.childNodes)) walk(child);
+    return parts.join(" ");
+  };
+
+  /**
    * Does this element contain something that would submit the application?
    *
    * The activation ladder climbs ancestors to find the box that opens a
@@ -365,13 +402,13 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
     }
     if (bits.length === 0) {
       const wrapping = element.closest("label");
-      if (wrapping !== null) push(wrapping.textContent);
+      if (wrapping !== null) push(visibleText(wrapping));
     }
     if (bits.length === 0) {
       const block = element.closest("div,fieldset,li,section,td");
       if (block !== null) {
         const blockLabel = block.querySelector("label,legend");
-        if (blockLabel !== null) push(blockLabel.textContent);
+        if (blockLabel !== null) push(visibleText(blockLabel));
       }
     }
     if (bits.length === 0) {

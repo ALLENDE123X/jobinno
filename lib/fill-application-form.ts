@@ -796,6 +796,36 @@ function describeControlInPage(sel: string): ControlDescriptor {
   const push = (value: string | null | undefined): void => {
     if (value) parts.push(String(value));
   };
+  // Text a sighted applicant would actually see under `root`, skipping any
+  // subtree hidden via `display:none`, `visibility:hidden` or `aria-hidden`.
+  // A wrapping <label> (or the nearest labelled block) can hold more than the
+  // caption: a combobox widget's own status chrome — a "No results" panel, a
+  // loading spinner's caption — lives in that same label/block and stays in
+  // the DOM the whole time, only ever toggled with `display`. Reading
+  // `.textContent` straight off pulls that chrome in too, so the haystack
+  // built here runs the same risk `form-fields.ts`'s `labelOf` had (issue
+  // #81, Lever's location autocomplete): "no location found" or "loading"
+  // text bleeding into what a field "describes itself as" here.
+  const visibleTextOf = (root: Element): string => {
+    if (root.getAttribute("aria-hidden") === "true") return "";
+    const rootStyle = window.getComputedStyle(root);
+    if (rootStyle.display === "none" || rootStyle.visibility === "hidden") return "";
+    const bits: string[] = [];
+    const walk = (node: Node): void => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (node.textContent !== null) bits.push(node.textContent);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const el = node as Element;
+      if (el.getAttribute("aria-hidden") === "true") return;
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") return;
+      for (const child of Array.from(node.childNodes)) walk(child);
+    };
+    for (const child of Array.from(root.childNodes)) walk(child);
+    return bits.join(" ");
+  };
   const attributes = ["name", "id", "placeholder", "aria-label", "autocomplete", "data-testid", "title"];
   for (const attribute of attributes) push(element.getAttribute(attribute));
 
@@ -813,13 +843,13 @@ function describeControlInPage(sel: string): ControlDescriptor {
     if (explicit) push(explicit.textContent);
   }
   const wrapping = element.closest("label");
-  if (wrapping) push(wrapping.textContent);
+  if (wrapping) push(visibleTextOf(wrapping));
   // Greenhouse renders <div><label>First Name</label><input></div>, so the
   // nearest labelled block is usually where the human-readable name lives.
   const block = element.closest("div,fieldset,li,section");
   if (block) {
     const blockLabel = block.querySelector("label,legend");
-    if (blockLabel) push(blockLabel.textContent);
+    if (blockLabel) push(visibleTextOf(blockLabel));
   }
 
   const asInput = element as HTMLInputElement;
