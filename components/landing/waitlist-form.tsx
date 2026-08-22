@@ -15,6 +15,12 @@
  * `lib/waitlist.ts`, on the same reasoning `lib/feedback.ts` documents: RLS on
  * `waitlist` allows an anonymous insert outright, so there is no server route
  * for this to post to, and none needs to exist.
+ *
+ * `referredBy` (JOB-041) is a prop, not state: nobody types it, it is the
+ * value `app/page.tsx` already resolved server side from `?ref=` and the
+ * cookie before this client component ever rendered. It is only read at
+ * submit time below, passed straight through to `submitWaitlist` alongside
+ * whatever the person actually typed.
  */
 
 import { useState } from "react";
@@ -64,7 +70,12 @@ type Status =
   | { kind: "joined"; email: string; alreadyJoined: boolean }
   | { kind: "error"; message: string };
 
-export function WaitlistForm() {
+export function WaitlistForm({
+  referredBy,
+}: {
+  /** Resolved server side by `app/page.tsx`; see the file header. */
+  referredBy: string | null;
+}) {
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [biggestFrustration, setBiggestFrustration] = useState("");
@@ -106,6 +117,7 @@ export function WaitlistForm() {
         name,
         biggestFrustration,
         weeklyApplicationVolume,
+        referredBy,
       });
 
       if (!result.ok) {

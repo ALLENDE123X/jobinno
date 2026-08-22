@@ -96,10 +96,21 @@ describe("a signed in visitor is sent to /dashboard instead of shown /login or /
       createServiceRoleClient: vi.fn(),
       RESUMES_BUCKET: "resumes",
     }));
+
+    // `app/page.tsx` reads the JOB-041 referral cookie via `next/headers`, and
+    // that only works inside a real Next.js request. Every test in this file
+    // drives `Home` directly, outside that context, so `cookies()` is stubbed
+    // the same way `@/lib/supabase/server` is above rather than hit for real.
+    // No test here is about referral attribution, so an empty cookie jar is
+    // the right stand-in: `resolveWaitlistReferral` falls through to null.
+    vi.doMock("next/headers", () => ({
+      cookies: async () => ({ get: () => undefined }),
+    }));
   });
 
   afterEach(() => {
     vi.doUnmock("@/lib/supabase/server");
+    vi.doUnmock("next/headers");
   });
 
   describe("/login", () => {

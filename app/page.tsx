@@ -20,6 +20,14 @@
  * JOB-016 shipped. JOB-038 moved it to the end instead, right before the
  * footer, on user feedback that the real pitch should come first.
  *
+ * ── Creator referral attribution (JOB-041) ────────────────────────────────
+ * `?ref=<code>` on this URL names the creator whose link brought the visitor
+ * here. This page reads the live query param via `searchParams`, and falls
+ * back to the cookie `middleware.ts` set from an earlier visit's `?ref=` when
+ * there is no live one, through `resolveWaitlistReferral` in
+ * `lib/waitlist.ts`. The resolved value is threaded down to `WaitlistBanner`
+ * and then to `WaitlistForm`, which is what actually submits it.
+ *
  * ── Somebody already signed in has no reason to see the marketing pitch
  *    (JOB-020), except while the gate is active ────────────────────────────
  * The check mirrors the one on `/login`: a session sends the visitor straight
@@ -44,6 +52,7 @@
 
 import { Suspense } from "react";
 
+import { cookies } from "next/headers";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { ArrowRight, Check, Clock, Moon, ShieldCheck } from "lucide-react";
@@ -65,6 +74,11 @@ import {
 } from "@/lib/billing/plans";
 import { createServerClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
+import {
+  resolveWaitlistReferral,
+  WAITLIST_REFERRAL_COOKIE,
+  WAITLIST_REFERRAL_QUERY_PARAM,
+} from "@/lib/waitlist";
 import { WAITLIST_GATE_ACTIVE } from "@/lib/waitlist-gate";
 
 /**
@@ -140,8 +154,11 @@ const PROMISES = [
 ] as const;
 
 /** The waitlist form and its surrounding copy (JOB-031), moved here from the
- * page it used to have to itself (JOB-032). See the file header for why. */
-function WaitlistBanner() {
+ * page it used to have to itself (JOB-032). See the file header for why.
+ * `referredBy` (JOB-041) is only ever handed down from `Home` below, never
+ * computed here: this component has no access to the request, only the
+ * resolved value it was given. */
+function WaitlistBanner({ referredBy }: { referredBy: string | null }) {
   return (
     <Section className="border-t bg-muted/30">
       <div className="mx-auto flex w-full max-w-2xl flex-col items-center gap-6 text-center">
@@ -162,7 +179,7 @@ function WaitlistBanner() {
           </p>
         </div>
 
-        <WaitlistForm />
+        <WaitlistForm referredBy={referredBy} />
       </div>
     </Section>
   );
@@ -206,6 +223,23 @@ export default async function Home({
 
     if (user) redirect("/dashboard");
   }
+
+  // ── JOB-041: resolve the referral code for this render ───────────────────
+  // The live `?ref=` on this request, if any, plus whatever `middleware.ts`
+  // already stamped into `WAITLIST_REFERRAL_COOKIE` from an earlier one.
+  // `resolveWaitlistReferral` is the one place that decides which wins; see
+  // its doc comment in `lib/waitlist.ts`. A `?ref=` repeated in the URL
+  // becomes an array, which is never a real referral code, so only a single
+  // string value is read from the query.
+  const rawReferralParam = params[WAITLIST_REFERRAL_QUERY_PARAM];
+  const referralFromQuery =
+    typeof rawReferralParam === "string" ? rawReferralParam : undefined;
+  const cookieStore = await cookies();
+  const referralFromCookie = cookieStore.get(WAITLIST_REFERRAL_COOKIE)?.value;
+  const referredBy = resolveWaitlistReferral(
+    referralFromQuery,
+    referralFromCookie
+  );
 
   return (
     <div className="flex min-h-screen flex-col">
@@ -452,7 +486,7 @@ export default async function Home({
           </p>
         </Section>
 
-        <WaitlistBanner />
+        <WaitlistBanner referredBy={referredBy} />
       </main>
 
       <footer className="border-t px-4 py-10 sm:px-6">
