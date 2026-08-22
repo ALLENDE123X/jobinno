@@ -169,6 +169,7 @@ import {
   closeBrowserSession,
   openBrowserSession,
   reResolveLive,
+  resolveBrowserbaseContextId,
   sleep,
   tryResolveAction,
   typeInto,
@@ -4756,7 +4757,39 @@ async function runBrowserFlow(
   // "Turn off your VPN or proxy" first). Run Ashby without proxies so the
   // outbound IP is the Browserbase host rather than a proxy node.
   const disableProxies = state.ats === "ashby";
-  const session = await openBrowserSession({ headless, logTag: LOG, disableProxies });
+  // JOB-050. A persistent context carries one fingerprint and one cookie jar
+  // across every run for this person, so a board sees a returning device rather
+  // than a brand new machine each time. Resolves to `undefined` whenever the
+  // flag is off or anything about it fails, and the run then proceeds exactly as
+  // it did before contexts existed.
+  const contextId = await resolveBrowserbaseContextId({
+    userId: state.candidateId,
+    logTag: LOG,
+    readStoredId: async () => {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("browserbase_context_id")
+        .eq("id", state.candidateId)
+        .maybeSingle();
+      if (error !== null) throw new Error(error.message);
+      const stored = (data as { browserbase_context_id?: string | null } | null)
+        ?.browserbase_context_id;
+      return stored ?? null;
+    },
+    persistId: async (value) => {
+      const { error } = await supabase
+        .from("profiles")
+        .update({ browserbase_context_id: value })
+        .eq("id", state.candidateId);
+      if (error !== null) throw new Error(error.message);
+    },
+  });
+  const session = await openBrowserSession({
+    headless,
+    logTag: LOG,
+    disableProxies,
+    contextId,
+  });
   const browserbaseSessionId = session.browser.sessionId ?? null;
   console.log(`${LOG} local browser session opened (headless=${headless}) — dedicated to this run`);
 

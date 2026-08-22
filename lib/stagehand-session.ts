@@ -1074,6 +1074,71 @@ export async function createBrowserbaseContext(
   return creation;
 }
 
+/**
+ * JOB-050 — the missing half of issue #88's Contexts work.
+ *
+ * `createBrowserbaseContext` above has existed and been correct since #88, and
+ * `openBrowserSession` has known how to attach a context since then too. Between
+ * the two there was nothing: no caller ever created a context, and no caller
+ * ever passed `contextId`, so the feature was unreachable code behind a flag
+ * nobody could usefully set. The `browserbase_context_id` column its own
+ * migration adds was likewise never read or written.
+ *
+ * That mattered because a context is the one countermeasure aimed squarely at
+ * what a cold session looks like: same fingerprint, same cookie jar, run after
+ * run, which is a returning device rather than a new machine every time.
+ *
+ * Returns `undefined` rather than throwing on every failure path, and that is
+ * deliberate. A context is a hardening measure, not a correctness requirement;
+ * an application that would have gone out without one should still go out when
+ * the contexts API is unreachable, the flag is off, or the column write loses a
+ * race. The only cost of returning `undefined` is a session that looks as cold
+ * as every session looked before this function existed.
+ */
+export async function resolveBrowserbaseContextId(input: {
+  userId: string;
+  /** Reads `profiles.browserbase_context_id` and writes it back when minted. */
+  readStoredId: () => Promise<string | null>;
+  persistId: (contextId: string) => Promise<void>;
+  logTag: string;
+  env?: EnvSource;
+}): Promise<string | undefined> {
+  const env = input.env ?? process.env;
+  if (readEnv(env, BROWSERBASE_CONTEXTS_ENABLED_ENV_VAR) !== "1") return undefined;
+
+  const choice = chooseBrowserProvider(env);
+  if (choice.provider !== "browserbase") return undefined;
+
+  try {
+    const stored = await input.readStoredId();
+    if (stored !== null && stored !== "") {
+      console.log(`${input.logTag} reusing Browserbase context ${stored.slice(0, 8)}…`);
+      return stored;
+    }
+
+    const created = await createBrowserbaseContext(input.userId, choice.apiKey, choice.projectId);
+    // Persisted before it is returned, so the next run reuses this one instead
+    // of minting another. A failure to persist is not a failure to browse: the
+    // context still works for this run, it just will not be found again.
+    try {
+      await input.persistId(created);
+    } catch (err) {
+      console.log(
+        `${input.logTag} Browserbase context ${created.slice(0, 8)}… was created but not stored ` +
+          `(${err instanceof Error ? err.message : String(err)}), so the next run will mint a new one`
+      );
+    }
+    console.log(`${input.logTag} created Browserbase context ${created.slice(0, 8)}…`);
+    return created;
+  } catch (err) {
+    console.log(
+      `${input.logTag} continuing without a Browserbase context: ` +
+        `${err instanceof Error ? err.message : String(err)}`
+    );
+    return undefined;
+  }
+}
+
 /** Compares URLs by origin + path — query/hash churn is not a different page. */
 export function samePage(a: string, b: string): boolean {
   try {
