@@ -71,6 +71,9 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { APPLICATION_STATUS, type ApplicationStatus } from "@/lib/application-status";
+// JOB-117. The one definition of "this page is another step of the same
+// application", shared with the fill phase that now presses Next.
+import { pageReadsAsFurtherStep } from "@/lib/application-wizard";
 import {
   APPLICATION_CONTROL_RE,
   MIN_IDENTITY_SLOTS_FOR_FORM,
@@ -424,64 +427,16 @@ export type SubmissionVerdict = {
 };
 
 /**
- * The destination naming itself a completed submission.
- *
- * Matched against the URL path and the page title only, never the body text —
- * body text is what `confirmationPresent` is for, and "please click SUBMIT to
- * complete your application" is an instruction rather than a receipt.
- *
- * This is a **veto on the further-step reading below**, not a route to
- * `submitted` on its own. Its whole job is to stop a board whose genuine thank
- * you page happens to live at a step-shaped URL from being mistaken for a step.
- *
- * ── Why these are phrases and not words ─────────────────────────────────────
- * Both halves this is matched against carry the job's own title: a board builds
- * its tab title as "{step} - {job title} - {company}", and its paths are
- * routinely slugged from the same string. So a bare `success` here would read
- * "Customer Success Engineer" as a receipt, a bare `received` or `submitted`
- * would do the same to any title containing them, and the effect would be this
- * whole guard switching itself off for a common class of role — restoring the
- * exact bug for those listings while looking like it was still working. None of
- * the 966 rows in `jobs` collides today, which is precisely why it would go
- * unnoticed until it did. Every entry below is therefore either a phrase no job
- * title contains, or a word no job title contains.
+ * JOB-117 moved the three patterns that used to sit here — the confirmation
+ * destination, the further-step path and the further-step title — into
+ * `lib/application-wizard.ts`, along with the predicate over them. Nothing about
+ * what they mean changed; what changed is that `fill-application-form.ts` now
+ * asks the same question, because it is the half of the pipeline that presses
+ * Next, and two copies of this definition would be free to drift apart in
+ * exactly the way that would let a receipt be read as a step on one side and a
+ * step be read as a receipt on the other. See that module for the reasoning
+ * behind each pattern, which is JOB-106's and is unedited.
  */
-const CONFIRMATION_DESTINATION_RE =
-  /thank[-\s_]?you|\bthanks\b|\bconfirmation\b|application[-\s_]+(?:submitted|received|complete)|submitted[-\s_]+successfully|(?:has|have)[-\s_]+been[-\s_]+(?:submitted|received)|submission[-\s_]+received|received[-\s_]+your[-\s_]+application/i;
-
-/**
- * A path segment that names a further step of an application.
- *
- * Grounded rather than guessed. SmartRecruiters' oneclick-ui ships its own route
- * to title map in its i18n bundle, and it has exactly two entries:
- * `page.title.prefix.form` = "Easy apply" and `page.title.prefix.screening` =
- * "Preliminary questions". `/screening` below is that route, read off the board
- * rather than imagined, and it is the one the failing run landed on.
- *
- * The rest are its close cousins across boards, kept to segments that can only
- * be a step. Deliberately **absent**: `apply`, `form`, `application` and
- * `review`. Those name the form's own page as often as a step, and this
- * predicate must never fire on a board that answers a submit in place.
- */
-const FURTHER_STEP_PATH_RE =
-  /(?:^|\/)(?:screening|screening[-_]questions|questions|additional[-_]?info(?:rmation)?|additional[-_]questions|assessment|eeo|demographics?|voluntary[-_]?(?:self[-_]?identification|disclosures?)|step[-_]?\d*)(?:\/|$)/i;
-
-/**
- * A page title that names a further step of an application.
- *
- * "Preliminary questions" is SmartRecruiters' own string for the screening step,
- * not a phrase inferred from one capture: it is the value of
- * `oneclick-ui.page.title.prefix.screening` in the board's shipped i18n bundle,
- * and the board prefixes the tab title with it on every screening page.
- *
- * Checked whether or not the board navigated, because a single page wizard can
- * advance a step without changing its URL and will still retitle itself. Kept to
- * names that can only be a further step: "Easy apply" is **not** here, because a
- * board that confirms in place keeps its original title and would be wrongly
- * vetoed by it.
- */
-const FURTHER_STEP_TITLE_RE =
-  /\bpreliminary\s+questions\b|\badditional\s+questions\b|\bscreening\s+questions\b|\badditional\s+information\b|\bstep\s+\d+\s+of\s+\d+\b/i;
 
 /**
  * The board's validation copy, in its own words, as a sentence that can be
@@ -497,45 +452,19 @@ function errorsFor(capture: ConfirmationCapture): string {
   )}.`;
 }
 
-/** The path of a URL, or the whole string when it will not parse as one. */
-function urlPath(url: string): string {
-  try {
-    return new URL(url).pathname;
-  } catch {
-    return url;
-  }
-}
-
 /**
  * Whether the page the board landed on reads as another step of the same
  * application rather than as a receipt.
  *
  * Exported for the regression test, which pins it against the real Avery
  * Dennison capture and against the wording SmartRecruiters uses on the page that
- * genuinely does confirm.
+ * genuinely does confirm. JOB-117 moved the rule itself into
+ * `lib/application-wizard.ts` so the fill phase decides "did Next actually
+ * advance a step" by the same rule this decides "was that a receipt" by; this
+ * signature, and everything it means, is unchanged.
  */
 export function readsAsFurtherStep(capture: ConfirmationCapture, wasAt: string): boolean {
-  // A board's own name for the step it has put on screen is the most specific
-  // thing either half of this can say, so it is checked first and it wins.
-  // The ordering is deliberate rather than incidental: the two ways of being
-  // wrong here are not equally bad. Reading a step as a receipt writes
-  // `submitted`, which is terminal and never revisited; reading a receipt as a
-  // step writes `submission_unconfirmed`, which a human then looks at. Where the
-  // signals disagree, this yields to the reading whose failure is recoverable.
-  if (FURTHER_STEP_TITLE_RE.test(capture.title)) return true;
-  const path = urlPath(capture.url);
-  // A destination that announces a completed submission is not a further step,
-  // however step-shaped its URL is. Checked against both halves, so that a thank
-  // you page at `/application/questions/confirmation` is not read as a step by
-  // its own path.
-  if (CONFIRMATION_DESTINATION_RE.test(path) || CONFIRMATION_DESTINATION_RE.test(capture.title)) {
-    return false;
-  }
-  // The path is only meaningful when the board actually went somewhere. When it
-  // stayed put, the path under examination is the form's own, and asking whether
-  // it looks like a step is asking about the page we started on.
-  if (samePage(capture.url, wasAt)) return false;
-  return FURTHER_STEP_PATH_RE.test(path);
+  return pageReadsAsFurtherStep(capture.title, capture.url, wasAt);
 }
 
 /**

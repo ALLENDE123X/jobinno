@@ -157,6 +157,9 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { APPLICATION_STATUS, type ApplicationStatus } from "@/lib/application-status";
+// JOB-117. JOB-106's rule for "this page is another step of the same
+// application", shared with `submit-application.ts` rather than restated here.
+import { pageReadsAsFurtherStep } from "@/lib/application-wizard";
 import { checkApplyUrl, forLog } from "@/lib/apply-url-guard";
 // Single source of truth for "which domains may speak for this board". ACT-006
 // applies it when it decides a link is safe to *report*; this module applies it
@@ -170,6 +173,7 @@ import {
   openBrowserSession,
   reResolveLive,
   resolveBrowserbaseContextId,
+  samePage,
   sleep,
   tryResolveAction,
   typeInto,
@@ -271,6 +275,43 @@ const INSTRUCTIONS = Object.freeze({
   COVER_LETTER_MANUAL:
     "the control that switches the cover letter from a file upload to typing the text in " +
     "directly, labelled something like \"Enter manually\", \"Type\", \"Write\" or \"Paste\"",
+  /**
+   * JOB-117. The control that moves a multi step form on to its next step.
+   *
+   * ── Why this says neither "application" nor "submit" ────────────────────────
+   * It used to. The first version read "the button that moves this job
+   * application on to its next step **without submitting it**", which is an
+   * accurate description of what is wanted and was exactly the wrong thing to
+   * write. `observe()` answers an instruction largely in the instruction's own
+   * vocabulary, so against the real Avery Dennison form it came back with "Next
+   * button that advances the job **application** to the next step without
+   * **submitting** it" — and that string is what `assertNotAnApplicationSubmit`
+   * is handed. That guard matches `APPLICATION_CONTROL_RE` and `SUBMIT_WORD_RE`
+   * independently and has no notion of negation, so a description whose only
+   * submit word sits inside "without submitting it" trips it exactly as hard as
+   * a real Submit button would. The run stopped with `form_fill_blocked` on a
+   * correctly filled form.
+   *
+   * The fix is here rather than in the guard, and that direction matters. The
+   * guard is right: a control describing itself as submitting an application
+   * must never be pressed by this module, and teaching it to read "without" is
+   * teaching it to be talked out of refusing. What was wrong was feeding it a
+   * description this module's own phrasing had poisoned. So this names a *form*
+   * and a *step* and never mentions an application or a submission, the observed
+   * description comes back in those terms, and the guard keeps every bit of its
+   * strength for the case it exists for — a board whose advance control really
+   * does submit, and says so.
+   *
+   * Contrast issue #91's `WIZARD_ADVANCE` in `submit-application.ts`, which
+   * tells a model to "click Next, Continue, Review, **Submit**, or whatever
+   * control makes sense". That one names Submit as an acceptable answer. This
+   * one cannot: it only ever reaches a page through `clickControl`, and
+   * `NEXT_STEP_ACCEPT_RE` has to agree independently that what came back reads
+   * as a next-step control.
+   */
+  NEXT_STEP:
+    "the button that moves this multi step form on to its next step, labelled something like " +
+    "\"Next\", \"Continue\", \"Next step\" or \"Save and continue\"",
 } as const);
 
 /**
@@ -6500,13 +6541,11 @@ async function runBrowserFlow(
       throw blockedForAnswers(needsInput, signals.url);
     }
 
-    // Read the page one last time so the report describes the form as it now
-    // stands, and so `submitControlLabels` names the button ACT-008 will need.
-    // Nothing below this line touches the page except a screenshot — in
-    // particular, no control is clicked, which is where this ticket ends. When
-    // the session is being retained, this read is also the *last* state ACT-008
-    // will see before it decides what to click, so it has to be a fresh one.
-    const final = await readFormSignals(session);
+    // Read the page again so the next decision is made against the form as it
+    // now stands. Before JOB-117 this was the last read of the run; it is now
+    // the read that answers "is the submit control on this step, or is this a
+    // wizard that has more of itself to show us?".
+    let final = await readFormSignals(session);
     // ACT-015 gave this module a second set of clicks — opening dropdowns and
     // choosing options — so the "did one of our clicks submit this?" check that
     // has always guarded the apply-click path is applied here too, against the
@@ -6514,6 +6553,53 @@ async function runBrowserFlow(
     // holding a submit control, which is the structural half; this is the
     // observed half, and neither is redundant with the other.
     assertNotAlreadySubmitted(final, "the filled form");
+
+    // ── JOB-117: the rest of the wizard ──────────────────────────────────────
+    // A SmartRecruiters `oneclick-ui` form carries no submit control at all on
+    // its first step; the only primary button is Next, and Submit lives on the
+    // "Preliminary questions" step behind it. Every fill report this pipeline
+    // has ever produced for that board reported `submitControlLabels: []`, and
+    // the resulting "the filled form reported no usable control that submits the
+    // application" was accurate rather than a perception failure — there was
+    // nothing to report. This walks the remaining steps, filling each one the
+    // same way the first was filled, and returns the page that finally does hold
+    // a submit control.
+    //
+    // It lives here, in the fill phase, rather than in `submit-application.ts`,
+    // and that placement is the design rather than a convenience. ACT-008's
+    // budget is "one logical submission, ever", enforced by `submitClicks` and by
+    // `submitAttempted` being set on the line before the click. Pressing Next is
+    // not a submission and must not spend any part of that budget, so it happens
+    // in the module that is structurally incapable of submitting: every click
+    // this file makes goes through `clickControl`, which puts
+    // `assertNotAnApplicationSubmit` in front of it. Advancing a step therefore
+    // cannot submit by accident, for the same reason opening a dropdown cannot.
+    final = await advanceThroughWizard(
+      supabase,
+      session,
+      state,
+      input,
+      profile,
+      final,
+      fields,
+      needsInput
+    );
+
+    // Issue #116 — a whole-form verification pass belongs on this line, between
+    // the last fill and the handoff to ACT-008, and JOB-117 deliberately does
+    // not add it. Not because it is unwanted: a wizard is exactly where a late
+    // corruption would hide, since step two's fill runs long after step one's
+    // fields were each read back clean. It is left out because doing it
+    // *correctly* is not the small addition it looks like. `FieldOutcome`
+    // carries no selector — `field` is a label-derived key for the ACT-015 pass
+    // and a hardcoded name ("firstName", "website") for the eight named ones —
+    // so nothing here can reliably rejoin a recorded intent to the control it
+    // went into, and the version that guesses at that join would either miss the
+    // named fields (which is where #116's observed Website corruption actually
+    // happened) or block live runs on boards that reformat a value after entry.
+    // Giving `FieldOutcome` a selector is the right fix and it is a change
+    // through `fillFields`, `record()` and the type itself — its own ticket,
+    // against the file where a false positive stops a real application.
     const screenshotPath = await captureFilledForm(
       session,
       state.jobApplicationId,
@@ -6584,6 +6670,321 @@ async function runBrowserFlow(
     await saveActionPlan(supabase, session.actionPlan, LOG);
     if (!retained) await closeBrowserSession(session);
   }
+}
+
+/**
+ * JOB-117. Every control the page itself marks required, across open shadow
+ * roots, deduplicated the way a person counts questions rather than the way the
+ * DOM counts elements.
+ *
+ * A radio group is one question and N `<input type="radio">` elements, so the
+ * elements are folded by their shared `name` before being counted. Anything
+ * without a `name` counts once on its own.
+ *
+ * Under-counting is the safe direction, as it is for `STRUCTURAL_FLOOR_SCRIPT`
+ * above: this number is compared against what perception managed to read, and a
+ * floor that reads low can only make the module less likely to stop.
+ */
+const REQUIRED_QUESTION_SCRIPT = `(() => {
+  var LIMIT = 12000;
+  var seen = 0;
+  var names = new Set();
+  var anonymous = 0;
+  var roots = [document];
+  var visited = new Set();
+  while (roots.length && seen < LIMIT) {
+    var root = roots.pop();
+    if (!root || visited.has(root)) continue;
+    visited.add(root);
+    var all;
+    try { all = root.querySelectorAll('*'); } catch (e) { continue; }
+    for (var i = 0; i < all.length; i++) {
+      if (seen++ >= LIMIT) break;
+      var el = all[i];
+      var inner = el.shadowRoot;
+      if (inner) roots.push(inner);
+      var required = el.getAttribute('aria-required') === 'true' || el.hasAttribute('required');
+      if (!required) continue;
+      var tag = el.tagName.toLowerCase();
+      var type = (el.getAttribute('type') || '').toLowerCase();
+      if (tag === 'input' && (type === 'hidden' || type === 'submit' || type === 'button')) continue;
+      if (el.getAttribute('aria-hidden') === 'true') continue;
+      var name = el.getAttribute('name') || el.getAttribute('aria-labelledby') || '';
+      if (name) names.add(name); else anonymous++;
+    }
+  }
+  return names.size + anonymous;
+})()`;
+
+/**
+ * How many required questions the page is showing, by its own markup.
+ *
+ * Returns `null` when the sweep cannot run at all, which the caller reads as "no
+ * evidence" rather than as "none": a guard that treats a failed measurement as a
+ * clean bill of health is not a guard.
+ */
+async function countRequiredQuestions(page: Page): Promise<number | null> {
+  try {
+    const count = await page.evaluate(REQUIRED_QUESTION_SCRIPT);
+    return typeof count === "number" && Number.isFinite(count) ? count : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * JOB-117. Refuses to call a wizard step filled when the page is showing more
+ * required questions than perception managed to read.
+ *
+ * ── The run that made this necessary ────────────────────────────────────────
+ * The first live run that got through to SmartRecruiters' "Preliminary
+ * questions" step reported `form_filled` with `blockedReason: null`, and the
+ * screenshot of the page it had just declared finished showed most of it blank:
+ * "Are you 18 years of age or older?", the sponsorship question, highest
+ * education, prior employment, non-compete, salary expectations and the privacy
+ * declaration were all still empty and all still marked required. Perception had
+ * read eleven controls on a page carrying roughly twice that, so the fields it
+ * never saw never became `needsInput` items, `blockedForAnswers` never fired,
+ * and the run reported a form it had not filled.
+ *
+ * That is worse than the bug this ticket set out to fix. Before JOB-117 a
+ * SmartRecruiters run stopped at `submission_blocked` with nothing clicked;
+ * with the wizard advance and without this check it would reach ACT-008 holding
+ * a real submit control and a form full of unanswered required questions, and
+ * ACT-008 would press it. A blank answer to "will you require sponsorship" on a
+ * real application is not a validation failure to shrug at, and the whole point
+ * of HARD STOP 9 is that the applicant is the one who wears what the form says.
+ *
+ * ── Why it is scoped to the wizard path ─────────────────────────────────────
+ * Deliberately called from `advanceThroughWizard` and nowhere else. Every board
+ * that fills and submits correctly today does so without ever advancing a step,
+ * and this comparison is a heuristic — a page that marks a question required in
+ * markup perception reads differently would be stopped by it. Applying it only
+ * to the path this ticket introduced means it cannot regress anything that
+ * currently works, and it fails closed on the one path where the evidence says
+ * perception is incomplete.
+ *
+ * Reads as "no evidence" and stays quiet when the sweep cannot run or when the
+ * page marks nothing required at all.
+ */
+export function assertStepFullyRead(
+  pageRequired: number | null,
+  readRequired: number,
+  step: number,
+  url: string
+): void {
+  if (pageRequired === null || pageRequired <= readRequired) return;
+  throw new FormFillBlockedError(
+    `dom_changed: step ${step} of the application at "${url}" is showing ${pageRequired} ` +
+      `required question(s), and only ${readRequired} of them could be read as fillable ` +
+      `controls. The ${pageRequired - readRequired} that were not read were never offered to ` +
+      `the candidate to answer and are still empty, so this form is NOT filled and must not be ` +
+      `handed on as though it were. Nothing was submitted. What wants fixing is the field ` +
+      `enumeration on this step, not this check.`
+  );
+}
+
+/**
+ * JOB-117. How many times one run will press Next.
+ *
+ * Three, against a board known to need one. The bound exists because "press the
+ * control that advances this form" is the kind of instruction that, given a page
+ * which answers it by doing nothing, will happily answer it again forever — and
+ * a loop that clicks an unknown control on a real employer's site an unbounded
+ * number of times is not something to leave to the page's good behaviour. Two
+ * spare steps is enough slack for a board that splits its questions three ways
+ * without being enough to matter if the detection below is ever wrong.
+ */
+const MAX_WIZARD_ADVANCES = 3;
+
+/**
+ * What a control's own description has to read as before this module will press
+ * it to advance a step.
+ *
+ * The second of two independent gates, and the narrow one.
+ * `assertNotAnApplicationSubmit` inside `clickControl` is the first: it refuses
+ * anything describing itself as both an application control and a submit,
+ * whatever this pattern thinks. This one then has to positively agree that what
+ * was found reads as a *next step* control, so a description that clears the
+ * refusal by accident — an unlabelled button, a control described only by its
+ * position — still does not get pressed. Deliberately absent: `submit`, `send`,
+ * `finish`, `complete`, `done` and `apply`. A wizard's Next button is never
+ * called any of those, and a control that is called one of those is not what
+ * this is looking for.
+ */
+export const NEXT_STEP_ACCEPT_RE = /\b(next|continue|proceed|forward|onward|step)\b/i;
+
+/**
+ * JOB-117. Walks a multi step application to the step that actually submits it,
+ * filling every step on the way with the same ladder that filled the first.
+ *
+ * ── Why this is not a loop around `act("click next")` ────────────────────────
+ * The interesting part of a wizard is not the clicking, it is that step two is a
+ * real form. SmartRecruiters' "Preliminary questions" step has its own required
+ * fields, its own dropdowns and its own attestations, and a run that pressed
+ * Next and then went straight for Submit would file an application with a screen
+ * full of empty required answers — or, worse, would be handed to ACT-008 as
+ * though it were a filled form. So each new step goes through exactly what the
+ * first step went through: `attachFormActionPlan` for the cached shape,
+ * `fillRemainingFields` for the answers, `assertNoMismatches` for the read back,
+ * and `blockedForAnswers` for anything the candidate has to answer themselves.
+ * There is no second decision mechanism and no shortcut; the attestation ladder,
+ * the EEO decline rule and HARD STOP 9 all apply to step two because it is the
+ * same code path that applies them to step one.
+ *
+ * ── Why pressing Next cannot submit ─────────────────────────────────────────
+ * Three things, in front of each other rather than beside each other:
+ *
+ *  1. `clickControl` runs `assertNotAnApplicationSubmit` on whatever `observe()`
+ *     said about the control, before the click. A control that describes itself
+ *     as the application's submit is refused and the run stops.
+ *  2. `NEXT_STEP_ACCEPT_RE` then has to agree, independently, that the same
+ *     description reads as a next-step control.
+ *  3. `assertNotAlreadySubmitted` is asked about the page the click produced,
+ *     before anything else is done to it. If Next turned out to submit after
+ *     all, the run stops with `possible_unintended_submission` rather than
+ *     carrying on and filling a confirmation page.
+ *
+ * `holdsSubmitControl` over in `form-fields.ts` is untouched by this and keeps
+ * doing its own structural half of the same job on every field-level click.
+ *
+ * ── Why it is here and not in `submit-application.ts` ───────────────────────
+ * That module's whole discipline is a bounded number of submissions:
+ * `submitAttempted` set on the line before the click, `submitClicks` counted and
+ * checked, no loop and no retry anywhere near either click site. Pressing Next
+ * is not a submission and must not spend any of that budget, and the way to
+ * guarantee it does not is to do it in the module that cannot submit at all
+ * rather than to raise a cap. ACT-008 sees what it has always seen: a filled
+ * form, and a `submitControlLabels` naming the control it may press once.
+ *
+ * Mutates `fields` and `needsInput` in place, for the same reason
+ * `runBrowserFlow` hoists them: a run that stops on step two must still report
+ * everything step one achieved. Returns the page read that ACT-008 will act on.
+ */
+async function advanceThroughWizard(
+  supabase: SupabaseClient,
+  session: BrowserSession,
+  state: ApplicationState,
+  input: FillApplicationFormInput,
+  profile: ResumeProfile,
+  current: FormSignals,
+  fields: FieldOutcome[],
+  needsInput: NeedsInputItem[]
+): Promise<FormSignals> {
+  let signals = current;
+
+  for (let advance = 1; advance <= MAX_WIZARD_ADVANCES; advance += 1) {
+    // The form on screen holds the control ACT-008 needs. Nothing left to do,
+    // and in particular nothing left to click.
+    if (signals.submitApplicationControlLabels.length > 0) return signals;
+
+    const wasAt = signals.url;
+    const before = new Set(
+      (await enumerateFormFields(session.page)).map((field) => field.selector)
+    );
+
+    // No submit control and no next control either. Not this module's failure to
+    // report: ACT-008 already stops on an empty `submitControlLabels` and says
+    // so with a screenshot and the page's own HTML, which is a better artifact
+    // for a human than a second opinion invented here.
+    const advanced = await clickControl(
+      session,
+      signals.url,
+      "the control that advances this application to its next step",
+      INSTRUCTIONS.NEXT_STEP,
+      NEXT_STEP_ACCEPT_RE
+    );
+    if (advanced === null) {
+      console.log(
+        `${LOG} the form at "${signals.url}" shows neither a submit control nor a next-step ` +
+          `control — leaving it as it stands`
+      );
+      return signals;
+    }
+
+    await awaitStableForm(session);
+    signals = await readFormSignals(session);
+
+    // Asked of the new page before anything else is, and before a single
+    // character is typed into it. See rule 3 in this function's header.
+    assertNotAlreadySubmitted(signals, `the application after pressing its next-step control`);
+    assertNoCaptcha(signals, `the application's step ${advance + 1}`);
+    await assertStillOnTheBoard(
+      session,
+      state,
+      `having advanced to step ${advance + 1} of the application`
+    );
+
+    // Did the board actually move? Three independent readings, because a single
+    // page wizard can advance without changing its URL, a board can change its
+    // URL without re-rendering, and the shadow DOM ones do neither visibly.
+    // `pageReadsAsFurtherStep` is JOB-106's rule, shared rather than re-stated,
+    // so "this page is another step" means the same thing on both sides of the
+    // submit click.
+    const mounted = (await enumerateFormFields(session.page)).filter(
+      (field) => !before.has(field.selector)
+    );
+    const movedOn =
+      pageReadsAsFurtherStep(signals.title, signals.url, wasAt) ||
+      !samePage(signals.url, wasAt) ||
+      mounted.length > 0;
+    if (!movedOn) {
+      console.warn(
+        `${LOG} pressed the next-step control at "${wasAt}" and the page did not change — ` +
+          `not pressing it again`
+      );
+      return signals;
+    }
+    console.log(
+      `${LOG} advanced to step ${advance + 1} of the application: "${signals.title}" at ` +
+        `${signals.url} (${mounted.length} newly mounted control(s))`
+    );
+
+    // ── The same ladder that filled step one ────────────────────────────────
+    // `fillRemainingFields` rather than `buildFieldPlan`/`fillFields`: the eight
+    // named fields are the applicant's identity and they belong to the step that
+    // asked for them, which was step one. A screening step asks questions, and
+    // questions are exactly what the ACT-015 pass is for. It also skips anything
+    // already holding a value, so a board that carries a field across steps does
+    // not get it retyped.
+    await attachFormActionPlan(supabase, session, signals.url);
+    const step = await fillRemainingFields(
+      session,
+      state,
+      profile,
+      input.jobDescription ?? null,
+      input.additionalAnswers ?? {}
+    );
+    fields.push(...step.outcomes);
+    needsInput.push(...step.needsInput);
+    assertNoMismatches(fields, signals.url);
+    if (needsInput.some((item) => item.required)) {
+      throw blockedForAnswers(needsInput, signals.url);
+    }
+
+    // Everything above this line asks perception what it managed to read. This
+    // asks the page how much there was to read, and refuses to call the step
+    // filled when the two disagree. See `assertStepFullyRead` for the live run
+    // that made it necessary.
+    const pageRequired = await countRequiredQuestions(session.page);
+    const readRequired = (await enumerateFormFields(session.page)).filter(
+      (field) => field.required
+    ).length;
+    console.log(
+      `${LOG} step ${advance + 1} required questions: ${pageRequired ?? "unreadable"} on the ` +
+        `page, ${readRequired} read as fillable controls`
+    );
+    assertStepFullyRead(pageRequired, readRequired, advance + 1, signals.url);
+
+    signals = await readFormSignals(session);
+    assertNotAlreadySubmitted(signals, `step ${advance + 1} of the application, once filled`);
+  }
+
+  console.warn(
+    `${LOG} still no submit control after ${MAX_WIZARD_ADVANCES} step(s) — handing the form on ` +
+      `as it stands rather than pressing anything else`
+  );
+  return signals;
 }
 
 /**
