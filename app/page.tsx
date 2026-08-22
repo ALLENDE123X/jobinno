@@ -135,6 +135,38 @@ const PLANS = [
   },
 ] as const;
 
+/**
+ * The id the waitlist section carries, and where this page's calls to action
+ * point while the gate is up.
+ *
+ * ── Why the buttons could not have worked ───────────────────────────────────
+ * `WAITLIST_GATE_ACTIVE` redirects every non-exempt path to `/`, and `/login`
+ * is deliberately one of them (see `lib/waitlist-gate.ts`). So a "Get started"
+ * button linking to `/login` sent a visitor to the page they were already on,
+ * scrolled back to the top, with nothing else to show for it. That is not a
+ * button that fails, it is a button that reads as broken, which is how it was
+ * reported: Courtney, testing the live site, said the get started button was
+ * not working for her and suggested the button say waitlist instead.
+ *
+ * Both halves of that are the same fix. While the gate is up every call to
+ * action leads to the waitlist form at the bottom of this page and says so;
+ * when it comes down they go back to `/login` with their original copy, with
+ * no second edit here to remember.
+ *
+ * The paid plan buttons below are the same story for a different reason: they
+ * POST to `CHECKOUT_PATH`, which is gated too and for a stated reason — the
+ * product being down for maintenance should not have a working, unlisted way
+ * to pay for it. While that holds they are links to the waitlist like the
+ * rest, rather than a form post that cannot complete.
+ */
+const WAITLIST_SECTION_ID = "waitlist";
+const CTA_HREF = WAITLIST_GATE_ACTIVE ? `#${WAITLIST_SECTION_ID}` : "/login";
+
+/** The copy a call to action carries, given what it would say once open. */
+function ctaLabel(whenOpen: string): string {
+  return WAITLIST_GATE_ACTIVE ? "Join the waitlist" : whenOpen;
+}
+
 const PROMISES = [
   {
     icon: Moon,
@@ -160,7 +192,7 @@ const PROMISES = [
  * resolved value it was given. */
 function WaitlistBanner({ referredBy }: { referredBy: string | null }) {
   return (
-    <Section className="border-t bg-muted/30">
+    <Section id={WAITLIST_SECTION_ID} className="border-t bg-muted/30">
       <div className="mx-auto flex w-full max-w-2xl flex-col items-center gap-6 text-center">
         <Badge
           variant="secondary"
@@ -271,7 +303,7 @@ export default async function Home({
             </Button>
             <ThemeToggle />
             <Button size="lg" asChild>
-              <Link href="/login">Get started</Link>
+              <Link href={CTA_HREF}>{ctaLabel("Get started")}</Link>
             </Button>
           </nav>
         </div>
@@ -302,8 +334,8 @@ export default async function Home({
 
                 <div className="flex w-full flex-col gap-3 sm:w-auto sm:flex-row sm:items-center">
                   <Button size="lg" asChild className="h-11 px-6 text-base">
-                    <Link href="/login">
-                      Get started free
+                    <Link href={CTA_HREF}>
+                      {ctaLabel("Get started free")}
                       <ArrowRight className="size-4" />
                     </Link>
                   </Button>
@@ -446,14 +478,14 @@ export default async function Home({
                   ))}
                 </ul>
 
-                {plan.slug === "free" ? (
+                {plan.slug === "free" || WAITLIST_GATE_ACTIVE ? (
                   <Button
                     className="mt-8 h-10 w-full text-sm"
                     variant={plan.featured ? "default" : "outline"}
                     size="lg"
                     asChild
                   >
-                    <Link href="/login">{plan.cta}</Link>
+                    <Link href={CTA_HREF}>{ctaLabel(plan.cta)}</Link>
                   </Button>
                 ) : (
                   // A plain form post rather than an onClick, so the button
