@@ -2790,6 +2790,14 @@ const US_COUNTRY_RE = /^(the\s+)?(united\s+states(\s+of\s+america)?|u\.?s\.?a?\.
  *     common case now that `citizenship_status`, `f1_status`, `work_authorized_us`
  *     and `requires_sponsorship` actually reach the fact catalogue, and it is
  *     the whole reason those four columns were plumbed through in this ticket.
+ *     JOB-101 added four more of exactly this kind — `clearance_eligibility`,
+ *     `clearance_level_held`, `visa_status` and `needs_sponsorship_non_us` —
+ *     each because a real run stopped on a question the candidate could answer
+ *     in seconds and had never been asked. Note what that does and does not
+ *     change: step 1 got wider, the ladder did not get shorter. Which stored
+ *     fact may back which question is still decided by
+ *     `attestationFactAllowed`, and a clearance question backed by a work
+ *     authorization fact is refused now exactly as it was before.
  *  2. Otherwise, if the control offers a way to decline, decline. Forms almost
  *     always offer one, and declining is truthful.
  *  3. Only if it is required, offers no decline option, and the stored data does
@@ -2850,14 +2858,27 @@ export const NON_ANSWER_RE =
  * categories named in the carve-out, and each lists the facts that genuinely
  * bear on it:
  *
- *  · Work authorization and sponsorship have four facts that answer them.
+ *  · Work authorization and sponsorship have the facts that answer them, which
+ *    since JOB-101 includes the visa status the candidate stated in their own
+ *    words and the separate non-US sponsorship answer (see the jurisdiction
+ *    rule in `attestationFactAllowed`).
  *  · Citizenship, nationality, residency and export control have the citizenship
  *    status and the yes/no restatements derived from it.
- *  · Security clearance and criminal history have NONE. Intake does not collect
- *    either, nothing in the catalogue implies either, and so nothing may back
- *    one except the candidate's own typed answer. That is not an oversight to be
- *    filled in later with a guess; it is the correct answer to "what do we know
- *    about this person's criminal record", which is nothing.
+ *  · Security clearance has the two clearance answers intake now collects and
+ *    the yes/no restatements of them, and nothing else. This list used to be
+ *    empty, and it was empty for the right reason at the time: intake did not
+ *    ask, so nothing in the catalogue knew, so nothing could truthfully back a
+ *    clearance question. JOB-101 changed the premise rather than the rule. The
+ *    candidate now states their eligibility and the level they have held, and
+ *    those two facts are the only things that may answer a clearance question
+ *    — a work authorization fact still may not, which is the exact pairing a
+ *    real run produced before the allow-list existed.
+ *  · Criminal history still has NONE, and always will unless a ticket decides
+ *    otherwise out loud. Intake does not ask, nothing in the catalogue implies
+ *    it, and so nothing may back one except the candidate's own typed answer.
+ *    That is not an oversight to be filled in later with a guess; it is the
+ *    correct answer to "what do we know about this person's criminal record",
+ *    which is nothing.
  *
  * `answer:*` is allowed everywhere: it is the candidate answering the question
  * themselves in a previous `needsInput` round, the highest-quality fact in the
@@ -2877,23 +2898,88 @@ export const NON_ANSWER_RE =
 const ATTESTATION_FACT_SCOPES: readonly [RegExp, RegExp][] = [
   [
     /\b(?:work(?:ing)?\s+authoriz\w*|authoriz\w*\s+to\s+work|right\s+to\s+work|legally\s+(?:authoriz\w*|entitled|permitted|eligible)|sponsor\w*|visa|work\s+permit|immigration)\b/i,
-    /^(?:workAuthorizedUs|requiresSponsorship|citizenshipStatus|f1Status|isUs(?:Citizen|PermanentResident|PersonForExportControl))$/,
+    /^(?:workAuthorizedUs|requiresSponsorship|needsSponsorshipNonUs|visaStatus|citizenshipStatus|f1Status|isUs(?:Citizen|PermanentResident|PersonForExportControl))$/,
   ],
   [
     /\b(?:citizen\w*|nationality|permanent\s+resident\w*|green\s+card|export\s+control\w*|itar|u\.?\s?s\.?\s+person)\b/i,
     /^(?:citizenshipStatus|f1Status|isUs(?:Citizen|PermanentResident|PersonForExportControl))$/,
   ],
-  // Clearance and criminal history deliberately admit nothing. See above.
-  [/\b(?:security\s+clearance|clearance\s+eligib\w*|clearance)\b/i, /^$/],
+  // JOB-101. Clearance admits the two answers the candidate now states and the
+  // yes/no restatements of them, and nothing else. Criminal history still
+  // admits nothing at all. See above for why those two are different cases.
+  [
+    /\b(?:security\s+clearance|clearance\s+eligib\w*|clearance)\b/i,
+    /^(?:clearanceEligibility|clearanceLevelHeld|holdsActiveUsClearance|isEligibleForUsClearance|hasEverHeldUsClearance)$/,
+  ],
   [
     /\b(?:felony|felonies|misdemean\w*|convict\w*|criminal\s+(?:history|record|background|conviction\w*)|background\s+check)\b/i,
     /^$/,
   ],
 ];
 
+/**
+ * ── Issue #108: the jurisdiction has to be in the rule, not in the prose ────
+ *
+ * Every fact key below is a statement about the United States and about nowhere
+ * else. `requires_sponsorship` is derived from a US citizenship status,
+ * `work_authorized_us` says so in its own name, the citizenship restatements
+ * are all "is a United States ...", and a US security clearance is US by
+ * definition.
+ *
+ * What made this a bug rather than a tidiness point is that the fact keys carry
+ * that "US" implicitly and the questions do not have to share it. On Virtu's UK
+ * sponsorship question — "Do you now, or will you in the future, need
+ * sponsorship from an employer in order to obtain, extend or renew your
+ * authorization to work in the UK?" — the same form was run seven times and
+ * answered "No" from `requiresSponsorship` four of them, escalating the other
+ * three on the reasoning that a US work authorization fact does not establish a
+ * UK one. A separate run answered an Irish version of the question the same
+ * way. The candidate is a US citizen with no UK or Irish work authorization, so
+ * "No" is false, and it is false about the one subject `LEGAL_ATTESTATION_RE`'s
+ * own header names as the kind of thing that costs somebody an offer months
+ * later.
+ *
+ * The non-determinism is the tell: safety rested on the model noticing a
+ * jurisdiction mismatch in prose. It notices about half the time. So the rule
+ * moves into TypeScript, and it runs in both directions — a US-only fact may
+ * not answer a question that names somewhere else, and the non-US sponsorship
+ * answer may not answer a question that does not.
+ */
+const US_ONLY_FACT_KEYS =
+  /^(?:workAuthorizedUs|requiresSponsorship|citizenshipStatus|f1Status|isUs(?:Citizen|PermanentResident|PersonForExportControl)|clearanceEligibility|clearanceLevelHeld|holdsActiveUsClearance|isEligibleForUsClearance|hasEverHeldUsClearance)$/;
+
+/** The mirror image: facts that are about anywhere EXCEPT the United States. */
+const NON_US_FACT_KEYS = /^(?:needsSponsorshipNonUs)$/;
+
+/**
+ * A question that names a jurisdiction other than the United States.
+ *
+ * Deliberately a list of the places these forms actually name rather than an
+ * attempt at every country on earth. A country this misses is a question that
+ * behaves exactly as it did before this rule existed, which is the direction a
+ * gap in a list like this should fail in; a false positive, by contrast, only
+ * ever costs an escalation, which is the safe outcome for an attestation.
+ *
+ * Note what this deliberately does not do: it does not ask whether the question
+ * also names the United States. A question naming both, "authorized to work in
+ * the US or the UK", is still one a US-only fact cannot truthfully answer, so
+ * naming somewhere else is enough on its own to disqualify those facts. Reading
+ * a US mention as permission would be the whole bug again with an extra step.
+ */
+const NON_US_JURISDICTION_RE =
+  /\b(?:united\s+kingdom|u\.?\s?k\.?|great\s+britain|britain|british|england|scotland|wales|northern\s+ireland|ireland|irish|eire|canada|canadian|australia|australian|new\s+zealand|singapore|india|germany|german|france|french|netherlands|dutch|switzerland|swiss|spain|italy|poland|sweden|norway|denmark|japan|japanese|china|chinese|hong\s+kong|israel|brazil|mexico|european\s+union|\beu\b|\beea\b|schengen)\b/i;
+
 /** Whether `factKey` is one this attestation question may be answered from. */
 function attestationFactAllowed(label: string, factKey: string): boolean {
   if (factKey.startsWith("answer:")) return true;
+
+  // Issue #108. Jurisdiction first, before the topic table is consulted at all,
+  // because a fact can be perfectly on topic and still be about the wrong
+  // country — which is precisely what a US sponsorship answer is on a UK form.
+  const namesElsewhere = NON_US_JURISDICTION_RE.test(label);
+  if (namesElsewhere && US_ONLY_FACT_KEYS.test(factKey)) return false;
+  if (!namesElsewhere && NON_US_FACT_KEYS.test(factKey)) return false;
+
   return ATTESTATION_FACT_SCOPES.some(
     ([topic, allowed]) => topic.test(label) && allowed.test(factKey)
   );
@@ -2972,10 +3058,24 @@ export function buildFactCatalog(
     "Legally authorized to work in the United States",
     yesNo(answers.workAuthorizedUs)
   );
+  // The label names the United States out loud, which it did not before JOB-101.
+  // The column has always been a US only fact, derived from a US citizenship
+  // status, but the sentence handed to the model did not say so, and issue #108
+  // is what that cost: across seven runs of Virtu's UK sponsorship question the
+  // model answered "No" from this fact four times and spotted the jurisdiction
+  // mismatch three times. Saying it in the label is not the fix — that is
+  // `attestationFactAllowed` below, in TypeScript — but a prompt that describes
+  // a fact accurately should not be left describing it ambiguously.
   add(
     "requiresSponsorship",
-    "Will now or in future require visa sponsorship",
+    "Will now or in future require visa sponsorship to work in the United States",
     yesNo(answers.requiresSponsorship)
+  );
+  // Issue #108's other half: the jurisdiction the fact above never covered.
+  add(
+    "needsSponsorshipNonUs",
+    "Will need visa sponsorship to work anywhere outside the United States",
+    yesNo(answers.needsSponsorshipNonUs)
   );
   add("willingToRelocate", "Willing to relocate for a role", yesNo(answers.willingToRelocate));
 
@@ -3034,6 +3134,56 @@ export function buildFactCatalog(
     );
     add("topLocationPreference", "Their most preferred work location", answers.targetLocations[0]);
   }
+
+  // ── JOB-101: the answers that were blocking real applications ────────────
+  //
+  // The same shape as the JOB-022 block above and for the same reason: each one
+  // is a column intake now collects, and a column the fill layer cannot name is
+  // a column the decision layer cannot cite, because `resolveDecision` refuses
+  // an answer with no `sourceFact` behind it.
+  //
+  // The clearance facts and the visa status are legal attestations. Listing
+  // them here does not make them answerable by anything that happens to be
+  // nearby: `attestationFactAllowed` scopes a clearance question to the
+  // clearance facts alone, and every one of these is refused for a question it
+  // is not about.
+  add(
+    "clearanceEligibility",
+    "US security clearance eligibility they stated at intake",
+    describeClearanceEligibility(answers.clearanceEligibility)
+  );
+  add(
+    "clearanceLevelHeld",
+    "Highest US security clearance they have ever held, as they stated it at intake",
+    describeClearanceLevel(answers.clearanceLevelHeld)
+  );
+  // The same two stored answers projected onto the yes/no shape a good share of
+  // these questions are drawn with, exactly as `citizenshipYesNo` does for the
+  // citizenship status and for the same reason: the sentence "Yes, I am
+  // eligible for a U.S. security clearance" does not say what a bare "Yes"
+  // option says, so without these the stored answer would bail on every
+  // question drawn as a two option radio. Every arm is a restatement of one
+  // enum value, and an unrecognised value produces nothing at all.
+  for (const [key, label, value] of clearanceYesNo(
+    answers.clearanceEligibility,
+    answers.clearanceLevelHeld
+  )) {
+    add(key, label, value);
+  }
+  add(
+    "visaStatus",
+    "Their current visa status, in their own words, as stated at intake",
+    answers.visaStatus
+  );
+
+  add("highSchoolName", "The high school they attended", answers.highSchoolName);
+  add(
+    "highSchoolGradYear",
+    "Year they graduated high school",
+    answers.highSchoolGradYear === undefined ? null : String(answers.highSchoolGradYear)
+  );
+  add("streetAddress", "Their street address", answers.streetAddress);
+  add("postalCode", "Their postal or ZIP code", answers.postalCode);
 
   // ── JOB-022: the whole resume, not its first row ─────────────────────────
   // `workHistory[0]` and `education[0]` were the only two entries that ever
@@ -3187,6 +3337,97 @@ function citizenshipYesNo(status: string | undefined): [string, string, string][
     default:
       return [];
   }
+}
+
+/**
+ * `profiles.clearance_eligibility` as the sentence the board itself uses.
+ *
+ * A lookup table, not an inference, and the arms are Anduril's own option text
+ * rather than a paraphrase of it. That is deliberate: `optionSupportsFact`
+ * compares this value against the option a control offers, so a fact worded the
+ * way the question is worded is the difference between the stored answer being
+ * chosen and the stored answer being declined as not saying what the option
+ * says. An unrecognised value is passed through rather than guessed at.
+ */
+function describeClearanceEligibility(status: string | undefined): string | null {
+  switch ((status ?? "").trim()) {
+    case "active_clearance":
+      return "Yes, I hold an active U.S. security clearance";
+    case "eligible":
+      return "Yes, I am eligible for a U.S. security clearance";
+    case "no":
+      return "No";
+    default:
+      return (status ?? "").trim() || null;
+  }
+}
+
+/** `profiles.clearance_level_held`, in the words the follow up question uses. */
+function describeClearanceLevel(level: string | undefined): string | null {
+  switch ((level ?? "").trim()) {
+    case "never_held":
+      return "N/A - have never held U.S. security clearance";
+    case "confidential":
+      return "Confidential";
+    case "secret":
+      return "Secret";
+    case "top_secret":
+      return "Top Secret";
+    default:
+      return (level ?? "").trim() || null;
+  }
+}
+
+/**
+ * The yes/no facts that follow directly from the two stored clearance answers.
+ *
+ * A lookup table, exactly like `citizenshipYesNo`, and bounded the same way: an
+ * unrecognised value yields nothing rather than a "No" nobody said. Note that
+ * `active_clearance` produces "Yes" for eligibility as well, because holding a
+ * clearance is the strongest possible statement of being eligible for one, and
+ * that is a restatement rather than an inference about a person.
+ *
+ * `hasEverHeldUsClearance` is read off the level rather than off the
+ * eligibility, because they are different questions: somebody eligible for a
+ * clearance today may never have held one, which is exactly the pair of answers
+ * this candidate gave.
+ */
+function clearanceYesNo(
+  eligibility: string | undefined,
+  level: string | undefined
+): [string, string, string][] {
+  const facts: [string, string, string][] = [];
+  switch ((eligibility ?? "").trim()) {
+    case "active_clearance":
+      facts.push(
+        ["holdsActiveUsClearance", "Holds an active US security clearance", "Yes"],
+        ["isEligibleForUsClearance", "Is eligible for a US security clearance", "Yes"]
+      );
+      break;
+    case "eligible":
+      facts.push(
+        ["holdsActiveUsClearance", "Holds an active US security clearance", "No"],
+        ["isEligibleForUsClearance", "Is eligible for a US security clearance", "Yes"]
+      );
+      break;
+    case "no":
+      facts.push(
+        ["holdsActiveUsClearance", "Holds an active US security clearance", "No"],
+        ["isEligibleForUsClearance", "Is eligible for a US security clearance", "No"]
+      );
+      break;
+  }
+  switch ((level ?? "").trim()) {
+    case "never_held":
+      facts.push(["hasEverHeldUsClearance", "Has ever held a US security clearance", "No"]);
+      break;
+    case "confidential":
+    case "secret":
+    case "top_secret":
+      facts.push(["hasEverHeldUsClearance", "Has ever held a US security clearance", "Yes"]);
+      break;
+  }
+  return facts;
 }
 
 /** An ISO date as the two pieces a form's month and year dropdowns want. */

@@ -42,6 +42,31 @@ export const F1_STATUS_OPTIONS = [
 ] as const;
 
 /**
+ * Security clearance eligibility, worded the way the boards that ask it word
+ * it. Values match the `clearance_eligibility` enum in `lib/db/schema.ts`.
+ *
+ * Asked at all because a required clearance question with no way to decline is
+ * one of the few things that stops a run outright, and it stopped Anduril twice
+ * on a candidate who could have answered it in a second. Asked in the board's
+ * own three states rather than as a yes or no, because the difference between
+ * holding a clearance and being able to get one is the difference the question
+ * is drawn to capture.
+ */
+export const CLEARANCE_ELIGIBILITY_OPTIONS = [
+  { value: "active_clearance", label: "I hold an active US security clearance" },
+  { value: "eligible", label: "I am eligible for a US security clearance" },
+  { value: "no", label: "Neither" },
+] as const;
+
+/** The follow up question. Matches the `clearance_level` enum. */
+export const CLEARANCE_LEVEL_OPTIONS = [
+  { value: "never_held", label: "I have never held one" },
+  { value: "confidential", label: "Confidential" },
+  { value: "secret", label: "Secret" },
+  { value: "top_secret", label: "Top Secret" },
+] as const;
+
+/**
  * Statuses that carry their own answer to the two work authorization questions.
  * A US citizen who says they need sponsorship has mis clicked something, and
  * storing that contradiction means generating two answers on one form that
@@ -53,6 +78,12 @@ const citizenshipStatus = z.enum(
   CITIZENSHIP_OPTIONS.map((option) => option.value)
 );
 const f1Status = z.enum(F1_STATUS_OPTIONS.map((option) => option.value));
+const clearanceEligibility = z.enum(
+  CLEARANCE_ELIGIBILITY_OPTIONS.map((option) => option.value)
+);
+const clearanceLevelHeld = z.enum(
+  CLEARANCE_LEVEL_OPTIONS.map((option) => option.value)
+);
 
 const requiredText = (field: string, max = 120) =>
   z
@@ -101,9 +132,30 @@ export function intakeSchema(userId: string) {
 
       workAuthorizedUs: z.boolean(),
       requiresSponsorship: z.boolean(),
+      /**
+       * Issue #108, and a separate question from `requiresSponsorship` rather
+       * than a rewording of it. That one is about the United States and is
+       * settled for a citizen or a permanent resident; this one is about
+       * everywhere else and is settled by neither. Asking them as one question
+       * is what let a US answer be written onto a UK form.
+       */
+      needsSponsorshipNonUs: z.boolean(),
+      /**
+       * The candidate's own words. Required, because "what is your current visa
+       * status?" is asked outright on real forms and a blank is a stopped run,
+       * and free text rather than a menu because "none, I am a US citizen" and
+       * "F-1, OPT expiring March 2027" are both answers and only the person can
+       * give either.
+       */
+      visaStatus: requiredText("Visa status", 200),
+
+      clearanceEligibility,
+      clearanceLevelHeld,
 
       currentCity: requiredText("Current city"),
       currentCountry: requiredText("Current country"),
+      streetAddress: requiredText("Street address", 200),
+      postalCode: requiredText("Postal code", 20),
       willingToRelocate: z.boolean(),
       targetLocations: z
         .array(requiredText("Target location"))
@@ -112,6 +164,22 @@ export function intakeSchema(userId: string) {
 
       gradDate: z.iso.date("Graduation date must be a real date."),
       earliestStart: z.iso.date("Earliest start date must be a real date."),
+
+      /**
+       * High school, which every one of Palantir's 128 Lever listings asks for
+       * by name and nothing in a resume reliably carries.
+       *
+       * The year is an integer rather than a date because that is what the
+       * question asks for, and it is bounded here rather than only by the CHECK
+       * on the column so that a mistyped year comes back as a sentence the
+       * person can act on instead of a constraint violation.
+       */
+      highSchoolName: requiredText("High school name"),
+      highSchoolGradYear: z
+        .number()
+        .int("High school graduation year must be a year.")
+        .min(1900, "High school graduation year must be a real year.")
+        .max(2100, "High school graduation year must be a real year."),
 
       resumePath: ownedObjectPath,
       /**
@@ -173,6 +241,25 @@ export function intakeSchema(userId: string) {
           path: ["requiresSponsorship"],
           message:
             "A US citizen or permanent resident does not need sponsorship.",
+        });
+      }
+
+      // The one clearance pair that cannot both be true. Every other
+      // combination can: somebody who held Secret years ago may no longer be
+      // eligible, and somebody eligible today may never have held anything,
+      // which is the ordinary case. Holding an active clearance while never
+      // having held one is not a story about a person, it is a mis click, and
+      // storing it would put two answers on one form that contradict.
+      if (
+        value.clearanceEligibility === "active_clearance" &&
+        value.clearanceLevelHeld === "never_held"
+      ) {
+        ctx.issues.push({
+          code: "custom",
+          input: value.clearanceLevelHeld,
+          path: ["clearanceLevelHeld"],
+          message:
+            "You said you hold an active clearance, so tell us which level it is.",
         });
       }
     });

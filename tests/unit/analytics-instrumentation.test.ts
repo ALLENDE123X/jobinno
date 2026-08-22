@@ -231,12 +231,23 @@ describe("intake_completed", () => {
       f1Status: "opt",
       workAuthorizedUs: true,
       requiresSponsorship: true,
+      // JOB-101's eight. Present here because `intakeSchema` is the real one, so
+      // a fixture missing a required answer would fail this file at the parse
+      // rather than at the assertion, and would say nothing about analytics.
+      needsSponsorshipNonUs: true,
+      visaStatus: "F-1, currently on OPT",
+      clearanceEligibility: "no",
+      clearanceLevelHeld: "never_held",
+      streetAddress: "12 Peachtree Street NE",
       currentCity: "Atlanta",
+      postalCode: "30303",
       currentCountry: "United States",
       willingToRelocate: true,
       targetLocations: ["San Francisco", "New York", "Seattle"],
       gradDate: "2027-05-01",
       earliestStart: "2027-06-01",
+      highSchoolName: "Northview High School",
+      highSchoolGradYear: 2022,
       resumePath: `${SESSION_USER}/${RESUME_OBJECT}.pdf`,
       attestation: true,
       ...overrides,
@@ -264,6 +275,10 @@ describe("intake_completed", () => {
     // Two facts about the shape. Not the city, not the country, not the
     // graduation date, and above all not the citizenship or sponsorship
     // answers, which `submitIntake` writes to `profiles` on the line above.
+    // JOB-101 added a security clearance status, a visa status and a home
+    // address to that same write, and none of those goes out here either. The
+    // exact-equality assertion is what keeps that true: a new property added to
+    // the capture fails this test rather than shipping quietly.
     expect(capture.properties).toEqual({
       has_linkedin_pdf: true,
       target_location_count: 3,

@@ -165,11 +165,15 @@ describe("loadCandidate", () => {
     // from here is not a typo sized problem: intake wrote all four of them and
     // this list not naming them is why the form filler had no graduation date,
     // no start date and no citizenship status to answer a form with. JOB-044
-    // added `github_url` on the same reasoning.
+    // added `github_url` on the same reasoning, and JOB-101 the eight after it
+    // on exactly the same reasoning again: a clearance eligibility written at
+    // intake and absent from this line is a question the candidate answered
+    // that no form ever gets told about.
     expect(callTo("profiles").columns).toBe(
       "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country," +
         "current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start," +
-        "github_url"
+        "github_url,clearance_eligibility,clearance_level_held,needs_sponsorship_non_us," +
+        "visa_status,high_school_name,high_school_grad_year,street_address,postal_code"
     );
     expect(callTo("profiles").filters).toContainEqual(["eq", "id", USER_ID]);
 

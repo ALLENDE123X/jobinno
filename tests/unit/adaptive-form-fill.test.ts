@@ -1737,3 +1737,448 @@ describe("a veteran status question is caught whatever a board calls it", () => 
     expect(resolution.kind).toBe("ask");
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+/**
+ * JOB-101: the intake answers that were blocking real applications, and the
+ * jurisdiction rule that closes issue #108.
+ *
+ * The candidate below is the real one, with the answers he actually gave on
+ * 2026 08 22: eligible for a US security clearance, has never held one, would
+ * need sponsorship to work outside the United States, and no visa because he is
+ * a US citizen. He deliberately has no street address and no postal code,
+ * because he did not supply either, and the tests say so rather than inventing
+ * them.
+ */
+const JOB_101_ANSWERS: CandidateApplicationAnswers = {
+  ...ANSWERS,
+  clearanceEligibility: "eligible",
+  clearanceLevelHeld: "never_held",
+  needsSponsorshipNonUs: true,
+  visaStatus: "Not applicable, US citizen",
+  highSchoolName: "Northview High School",
+  highSchoolGradYear: 2022,
+};
+
+function job101Facts(
+  overrides: Partial<CandidateApplicationAnswers> = {}
+): Map<string, CandidateFact> {
+  const list = buildFactCatalog(PROFILE, { ...JOB_101_ANSWERS, ...overrides }, {});
+  return new Map(list.map((fact) => [fact.key, fact]));
+}
+
+/** Anduril's two clearance questions, verbatim, from the skip_log rows. */
+const ANDURIL_CLEARANCE_LABEL =
+  "CLEARANCE ELIGIBILITY - This position may require eligibility to obtain and maintain a U.S. security clearance.";
+const ANDURIL_CLEARANCE_OPTIONS = [
+  "Yes, I hold an active U.S. security clearance",
+  "Yes, I am eligible for a U.S. security clearance",
+  "No",
+];
+const ANDURIL_CLEARANCE_LEVEL_LABEL =
+  "If you have held a U.S. security clearance in the past, what clearance level have you held?";
+const ANDURIL_CLEARANCE_LEVEL_OPTIONS = [
+  "N/A - have never held U.S. security clearance",
+  "Confidential",
+  "Secret",
+  "Top Secret",
+];
+
+describe("a clearance question is answered from the candidate's own answer", () => {
+  it("states the clearance answers in the words Anduril's own options use", () => {
+    const known = job101Facts();
+    expect(known.get("clearanceEligibility")?.value).toBe(
+      "Yes, I am eligible for a U.S. security clearance"
+    );
+    expect(known.get("clearanceLevelHeld")?.value).toBe(
+      "N/A - have never held U.S. security clearance"
+    );
+  });
+
+  it("answers Anduril's eligibility question rather than escalating it", () => {
+    // The whole ticket, in one case. This exact question stopped two real
+    // Anduril applications as `needs_attestation`, against a candidate who can
+    // answer it in a second and had simply never been asked.
+    const resolution = resolveDecision(
+      field({
+        label: ANDURIL_CLEARANCE_LABEL,
+        kind: "select",
+        options: ANDURIL_CLEARANCE_OPTIONS,
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "clearance eligibility",
+        decision: "answer",
+        value: "Yes, I am eligible for a U.S. security clearance",
+        sourceFact: "clearanceEligibility",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Yes, I am eligible for a U.S. security clearance");
+      expect(resolution.declined).toBe(false);
+    }
+  });
+
+  it("answers the follow up about which level has ever been held", () => {
+    const resolution = resolveDecision(
+      field({
+        label: ANDURIL_CLEARANCE_LEVEL_LABEL,
+        kind: "select",
+        options: ANDURIL_CLEARANCE_LEVEL_OPTIONS,
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "clearance level",
+        decision: "answer",
+        value: "N/A - have never held U.S. security clearance",
+        sourceFact: "clearanceLevelHeld",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("N/A - have never held U.S. security clearance");
+    }
+  });
+
+  it("answers the yes/no wording of the same question", () => {
+    // Not every board draws it the way Anduril does. "Yes, I am eligible for a
+    // U.S. security clearance" does not say what a bare "Yes" says, so without
+    // the derived restatement the correct stored answer would bail on a two
+    // option radio while nothing else could answer it either.
+    const resolution = resolveDecision(
+      field({
+        label: "Are you eligible for a U.S. security clearance?",
+        kind: "radio",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "clearance",
+        decision: "answer",
+        value: "Yes",
+        sourceFact: "isEligibleForUsClearance",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("Yes");
+  });
+
+  it("says No to holding an active clearance, which is the truthful answer", () => {
+    // Eligible and holding are different questions, and the derived facts keep
+    // them apart. Answering "Yes" to holding one out of a true statement about
+    // eligibility would be a false statement to a defence contractor.
+    expect(job101Facts().get("holdsActiveUsClearance")?.value).toBe("No");
+    expect(job101Facts().get("hasEverHeldUsClearance")?.value).toBe("No");
+  });
+
+  it("still refuses a clearance question backed by a work authorization fact", () => {
+    // The guard that existed before this ticket, unchanged by it. Storing a
+    // clearance answer widened step 1 of the ladder; it did not widen what may
+    // back a clearance question, and a work authorization fact still may not.
+    const resolution = resolveDecision(
+      field({
+        label: ANDURIL_CLEARANCE_LABEL,
+        kind: "select",
+        options: ANDURIL_CLEARANCE_OPTIONS,
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "clearance",
+        decision: "answer",
+        value: "Yes, I am eligible for a U.S. security clearance",
+        sourceFact: "workAuthorizedUs",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("refuses a criminal history question backed by a clearance fact", () => {
+    // The mirror of the case above, and the reason the scope table is per topic
+    // rather than one flat list of "the status facts". Being eligible for a
+    // clearance says nothing about a criminal record, and the criminal history
+    // topic still admits nothing at all.
+    const resolution = resolveDecision(
+      field({
+        label: "Have you ever been convicted of a felony?",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "felony",
+        decision: "answer",
+        value: "No",
+        sourceFact: "isEligibleForUsClearance",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("still declines for a candidate who has not answered the clearance question", () => {
+    // Nothing about this ticket makes an unanswered question answerable. A
+    // profile with no stored clearance takes exactly the path it took before.
+    const resolution = resolveDecision(
+      field({
+        label: ANDURIL_CLEARANCE_LABEL,
+        kind: "select",
+        options: [...ANDURIL_CLEARANCE_OPTIONS, "Prefer not to answer"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "clearance",
+        decision: "ask",
+        question: "Do you hold one?",
+        why: "not established",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.declined).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+describe("issue #108: a sponsorship question is answered in its own jurisdiction", () => {
+  /** Virtu's UK question, verbatim. */
+  const VIRTU_UK_LABEL =
+    "Do you now, or will you in the future, need sponsorship from an employer in order to obtain, extend or renew your authorization to work in the UK?";
+
+  it("refuses to answer a UK sponsorship question from the US sponsorship fact", () => {
+    // Observed on a real form, non-deterministically: across seven runs the
+    // model answered "No" from `requiresSponsorship` four times and escalated
+    // three times, reasoning on those three that a US work authorization fact
+    // does not establish a UK one. The escalating branch was right. Safety that
+    // rests on the model noticing is not safety, so the rule is in TypeScript.
+    const resolution = resolveDecision(
+      field({ label: VIRTU_UK_LABEL, kind: "select", options: ["Yes", "No"], optionsKnown: true }),
+      decision({
+        fieldKey: "uk sponsorship",
+        decision: "answer",
+        value: "No",
+        sourceFact: "requiresSponsorship",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("refuses the Irish version of the same question from the same fact", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Will you now or in the future require sponsorship to work in Ireland?",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "ireland sponsorship",
+        decision: "answer",
+        value: "No",
+        sourceFact: "requiresSponsorship",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("refuses a UK work authorization question from the US authorization fact", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Are you legally authorized to work in the United Kingdom?",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "uk work auth",
+        decision: "answer",
+        value: "Yes",
+        sourceFact: "workAuthorizedUs",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("refuses a Canadian citizenship question from the US citizenship fact", () => {
+    // The other place a US specific fact becomes prose that a form of any
+    // nationality might read, named in the issue as worth the same treatment.
+    const resolution = resolveDecision(
+      field({
+        label: "Are you a citizen of Canada?",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "canada citizen",
+        decision: "answer",
+        value: "Yes",
+        sourceFact: "isUsCitizen",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("answers the UK question from the answer that is actually about it", () => {
+    // The point of the new column. "Yes" is the truthful answer for a US citizen
+    // with no UK work authorization, and it is the candidate's own stated answer
+    // rather than anything derived across a border.
+    const resolution = resolveDecision(
+      field({ label: VIRTU_UK_LABEL, kind: "select", options: ["Yes", "No"], optionsKnown: true }),
+      decision({
+        fieldKey: "uk sponsorship",
+        decision: "answer",
+        value: "Yes",
+        sourceFact: "needsSponsorshipNonUs",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("Yes");
+  });
+
+  it("refuses to answer a US sponsorship question from the non-US fact", () => {
+    // The rule runs both ways. "Yes, I would need sponsorship outside the US" is
+    // not an answer to a US form either, and letting it through would be the
+    // same bug pointing the other direction.
+    const resolution = resolveDecision(
+      field({
+        label:
+          "Will you now or in the future require sponsorship for employment visa status in the United States?",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "us sponsorship",
+        decision: "answer",
+        value: "Yes",
+        sourceFact: "needsSponsorshipNonUs",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("still answers the ordinary US sponsorship question exactly as it did", () => {
+    // The regression that matters most: the jurisdiction rule must not cost a
+    // single answer on the forms that were already working.
+    const resolution = resolveDecision(
+      field({
+        label: "Will you now or in the future require sponsorship for employment visa status?",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "sponsorship",
+        decision: "answer",
+        value: "No",
+        sourceFact: "requiresSponsorship",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("No");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+describe("the visa status, high school and address a form asks for by name", () => {
+  it("answers Pylon's plain text visa status box from the stated answer", () => {
+    // "What is your current visa status?" is a legal attestation drawn as a text
+    // input, so prose is never composed for it. Before this ticket there was
+    // nothing to type and the run stopped; now there is the candidate's own
+    // sentence, and nothing else.
+    const resolution = resolveDecision(
+      field({ label: "What is your current visa status?", kind: "text" }),
+      decision({
+        fieldKey: "what is your current visa status?",
+        decision: "answer",
+        value: "Not applicable, US citizen",
+        sourceFact: "visaStatus",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Not applicable, US citizen");
+    }
+  });
+
+  it("still stops on a visa status box for a candidate who never gave one", () => {
+    const resolution = resolveDecision(
+      field({ label: "What is your current visa status?", kind: "text" }),
+      decision({
+        fieldKey: "what is your current visa status?",
+        decision: "generate",
+        why: "free text",
+      }),
+      job101Facts({
+        visaStatus: undefined,
+        citizenshipStatus: undefined,
+        workAuthorizedUs: undefined,
+        requiresSponsorship: undefined,
+      })
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+
+  it("names the high school all 128 Palantir listings ask for", () => {
+    const known = job101Facts();
+    expect(known.get("highSchoolName")?.value).toBe("Northview High School");
+    expect(known.get("highSchoolGradYear")?.value).toBe("2022");
+  });
+
+  it("types the high school into Palantir's own field", () => {
+    const resolution = resolveDecision(
+      field({ label: "High School Name", kind: "text" }),
+      decision({
+        fieldKey: "high school name",
+        decision: "answer",
+        value: "Northview High School",
+        sourceFact: "highSchoolName",
+      }),
+      job101Facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("Northview High School");
+  });
+
+  it("answers Belvedere's address fields once they are stored", () => {
+    const stored = job101Facts({ streetAddress: "12 Peachtree Street NE", postalCode: "30303" });
+    expect(stored.get("streetAddress")?.value).toBe("12 Peachtree Street NE");
+    expect(stored.get("postalCode")?.value).toBe("30303");
+
+    const resolution = resolveDecision(
+      field({ label: "Street Address", kind: "text" }),
+      decision({
+        fieldKey: "street address",
+        decision: "answer",
+        value: "12 Peachtree Street NE",
+        sourceFact: "streetAddress",
+      }),
+      stored
+    );
+    expect(resolution.kind).toBe("apply");
+  });
+
+  it("carries no address fact at all for a candidate who has not given one", () => {
+    // This candidate has not, so Belvedere stays blocked. Said out loud in a
+    // test rather than papered over: the honest outcome of an unanswered
+    // required field is a stopped run and a question, and the run of 2026 08 22
+    // that typed "Not provided" into two of these boxes is what the alternative
+    // looks like.
+    const known = job101Facts();
+    expect(known.has("streetAddress")).toBe(false);
+    expect(known.has("postalCode")).toBe(false);
+  });
+});

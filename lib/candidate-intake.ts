@@ -175,14 +175,58 @@ export type CandidateApplicationAnswers = {
    * four of them.
    */
   targetLocations?: string[];
+  /**
+   * ── JOB-101: the answers that were blocking real applications ─────────────
+   *
+   * Eight more, added the same way and for the same reason the four above were:
+   * a required field on a real employer's form had no stored answer behind it,
+   * so the run stopped. The lesson JOB-022 wrote down is the one that governs
+   * them, and it is worth repeating because it is what makes this block longer
+   * than the column list. A column written at intake that never reaches the
+   * fill layer is worse than no column at all, because the person answered the
+   * question and nothing asked the database for the answer. Every key below is
+   * read by `toApplicationAnswers`, is named in `CANDIDATE_COLUMNS`, and has a
+   * fact in `buildFactCatalog`. Adding a ninth means doing all three.
+   *
+   * The two clearance answers and the visa status are legal attestations, and
+   * they arrive under the rule `LEGAL_ATTESTATION_RE` states rather than around
+   * it: storing an answer is not a licence to guess one, it is what lets the
+   * question be answered from the candidate's own words instead of stopping the
+   * run. `attestationFactAllowed` still decides which stored fact may back
+   * which question, and a clearance question may be backed only by a clearance
+   * fact.
+   */
+  /** `profiles.clearance_eligibility`, one of the `clearance_eligibility` enum values. */
+  clearanceEligibility?: string;
+  /** `profiles.clearance_level_held`, one of the `clearance_level` enum values. */
+  clearanceLevelHeld?: string;
+  /**
+   * `profiles.needs_sponsorship_non_us`. Issue #108.
+   *
+   * Deliberately a separate answer from `requiresSponsorship` rather than a
+   * reading of it. That one is a US only fact, derived from a US citizenship
+   * status, and says nothing about the United Kingdom or Ireland; this is the
+   * jurisdiction it never covered.
+   */
+  needsSponsorshipNonUs?: boolean;
+  /** `profiles.visa_status`, in the candidate's own words. */
+  visaStatus?: string;
+  /** `profiles.high_school_name`. Required by all 128 Palantir listings. */
+  highSchoolName?: string;
+  /** `profiles.high_school_grad_year`, a four digit year. */
+  highSchoolGradYear?: number;
+  /** `profiles.street_address`. The half of a postal address `current_city` never held. */
+  streetAddress?: string;
+  /** `profiles.postal_code`, the other half. */
+  postalCode?: string;
 };
 
 /** `CandidateApplicationAnswers` → the row shape, dropping anything unstated. */
 function applicationAnswerColumns(
   answers: CandidateApplicationAnswers | undefined
-): Record<string, string | boolean | null> {
+): Record<string, string | number | boolean | null> {
   if (answers === undefined) return {};
-  const row: Record<string, string | boolean | null> = {};
+  const row: Record<string, string | number | boolean | null> = {};
   // `undefined` is left out entirely rather than written as NULL, so that a
   // caller who says nothing about sponsorship cannot overwrite a column that
   // already holds an answer. On an INSERT the two are the same; the distinction
@@ -211,6 +255,27 @@ function applicationAnswerColumns(
   if (grad !== null) row.grad_date = grad;
   const start = normalizeOptionalText(answers.earliestStart);
   if (start !== null) row.earliest_start = start;
+  // JOB-101. Same rule again for the eight late arrivals: unstated is left out
+  // entirely rather than written as NULL, so that a caller who says nothing
+  // about a clearance or an address cannot blank an answer already stored.
+  const clearance = normalizeOptionalText(answers.clearanceEligibility);
+  if (clearance !== null) row.clearance_eligibility = clearance;
+  const clearanceLevel = normalizeOptionalText(answers.clearanceLevelHeld);
+  if (clearanceLevel !== null) row.clearance_level_held = clearanceLevel;
+  if (typeof answers.needsSponsorshipNonUs === "boolean") {
+    row.needs_sponsorship_non_us = answers.needsSponsorshipNonUs;
+  }
+  const visa = normalizeOptionalText(answers.visaStatus);
+  if (visa !== null) row.visa_status = visa;
+  const highSchool = normalizeOptionalText(answers.highSchoolName);
+  if (highSchool !== null) row.high_school_name = highSchool;
+  if (Number.isInteger(answers.highSchoolGradYear)) {
+    row.high_school_grad_year = answers.highSchoolGradYear as number;
+  }
+  const street = normalizeOptionalText(answers.streetAddress);
+  if (street !== null) row.street_address = street;
+  const postal = normalizeOptionalText(answers.postalCode);
+  if (postal !== null) row.postal_code = postal;
   return row;
 }
 
@@ -627,9 +692,15 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * JOB-044's, and is read straight onto `CandidateRecord.githubUrl` rather than
  * through `toApplicationAnswers`, since it is a stated fact about the
  * candidate rather than an answer collected for a specific form question.
+ *
+ * The trailing eight are JOB-101's, and they are the whole reason that ticket
+ * touched three files rather than one: a column intake writes and this literal
+ * does not name is a question the person answered and the form filler never
+ * sees. Keep them in step with `toApplicationAnswers` below and with
+ * `buildFactCatalog` in `lib/fill-application-form.ts`.
  */
 const CANDIDATE_COLUMNS =
-  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start,github_url";
+  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start,github_url,clearance_eligibility,clearance_level_held,needs_sponsorship_non_us,visa_status,high_school_name,high_school_grad_year,street_address,postal_code";
 
 /**
  * Row → the answers that were actually recorded.
@@ -667,6 +738,36 @@ export function toApplicationAnswers(row: Record<string, unknown>): CandidateApp
     ? row.target_locations.map(String).filter((entry) => entry.trim() !== "")
     : [];
   if (locations.length > 0) answers.targetLocations = locations;
+  // JOB-101. The same rule a third time, and the reason it is written out
+  // rather than looped: a NULL column is left out, so "never asked" and "the
+  // answer is no" stay different statements. That distinction is what makes an
+  // unanswered clearance question become a question put to the candidate
+  // instead of a "No" nobody said.
+  const clearance =
+    typeof row.clearance_eligibility === "string" ? row.clearance_eligibility.trim() : "";
+  if (clearance !== "") answers.clearanceEligibility = clearance;
+  const clearanceLevel =
+    typeof row.clearance_level_held === "string" ? row.clearance_level_held.trim() : "";
+  if (clearanceLevel !== "") answers.clearanceLevelHeld = clearanceLevel;
+  if (typeof row.needs_sponsorship_non_us === "boolean") {
+    answers.needsSponsorshipNonUs = row.needs_sponsorship_non_us;
+  }
+  const visa = typeof row.visa_status === "string" ? row.visa_status.trim() : "";
+  if (visa !== "") answers.visaStatus = visa;
+  const highSchool =
+    typeof row.high_school_name === "string" ? row.high_school_name.trim() : "";
+  if (highSchool !== "") answers.highSchoolName = highSchool;
+  // PostgREST hands an `integer` column back as a JSON number, but a stored
+  // year that arrives as a string still parses to the same year, and refusing
+  // it would drop an answer over a transport detail.
+  const gradYear = Number(row.high_school_grad_year);
+  if (row.high_school_grad_year !== null && Number.isInteger(gradYear)) {
+    answers.highSchoolGradYear = gradYear;
+  }
+  const street = typeof row.street_address === "string" ? row.street_address.trim() : "";
+  if (street !== "") answers.streetAddress = street;
+  const postal = typeof row.postal_code === "string" ? row.postal_code.trim() : "";
+  if (postal !== "") answers.postalCode = postal;
   return answers;
 }
 
