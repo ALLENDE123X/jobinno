@@ -176,6 +176,16 @@ export type WaitlistWeeklyVolumeBucket =
   (typeof WAITLIST_WEEKLY_VOLUME_BUCKETS)[number];
 
 /**
+ * How a creator wants their affiliate payout sent, chosen on the creator
+ * signup form (JOB-042). Three real payment apps and nothing else: this is
+ * cash actually moving to a real person, not a preference to segment on
+ * later the way `WAITLIST_WEEKLY_VOLUME_BUCKETS` is, so the set stays closed
+ * and small on purpose.
+ */
+export const CREATOR_PAYOUT_METHODS = ["zelle", "venmo", "cashapp"] as const;
+export type CreatorPayoutMethod = (typeof CREATOR_PAYOUT_METHODS)[number];
+
+/**
  * The ATS platforms V1 targets, per CLAUDE.md. Not a database constraint, see
  * the header. Validate against this in application code.
  */
@@ -701,6 +711,111 @@ export const waitlist = pgTable(
      * list back for real.
      */
     pgPolicy("waitlist_insert_any", {
+      for: "insert",
+      to: [anonRole, authenticatedRole],
+      withCheck: sql`true`,
+    }),
+  ]
+);
+
+// ───────────────────────────────────
+// creators
+// ───────────────────────────────────
+
+/**
+ * Self serve signups for the affiliate program (JOB-042). A creator picks
+ * their own referral code, proves they hold a real audience on at least one
+ * platform, and gives payout details, all without Pranav or Courtney
+ * inserting a row by hand.
+ *
+ * Shaped after `waitlist` immediately above for the same reason: no session
+ * exists yet for a row here to belong to, so there is nothing in this table
+ * that references `profiles`, and the RLS posture is the same open insert
+ * with no select for `anon` or `authenticated` at all, see the policy below.
+ * Unlike `waitlist`, most columns here are required. A waitlist signup that
+ * loses a field still has an email to write to later; a creator row that
+ * loses its payout details is useless, because the entire point of this
+ * table is to hand back a working referral link and later actually pay the
+ * person, so the fields that make both of those possible are not optional.
+ */
+export const creators = pgTable(
+  "creators",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    /** Lowercased and trimmed before it ever reaches this column, see `lib/creator-signup.ts`. */
+    email: text("email").notNull(),
+    /**
+     * The code a creator's referral link carries, e.g. `?ref=courtney`. Also
+     * lowercased and trimmed before it reaches this column, for the same
+     * reason `email` is: the unique constraint below has to see two spellings
+     * of the same code as the same code.
+     */
+    refCode: text("ref_code").notNull(),
+    /**
+     * The five ways a creator can show they hold a real audience. All five
+     * are individually optional so nobody is forced onto a platform they do
+     * not use, but the check constraint below refuses a row with all five
+     * left blank, because a signup that proves no audience anywhere is not
+     * one the affiliate program can use.
+     */
+    instagramHandle: text("instagram_handle"),
+    linkedinHandle: text("linkedin_handle"),
+    tiktokHandle: text("tiktok_handle"),
+    twitterHandle: text("twitter_handle"),
+    otherSocial: text("other_social"),
+    /** One of `CREATOR_PAYOUT_METHODS`. */
+    payoutMethod: text("payout_method").notNull(),
+    /**
+     * The phone number for Zelle, or the username or tag for Venmo or
+     * CashApp. Which one it means depends on `payoutMethod`, and the form
+     * swaps the field label client side to match; nothing here enforces the
+     * shape of the value against the chosen method, because a phone number
+     * and a payment app tag are both just strings a real person typed and
+     * Postgres has no way to tell a bad one from an unusual one.
+     */
+    payoutTag: text("payout_tag").notNull(),
+    /**
+     * A general contact number, separate from `payoutTag` even when the
+     * payout method is Zelle and both happen to be phone numbers: one is how
+     * we reach the creator, the other is where the money goes, and a creator
+     * who wants those to be two different numbers has to be able to say so.
+     */
+    phoneNumber: text("phone_number").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique("creators_email_key").on(table.email),
+    unique("creators_ref_code_key").on(table.refCode),
+    check(
+      "creators_payout_method_check",
+      inList("payout_method", CREATOR_PAYOUT_METHODS)
+    ),
+    /**
+     * The same rule the form enforces client side, repeated here as a real
+     * constraint so it holds for a row written outside the form too, per
+     * JOB-042. `waitlist_weekly_application_volume_check` above is the
+     * pattern this follows: a CHECK built from columns rather than trusting
+     * every future writer to remember an application level rule.
+     */
+    check(
+      "creators_at_least_one_social_check",
+      sql`${table.instagramHandle} is not null or ${table.linkedinHandle} is not null or ${table.tiktokHandle} is not null or ${table.twitterHandle} is not null or ${table.otherSocial} is not null`
+    ),
+    /**
+     * Anonymous insert allowed unconditionally, matching `waitlist_insert_any`
+     * above and for the same reason: anyone signing up here holds no session
+     * to check ownership against.
+     *
+     * No select policy at all, again matching `waitlist`, and for a sharper
+     * reason this time: this table holds a phone number as well as an email,
+     * so leaving reads to the service role only is not just tidy, it is the
+     * only thing standing between the anon key and a list of real people's
+     * phone numbers.
+     */
+    pgPolicy("creators_insert_any", {
       for: "insert",
       to: [anonRole, authenticatedRole],
       withCheck: sql`true`,

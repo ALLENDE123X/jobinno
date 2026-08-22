@@ -36,6 +36,13 @@
  * announces itself: nothing here throws or 500s, the webhook sender just stops
  * hearing back and gives up quietly on its own retry schedule.
  *
+ * `/creator-signup` (JOB-042) is exempt for a third reason: it is not part of
+ * the gated product at all. A creator reaches it from a link Pranav or
+ * Courtney sends directly, never by browsing the app, and the form only ever
+ * writes to `creators`, a table this gate has nothing to do with. Gating it
+ * would mean the affiliate program cannot onboard anyone until `v1` merges,
+ * which has no relationship to why the gate went up in the first place.
+ *
  * Everything else, `/login`, `/dashboard`, `/onboarding`, `/billing/success`,
  * `/auth/callback`, `/api/billing/checkout`, and every other page or page
  * adjacent route this app has or ever adds, is gated on purpose:
@@ -75,6 +82,7 @@ const EXEMPT_PATHS: ReadonlySet<string> = new Set([
   WAITLIST_PATH,
   "/api/inngest",
   "/api/webhooks/stripe",
+  "/creator-signup",
 ]);
 
 /**
