@@ -252,6 +252,19 @@ export const BROWSERBASE_SESSION_TIMEOUT_S = 20 * 60;
  * deliberately absent for the same reason `os` almost stayed in by mistake:
  * issue #80's investigation confirmed `advancedStealth` is Scale-plan-gated,
  * and `verified` gates `os` the same way `os` alone turned out to require it.
+ *
+ * `browserSettings.blockAds: true` was added for issue #85, for a different
+ * pair of stops than `os` was chasing: SmartRecruiters (`oneclick-ui` shape)
+ * filled an entire form and then reported no usable submit control at all,
+ * and Workable clicked what it identified as the submit control and got no
+ * confirmation either way — both genuinely unexplained. An ad iframe or
+ * overlay sitting on top of the real submit control, or intercepting the
+ * click, is a plausible explanation for either. Confidence: moderate — a
+ * real mechanism, not a documented Browserbase claim tied to this specific
+ * symptom. It is also a setting that can break something else: ad blocking
+ * can take out legitimate functionality served from an ad-network-adjacent
+ * domain, so this wants a re-run against both SmartRecruiters and Workable to
+ * confirm nothing this pipeline actually needs got blocked along with it.
  */
 export const BROWSERBASE_VIEWPORT = { width: 1920, height: 1080 } as const;
 
@@ -703,6 +716,76 @@ async function blockUnroutableDomains(
   }
 }
 
+// ───────────────────────────────────
+// Captcha-solving evidence (issue #85)
+// ───────────────────────────────────
+
+/** The two console markers Browserbase's own managed solver writes. */
+const CAPTCHA_SOLVING_STARTED_MARKER = "browserbase-solving-started";
+const CAPTCHA_SOLVING_FINISHED_MARKER = "browserbase-solving-finished";
+
+/**
+ * Best-effort text out of a `Runtime.consoleAPICalled` CDP event's `args`.
+ *
+ * This SDK's `page.on("console", …)` (below) hands a listener the raw CDP
+ * event, not a Playwright `ConsoleMessage` — there is no `.text()` to call.
+ * Each console argument is a Chrome DevTools `RemoteObject`; for the plain
+ * string `console.log(...)` calls a marker like this is written with, `value`
+ * carries the text directly. Deliberately permissive rather than a full CDP
+ * `RemoteObject` parser: this only ever has to recognise two fixed strings.
+ */
+function consoleEventArgsText(params: Record<string, unknown> | undefined): string {
+  const args = params?.args;
+  if (!Array.isArray(args)) return "";
+  return args
+    .map((arg) => {
+      if (arg === null || typeof arg !== "object") return "";
+      const record = arg as Record<string, unknown>;
+      if (typeof record.value === "string") return record.value;
+      if (typeof record.description === "string") return record.description;
+      return "";
+    })
+    .join(" ");
+}
+
+/**
+ * Issue #85: confirms — rather than assumes — that Browserbase's managed
+ * captcha solver actually engaged on a given run.
+ *
+ * `browserSettings.solveCaptchas` defaults to `true` already (confirmed in
+ * the installed `@browserbasehq/sdk` types) and nothing here changes that.
+ * What was missing was evidence: Browserbase's solver writes
+ * `browserbase-solving-started` / `browserbase-solving-finished` to the
+ * page's own console when it engages, so a console listener turns "maybe a
+ * captcha ate the submit button" into a yes/no for future debugging, right
+ * in the same log stream as the rest of a run's `logTag` narration (e.g.
+ * `[act-007]`/`[act-008]`).
+ *
+ * Best effort, in the same shape as `blockUnroutableDomains` just above: a
+ * `page` that does not implement `on()` at all — every mocked page in this
+ * repo's test suite, and any future non-Browserbase provider — must not be
+ * the reason a run fails over a piece of after-the-fact evidence.
+ */
+async function watchForCaptchaSolvingEvidence(page: Page, logTag: string): Promise<void> {
+  try {
+    await page.on("console", (event) => {
+      const text = consoleEventArgsText(event.params);
+      if (text.includes(CAPTCHA_SOLVING_STARTED_MARKER)) {
+        console.log(`${logTag} captcha solving detected: started`);
+      } else if (text.includes(CAPTCHA_SOLVING_FINISHED_MARKER)) {
+        console.log(`${logTag} captcha solving detected: finished`);
+      }
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `${logTag} could not attach a console listener for captcha-solving evidence (ignored): ` +
+        `${reason}. This does not change whether Browserbase's own captcha solver runs — only ` +
+        `whether this process can see when it did.`
+    );
+  }
+}
+
 export async function openBrowserSession(
   options: OpenBrowserSessionOptions
 ): Promise<BrowserSession> {
@@ -749,9 +832,11 @@ export async function openBrowserSession(
             // JOB-046 (issue #80): see `BROWSERBASE_VIEWPORT`'s comment above
             // for why these are here and what is deliberately not (including
             // `os`, which was here too and broke every session on this plan).
+            // `blockAds` (issue #85) is documented in that same comment.
             proxies: true,
             browserSettings: {
               viewport: BROWSERBASE_VIEWPORT,
+              blockAds: true,
             },
           })
         : await localBrowser.launch({ headless: options.headless });
@@ -788,6 +873,9 @@ export async function openBrowserSession(
     const context = stagehand.browser.context;
     await blockUnroutableDomains(context, options.logTag);
     const page = (await context.activePage()) ?? (await context.newPage());
+    // Issue #85: evidence that Browserbase's captcha solver did or did not
+    // fire on this run, in the same log stream as the rest of it.
+    await watchForCaptchaSolvingEvidence(page, options.logTag);
     const session: BrowserSession = { stagehand, browser, page, logTag: options.logTag };
     // The last statement before the return, so a session only ever becomes the
     // holder of a slot once it is a session the caller actually has and can

@@ -1196,6 +1196,91 @@ async function captureSubmissionPage(
 }
 
 // ───────────────────────────────────
+// Diagnostics for the two unexplained failure points (issue #85)
+// ───────────────────────────────────
+
+/** `document.body.innerHTML`, or empty string when there is no body yet. */
+const BODY_INNER_HTML_SCRIPT = `(document.body && document.body.innerHTML) || ''`;
+
+/**
+ * Screenshot + rendered-HTML capture for the two points issue #85 names as
+ * genuinely unexplained: `chooseSubmitControlLabel` finding no usable submit
+ * control at all (the SmartRecruiters case), and the "clicked, but nothing
+ * confirms it" branch below (the Workable case). Both used to stop with
+ * nothing but a sentence in the log — no way to tell an ad overlay sitting on
+ * the real button from a hidden review step from genuinely nothing there.
+ *
+ * Written to local files, the same choice `captureSubmissionPage` above
+ * already made and the schema itself documents at `skipLog.rawContext`:
+ * "never a screenshot and never resume text". This function returns file
+ * paths, not bytes; the caller folds those paths into the `why` string that
+ * does reach `raw_context.message` via `recordSkipQuietly`, so a human
+ * reading a skip_log row still gets straight to both artifacts without the
+ * database row ever holding the artifacts themselves.
+ *
+ * Deliberately not built around Browserbase's own DOM-replay recording:
+ * issue #85's research found that feature is being deprecated and documented
+ * as "not always accurate".
+ *
+ * Never fatal, and the two artifacts are captured independently so one
+ * failing does not cost the other — same never-throw discipline as
+ * `captureSubmissionPage`.
+ */
+async function captureFailurePoint(
+  session: BrowserSession,
+  jobApplicationId: string,
+  tag: string,
+  directory: string
+): Promise<{ screenshotPath: string | null; htmlPath: string | null }> {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  let screenshotPath: string | null = null;
+  let htmlPath: string | null = null;
+
+  try {
+    await mkdir(directory, { recursive: true });
+    const path = resolve(directory, `${jobApplicationId}-${tag}-${stamp}.png`);
+    const bytes = await session.page.screenshot({ fullPage: true });
+    await writeFile(path, bytes);
+    screenshotPath = path;
+    console.log(`${LOG} failure-point screenshot (${tag}) → ${path}`);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(`${LOG} could not save the failure-point screenshot (${tag}, ignored): ${reason}`);
+  }
+
+  try {
+    await mkdir(directory, { recursive: true });
+    const html = await session.page.evaluate(BODY_INNER_HTML_SCRIPT);
+    const path = resolve(directory, `${jobApplicationId}-${tag}-${stamp}.html`);
+    await writeFile(path, typeof html === "string" ? html : String(html), "utf8");
+    htmlPath = path;
+    console.log(`${LOG} failure-point DOM capture (${tag}) → ${path}`);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(`${LOG} could not save the failure-point DOM capture (${tag}, ignored): ${reason}`);
+  }
+
+  return { screenshotPath, htmlPath };
+}
+
+/**
+ * Folds where `captureFailurePoint`'s artifacts landed into a `blocked()` /
+ * `unconfirmed()` reason string, so `recordSkipQuietly` carries them into
+ * `skip_log.raw_context.message` without the column ever holding the
+ * artifacts themselves. A no-op when both captures failed — a diagnostics
+ * capture that could not be written must not make the reason harder to read.
+ */
+function withFailureArtifacts(
+  why: string,
+  artifacts: { screenshotPath: string | null; htmlPath: string | null }
+): string {
+  const parts: string[] = [];
+  if (artifacts.screenshotPath !== null) parts.push(`screenshot: ${artifacts.screenshotPath}`);
+  if (artifacts.htmlPath !== null) parts.push(`page HTML: ${artifacts.htmlPath}`);
+  return parts.length === 0 ? why : `${why} [issue #85 diagnostics — ${parts.join(", ")}]`;
+}
+
+// ───────────────────────────────────
 // Main flow
 // ───────────────────────────────────
 
@@ -1589,7 +1674,18 @@ async function runSubmitPhase(
   try {
     // ── Which control, according to the form ACT-007 just filled ─────────────
     const choice = chooseSubmitControlLabel(fill.submitControlLabels);
-    if (choice.label === null) return await blocked(choice.why);
+    if (choice.label === null) {
+      // Issue #85: one of the two points that used to stop with nothing but
+      // this sentence. A screenshot and the page's own HTML are the
+      // difference between "a human can see why" and a bare log line.
+      const artifacts = await captureFailurePoint(
+        session,
+        jobApplicationId,
+        "no-submit-control",
+        input.screenshotDir ?? DEFAULT_SCREENSHOT_DIR
+      );
+      return await blocked(withFailureArtifacts(choice.why, artifacts));
+    }
     submitControlLabel = choice.label;
     console.log(`${LOG} submit control chosen: "${choice.label}" — ${choice.note}`);
 
@@ -1787,19 +1883,33 @@ async function runSubmitPhase(
     const pageAsksForCode =
       capture.securityCodeRequested || capture.codePromptInText || codePromptNow;
     if (!pageAsksForCode || groups.length === 0) {
+      // Issue #85: the other of the two points that used to stop with
+      // nothing but a sentence — the click landed, nothing on the page
+      // confirms it, and there was previously no artifact to show a human
+      // whether that was an overlay, a hidden review step, or genuinely
+      // nothing there.
+      const artifacts = await captureFailurePoint(
+        session,
+        jobApplicationId,
+        "no-confirmation",
+        input.screenshotDir ?? DEFAULT_SCREENSHOT_DIR
+      );
       return await unconfirmed(
-        `"${choice.label}" was clicked, but the application form is still on screen at ` +
-          `"${capture.url}" with no confirmation of any kind — the board most likely rejected ` +
-          `the submission (validation, or an anti-bot check).${errors} ` +
-          (pageAsksForCode
-            ? `The page reads as asking for an emailed one-time code, but no empty code field ` +
-              `could be found in the DOM to type one into. `
-            : groups.length > 0
-              ? `An empty code-shaped field is present, but neither the page's own text nor a ` +
-                `read of it says a code was emailed. `
-              : "") +
-          `"Most likely" is not "certainly", so this is not being retried: a human should look ` +
-          `at the board before anything clicks here again.`
+        withFailureArtifacts(
+          `"${choice.label}" was clicked, but the application form is still on screen at ` +
+            `"${capture.url}" with no confirmation of any kind — the board most likely rejected ` +
+            `the submission (validation, or an anti-bot check).${errors} ` +
+            (pageAsksForCode
+              ? `The page reads as asking for an emailed one-time code, but no empty code field ` +
+                `could be found in the DOM to type one into. `
+              : groups.length > 0
+                ? `An empty code-shaped field is present, but neither the page's own text nor a ` +
+                  `read of it says a code was emailed. `
+                : "") +
+            `"Most likely" is not "certainly", so this is not being retried: a human should look ` +
+            `at the board before anything clicks here again.`,
+          artifacts
+        )
       );
     }
 
