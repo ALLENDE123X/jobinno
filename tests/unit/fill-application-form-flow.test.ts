@@ -32,6 +32,24 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => {
   type Resolution = { selector: string; description: string; replayed: boolean } | null;
 
+  /** One control as `enumerateFormFields` reports it. Mirrors `EnumeratedField`. */
+  type FormControl = {
+    key: string;
+    selector: string;
+    activateSelectors: string[];
+    label: string;
+    kind: string;
+    required: boolean;
+    currentValue: string;
+    options: string[];
+    optionSelectors: string[];
+    optionValues: string[];
+    optionsKnown: boolean;
+    optionsTruncated: boolean;
+    maxLength: number | null;
+    helpText: string;
+  };
+
   /** What `STRUCTURAL_FLOOR_SCRIPT` answers with. Mirrors the module's own type. */
   type StructuralFloor = {
     passwordFields: number;
@@ -154,6 +172,33 @@ const h = vi.hoisted(() => {
      * on the second, which no fixed fixture can express.
      */
     signalsOverride: null as null | ((call: number) => Record<string, unknown>),
+    /**
+     * Issue #100. Controls the ACT-015 pass really has to deal with, appended to
+     * the three above.
+     *
+     * Empty by default and deliberately so: every other test in this file wants
+     * a form with nothing left to fill, which is what `control`'s non-empty
+     * `currentValue` buys. A test about the unknown-field fallback needs the
+     * opposite, a required control sitting empty with no stored fact and no
+     * model decision behind it, since that is the only way anything reaches the
+     * fallback at all.
+     */
+    extraControls: [] as FormControl[],
+    /**
+     * What `readFieldValue` reports for a selector. Keyed by selector; a
+     * selector that is absent reads empty, which is what an untouched control
+     * does.
+     */
+    fieldReadBacks: {} as Record<string, string>,
+    /**
+     * The same, but only once the unknown-field fallback has called `act()`.
+     * Merged over `fieldReadBacks` from that moment on, which is the only way a
+     * fixture can say "this box was not ticked, and then it was" — the exact
+     * before/after the stray-tick check is looking for.
+     */
+    fieldReadBacksAfterAct: {} as Record<string, string>,
+    /** Every instruction the unknown-field fallback handed `act()`, in order. */
+    fallbackActs: [] as string[],
   };
 
   const reset = (): void => {
@@ -187,6 +232,10 @@ const h = vi.hoisted(() => {
     state.extractCalls = 0;
     state.selectorWaits = [];
     state.signalsOverride = null;
+    state.extraControls = [];
+    state.fieldReadBacks = {};
+    state.fieldReadBacksAfterAct = {};
+    state.fallbackActs = [];
   };
 
   /**
@@ -223,7 +272,7 @@ const h = vi.hoisted(() => {
    * The controls a DOM read finds. `currentValue` is non empty throughout so the
    * ACT-015 pass has nothing left to do and the test stays about the ordering.
    */
-  const control = (label: string, kind: string, selector: string) => ({
+  const control = (label: string, kind: string, selector: string): FormControl => ({
     key: label.toLowerCase(),
     selector,
     activateSelectors: [],
@@ -240,11 +289,23 @@ const h = vi.hoisted(() => {
     helpText: "",
   });
 
+  /**
+   * Issue #100. The same control left genuinely unanswered, and required, which
+   * is what puts it in front of the ACT-015 pass and then the fallback.
+   */
+  const unanswered = (label: string, kind: string, selector: string): FormControl => ({
+    ...control(label, kind, selector),
+    required: true,
+    currentValue: "",
+    optionsKnown: false,
+  });
+
   /** A self hosted careers page: no ids anywhere, so every selector is an XPath. */
-  const formControls = () => (!state.domHasForm ? [] : [
+  const formControls = (): FormControl[] => (!state.domHasForm ? [] : [
     control("First Name", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[1]/input[1]"),
     control("Last Name", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[2]/input[1]"),
     control("Email", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[3]/input[1]"),
+    ...state.extraControls,
     ...(state.manualEntryClicked
       ? [
           control(
@@ -298,8 +359,25 @@ const h = vi.hoisted(() => {
       state.events.push("waited for the page to have content");
       return true;
     },
-    evaluate: async (script: unknown) =>
-      String(script).includes("passwordFields") ? readFloor() : state.descriptor,
+    evaluate: async (script: unknown) => {
+      const source = String(script);
+      if (source.includes("passwordFields")) return readFloor();
+      // Issue #100. `readFieldValue`'s script is the only one that asks a
+      // control whether it is checked, which is what identifies it here. The
+      // selector it was built for is embedded in the script as a literal, so
+      // the answer is looked up by finding the scripted selector inside it —
+      // the same trick `tests/unit/form-fields.test.ts` uses to tell this
+      // module's evaluated scripts apart.
+      if (source.includes('type === "radio" || type === "checkbox"')) {
+        const table =
+          state.fallbackActs.length === 0
+            ? state.fieldReadBacks
+            : { ...state.fieldReadBacks, ...state.fieldReadBacksAfterAct };
+        const hit = Object.keys(table).find((selector) => source.includes(selector));
+        return hit === undefined ? "" : table[hit];
+      }
+      return state.descriptor;
+    },
     screenshot: async () => new Uint8Array([1, 2, 3]),
     locator: () => ({
       inputValue: async () => state.lastTyped,
@@ -335,7 +413,15 @@ const h = vi.hoisted(() => {
         const override = state.signalsOverride?.(state.extractCalls) ?? {};
         return { data: { ...readPage(), ...override } };
       },
-      act: async (action: { description?: string }) => {
+      act: async (action: { description?: string } | string) => {
+        // Issue #100. The unknown-field fallback calls `act()` with a plain
+        // string rather than a resolved action, and what this fixture is for is
+        // recording whether it was called at all and with what.
+        if (typeof action === "string") {
+          state.fallbackActs.push(action);
+          state.events.push("the unknown-field fallback acted");
+          return;
+        }
         const description = action.description ?? "";
         if (description.includes("switches the cover letter")) {
           state.manualEntryClicked = true;
@@ -353,6 +439,7 @@ const h = vi.hoisted(() => {
     reset,
     session,
     formControls,
+    unanswered,
     manualEntryOnly,
     APPLY_URL,
     BOARD_TOKEN,
@@ -1381,5 +1468,125 @@ describe("an apply control labelled the way SmartRecruiters labels it", () => {
     expect(result.status).toBe("form_fill_blocked");
     expect(result.blockedReason).toContain("Refusing to click");
     expect(result.blockedReason).toContain("SUBMITS the application");
+  });
+});
+
+// ───────────────────────────────────
+// Issue #100 — the unknown-field fallback reports what it does, and refuses to
+// assert anything
+// ───────────────────────────────────
+//
+// The fallback near the bottom of `fillRemainingFields` is the last thing that
+// touches a form before the screenshot, and it is the only path in this module
+// that hands a page-derived label to `act()` and asks for "the most appropriate
+// value for a job applicant". It cannot be exercised from the pure tests in
+// `adaptive-form-fill.test.ts`, because what changed about it is not what it
+// decides but what it leaves behind: whether a value it put on a real
+// employer's form appears anywhere a human will read.
+//
+// Every case below therefore runs the whole flow with one control that nothing
+// else could answer. `decideFieldAnswers` is mocked to return no decisions at
+// all, which is exactly the state the fallback exists for.
+describe("what the unknown-field fallback leaves behind", () => {
+  const QUESTION = "xpath=/html[1]/body[1]/main[1]/form[1]/div[9]/input[1]";
+
+  // Said rather than assumed: `reset()` does not restore `domHasForm`, so a
+  // block running after the JOB-052 cases inherits whatever they last set. A
+  // fixture whose whole premise is "there is a control on the form" has to
+  // state that itself.
+  beforeEach(() => {
+    h.state.domHasForm = true;
+  });
+
+  it("reports a field it filled as filled, with what the control now reads", async () => {
+    h.state.extraControls = [h.unanswered("Which team interests you most?", "text", QUESTION)];
+    h.state.fieldReadBacksAfterAct = { [QUESTION]: "Platform Engineering" };
+
+    const result = await run();
+
+    // It really did go through the fallback rather than through any rule.
+    expect(h.state.fallbackActs).toHaveLength(1);
+    expect(h.state.fallbackActs[0]).toContain("Which team interests you most?");
+
+    // And the report says so, in the same shape an ordinary fill produces: one
+    // line for the field, `filled`, carrying what the browser reads back out of
+    // the control. Before this ticket that line said "needs-input" forever and
+    // the value was in no report at all.
+    const lines = result.fields.filter((entry) => entry.field === "which team interests you most?");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.outcome).toBe("filled");
+    expect(lines[0]?.readBack).toBe("Platform Engineering");
+    expect(lines[0]?.detail).toContain("chosen by a model, not by the candidate");
+  });
+
+  it("keeps a field it could not verify as the candidate's question", async () => {
+    // `act()` returning without throwing used to be the whole test for success,
+    // and it is not evidence of anything: the control here reads empty
+    // afterwards, so nothing was filled and the question is still open.
+    h.state.extraControls = [h.unanswered("Which team interests you most?", "text", QUESTION)];
+    h.state.fieldReadBacks = {};
+
+    const result = await run();
+
+    expect(h.state.fallbackActs).toHaveLength(1);
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.needsInput.map((item) => item.fieldLabel)).toContain(
+      "Which team interests you most?"
+    );
+    const line = result.fields.find((entry) => entry.field === "which team interests you most?");
+    expect(line?.outcome).toBe("needs-input");
+    expect(line?.detail).toContain("still reads empty");
+  });
+
+  it("will not point act() at a checkbox, whatever its label says", async () => {
+    // The label here is as ordinary as a label gets and matches no consent,
+    // attestation or demographic pattern anywhere in this codebase. The refusal
+    // is on the shape of the control, so a wording nobody anticipated cannot
+    // get past it — which is the whole difference between this and the regex
+    // that failed to match Avery Dennison's privacy declaration.
+    h.state.extraControls = [h.unanswered("Which team interests you most?", "checkbox", QUESTION)];
+
+    const result = await run();
+
+    expect(h.state.fallbackActs).toEqual([]);
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.needsInput.map((item) => item.fieldLabel)).toContain(
+      "Which team interests you most?"
+    );
+  });
+
+  it("will not point act() at a radio group either", async () => {
+    h.state.extraControls = [h.unanswered("Which team interests you most?", "radio", QUESTION)];
+
+    const result = await run();
+
+    expect(h.state.fallbackActs).toEqual([]);
+    expect(result.status).toBe("form_fill_blocked");
+  });
+
+  it("stops the run when a box gets ticked while it is filling something else", async () => {
+    // `act()` drives the whole page rather than one control, so refusing to
+    // point it at a checkbox is not the same as it never ticking one. Here the
+    // box the fallback was not asked about becomes checked while it works, and
+    // the form is no longer safe to submit: `assertNoMismatches` stops the run
+    // with the tick named.
+    const BOX = "xpath=/html[1]/body[1]/main[1]/form[1]/div[10]/input[1]";
+    h.state.extraControls = [
+      h.unanswered("Which team interests you most?", "text", QUESTION),
+      { ...h.unanswered("Keep me posted about other roles", "checkbox", BOX), required: false },
+    ];
+    // Both read empty until the fallback runs. Then the text control holds an
+    // answer, and so does a box nobody asked it about — which is what the live
+    // Avery Dennison run produced.
+    h.state.fieldReadBacksAfterAct = { [QUESTION]: "Platform Engineering", [BOX]: "checked" };
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("read back as");
+    const tick = result.fields.find(
+      (entry) => entry.field === "keep me posted about other roles" && entry.outcome === "mismatch"
+    );
+    expect(tick?.detail).toContain("nothing chose to tick it");
   });
 });

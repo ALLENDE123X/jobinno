@@ -217,6 +217,7 @@ import {
   inPageError,
   inPageExpression,
   normalizeText,
+  readFieldValue,
   CONSENT_FIELD_RE,
   EEO_FIELD_RE,
   type EnumeratedField,
@@ -2861,9 +2862,21 @@ const US_COUNTRY_RE = /^(the\s+)?(united\s+states(\s+of\s+america)?|u\.?s\.?a?\.
  * Nothing here is ever inferred, generated or best guessed, whatever the model
  * proposes. That is enforced in `resolveDecision` in TypeScript rather than
  * asked for in a prompt.
+ *
+ * ── Issue #100 added the restrictive covenants ──────────────────────────────
+ * The same Avery Dennison run that ticked a privacy declaration also answered
+ * "No" to a non-compete question, from a model, with nothing behind it. That is
+ * the identical shape of error as the felony case above: a statement about a
+ * legal obligation the candidate may or may not be under, made by a system that
+ * has never been told either way, on a form the candidate signs. Whether
+ * somebody is bound by a non-compete, a non-solicitation clause or any other
+ * restrictive covenant is a fact about their existing contracts, and this system
+ * holds no such fact — so, exactly like criminal history, the ladder can only
+ * ever reach step 2 or step 3 for one. `ATTESTATION_FACT_SCOPES` names no topic
+ * that matches these labels, so no stored fact can back one either.
  */
 export const LEGAL_ATTESTATION_RE =
-  /\b(?:work(?:ing)?\s+authoriz\w*|authoriz\w*\s+to\s+work|right\s+to\s+work|legally\s+(?:authoriz\w*|entitled|permitted|eligible)|citizen\w*|nationality|permanent\s+resident\w*|green\s+card|visa|sponsor\w*|immigration|work\s+permit|security\s+clearance|clearance\s+eligib\w*|clearance|export\s+control\w*|itar|u\.?\s?s\.?\s+person|felony|felonies|misdemean\w*|convict\w*|criminal\s+(?:history|record|background|conviction\w*)|background\s+check)\b/i;
+  /\b(?:work(?:ing)?\s+authoriz\w*|authoriz\w*\s+to\s+work|right\s+to\s+work|legally\s+(?:authoriz\w*|entitled|permitted|eligible)|citizen\w*|nationality|permanent\s+resident\w*|green\s+card|visa|sponsor\w*|immigration|work\s+permit|security\s+clearance|clearance\s+eligib\w*|clearance|export\s+control\w*|itar|u\.?\s?s\.?\s+person|felony|felonies|misdemean\w*|convict\w*|criminal\s+(?:history|record|background|conviction\w*)|background\s+check|non[-\s]?compet\w*|noncompet\w*|non[-\s]?solicit\w*|nonsolicit\w*|restrictive\s+covenant\w*)\b/i;
 
 /**
  * A proposed value that announces the absence of an answer instead of being
@@ -3048,6 +3061,68 @@ function attestationFactAllowed(label: string, factKey: string): boolean {
  */
 export function isAttestationField(label: string): boolean {
   return EEO_FIELD_RE.test(label) || LEGAL_ATTESTATION_RE.test(label);
+}
+
+/**
+ * Controls whose only way of holding a value is an assertion the candidate makes.
+ *
+ * A ticked box says "yes, I do" and a chosen radio says "this one is true of
+ * me". Neither has a spelling that means "here is a piece of information about
+ * me" the way a typed address does, so there is no such thing as a harmless
+ * automatic answer to one that nobody chose. This set is the whole basis of the
+ * refusal in `fallbackRefusalReason` below, and it is deliberately about the
+ * shape of the control and not about a single word of its label.
+ */
+const ASSERTING_KINDS: ReadonlySet<FormFieldKind> = new Set(["checkbox", "radio"]);
+
+/**
+ * ── Issue #100: why the unknown-field fallback may not touch this ────────────
+ *
+ * The fallback near the bottom of `fillRemainingFields` hands a page-derived
+ * label to `act()` and asks for "the most appropriate value for a job
+ * applicant". Until this ticket the only thing standing between that and a
+ * legal commitment made in a real person's name was `isAttestationField`, which
+ * is two regexes. On a live Avery Dennison run those regexes did not match "By
+ * checking this box you declare that you have read and understood the Privacy
+ * Notice", and the fallback ticked it.
+ *
+ * Widening the regexes was worth doing and is done — see `CONSENT_FIELD_RE` and
+ * `LEGAL_ATTESTATION_RE`, both of which now match that sentence and the
+ * non-compete question from the same run. But a regex is the wrong last line of
+ * defence for "is this a legal commitment", because it can only ever hold the
+ * wordings somebody already thought of, and the next board will write the next
+ * sentence. Every widening of it is a fix for one run that has already gone
+ * wrong.
+ *
+ * So the first rule below does not read the label at all. A checkbox or a radio
+ * group is refused for being a checkbox or a radio group: whatever the words
+ * next to it say, ticking it is the candidate asserting something, and this
+ * fallback is not entitled to assert anything on their behalf. That check
+ * cannot be defeated by unanticipated wording, because it never looks at the
+ * wording. The pattern checks that follow it are a second layer over the
+ * typed and chosen-from-a-list controls that remain, not the load-bearing one.
+ *
+ * Returns the reason the fallback must leave this item alone, or null when it
+ * may attempt it. Exported so the refusal can be tested at the level it is
+ * decided, without a browser.
+ */
+export function fallbackRefusalReason(item: NeedsInputItem): string | null {
+  if (!item.required) {
+    return "an optional question, which blocks nothing and is better asked than guessed at";
+  }
+  if (ASSERTING_KINDS.has(item.kind)) {
+    return (
+      `a ${item.kind} is answered by asserting something rather than by reporting it, and ` +
+      `this fallback never asserts anything in the candidate's name`
+    );
+  }
+  if (CONSENT_FIELD_RE.test(item.fieldLabel)) {
+    return "an agreement, consent or declaration, which only the candidate can give";
+  }
+  if (isAttestationField(item.fieldLabel)) {
+    return "a legal attestation or a demographic question, which is never best guessed";
+  }
+  return null;
 }
 
 /**
@@ -5259,8 +5334,17 @@ async function fillRemainingFields(
     });
   };
 
+  /**
+   * Issue #100. The control each escalated question came off, kept by the item's
+   * own identity rather than by its key, because `key` is the label folded to
+   * lower case and two controls on one form can share a label. The fallback at
+   * the bottom needs the selector to read back what it did, and a map keyed by
+   * object identity cannot hand it the wrong one.
+   */
+  const escalatedFrom = new Map<NeedsInputItem, EnumeratedField>();
+
   const ask = (field: EnumeratedField, question: string, why: string): void => {
-    needsInput.push({
+    const item: NeedsInputItem = {
       key: field.key,
       fieldLabel: field.label,
       question,
@@ -5268,9 +5352,42 @@ async function fillRemainingFields(
       required: field.required,
       kind: field.kind,
       ...(field.optionsKnown && field.options.length > 0 ? { options: field.options } : {}),
-    });
+    };
+    needsInput.push(item);
+    escalatedFrom.set(item, field);
     record(field, "needs-input", null, `left blank and escalated — ${why}`);
     console.warn(`${LOG} needs the candidate: ${field.label} — ${why}`);
+  };
+
+  /**
+   * Issue #100. Replaces the `needs-input` line a field already has rather than
+   * adding a second one for the same key.
+   *
+   * `printReport` and `fill-application-form-flow`'s assertions both reach for a
+   * field's outcome with `.find`, which returns the first match, so appending a
+   * later line would leave every reader looking at the earlier one. A field that
+   * was escalated and then filled has one true final state, and this is how the
+   * report comes to hold it.
+   */
+  const supersede = (
+    field: EnumeratedField,
+    outcome: FieldOutcome["outcome"],
+    intended: string | null,
+    detail: string,
+    readBack: string | null
+  ): void => {
+    const line: FieldOutcome = {
+      field: field.key,
+      intended,
+      outcome,
+      detail: `${field.required ? "required — " : ""}${detail}`,
+      readBack,
+    };
+    const at = outcomes.findIndex(
+      (entry) => entry.field === field.key && entry.outcome === "needs-input"
+    );
+    if (at === -1) outcomes.push(line);
+    else outcomes[at] = line;
   };
 
   // ── Step 3: the user's own answers, applied without a model ──────────────
@@ -5504,11 +5621,99 @@ async function fillRemainingFields(
   // rule, requested by the coordinator (issue #91). The label is truncated to
   // 200 characters to bound potential injection surface.
   //
-  // The field is removed from needsInput only if act() does not throw: a throw
-  // is treated as "still unknown", keeping the candidate-escalation path alive.
+  // ── Issue #100 rewrote what this is allowed to do, and what it must say ────
+  //
+  // It used to drop an item from `needsInput` whenever `act()` did not throw,
+  // and leave the field's `outcomes` line reading "needs-input" — so a value it
+  // put on a real employer's form under a real person's name appeared in no
+  // report at all, and the candidate was never told. On a live Avery Dennison
+  // run that silence covered a ticked privacy declaration and a "No" typed into
+  // a non-compete question. Two things changed:
+  //
+  //  1. What it will attempt is decided by `fallbackRefusalReason`, whose first
+  //     rule refuses checkboxes and radio groups on the shape of the control
+  //     without reading the label, so no unanticipated wording can get past it.
+  //     A refused item stays in `needsInput` and goes to the candidate, which is
+  //     the outcome the old code produced only when a regex happened to fire.
+  //
+  //  2. Nothing leaves `needsInput` silently. An attempt is only accepted when
+  //     the control reads back as holding something, and the field's report line
+  //     is then rewritten to say what it holds — the same `filled` line with the
+  //     same `readBack` column that every ordinary fill produces, so a human
+  //     scanning the report sees it exactly as they see the rest of the form.
+  //     `act()` returning without throwing is not evidence that anything was
+  //     filled, let alone filled correctly, so it is no longer treated as any.
+  //
+  //  3. `act()` drives the whole page, not one control, so refusing to point it
+  //     at a checkbox is not the same as it never ticking one. Every checkbox
+  //     and radio on the form is read before and after each attempt, and a box
+  //     that became ticked while this ran is recorded as a `mismatch` —
+  //     `assertNoMismatches` then stops the run with the form unsubmitted, which
+  //     is what should happen to a form now carrying an assertion nobody made.
+  const attempts = needsInput.filter((item) => fallbackRefusalReason(item) === null);
   const afterLlmFallback: NeedsInputItem[] = [];
+
+  // Read once, before any attempt, rather than trusting the `currentValue` from
+  // enumeration: the ordinary pass above ticks required agreement boxes by
+  // deliberate policy (see `applyConsentPolicy`), and those are legitimately
+  // ticked and must not be reported here.
+  const assertionControls =
+    attempts.length === 0 ? [] : all.filter((field) => ASSERTING_KINDS.has(field.kind));
+  const tickedBefore = new Set<string>();
+  for (const control of assertionControls) {
+    if ((await readFieldValue(session.page, control)) !== "") tickedBefore.add(control.selector);
+  }
+
+  /**
+   * Records any box that became ticked while the fallback was running.
+   *
+   * Two honest limits, neither of which weakens the refusal above and both of
+   * which are worth writing down rather than discovering later. It watches the
+   * controls enumeration found, so a checkbox the page renders for the first
+   * time during an `act()` is not in the list. And a radio group whose selector
+   * addresses the group rather than an input reads empty either way, so this
+   * catches ticks on checkboxes far more reliably than on radios. The check is
+   * a second net under a refusal that already holds, not the refusal itself.
+   */
+  const reportStrayTicks = async (safeLabel: string): Promise<void> => {
+    for (const control of assertionControls) {
+      if (tickedBefore.has(control.selector)) continue;
+      if ((await readFieldValue(session.page, control)) === "") continue;
+      // Added to the set so one stray tick is reported once rather than again on
+      // every later attempt.
+      tickedBefore.add(control.selector);
+      record(
+        control,
+        "mismatch",
+        null,
+        `this control was ticked while the unknown field fallback was filling ` +
+          `"${safeLabel}", and nothing chose to tick it. A ticked box is an assertion ` +
+          `made in the candidate's name, so the form is not safe to submit.`,
+        "checked"
+      );
+      console.error(
+        `${LOG} LLM fallback (unknown-field): STRAY TICK on "${control.label}" while ` +
+          `filling "${safeLabel}"`
+      );
+    }
+  };
+
   for (const item of needsInput) {
-    if (!item.required || isAttestationField(item.fieldLabel)) {
+    const refusal = fallbackRefusalReason(item);
+    if (refusal !== null) {
+      if (item.required) {
+        console.log(
+          `${LOG} LLM fallback (unknown-field): refusing "${item.fieldLabel.slice(0, 80)}" — ${refusal}`
+        );
+      }
+      afterLlmFallback.push(item);
+      continue;
+    }
+    const field = escalatedFrom.get(item);
+    if (field === undefined) {
+      // Cannot read back what cannot be addressed, and an unverifiable fill is
+      // not one this reports as done. Unreachable today — every item in this
+      // list came from `ask` — and it stays a question rather than an assumption.
       afterLlmFallback.push(item);
       continue;
     }
@@ -5519,17 +5724,50 @@ async function fillRemainingFields(
         `Fill the field labelled '${safeLabel}' with the most appropriate value for a job applicant.`,
         { page: session.page }
       );
-      // act() did not throw — treat as filled; leave out of the returned needsInput
-      // so the escalation loop does not re-ask the candidate. The field stays in
-      // `outcomes` as "needs-input" (recorded above) which is fine: the outcome
-      // log is for audit, not for re-driving the fill.
     } catch (err) {
       console.warn(
         `${LOG} LLM fallback (unknown-field): act() threw for "${safeLabel}" — ` +
           `${err instanceof Error ? err.message : String(err)}`
       );
+      await reportStrayTicks(safeLabel);
       afterLlmFallback.push(item);
+      continue;
     }
+
+    await reportStrayTicks(safeLabel);
+
+    const readBack = await readFieldValue(session.page, field);
+    if (readBack === "") {
+      console.warn(
+        `${LOG} LLM fallback (unknown-field): act() returned but "${safeLabel}" still reads ` +
+          `empty — still the candidate's question`
+      );
+      supersede(
+        field,
+        "needs-input",
+        null,
+        `left blank and escalated — ${item.why}; the unknown field fallback tried and the ` +
+          `control still reads empty`,
+        ""
+      );
+      afterLlmFallback.push(item);
+      continue;
+    }
+    // `intended` stays null on purpose: this module chose no value here, so
+    // saying it meant to put one would be a second small untruth in a report
+    // whose whole job is that the candidate can see what is on their form.
+    // `readBack` is what the control actually holds, which is the question
+    // anybody reading this line is asking.
+    supersede(
+      field,
+      "filled",
+      null,
+      `no rule and no stored fact answered this, so it was filled by the unknown field ` +
+        `fallback and read back. This value was chosen by a model, not by the candidate, ` +
+        `and it is on the form.`,
+      readBack
+    );
+    console.log(`${LOG} ${field.label}: filled by fallback + verified — reads ${JSON.stringify(readBack)}`);
   }
 
   return { outcomes, needsInput: [...afterLlmFallback, ...repeatingNeedsInput] };

@@ -36,12 +36,14 @@ import {
   isAttestationField,
   resolveAdditionalAnswer,
   resolveDecision,
+  fallbackRefusalReason,
   CONFIRM_EMAIL_RE,
   LEGAL_ATTESTATION_RE,
+  type NeedsInputItem,
 } from "@/lib/fill-application-form";
 import type { CandidateApplicationAnswers } from "@/lib/candidate-intake";
 import type { CandidateFact, FieldDecision, ResumeProfile } from "@/lib/resume-parser";
-import type { EnumeratedField } from "@/lib/form-fields";
+import { CONSENT_FIELD_RE, type EnumeratedField } from "@/lib/form-fields";
 
 /**
  * The real user's profile row, as production held it on the day of the run.
@@ -2180,5 +2182,221 @@ describe("the visa status, high school and address a form asks for by name", () 
     const known = job101Facts();
     expect(known.has("streetAddress")).toBe(false);
     expect(known.has("postalCode")).toBe(false);
+  });
+});
+
+// ── Issue #100: the declaration the patterns missed, and the refusal that does
+// not depend on a pattern at all ────────────────────────────────────────────
+//
+// A live Avery Dennison run ticked "By checking this box you declare that you
+// have read and understood the Privacy Notice" and typed "No" into a non-compete
+// question, and reported neither, because a required `needsInput` item that did
+// not match `isAttestationField` was handed to `act()` and then dropped from the
+// list whenever `act()` did not throw.
+//
+// The two halves of the fix are tested separately here on purpose, because they
+// are not the same kind of thing. The first block is a regex getting wider,
+// which fixes the wordings somebody has now seen. The second is a refusal that
+// never reads the label, which is what covers the wordings nobody has seen yet.
+describe("the agreement wordings the consent pattern used to miss", () => {
+  it.each([
+    "By checking this box you declare that you have read and understood the Privacy Notice",
+    "I declare that the information given in this application is true and complete",
+    "I have read and understood the Candidate Privacy Notice",
+    "I have read and accept the Terms of Use",
+    "Please confirm you have read our Recruitment Privacy Statement",
+    "Data Protection Notice",
+    "I consent to the processing of my personal data under GDPR",
+    "I acknowledge the recruitment privacy notice",
+  ])("treats %j as an agreement", (label) => {
+    expect(CONSENT_FIELD_RE.test(label)).toBe(true);
+  });
+
+  it.each([
+    // Every one of these is an ordinary question, and a pattern wide enough to
+    // catch a privacy declaration must not start ticking or escalating them.
+    // "certificate" is the near miss worth naming: `certify` was deliberately
+    // not widened to the stem `certif\w*`, because a skills question about a
+    // certificate is not an agreement about anything.
+    "Do you hold an AWS certificate?",
+    "Which of these books have you read?",
+    "How did you hear about us?",
+    "Are you at least 18 years old?",
+    "What is your expected graduation date?",
+    "Describe a project you are proud of",
+    "Preferred office location",
+    "How many years of professional experience do you have?",
+    "Highest level of education completed",
+    "Desired salary",
+  ])("does not treat %j as one", (label) => {
+    expect(CONSENT_FIELD_RE.test(label)).toBe(false);
+  });
+});
+
+describe("where the widened wording sends the declaration instead", () => {
+  const AVERY =
+    "By checking this box you declare that you have read and understood the Privacy Notice";
+
+  it("hands a required declaration to the deterministic consent policy, which reports it", () => {
+    // Worth being blunt about what widening the pattern actually changes. It
+    // does not stop this box being ticked — `applyConsentPolicy` has ticked
+    // required agreement boxes since issue #94, on the deliberate product
+    // decision recorded there, and this ticket does not revisit it. What
+    // changes is which code path does it: a branch that decides in TypeScript
+    // and returns a note that reaches the candidate's report, rather than an
+    // `act()` call whose work appeared in no report at all.
+    const resolution = resolveDecision(
+      field({ label: AVERY, kind: "checkbox", required: true }),
+      undefined,
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Yes");
+      expect(resolution.note).toContain("a required agreement the form will not submit without");
+    }
+  });
+
+  it("leaves the same declaration alone when the form does not require it", () => {
+    const resolution = resolveDecision(
+      field({ label: AVERY, kind: "checkbox", required: false }),
+      undefined,
+      facts()
+    );
+    expect(resolution.kind).toBe("skip");
+  });
+});
+
+describe("a restrictive covenant question is a legal attestation", () => {
+  it.each([
+    // The second thing the same run answered from nothing. Whether somebody is
+    // bound by one of these is a fact about their existing contracts, and this
+    // system holds no such fact — so "No" was a statement about a legal
+    // obligation made by something that had never been told either way.
+    "Are you subject to a non-compete agreement with a current or former employer?",
+    "Are you bound by any noncompete or non-solicitation obligations?",
+    "Do you have any restrictive covenants that would affect your employment?",
+  ])("treats %j as one", (label) => {
+    expect(LEGAL_ATTESTATION_RE.test(label)).toBe(true);
+    expect(isAttestationField(label)).toBe(true);
+  });
+
+  it.each([
+    "Are you comfortable working in a competitive environment?",
+    "Describe a competition you have won",
+    "How competitive is your desired salary?",
+  ])("does not treat %j as one", (label) => {
+    expect(isAttestationField(label)).toBe(false);
+  });
+
+  it("still has nothing in the catalogue that could answer one", () => {
+    // The same property criminal history has. `ATTESTATION_FACT_SCOPES` names no
+    // topic matching these labels, so the ladder can only ever reach "decline"
+    // or "ask" — never "answer it from a stored fact".
+    const resolution = resolveDecision(
+      field({
+        label: "Are you subject to a non-compete agreement?",
+        kind: "radio",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({
+        fieldKey: "are you subject to a non-compete agreement?",
+        decision: "answer",
+        value: "No",
+        sourceFact: "requiresSponsorship",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+});
+
+describe("what the unknown-field fallback refuses, and why", () => {
+  const item = (over: Partial<NeedsInputItem> & { fieldLabel: string }): NeedsInputItem => ({
+    key: over.fieldLabel.toLowerCase(),
+    question: "What should we put?",
+    why: "nothing answered it",
+    required: true,
+    kind: "text",
+    ...over,
+  });
+
+  it("refuses a checkbox whose label matches nothing at all", () => {
+    // This is the whole point of the ticket. The label is as ordinary as a
+    // label gets and matches no consent, attestation or demographic pattern
+    // anywhere in this codebase, so a regex-based gate lets it through. The
+    // refusal is on the shape of the control, so it does not.
+    const reason = fallbackRefusalReason(
+      item({ fieldLabel: "Which team interests you most?", kind: "checkbox" })
+    );
+    expect(reason).not.toBeNull();
+    expect(reason).toContain("never asserts anything in the candidate's name");
+  });
+
+  it("refuses a radio group on the same grounds", () => {
+    const reason = fallbackRefusalReason(
+      item({ fieldLabel: "Which office would you prefer?", kind: "radio" })
+    );
+    expect(reason).toContain("never asserts anything in the candidate's name");
+  });
+
+  it("refuses the Avery Dennison declaration on shape before wording is consulted", () => {
+    // Both layers now catch this one, and the order matters for what it proves:
+    // the reason given is the structural one, so the run would have refused it
+    // even on the day `CONSENT_FIELD_RE` still returned false for this sentence.
+    const reason = fallbackRefusalReason(
+      item({
+        fieldLabel:
+          "By checking this box you declare that you have read and understood the Privacy Notice",
+        kind: "checkbox",
+      })
+    );
+    expect(reason).toContain("never asserts anything in the candidate's name");
+  });
+
+  it("refuses an agreement drawn as a typed field, on the widened wording", () => {
+    // A typed control is not refused by shape, so this is the layer the regex
+    // is genuinely load bearing for — and the wording it now matches.
+    expect(
+      fallbackRefusalReason(
+        item({
+          fieldLabel: "I declare that I have read and understood the Privacy Notice",
+          kind: "text",
+        })
+      )
+    ).toContain("only the candidate can give");
+  });
+
+  it("refuses a legal attestation and a demographic question", () => {
+    expect(
+      fallbackRefusalReason(item({ fieldLabel: "Are you subject to a non-compete?", kind: "text" }))
+    ).toContain("never best guessed");
+    expect(
+      fallbackRefusalReason(item({ fieldLabel: "Gender", kind: "combobox" }))
+    ).toContain("never best guessed");
+  });
+
+  it("leaves an optional question alone rather than guessing at it", () => {
+    expect(
+      fallbackRefusalReason(
+        item({ fieldLabel: "Anything else we should know?", kind: "textarea", required: false })
+      )
+    ).toContain("blocks nothing");
+  });
+
+  it("still allows the ordinary unknown required field it exists for", () => {
+    // The Workable compliance dropdown issue #91 added this path for. Refusing
+    // everything would be safe and useless; the point is that what survives is
+    // typed or chosen from a list the page itself offers, and is now reported.
+    expect(
+      fallbackRefusalReason(
+        item({ fieldLabel: "Which team interests you most?", kind: "combobox" })
+      )
+    ).toBeNull();
+    expect(
+      fallbackRefusalReason(item({ fieldLabel: "How did you hear about us?", kind: "text" }))
+    ).toBeNull();
   });
 });
