@@ -161,13 +161,15 @@ describe("loadCandidate", () => {
     expect(calls.map((call) => call.table)).not.toContain("job_applications");
 
     // The exact column list, because a typo in it is the whole bug class. The
-    // trailing four are JOB-022's, and a column missing from here is not a typo
-    // sized problem: intake wrote all four of them and this list not naming them
-    // is why the form filler had no graduation date, no start date and no
-    // citizenship status to answer a form with.
+    // trailing four before `github_url` are JOB-022's, and a column missing
+    // from here is not a typo sized problem: intake wrote all four of them and
+    // this list not naming them is why the form filler had no graduation date,
+    // no start date and no citizenship status to answer a form with. JOB-044
+    // added `github_url` on the same reasoning.
     expect(callTo("profiles").columns).toBe(
       "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country," +
-        "current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start"
+        "current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start," +
+        "github_url"
     );
     expect(callTo("profiles").filters).toContainEqual(["eq", "id", USER_ID]);
 

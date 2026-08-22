@@ -70,6 +70,7 @@ const PROFILE_USER_COLUMNS = [
   "earliest_start",
   "email",
   "f1_status",
+  "github_url",
   "grad_date",
   "id",
   "requires_sponsorship",

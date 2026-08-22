@@ -1483,6 +1483,7 @@ async function loadApplicationState(
       id: candidateId,
       applicationEmail: candidate.applicationEmail,
       linkedinUrl: candidate.linkedinUrl,
+      githubUrl: candidate.githubUrl,
       resumeUrl: candidate.resumeUrl,
     },
     applicationAnswers: candidate.applicationAnswers,
@@ -2539,16 +2540,23 @@ export function buildFactCatalog(
     add("skills", "Skills and technologies listed on their resume", profile.skills.join(", "));
   }
   // A GitHub URL is asked for by name on a large share of engineering forms and
-  // was reported unanswerable four times in one run. The resume parse already
-  // validates and sanitises both URL fields; this only says which one is GitHub.
-  const github = [profile.websiteUrl, profile.linkedinUrl].find(
-    // Anchored at the scheme and matched against the host, so that a path
-    // spelling `/github.com/` on some other origin cannot claim to be one.
-    // `sanitizeUrl` has already confirmed both of these are https and on the
-    // host they claim; this only says which of the two is the GitHub one.
-    (url) => typeof url === "string" && /^https:\/\/([a-z0-9-]+\.)*github\.(com|io)(\/|$)/i.test(url)
-  );
-  add("githubUrl", "Their GitHub URL, as printed on their resume", github ?? null);
+  // was reported unanswerable four times in one run. `profile.githubUrl` is the
+  // real thing now (JOB-044: `profiles.github_url`, threaded through
+  // `CandidateRecord` in `lib/candidate-intake.ts`) and wins whenever the
+  // candidate has stated it. The inference below is the fallback for everyone
+  // who has not — most candidates, until the intake form grows a field for it —
+  // and is otherwise unchanged: the resume parse already validates and
+  // sanitises both URL fields, so this only says which one is GitHub.
+  const github =
+    profile.githubUrl ??
+    [profile.websiteUrl, profile.linkedinUrl].find(
+      // Anchored at the scheme and matched against the host, so that a path
+      // spelling `/github.com/` on some other origin cannot claim to be one.
+      // `sanitizeUrl` has already confirmed both of these are https and on the
+      // host they claim; this only says which of the two is the GitHub one.
+      (url) => typeof url === "string" && /^https:\/\/([a-z0-9-]+\.)*github\.(com|io)(\/|$)/i.test(url)
+    );
+  add("githubUrl", "Their GitHub URL", github ?? null);
 
   // The user's own answers from a previous `needsInput` round. Highest-quality
   // facts in the catalogue — they came from the person themselves — and keyed by
@@ -2913,6 +2921,44 @@ const DEGREE_FIELD_LABEL_RE =
   /\b(degree|qualification|education\s+level|level\s+of\s+(?:education|study)|highest\s+(?:degree|education|level))\b/i;
 
 /**
+ * JOB-044. The field labels a school question is drawn with, and one half of
+ * the double gate `inferOrAsk` and its caller use to decide when to type free
+ * text into a combobox that nothing on the menu matches.
+ *
+ * Deliberately narrow, on the same reasoning as `DEGREE_FIELD_LABEL_RE`: a
+ * combobox is a text input with a suggestion list layered on top, and typing
+ * whatever was proposed is a real answer only when the control is actually
+ * asking for a school. The 2026 08 21 failure analysis found Greenhouse's own
+ * "School" combobox accepts exactly that — it takes what is typed even when
+ * the candidate's school never appears among its suggestions — but a Location
+ * or Country combobox does not, and leaving unselected free text in one of
+ * those puts a value on the form nothing chose.
+ *
+ * Label alone is not enough, which review of this same ticket caught before
+ * it shipped, on the same reasoning `DEGREE_FIELD_LABEL_RE` was already double
+ * gated for below: a university's own Greenhouse posting can ask which
+ * "School" or "College" a role belongs to — an org-structure question about
+ * the employer, not the candidate — and that field's label matches this regex
+ * just as well as "What school did you attend?" does. See `SCHOOL_FACT_KEY_RE`
+ * for the other half.
+ */
+const SCHOOL_FIELD_LABEL_RE = /\b(school|university|college)\b/i;
+
+/**
+ * JOB-044. The fact keys that hold the candidate's own school, and the only
+ * ones `SCHOOL_FIELD_LABEL_RE`'s free-text fallback may run for.
+ *
+ * Paired with `SCHOOL_FIELD_LABEL_RE` the same way `DEGREE_FACT_KEY_RE` is
+ * paired with `DEGREE_FIELD_LABEL_RE`, and for the same reason: the label
+ * alone cannot tell "which school did you attend" apart from an employer's own
+ * "which School is this role in" question, so the fact backing the proposed
+ * value has to actually be the candidate's education before free text is
+ * allowed onto the form. `buildFactCatalog` writes `school` and
+ * `educationN.school`.
+ */
+const SCHOOL_FACT_KEY_RE = /(?:^|\.)school$/;
+
+/**
  * Which level of degree a string names, or null when it names none.
  *
  * A closed lookup rather than a similarity score. Abbreviation and long form are
@@ -3183,6 +3229,34 @@ function inferOrAsk(
           value: match,
           declined: false,
           note: `a best effort answer chosen from the control's own options: ${why}`,
+        };
+      }
+      // JOB-044. Nothing on the menu says what was proposed, but a combobox
+      // asking for a school is a text input first and a suggestion list
+      // second — see `SCHOOL_FIELD_LABEL_RE`. Typing the candidate's own
+      // school where none of the offered options match it is answering the
+      // question, not guessing at one, so this is applied as free text rather
+      // than escalated. `applyFieldValue`'s caller passes `allowFreeText` for
+      // exactly this field shape, which is what lets the control keep the
+      // typed value instead of requiring a click on an option that does not
+      // exist.
+      //
+      // Gated on the fact key too, not just the label — see `SCHOOL_FACT_KEY_RE`.
+      // Label alone cannot tell a "which school did you attend" question apart
+      // from a university employer's own "which School/College is this role
+      // in" org-structure question, and `proposed` typed as free text onto the
+      // wrong one of those states something about the employer's org chart,
+      // not the candidate.
+      if (
+        field.kind === "combobox" &&
+        SCHOOL_FIELD_LABEL_RE.test(field.label) &&
+        SCHOOL_FACT_KEY_RE.test(decision?.sourceFact ?? "")
+      ) {
+        return {
+          kind: "apply",
+          value: proposed,
+          declined: false,
+          note: `a best effort answer typed as free text, since none of the dropdown's own options said it: ${why}`,
         };
       }
     } else {
@@ -3751,7 +3825,8 @@ async function fillRemainingFields(
   // ── Step 6: policy, then action, then read-back ──────────────────────────
   let generated = 0;
   for (const field of undecided) {
-    const resolution = resolveDecision(field, byKey.get(field.key), factsByKey);
+    const decision = byKey.get(field.key);
+    const resolution = resolveDecision(field, decision, factsByKey);
 
     if (resolution.kind === "skip") {
       record(field, "skipped", null, `left blank — ${resolution.why}`);
@@ -3813,6 +3888,16 @@ async function fillRemainingFields(
       // No fixed option list means this is a search control that answers a
       // query rather than a menu with a fixed set — see `chooseFromMenu`.
       allowContains: OPTION_KINDS.has(field.kind) && field.options.length === 0,
+      // JOB-044. Scoped to school-shaped comboboxes by label AND by the fact
+      // key that backed `value`, same double gate as the resolution that
+      // produced `value` above — see `SCHOOL_FIELD_LABEL_RE`, `SCHOOL_FACT_KEY_RE`,
+      // and `chooseFromMenu`'s own comment on what this permits. The label
+      // alone would also let free text through on an employer's own "School"
+      // or "College" org-structure field, which is not what `value` answers.
+      allowFreeText:
+        field.kind === "combobox" &&
+        SCHOOL_FIELD_LABEL_RE.test(field.label) &&
+        SCHOOL_FACT_KEY_RE.test(decision?.sourceFact ?? ""),
     });
 
     if (outcome.ok) {

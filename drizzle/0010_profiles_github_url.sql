@@ -1,0 +1,21 @@
+-- `profiles.github_url`. JOB-044.
+--
+-- "Github Link" is a required field on a large share of engineering
+-- application forms, and until this column existed nothing answered it except
+-- a GitHub URL that happened to already be sitting in `website_url` or a
+-- LinkedIn field — most candidates' resumes not at all. See
+-- `CandidateRecord.githubUrl` in `lib/candidate-intake.ts` for how this is
+-- read and written, and `lib/fill-application-form.ts`'s `buildFactCatalog`
+-- for the inference fallback this still leaves in place for a candidate who
+-- has not filled it in yet.
+--
+-- Owned by the person, not by us, so `drizzle/0011_profiles_github_url_privileges.sql`
+-- grants it to `authenticated` by name, the way `0003_profiles_column_privileges.sql`
+-- requires of every column added since it: `authenticated` holds no table wide
+-- UPDATE on `profiles` any more, so this column is not writable by a user
+-- session until that grant lands.
+--
+-- Null on every existing row, meaning nobody has stated one yet, which is the
+-- correct starting state and is also what tells `buildFactCatalog` to fall
+-- back to the inferred value instead.
+ALTER TABLE "profiles" ADD COLUMN "github_url" text;

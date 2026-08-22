@@ -124,6 +124,17 @@ export type ResumeProfile = {
    */
   linkedinUrl: string | null;
   websiteUrl: string | null;
+  /**
+   * `profiles.github_url`, stated at intake. Added by JOB-044, and unlike
+   * `linkedinUrl` above this one is real: `CandidateRecord.githubUrl` here
+   * reads a column that actually exists, so this is the candidate's own
+   * answer whenever they gave one rather than a value inferred from another
+   * field. Null when they have not, which is what
+   * `buildFactCatalog` in `lib/fill-application-form.ts` treats as license to
+   * fall back to a GitHub URL spotted in `websiteUrl` or `linkedinUrl`
+   * instead.
+   */
+  githubUrl: string | null;
   workHistory: WorkHistoryEntry[];
   education: EducationEntry[];
   skills: string[];
@@ -807,6 +818,8 @@ export type CandidateRecord = {
   /** NOT NULL in `profiles`; the address the whole pipeline keys off. */
   applicationEmail: string;
   linkedinUrl: string | null;
+  /** `profiles.github_url`. See `ResumeProfile.githubUrl`. */
+  githubUrl: string | null;
 };
 
 /**
@@ -895,6 +908,13 @@ function buildResumeProfile(
   const websiteUrl = sanitizeUrl(extracted.websiteUrl);
   drop("websiteUrl", websiteUrl === null ? extracted.websiteUrl : null);
 
+  // JOB-044. Stored, not extracted: nothing here asks the model for a GitHub
+  // URL, because `lib/fill-application-form.ts` already finds one on its own
+  // when `websiteUrl` or `linkedinUrl` happens to be on github.com or
+  // github.io. This is only the real, candidate-stated answer, sanitised the
+  // same way `linkedinUrl` is — an https URL and on the host it claims to be.
+  const githubUrl = sanitizeUrl(candidate.githubUrl, "github.com");
+
   // The per-field validation above bounds what a value can *be* — 60 characters
   // of letters and spaces for a name, an https linkedin.com URL for a profile —
   // but "Ignore all previous instructions" is 32 characters of letters and
@@ -915,6 +935,7 @@ function buildResumeProfile(
     location,
     linkedinUrl,
     websiteUrl,
+    githubUrl,
     workHistory: extracted.workHistory.slice(0, 12).map((entry) => ({
       company: sanitizeLine(entry.company, 120),
       title: sanitizeLine(entry.title, 120),

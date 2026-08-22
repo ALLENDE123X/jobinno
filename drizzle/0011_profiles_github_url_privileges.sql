@@ -1,0 +1,25 @@
+-- Grants `github_url` to `authenticated`. JOB-044.
+--
+-- `0003_profiles_column_privileges.sql` revoked the table wide UPDATE grant
+-- Supabase's defaults left on `profiles` and granted back, by name, the
+-- columns a person owns about themselves — and said plainly that a new column
+-- added after it is not writable by `authenticated` until a migration grants
+-- it. `github_url` (added in `0010_profiles_github_url.sql`) is one a person
+-- owns: it is their own GitHub URL, stated at intake the same way
+-- `current_city` or `target_locations` is, so it belongs on the same list.
+--
+-- A second file rather than an edit to 0003 itself, for the reason that file's
+-- own header gives for being hand written in the first place: it is already
+-- journalled and already applied wherever this schema has been pushed, and
+-- rewriting an applied migration's content is how a checksum mismatch or a
+-- silently-missing grant happens on whatever database was migrated before this
+-- shipped. A later privilege change is a new file, always.
+--
+-- Hand written rather than generated, same as 0003: the Drizzle schema DSL has
+-- no way to express GRANT, so this was created with `drizzle-kit generate
+-- --custom` to stay journalled in `drizzle.__drizzle_migrations` and then
+-- filled in by hand. `.github/workflows/ci.yml` applies `0003` by explicit
+-- name because `drizzle-kit push` cannot see it; this file needs the same
+-- explicit line added there, for the same reason.
+
+GRANT UPDATE (github_url) ON public.profiles TO authenticated;
