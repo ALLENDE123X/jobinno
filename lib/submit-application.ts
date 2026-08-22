@@ -416,6 +416,36 @@ async function readConfirmation(session: BrowserSession): Promise<ConfirmationCa
  *
  * Nothing here weakens a check. Both surviving routes are strictly narrower than
  * what they replace.
+ *
+ * ── JOB-124: the half of that route 1 left open ─────────────────────────────
+ * "Unchanged" above is the word this ticket corrects. `continuedToFurtherStep`
+ * was computed, written into the evidence string, and then not consulted on
+ * route 1 at all, so a model answering `confirmationPresent: true` was on its
+ * own sufficient to write the terminal status **even on a page the board's own
+ * URL and tab title call a further step of the same application**. That is not
+ * a hypothetical pairing: SmartRecruiters titles its screening step
+ * "Preliminary questions - <job title> - <employer>", which is the board's own
+ * name for a mid-flow step, and #110 is a mid-flow "Thank you for finishing the
+ * test" that already read as a confirmation to a model once. Route 2 was
+ * already subordinated to the same signal; route 1 was not, and the stronger of
+ * the two routes was the one running unguarded.
+ *
+ * So both routes now require the destination not to read as a further step. Two
+ * signals in contradiction resolve to the non-terminal outcome: being unable to
+ * tell which of them is right is exactly what `submission_unconfirmed` is for,
+ * and it is never retried automatically, so the cost of resolving that way is
+ * that a human looks rather than that an application is sent twice.
+ *
+ * The under-reporting risk `succeed()` reasons about is real and is not
+ * dismissed here, it is measured. `pageReadsAsFurtherStep` was run over the
+ * receipt shapes the ten target boards actually render — SmartRecruiters'
+ * `/success` page carrying its own "Application submitted!" title, Greenhouse's
+ * `/thank-you` redirect, Lever's `/apply/thanks`, an in-place Workable
+ * confirmation, an Ashby "Application received", and a receipt hosted at a
+ * step-shaped path — and not one of them reads as a further step. The
+ * confirmation-destination veto and the `samePage` guard inside that predicate
+ * are what hold that line. Two shapes do collide, and both are recorded at
+ * `readsAsFurtherStep` rather than left for the next reader to rediscover.
  */
 export type SubmissionVerdict = {
   /** Whether the evidence supports writing the terminal `submitted` status. */
@@ -428,6 +458,19 @@ export type SubmissionVerdict = {
    * which of the two this was.
    */
   continuedToFurtherStep: boolean;
+  /**
+   * JOB-124. The model called this page a confirmation and the board's own name
+   * for it says it is a further step of the same application. Never true
+   * alongside `submitted`.
+   *
+   * Reported rather than merely implied by the other two fields, because the
+   * caller has to be able to route this case to its own exit. A page carrying a
+   * confirmation claim must not fall through into ACT-017's second-click
+   * branch, whose entry condition is written as "no confirmation of any kind"
+   * and has to stay literally true of the code, and it must not be described to
+   * an operator by a sentence asserting the page confirmed nothing.
+   */
+  confirmationContradicted: boolean;
   /** The signals, in the wording `succeed()` has always logged them in. */
   evidence: string;
 };
@@ -468,6 +511,32 @@ function errorsFor(capture: ConfirmationCapture): string {
  * `lib/application-wizard.ts` so the fill phase decides "did Next actually
  * advance a step" by the same rule this decides "was that a receipt" by; this
  * signature, and everything it means, is unchanged.
+ *
+ * ── The two shapes where this fires on a page that really did confirm ────────
+ * JOB-124 subordinates the model's confirmation claim to this predicate, so
+ * what it costs on a board that genuinely confirms stopped being an academic
+ * question. Measured rather than assumed, against the receipt every target
+ * board actually renders: none of them reads as a further step. Two constructed
+ * shapes do, and they are worth knowing about before anyone edits either side.
+ *
+ *   1. **A receipt whose tab title keeps a step counter.** `Step 3 of 3` is a
+ *      further-step title, it is checked before the confirmation-destination
+ *      veto and it wins, and it is checked whether or not the board navigated.
+ *      So a wizard that shows its counter on the pane where it also says thank
+ *      you collides — `Step 3 of 3 - Thank you for applying` reads as a step.
+ *   2. **A receipt served at a step-shaped path** the board navigated to, with
+ *      no confirmation word anywhere in the path or the title. A receipt at
+ *      `/application/questions/confirmation` is safe, because the veto reads
+ *      the whole path; one at a bare `/screening` under a neutral title is not.
+ *
+ * Neither is carved out, and the reason is that the carve-out would be aimed at
+ * the wrong target. Shape 1 is also the exact shape of #110: a mid-flow "Thank
+ * you for finishing the test" on a wizard pane that is displaying its own step
+ * counter. Exempting a step counter from vetoing a confirmation claim would
+ * re-open this hole for the likelier of the two events in order to close it for
+ * the rarer one. A second definition of "further step" living here would also
+ * be free to drift away from the one in `lib/application-wizard.ts`, which is
+ * precisely what JOB-117 consolidated that module to prevent.
  */
 export function readsAsFurtherStep(capture: ConfirmationCapture, wasAt: string): boolean {
   return pageReadsAsFurtherStep(capture.title, capture.url, wasAt);
@@ -488,25 +557,35 @@ export function judgeSubmission(capture: ConfirmationCapture, wasAt: string): Su
   // model's reading alone when `querySelectorAll` can contradict it.
   const formStillPresent = capture.applicationFormStillPresent || capture.identityFieldsPresent;
   const continuedToFurtherStep = readsAsFurtherStep(capture, wasAt);
+  // Unchanged, and deliberately so: all four signals, in the wording `succeed()`
+  // has always logged them in. What a human needs from this line is the ability
+  // to reconstruct the judgement, which means it has to keep reporting the
+  // signal that was overruled as loudly as the ones that agreed.
   const evidence =
     `confirmation page: ${capture.confirmationPresent}, ` +
     `form gone: ${!formStillPresent}, ` +
     `navigated: ${navigated}, ` +
     `destination reads as a further step: ${continuedToFurtherStep}`;
+  // JOB-124. The model says receipt, the board's own URL and tab title say step.
+  // Split out so the caller can route it rather than infer it; see the field.
+  const confirmationContradicted = capture.confirmationPresent && continuedToFurtherStep;
+  const verdict = { navigated, continuedToFurtherStep, confirmationContradicted, evidence };
 
-  // The board saying so, in its own words. Unchanged, and still sufficient on
-  // its own: this is the strongest signal there is and the one a board that
-  // redirects to a real thank you page will always produce.
-  if (capture.confirmationPresent) {
-    return { submitted: true, navigated, continuedToFurtherStep, evidence };
+  // The board saying so, in its own words. Still the strongest signal there is
+  // and the one a board that redirects to a real thank you page will always
+  // produce — but no longer sufficient *on its own*, because a model's reading
+  // of a page does not outrank the board's own account of where that page sits
+  // in its flow. JOB-124; the reasoning is above the type.
+  if (capture.confirmationPresent && !continuedToFurtherStep) {
+    return { submitted: true, ...verdict };
   }
   // The form has gone and the board did not simply move us along. This is what
   // catches a genuine confirmation whose wording a model failed to read: a thank
   // you page has no applicant form on it and does not name itself a step.
   if (!formStillPresent && !continuedToFurtherStep) {
-    return { submitted: true, navigated, continuedToFurtherStep, evidence };
+    return { submitted: true, ...verdict };
   }
-  return { submitted: false, navigated, continuedToFurtherStep, evidence };
+  return { submitted: false, ...verdict };
 }
 
 // ───────────────────────────────────
@@ -2100,6 +2179,47 @@ async function runSubmitPhase(
       return await succeed(capture, fill.finalUrl, `the "${choice.label}" click`);
     }
 
+    // ══ JOB-124: the page claims a confirmation and names itself a step ══════
+    // Its own exit, ahead of both branches below, for two reasons that are
+    // about them rather than about this one.
+    //
+    // The ACT-017 branch further down is entered on "the form is still on
+    // screen, at the same URL, with no confirmation", and that sentence is the
+    // entire licence for the second click this file allows. A page reading as a
+    // further step by its *title* does so whether or not the board navigated,
+    // so without this exit a page carrying a confirmation claim could reach that
+    // branch at the same URL — widening the set of pages a second click can be
+    // issued on, which is the one thing JOB-106 took care not to do. The
+    // two-click ceiling would hold; the reasoning under it would not.
+    //
+    // And the JOB-106 branch below would describe this page to a human as one
+    // that confirmed nothing, which is not what the capture says. What the
+    // capture says is that two readings disagree, so that is what gets written
+    // down. The status is `submission_unconfirmed`: the control was clicked,
+    // nothing is retried, nothing is clicked again, and the artifacts are
+    // captured because this is the case a human most needs to see rendered.
+    if (verdict.confirmationContradicted) {
+      const artifacts = await captureFailurePoint(
+        session,
+        jobApplicationId,
+        "confirmation-contradicted",
+        input.screenshotDir ?? DEFAULT_SCREENSHOT_DIR
+      );
+      return await unconfirmed(
+        withFailureArtifacts(
+          `"${choice.label}" was clicked at "${fill.finalUrl}" and the page now at ` +
+            `"${capture.url}" (page "${sanitizePageText(capture.title, 200)}") reads as a ` +
+            `confirmation to the model and as a further step of the same application to the ` +
+            `board's own URL and tab title — ${verdict.evidence}.${errorsFor(capture)} Those two ` +
+            `cannot both be right, and this row is deliberately not marked as though the first ` +
+            `one is: a board that has genuinely finished does not go on calling the page a step. ` +
+            `The application has NOT been shown to reach the employer. A human should check the ` +
+            `employer's side before this listing is run again.`,
+          artifacts
+        )
+      );
+    }
+
     // ══ JOB-106: the board moved us, and did not confirm anything ════════════
     // Taken before the ACT-017 branch below on purpose, and the condition is
     // `navigated` rather than `continuedToFurtherStep` for a reason that is
@@ -2408,6 +2528,25 @@ async function runSubmitPhase(
     }
 
     const resubmitErrors = errorsFor(resubmitCapture);
+    // JOB-124, the same rule as after the first click, and taken first here for
+    // the second of the two reasons given there: there is no third click either
+    // way, so nothing about the click budget turns on this, but both messages
+    // below assert that the board confirmed nothing and one of them asserts the
+    // form is still sitting there. Neither is true of a page a model has just
+    // called a receipt, and a reason string that misdescribes the page is worse
+    // than a longer one.
+    if (resubmitVerdict.confirmationContradicted) {
+      return await unconfirmed(
+        `"${choice.label}" was clicked a second time with the emailed security code entered, and ` +
+          `the page now at "${resubmitCapture.url}" (page ` +
+          `"${sanitizePageText(resubmitCapture.title, 200)}") reads as a confirmation to the ` +
+          `model and as a further step of the same application to the board's own URL and tab ` +
+          `title — ${resubmitVerdict.evidence}.${resubmitErrors} Those two cannot both be right ` +
+          `and this row is not marked as though the first one is. There is no third click: a ` +
+          `human should look at the board and at the ACT-006 inbox before anything clicks here ` +
+          `again.`
+      );
+    }
     // JOB-106, the same rule as after the first click. There is no third click
     // either way, so this changes only what the row is filed as and what the
     // person reading it is told — but "the board moved us to another step" and
