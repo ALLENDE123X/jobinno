@@ -36,6 +36,7 @@ import {
   isAttestationField,
   resolveAdditionalAnswer,
   resolveDecision,
+  CONFIRM_EMAIL_RE,
   LEGAL_ATTESTATION_RE,
 } from "@/lib/fill-application-form";
 import type { CandidateApplicationAnswers } from "@/lib/candidate-intake";
@@ -1172,5 +1173,62 @@ describe("degree equivalence stays inside degree fields", () => {
     );
     expect(resolution.kind).toBe("apply");
     if (resolution.kind === "apply") expect(resolution.value).toBe("Bachelor's Degree");
+  });
+});
+
+// ── CONFIRM_EMAIL_RE ────────────────────────────────────────────────────────
+//
+// Confirms that all the common "re-enter your email" label patterns the Workable
+// and Greenhouse boards use are matched, and that primary email fields are not.
+describe("CONFIRM_EMAIL_RE", () => {
+  const matches = [
+    "Confirm email",
+    "Confirm your email",
+    "Confirm Email Address",
+    "Re-enter email",
+    "Reenter your email address",
+    "Repeat email",
+    "Verify email",
+    "Retype email",
+    "Email confirmation",
+  ];
+  for (const label of matches) {
+    it(`matches "${label}"`, () => {
+      expect(CONFIRM_EMAIL_RE.test(label)).toBe(true);
+    });
+  }
+
+  const nonMatches = [
+    "Email",
+    "Email address",
+    "Work email",
+    "Your email",
+    "Primary email",
+  ];
+  for (const label of nonMatches) {
+    it(`does not match primary-email field "${label}"`, () => {
+      expect(CONFIRM_EMAIL_RE.test(label)).toBe(false);
+    });
+  }
+});
+
+// ── minimumAge fact ─────────────────────────────────────────────────────────
+//
+// `buildFactCatalog` should always produce a `minimumAge` fact with value "Yes"
+// so that Workable compliance dropdowns asking "Are you at least 18 years old?"
+// are answered deterministically.
+describe("buildFactCatalog minimumAge fact", () => {
+  it("always includes minimumAge: Yes", () => {
+    const catalog = buildFactCatalog(PROFILE, ANSWERS, {});
+    const fact = catalog.find((f) => f.key === "minimumAge");
+    expect(fact).toBeDefined();
+    expect(fact?.value).toBe("Yes");
+  });
+
+  it("minimumAge is not treated as a legal attestation", () => {
+    // The minimum-age question is NOT a work-authorization or criminal-history
+    // attestation, so isAttestationField must return false for it. The model is
+    // allowed to use the `minimumAge` fact to answer it via inferOrAsk.
+    expect(isAttestationField("Are you at least 18 years old?")).toBe(false);
   });
 });

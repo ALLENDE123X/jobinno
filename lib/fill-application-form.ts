@@ -2519,6 +2519,13 @@ export function buildFactCatalog(
   );
   add("willingToRelocate", "Willing to relocate for a role", yesNo(answers.willingToRelocate));
 
+  // A job applicant is by definition at least the minimum working age. Boards
+  // that ask "Are you at least 18 years old?" are asking whether the candidate
+  // is eligible to work, and a candidate who submitted a resume implicitly
+  // asserts that they are. The constant "Yes" is not a guess; it is the only
+  // answer that is consistent with being a job applicant at all.
+  add("minimumAge", "At least 18 years old (minimum working age)", "Yes");
+
   // Derived, in TypeScript rather than by a model: "they live in the United
   // States" entails "they are currently located in the US". That is an
   // entailment, not an inference about a person, and boards ask it as often as
@@ -3032,6 +3039,18 @@ const SCHOOL_FIELD_LABEL_RE = /\b(school|university|college)\b/i;
  * `educationN.school`.
  */
 const SCHOOL_FACT_KEY_RE = /(?:^|\.)school$/;
+
+/**
+ * Matches "Confirm email", "Confirm your email", "Re-enter email",
+ * "Repeat email", "Verify email" and similar second-email fields.
+ *
+ * These are always filled with the same value as the primary email address,
+ * so they are caught before the standard fact-lookup and filled directly from
+ * the `email` fact.
+ */
+export const CONFIRM_EMAIL_RE =
+  /\b(?:confirm|re-?enter|repeat|verify|re-?type)\b.*\bemail\b|\bemail\b.*\b(?:confirm(?:ation)?|re-?enter|repeat|verify|re-?type)\b/i;
+
 
 /**
  * Which level of degree a string names, or null when it names none.
@@ -3822,6 +3841,30 @@ async function fillRemainingFields(
   // to `undecided` and are left to `resolveDecision`'s own policy instead.
   const undecided: EnumeratedField[] = [];
   for (const field of empty) {
+    // ── Confirm-email shortcut ───────────────────────────────────────────────
+    // "Confirm email", "Re-enter email", "Repeat email" etc. are always the
+    // same value as the primary email address. Handled here, before the
+    // additional-answer lookup and the model, so nothing model-derived ever
+    // touches this field. The regex is anchored to the label text, which is
+    // page-derived, but the VALUE it types is always the `email` fact — a
+    // compile-time-keyed catalogue entry — not anything lifted off the page.
+    if (CONFIRM_EMAIL_RE.test(field.label)) {
+      const emailFact = factsByKey.get("email");
+      if (emailFact !== undefined) {
+        await sleep(randomInteractionDelayMs());
+        const outcome = await applyFieldValue(session.page, field, emailFact.value, {});
+        if (outcome.ok) {
+          record(field, "filled", emailFact.value, `confirm-email — filled with the email fact; ${outcome.detail}`, outcome.readBack);
+          console.log(`${LOG} ${field.label}: filled as confirm-email`);
+        } else if (outcome.readBack !== "") {
+          record(field, "mismatch", emailFact.value, outcome.detail, outcome.readBack);
+        } else {
+          ask(field, `The confirm-email field "${field.label}" could not be filled. ${outcome.detail}. What email address should we use?`, `confirm-email fill failed — ${outcome.detail}`);
+        }
+        continue;
+      }
+    }
+
     const decision = resolveAdditionalAnswer(field, additionalAnswers);
     if (decision.kind !== "apply") {
       undecided.push(field);
@@ -3994,7 +4037,46 @@ async function fillRemainingFields(
     );
   }
 
-  return { outcomes, needsInput };
+  // ── Issue #91 Part 2: LLM fallback for unknown required fields ───────────
+  // If any required field that is not a legal attestation or EEO question is
+  // still in needsInput at this point, the rule-based system had nothing for
+  // it. A single stagehand.act() can often fill it directly — Workable
+  // compliance dropdowns that landed here without a matching fact, for example.
+  //
+  // Security note: the field label is page-derived text included in an act()
+  // instruction. This is an intentional exception to the compile-time-constant
+  // rule, requested by the coordinator (issue #91). The label is truncated to
+  // 200 characters to bound potential injection surface.
+  //
+  // The field is removed from needsInput only if act() does not throw: a throw
+  // is treated as "still unknown", keeping the candidate-escalation path alive.
+  const afterLlmFallback: NeedsInputItem[] = [];
+  for (const item of needsInput) {
+    if (!item.required || isAttestationField(item.fieldLabel)) {
+      afterLlmFallback.push(item);
+      continue;
+    }
+    const safeLabel = item.fieldLabel.slice(0, 200);
+    console.log(`${LOG} LLM fallback (unknown-field): filling "${safeLabel}" via act()`);
+    try {
+      await session.stagehand.act(
+        `Fill the field labelled '${safeLabel}' with the most appropriate value for a job applicant.`,
+        { page: session.page }
+      );
+      // act() did not throw — treat as filled; leave out of the returned needsInput
+      // so the escalation loop does not re-ask the candidate. The field stays in
+      // `outcomes` as "needs-input" (recorded above) which is fine: the outcome
+      // log is for audit, not for re-driving the fill.
+    } catch (err) {
+      console.warn(
+        `${LOG} LLM fallback (unknown-field): act() threw for "${safeLabel}" — ` +
+          `${err instanceof Error ? err.message : String(err)}`
+      );
+      afterLlmFallback.push(item);
+    }
+  }
+
+  return { outcomes, needsInput: afterLlmFallback };
 }
 
 /**

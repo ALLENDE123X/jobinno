@@ -128,13 +128,16 @@ const INSTRUCTIONS = Object.freeze({
     "the button that submits the completed job application to the employer, labelled " +
     'something like "Submit Application", "Submit" or "Send Application"',
   /**
-   * Issue #88: SmartRecruiters shows an intermediate "Review application" /
-   * "Review your application" page before the final submit button. This
-   * instruction clicks through that page to reach the real submit screen.
+   * Issue #91: LLM fallback for when the fill phase could not locate a submit
+   * control — e.g. because the form is a multi-step wizard and the current step
+   * shows "Next" rather than "Submit". This instruction tells Stagehand to take
+   * whatever advancing action makes sense given what is on screen.
    */
-  SMARTRECRUITERS_REVIEW:
-    'the button that advances to the next step, labelled something like "Review application", ' +
-    '"Review your application", "Review", or "Continue"',
+  WIZARD_ADVANCE:
+    "You are on a job application form. No submit button was found by the automated scanner. " +
+    "Look at the page and take the most appropriate action to advance the application toward " +
+    'submission — click Next, Continue, Review, Submit, or whatever control makes sense ' +
+    "given what you see.",
 } as const);
 
 const CONFIRMATION_EXTRACT_INSTRUCTION =
@@ -1684,19 +1687,64 @@ async function runSubmitPhase(
     // ── Which control, according to the form ACT-007 just filled ─────────────
     const choice = chooseSubmitControlLabel(fill.submitControlLabels);
     if (choice.label === null) {
-      // Issue #85: one of the two points that used to stop with nothing but
-      // this sentence. A screenshot and the page's own HTML are the
-      // difference between "a human can see why" and a bare log line.
-      const artifacts = await captureFailurePoint(
-        session,
-        jobApplicationId,
-        "no-submit-control",
-        input.screenshotDir ?? DEFAULT_SCREENSHOT_DIR
+      // Issue #91 Part 1: LLM fallback. The fill phase found no submit control,
+      // which typically means the form is a multi-step wizard still on an
+      // intermediate step (e.g. SmartRecruiters "Next" before "Submit"). Try up
+      // to three times to advance via Stagehand before concluding the application
+      // is blocked. Each attempt calls act() and then checks for a submit button
+      // via tryResolveAction so the check is DOM-based, not re-extracted from the
+      // fill-phase scan (which only runs once, before we get here).
+      let fallbackResolved: Awaited<ReturnType<typeof tryResolveAction>> = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        console.log(
+          `${LOG} LLM fallback (submit-not-found, attempt ${attempt}/3): ` +
+            `no submit control in fill-phase scan — attempting act() to advance`
+        );
+        try {
+          await session.stagehand.act(INSTRUCTIONS.WIZARD_ADVANCE, { page: session.page });
+        } catch (err) {
+          console.log(
+            `${LOG} LLM fallback (submit-not-found, attempt ${attempt}/3): ` +
+              `act() threw — ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+        fallbackResolved = await tryResolveAction(
+          session,
+          await session.page.url(),
+          INSTRUCTIONS.SUBMIT_APPLICATION
+        );
+        if (fallbackResolved !== null) {
+          console.log(
+            `${LOG} LLM fallback (submit-not-found, attempt ${attempt}/3): submit control found`
+          );
+          break;
+        }
+        console.log(
+          `${LOG} LLM fallback (submit-not-found, attempt ${attempt}/3): submit control still not found`
+        );
+      }
+      if (fallbackResolved === null) {
+        // Issue #85: one of the two points that used to stop with nothing but
+        // this sentence. A screenshot and the page's own HTML are the
+        // difference between "a human can see why" and a bare log line.
+        const artifacts = await captureFailurePoint(
+          session,
+          jobApplicationId,
+          "no-submit-control",
+          input.screenshotDir ?? DEFAULT_SCREENSHOT_DIR
+        );
+        return await blocked(withFailureArtifacts(choice.why, artifacts));
+      }
+      const fallbackDescriptor = await describeControl(
+        session.page,
+        fallbackResolved.action.selector
       );
-      return await blocked(withFailureArtifacts(choice.why, artifacts));
+      submitControlLabel = fallbackDescriptor.text.trim() || "Submit Application";
+      console.log(`${LOG} submit control chosen via LLM fallback: "${submitControlLabel}"`);
+    } else {
+      submitControlLabel = choice.label;
+      console.log(`${LOG} submit control chosen: "${choice.label}" — ${choice.note}`);
     }
-    submitControlLabel = choice.label;
-    console.log(`${LOG} submit control chosen: "${choice.label}" — ${choice.note}`);
 
     // ── Where that control is, according to the browser ──────────────────────
     // A constant instruction, so nothing page-derived reaches a model, and
@@ -1734,7 +1782,7 @@ async function runSubmitPhase(
     // So it is still computed, still logged, and still recorded on the review
     // gate — but a failure to corroborate no longer stops the run.
     const descriptor = await describeControl(session.page, selector);
-    const check = corroborateSubmitControl(descriptor, choice.label);
+    const check = corroborateSubmitControl(descriptor, submitControlLabel ?? "");
     const evidence = check.ok ? check.evidence : `not corroborated: ${check.why}`;
     console.log(
       check.ok
@@ -1753,7 +1801,7 @@ async function runSubmitPhase(
       company: row.company,
       jobTitle: row.jobTitle,
       url: fill.finalUrl,
-      submitControlLabel: choice.label,
+      submitControlLabel: submitControlLabel ?? "",
       submitControlEvidence: evidence,
       fill,
     });
@@ -1772,29 +1820,6 @@ async function runSubmitPhase(
         unconfirmedReason: null,
         rowUpdated: false,
       });
-    }
-
-    // ── SmartRecruiters intermediate review step (issue #88) ────────────────
-    // SmartRecruiters inserts a "Review application" page between the filled
-    // form and the final submit button. Clicking through it is reversible —
-    // nothing is sent to the employer — so it happens here, before the point
-    // of no return, while a throw is still a safe stop.
-    if (row.ats === "smartrecruiters") {
-      try {
-        await session.stagehand.act(INSTRUCTIONS.SMARTRECRUITERS_REVIEW, {
-          page: session.page,
-        });
-        console.log(`${LOG} clicked through SmartRecruiters review step`);
-      } catch {
-        // The review step is not always present (some SmartRecruiters boards
-        // go straight to submit). A click failure here means either the page
-        // did not have a review button, or the button could not be found. In
-        // either case, proceed: the submit click below will land on whichever
-        // button the page actually shows.
-        console.log(
-          `${LOG} SmartRecruiters review step not found or already past — proceeding to submit`
-        );
-      }
     }
 
     // ── the point of no return ───────────────────────────────────────────────
