@@ -240,7 +240,14 @@ type RawField = {
 function enumerateFieldsInPage(
   maxFields: number,
   maxOptions: number,
-  handleAttr: string
+  handleAttr: string,
+  // Passed in rather than closed over: this function is serialised with
+  // `toString()` and sent to a browser that has never heard of this module, so a
+  // module constant referenced here would be a `ReferenceError` in the page.
+  // Threading them keeps one definition shared with `readFieldValue`, which is
+  // the whole point — see `SELECTED_VALUE_SELECTOR`.
+  SELECTED_VALUE_SEL: string,
+  VALUE_MIRROR_SEL: string
 ): RawField[] {
   const out: RawField[] = [];
   let handleCount = 0;
@@ -812,24 +819,72 @@ function enumerateFieldsInPage(
    * hidden mirror input these widgets keep for native form validation, which is
    * the most reliable of the three when it exists.
    */
+  /**
+   * The nearest thing matching `css` at one level of the walk: this element's
+   * own subtree, then its own shadow root.
+   *
+   * Two `querySelector` calls rather than a walk over everything underneath, and
+   * that is a correctness decision as much as a speed one. The enumerate-then-
+   * filter version of this had to be bounded to stay affordable, and the bound
+   * is what hid the answer: SmartRecruiters' `spl-select` holds 245 country
+   * options in its light DOM and paints its trigger caption *after* all of them,
+   * at element 1229 of 1230. Any budget small enough to be safe to run per
+   * control per pass stopped a thousand elements short of it. `querySelector`
+   * has no such problem — the engine finds the one match at any depth — so the
+   * only thing this has to add is the shadow root, which `querySelector` alone
+   * will not enter.
+   */
+  const nearestMatch = (root: Element, css: string): Element | null => {
+    try {
+      const light = root.querySelector(css);
+      if (light !== null) return light;
+    } catch {
+      return null;
+    }
+    const inner = (root as HTMLElement).shadowRoot;
+    if (inner === null || inner === undefined) return null;
+    try {
+      return inner.querySelector(css);
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * What a scripted dropdown currently holds, which is what decides whether the
+   * fill treats it as an empty control that still needs answering.
+   *
+   * JOB-107 makes it see through open shadow roots, in both directions, and
+   * teaches it the second spelling of "the selection". It has to give the same
+   * answer as `readFieldValue` — see `SELECTED_VALUE_SELECTOR` for what happened
+   * when it did not — and the two blind spots were the same in both:
+   * `querySelector` does not descend into a shadow root and `parentElement` does
+   * not climb out of one, so on a board where every control is a web component
+   * this used to look only at the search box a person types into. A search box
+   * is empty by design once a selection commits, so every such control read as
+   * unanswered no matter what the board had already put in it.
+   */
   const comboboxValue = (element: Element): string => {
-    const own = clean((element as HTMLInputElement).value);
+    // Defensive about the type: a custom element's `value` is often not a string
+    // (SmartRecruiters' phone field holds `{"country":"US"}`), and `clean` on one
+    // would throw out of the whole enumeration.
+    const raw = (element as HTMLInputElement).value;
+    const own = clean(typeof raw === "string" ? raw : "");
     if (own !== "") return own;
     let shell: Element | null = element;
-    for (let depth = 0; shell !== null && depth < 5; depth++) {
-      const rendered = shell.querySelector(
-        '[class*="single-value"],[class*="singleValue"],[class*="multi-value"],[class*="multiValue"]'
-      );
+    for (let depth = 0; shell !== null && depth < 7; depth++) {
+      const rendered = nearestMatch(shell, SELECTED_VALUE_SEL);
       if (rendered !== null) {
         const text = clean(rendered.textContent);
         if (text !== "") return text;
       }
-      const mirror = shell.querySelector('input[aria-hidden="true"][tabindex="-1"]');
+      const mirror = nearestMatch(shell, VALUE_MIRROR_SEL);
       if (mirror !== null) {
-        const value = clean((mirror as HTMLInputElement).value);
+        const mirrored = (mirror as HTMLInputElement).value;
+        const value = clean(typeof mirrored === "string" ? mirrored : "");
         if (value !== "") return value;
       }
-      shell = shell.parentElement;
+      shell = parentOf(shell);
     }
     return "";
   };
@@ -1089,6 +1144,33 @@ export const FIELD_HANDLE_ATTR = "data-jobinno-field";
 /** The same idea for one option inside an open dropdown. See `readOpenMenuInPage`. */
 export const OPTION_HANDLE_ATTR = "data-jobinno-option";
 
+/**
+ * Where a scripted dropdown paints the selection it has committed.
+ *
+ * One definition, spliced into both readers, because there are exactly two
+ * places that ask "what does this control hold" and they are required to give
+ * the same answer. `comboboxValue` inside `enumerateFieldsInPage` decides
+ * whether a control counts as already filled, and `readFieldValue` decides
+ * whether a fill stuck. When they disagree the run does something incoherent:
+ * JOB-107 caught the pair of them with the same two blind spots, so a phone
+ * country picker that the board had already set to United States read as empty,
+ * was "filled" anyway, and the typing landed in a neighbouring Website box that
+ * the board then rejected. Neither reader was individually wrong about the
+ * element it was looking at. They were both looking at the wrong element.
+ *
+ * react-select spells it `single-value`; SmartRecruiters' `spl-select` spells it
+ * `selected-value`. Matching on the substring rather than the whole class name
+ * is what makes the same probe work on both, and both spellings of "one" and
+ * "many" are here because a multi-select that has committed one value is still
+ * a control that is not empty.
+ */
+const SELECTED_VALUE_SELECTOR =
+  '[class*="single-value"],[class*="singleValue"],[class*="multi-value"],' +
+  '[class*="multiValue"],[class*="selected-value"],[class*="selectedValue"]';
+
+/** The hidden input a scripted dropdown keeps so native form validation can see its value. */
+const VALUE_MIRROR_SELECTOR = 'input[aria-hidden="true"][tabindex="-1"]';
+
 /** And for the control that adds an entry to a repeating section. See `enumerateRepeatingSectionsInPage`. */
 export const SECTION_HANDLE_ATTR = "data-jobinno-section";
 
@@ -1195,7 +1277,8 @@ export async function enumerateFormFields(page: Page): Promise<EnumeratedField[]
     const result = await page.evaluate(
       inPageExpression(
         enumerateFieldsInPage,
-        `${MAX_FIELDS}, ${MAX_OPTIONS_REPORTED}, ${jsLiteral(FIELD_HANDLE_ATTR)}`
+        `${MAX_FIELDS}, ${MAX_OPTIONS_REPORTED}, ${jsLiteral(FIELD_HANDLE_ATTR)}, ` +
+          `${jsLiteral(SELECTED_VALUE_SELECTOR)}, ${jsLiteral(VALUE_MIRROR_SELECTOR)}`
       )
     );
     const failure = inPageError(result);
@@ -2782,13 +2865,49 @@ export type ApplyOutcome = {
   detail: string;
 };
 
-/** Reads one control's current value back out of the page. */
+/**
+ * Reads one control's current value back out of the page.
+ *
+ * ── Why the search box is not where the answer is (JOB-107) ─────────────────
+ * A web component select does not keep its committed selection on the element
+ * this addresses. SmartRecruiters' phone-country picker is the case that forced
+ * this: the focusable control is an `input[role="combobox"]` labelled "Search by
+ * country/region or code", and a search box is *supposed* to clear itself once a
+ * selection commits. So the read below found `""` on a control that had just
+ * been set correctly, `applyFieldValue` reported "the value could not be
+ * applied", and a required field the board validates ("Please provide a valid
+ * phone number") blocked every run.
+ *
+ * The read back guard was right to refuse — an empty control is an empty
+ * control, and loosening it would have let a genuinely unset picker through.
+ * What was wrong was the question. Read off the live board, the committed
+ * selection renders one shadow root up, on the `spl-select` that owns the search
+ * box, as `<spl-typography-body class="c-spl-phone-field-selected-value">+1`.
+ * That is the same *kind* of node react-select calls `single-value`, spelled
+ * differently, and it was unreachable for two independent reasons: the class
+ * probe did not know the word "selected", and neither `querySelector` nor
+ * `parentElement` crosses a shadow boundary, so the walk up died at the first
+ * one and never reached the owner at all.
+ *
+ * Both are fixed here and nothing else is. The value still has to be *rendered*
+ * somewhere an applicant would read it; a component that shows nothing still
+ * reads `""` and is still escalated. In particular the owning element's own
+ * committed `value` property is deliberately **not** consulted as a fallback:
+ * on this very picker it holds `"US"` while the option chosen is
+ * "United States +1", and answering with a code no applicant sees would turn a
+ * correct selection into a reported mismatch. The caption is what the person
+ * sees, so the caption is what is checked.
+ */
 export async function readFieldValue(page: Page, field: EnumeratedField): Promise<string> {
   const script = `(() => {
     const sel = ${jsLiteral(field.selector)};
     const el = ${RESOLVE_IN_PAGE_SRC}(sel);
     if (!el) return "";
-    const clean = (v) => (v || "").replace(/\\s+/g, " ").trim();
+    // Defensive about the type as well as the whitespace: a custom element's
+    // \`value\` is frequently not a string at all (this board's phone field holds
+    // the object \`{"country":"US"}\`), and calling \`.replace\` on one throws out
+    // of the whole script, which reads downstream as an empty control.
+    const clean = (v) => (typeof v === "string" ? v : "").replace(/\\s+/g, " ").trim();
     const tag = el.tagName.toLowerCase();
     if (tag === "select") {
       const opt = el.options[el.selectedIndex];
@@ -2799,13 +2918,35 @@ export async function readFieldValue(page: Page, field: EnumeratedField): Promis
     const role = (el.getAttribute("role") || "").toLowerCase();
     const isCombo = role === "combobox" || el.getAttribute("aria-autocomplete") === "list";
     if (isCombo) {
+      // One level of the walk: this element's own subtree, then its own shadow
+      // root. Two \`querySelector\` calls rather than a bounded walk over
+      // everything underneath — see \`nearestMatch\` in \`enumerateFieldsInPage\`
+      // for why a budget is the wrong tool here, and why these two have to stay
+      // the same shape as each other.
+      const nearestMatch = (root, css) => {
+        try { const light = root.querySelector(css); if (light) return light; }
+        catch (e) { return null; }
+        const inner = root.shadowRoot;
+        if (!inner) return null;
+        try { return inner.querySelector(css); } catch (e) { return null; }
+      };
+      // The nearest level that renders something wins, exactly as before. Only
+      // the reach of each level, and the number of levels, has changed.
       let shell = el;
-      for (let d = 0; shell && d < 5; d++) {
-        const rendered = shell.querySelector('[class*="single-value"],[class*="singleValue"],[class*="multi-value"],[class*="multiValue"]');
+      for (let d = 0; shell && d < 7; d++) {
+        const rendered = nearestMatch(shell, ${jsLiteral(SELECTED_VALUE_SELECTOR)});
         if (rendered) { const t = clean(rendered.textContent); if (t) return t; }
-        const mirror = shell.querySelector('input[aria-hidden="true"][tabindex="-1"]');
+        const mirror = nearestMatch(shell, ${jsLiteral(VALUE_MIRROR_SELECTOR)});
         if (mirror) { const v = clean(mirror.value); if (v) return v; }
-        shell = shell.parentElement;
+        // \`parentElement\` is null at the top of a shadow root; the way out is
+        // the root's host. Without this the walk stops inside the widget that
+        // holds the search box and never reaches the one holding the answer.
+        let up = shell.parentElement;
+        if (!up) {
+          const root = shell.getRootNode && shell.getRootNode();
+          up = root && root.host ? root.host : null;
+        }
+        shell = up;
       }
     }
     return clean(el.value);
