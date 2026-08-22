@@ -313,6 +313,74 @@ const CACHEABLE_INSTRUCTIONS: ReadonlyMap<string, CoreSlot> = new Map<string, Co
 /** Exported for the test that pins it against `classifyCoreSlot`. */
 export const CACHEABLE_INSTRUCTION_SLOTS = CACHEABLE_INSTRUCTIONS;
 
+/**
+ * Whether the page is showing this file name anywhere a person could read it,
+ * shadow roots included.
+ *
+ * The second, independent confirmation that a resume actually attached, and it
+ * exists because the first one stopped being sufficient. `attachedFiles` reads
+ * `input.files.length`, which is the right question for a plain `<input
+ * type="file">` and the wrong one for a component that reads the File, uploads
+ * it itself and resets the input — SmartRecruiters does exactly that, then
+ * renders a chip with the file name and a delete button beside it. Its input
+ * honestly reports zero files while the applicant is plainly looking at their
+ * attached resume.
+ *
+ * This is deliberately positive evidence and not a relaxation: the board has to
+ * be showing the exact file name that was just uploaded. "The input says zero"
+ * still fails the attachment when nothing on the page says otherwise.
+ */
+function pageShowsFileNameInPage(needle: string): boolean {
+  const wanted = needle.replace(/\s+/g, " ").trim().toLowerCase();
+  if (wanted === "") return false;
+
+  const seen = new Set<Document | ShadowRoot>();
+  const stack: (Document | ShadowRoot)[] = [document];
+  let budget = 6000;
+  while (stack.length > 0 && budget > 0) {
+    const root = stack.pop();
+    if (root === undefined || seen.has(root)) continue;
+    seen.add(root);
+    let all: Element[];
+    try {
+      all = Array.from(root.querySelectorAll("*"));
+    } catch {
+      continue;
+    }
+    for (const element of all) {
+      if (budget-- <= 0) break;
+      const inner = (element as HTMLElement).shadowRoot;
+      if (inner !== null && inner !== undefined) stack.push(inner);
+      if (element.children.length > 0) continue;
+      const text = (element.textContent ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text === "" || !text.includes(wanted)) continue;
+      // Painted, not merely present. A hidden template holding the name is not
+      // the board acknowledging the upload.
+      const box = element.getBoundingClientRect();
+      if (box.width > 0 && box.height > 0) return true;
+      const parent = element.parentElement;
+      if (parent !== null) {
+        const parentBox = parent.getBoundingClientRect();
+        if (parentBox.width > 0 && parentBox.height > 0) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** `pageShowsFileNameInPage`, run in the page. Never throws; unreadable means no. */
+async function pageShowsFileName(page: Page, fileName: string): Promise<boolean> {
+  try {
+    const raw = await page.evaluate(
+      inPageExpression(pageShowsFileNameInPage, jsExpression(fileName))
+    );
+    if (inPageError(raw) !== null) return false;
+    return raw === true;
+  } catch {
+    return false;
+  }
+}
+
 // ───────────────────────────────────
 // Reading the page
 // ───────────────────────────────────
@@ -845,14 +913,98 @@ function describeControlInPage(sel: string): ControlDescriptor {
     text: "",
     role: "",
   };
+  /**
+   * JOB-047. Stagehand marks a shadow boundary in its XPath with a double
+   * slash, and `document.evaluate` cannot cross one.
+   *
+   * A selector its `observe()` returns for a web component board looks like
+   * `/html[1]/.../oc-input[1]/spl-input[1]//spl-internal-form-field[1]/div[1]/input[1]`
+   * — the `//` sits exactly where `spl-input`'s shadow root begins. To XPath
+   * that reads as "descendant-or-self", which does not enter a shadow root, so
+   * the evaluation returns null and this function reports `found: false`.
+   *
+   * That is not a cosmetic miss. `corroborateSubmitControl` fails closed on
+   * `found: false` with "Refusing to click a submit button this module cannot
+   * see", so on **every** board built out of web components the submit control
+   * could never be corroborated and therefore could never be clicked. The guard
+   * was doing the safe thing for the wrong reason: not "this control is not what
+   * it claims" but "this module cannot resolve its own driver's selector".
+   *
+   * So each `//` splits the path into a segment, and each segment after the
+   * first is walked inside the previous element's shadow root. The steps are the
+   * simple `tag[n]` form Stagehand emits, walked by hand because XPath over a
+   * `ShadowRoot` is not something every engine supports. A path with no `//` in
+   * it takes the original `document.evaluate` route untouched, so nothing about
+   * an ordinary board changes.
+   */
+  const stepInto = (root: ParentNode, path: string): Element | null => {
+    let current: ParentNode | null = root;
+    for (const step of path.split("/")) {
+      if (step === "" || current === null) continue;
+      const match = /^([A-Za-z0-9_-]+)(?:\[(\d+)\])?$/.exec(step);
+      if (!match) return null;
+      const tag = (match[1] ?? "").toLowerCase();
+      const nth = match[2] === undefined ? 1 : Number(match[2]);
+      let seen = 0;
+      let next: Element | null = null;
+      for (const child of Array.from(current.children)) {
+        if (child.tagName.toLowerCase() !== tag) continue;
+        seen++;
+        if (seen === nth) {
+          next = child;
+          break;
+        }
+      }
+      if (next === null) return null;
+      current = next;
+    }
+    return current === root ? null : (current as Element);
+  };
+
   let element: Element | null = null;
   try {
     const path = sel.startsWith("xpath=") ? sel.slice("xpath=".length) : sel;
-    if (path.startsWith("/") || path.startsWith("(")) {
+    if (path.includes("//") && (path.startsWith("/") || path.startsWith("("))) {
+      const segments = path.split("//");
+      const first = segments.shift() ?? "";
+      // 9 === XPathResult.FIRST_ORDERED_NODE_TYPE
+      let node = document.evaluate(first, document, null, 9, null).singleNodeValue as Element | null;
+      for (const segment of segments) {
+        const inner = node === null ? null : (node as HTMLElement).shadowRoot;
+        if (inner === null || inner === undefined) {
+          node = null;
+          break;
+        }
+        node = stepInto(inner, segment);
+      }
+      element = node;
+    } else if (path.startsWith("/") || path.startsWith("(")) {
       // 9 === XPathResult.FIRST_ORDERED_NODE_TYPE
       element = document.evaluate(path, document, null, 9, null).singleNodeValue as Element | null;
     } else {
       element = document.querySelector(sel);
+      if (element === null) {
+        // A plain CSS selector that matches nothing in the light document is
+        // looked for inside the open shadow roots, deepest last. This is the
+        // branch a `form-fields.ts` stamped handle takes.
+        const stack: (Document | ShadowRoot)[] = [document];
+        const seen = new Set<Document | ShadowRoot>();
+        while (stack.length > 0 && element === null) {
+          const root = stack.pop();
+          if (root === undefined || seen.has(root)) continue;
+          seen.add(root);
+          for (const host of Array.from(root.querySelectorAll("*"))) {
+            const inner = (host as HTMLElement).shadowRoot;
+            if (inner === null || inner === undefined) continue;
+            const hit = inner.querySelector(sel);
+            if (hit !== null) {
+              element = hit;
+              break;
+            }
+            stack.push(inner);
+          }
+        }
+      }
     }
   } catch {
     return empty;
@@ -896,17 +1048,23 @@ function describeControlInPage(sel: string): ControlDescriptor {
   const attributes = ["name", "id", "placeholder", "aria-label", "autocomplete", "data-testid", "title"];
   for (const attribute of attributes) push(element.getAttribute(attribute));
 
+  // Scoped to the control's own root. For a light DOM control that root *is*
+  // the document, so this is unchanged; for a shadow one it stops the lookup
+  // finding a same-id element belonging to some other component entirely.
+  const ownRoot = element.getRootNode();
+  const scope: ParentNode = ownRoot instanceof ShadowRoot ? ownRoot : document;
   const labelledBy = element.getAttribute("aria-labelledby");
   if (labelledBy) {
     for (const id of labelledBy.split(/\s+/)) {
-      const target = document.getElementById(id);
+      const escapedId = id.replace(/["\\]/g, "\\$&");
+      const target = scope.querySelector('[id="' + escapedId + '"]');
       if (target) push(target.textContent);
     }
   }
   const ownId = element.getAttribute("id");
   if (ownId) {
     const escaped = ownId.replace(/["\\]/g, "\\$&");
-    const explicit = document.querySelector('label[for="' + escaped + '"]');
+    const explicit = scope.querySelector('label[for="' + escaped + '"]');
     if (explicit) push(explicit.textContent);
   }
   const wrapping = element.closest("label");
@@ -919,12 +1077,61 @@ function describeControlInPage(sel: string): ControlDescriptor {
     if (blockLabel) push(visibleTextOf(blockLabel));
   }
 
+  // JOB-047. Keep looking on the other side of the shadow boundary.
+  //
+  // Everything above stops at the edge of the control's own root, because
+  // `closest` does. On a web component board that means the walk never reaches
+  // the section the control sits in — and the section is where its name is. A
+  // SmartRecruiters resume dropzone describes itself as "file-input | Choose a
+  // file or drop it here", which is a perfectly accurate description of a file
+  // input and says nothing about a resume; the word "Resume" is the section
+  // heading, one host up and outside the shadow root, exactly where a sighted
+  // applicant reads it.
+  //
+  // Making the resolver see shadow DOM (above) turned that from a silent
+  // bypass — `found: false`, corroboration skipped entirely, control used
+  // anyway — into an active refusal to upload somebody's resume into a control
+  // the module could not identify. The refusal was right on the evidence it
+  // had. This gives it the rest of the evidence rather than lowering the bar:
+  // the host's own identifying attributes, and the nearest heading of the block
+  // the host sits in, which is precisely what the two lookups above already do
+  // for a control that happens to live in the light DOM.
+  const HEADINGS = "label,legend,h1,h2,h3,h4,h5,h6,[data-test*='title' i]";
+  let host: Element = element;
+  for (let depth = 0; depth < 4; depth++) {
+    const hostRoot = host.getRootNode();
+    if (!(hostRoot instanceof ShadowRoot)) break;
+    host = hostRoot.host;
+    for (const attribute of attributes) push(host.getAttribute(attribute));
+    push(host.getAttribute("data-test"));
+    const hostBlock = host.closest("div,fieldset,li,section");
+    if (hostBlock) {
+      const heading = hostBlock.querySelector(HEADINGS);
+      // The heading only, never the block's whole text: a section's prose is
+      // its neighbours' words as much as this control's, and `corroborate`
+      // treats everything in the haystack as evidence about this control.
+      if (heading) push(visibleTextOf(heading).slice(0, 120));
+    }
+  }
+
   const asInput = element as HTMLInputElement;
   const tag = element.tagName.toLowerCase();
   // `<input type="submit" value="Submit Application">` has no text content; its
   // label lives in `value`. Every other control's label is its text.
-  const ownText =
+  let ownText =
     tag === "input" ? (element.getAttribute("value") ?? "") : (element.textContent ?? "");
+  // A web component button is an empty `<button>` in a shadow root with a
+  // `<slot>` in it: the caption ("Submit application", "Next") is declared on
+  // the light DOM host and projected in. Reading only the element itself sees an
+  // unnamed control, and `corroborateSubmitControl` refuses an unnamed control
+  // outright — so without this the words it is meant to check against the
+  // reported label do not exist. Read only as a fallback, so a control that does
+  // carry its own text is described by that exactly as before.
+  if (ownText.trim() === "" && ownRoot instanceof ShadowRoot) {
+    const host = ownRoot.host;
+    ownText = host.textContent ?? "";
+    if (ownText.trim() === "") ownText = host.getAttribute("aria-label") ?? "";
+  }
 
   return {
     found: true,
@@ -5040,11 +5247,20 @@ async function attachResume(
   }
 
   const after = await describeControl(session.page, selector);
+  // JOB-047. A component that consumes the file and resets its own input reads
+  // back as zero files however well the upload went, so the board's own
+  // rendering of the file name is asked as a second, independent question
+  // before this is called a failure. Both silent means it failed.
+  let shownOnPage = false;
   if (after.found && after.attachedFiles === 0) {
-    throw new FormFillBlockedError(
-      `The resume was set on the upload control found via ${via}, but the control still ` +
-        `reports no attached file. Nothing was submitted.`
-    );
+    shownOnPage = await pageShowsFileName(session.page, fileName);
+    if (!shownOnPage) {
+      throw new FormFillBlockedError(
+        `The resume was set on the upload control found via ${via}, but the control still ` +
+          `reports no attached file and the page does not show "${fileName}" anywhere. ` +
+          `Nothing was submitted.`
+      );
+    }
   }
 
   console.log(`${LOG} resume attached as "${fileName}" (${bytes.byteLength} bytes) via ${via}`);
@@ -5055,9 +5271,17 @@ async function attachResume(
     detail:
       after.attachedFiles > 0
         ? `attached via ${via}; the control confirms ${after.attachedFiles} file(s)`
-        : `attached via ${via}; the control could not be re-read to confirm (the form is ` +
-          `probably inside an iframe or a web component's shadow DOM)`,
-    readBack: after.attachedFiles > 0 ? `${after.attachedFiles} file(s)` : null,
+        : shownOnPage
+          ? `attached via ${via}; the control reports no file because it hands the upload off ` +
+            `itself, and the page shows "${fileName}"`
+          : `attached via ${via}; the control could not be re-read to confirm (the form is ` +
+            `probably inside an iframe)`,
+    readBack:
+      after.attachedFiles > 0
+        ? `${after.attachedFiles} file(s)`
+        : shownOnPage
+          ? fileName
+          : null,
   };
 }
 
