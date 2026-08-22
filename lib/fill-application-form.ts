@@ -186,16 +186,17 @@ import {
   saveActionPlan,
   type CoreSlot,
 } from "@/lib/form-action-cache";
+import { resolveCandidateProfile } from "@/lib/candidate-documents";
 import {
   decideFieldAnswers,
   generateCoverLetter,
   generateEssayAnswer,
   loadResume,
-  parseResume,
   InjectionSuspectedError,
   type CandidateFact,
   type CandidateRecord,
   type DecidableField,
+  type DocumentSource,
   type FieldDecision,
   type ResumeProfile,
 } from "@/lib/resume-parser";
@@ -1796,7 +1797,17 @@ type ApplicationState = {
   jobTitle: string;
   applyUrl: string;
   status: string;
-  candidate: CandidateRecord & { resumeUrl: string };
+  /**
+   * JOB-112 added `resumeId` and `linkedinPdfPath`. Both are properties of the
+   * `resumes` row rather than of the person, and both are needed before a
+   * stored parse can be read: the id is what `resumes.parsed` is keyed on, and
+   * the LinkedIn path is the second document that parse is derived from.
+   */
+  candidate: CandidateRecord & {
+    resumeId: string;
+    resumeUrl: string;
+    linkedinPdfPath: string | null;
+  };
   /**
    * ACT-015. The reusable form answers intake collected, or `{}` when it
    * collected none. An absent key means "never asked", and the fill layer turns
@@ -1938,7 +1949,9 @@ async function loadApplicationState(
       applicationEmail: candidate.applicationEmail,
       linkedinUrl: candidate.linkedinUrl,
       githubUrl: candidate.githubUrl,
+      resumeId: candidate.resumeId,
       resumeUrl: candidate.resumeUrl,
+      linkedinPdfPath: candidate.linkedinPdfPath,
     },
     applicationAnswers: candidate.applicationAnswers,
   };
@@ -3025,6 +3038,25 @@ export function isAttestationField(label: string): boolean {
  * changed is that it stopped being a list of the questions the system was
  * willing to answer and went back to being a description of the person.
  */
+/**
+ * JOB-112. Which document a work or education entry came from, said in the
+ * fact's own label.
+ *
+ * The label is where this belongs rather than a new field on `CandidateFact`,
+ * because the label is what actually travels: it is what `decideFieldAnswers`
+ * reads when it chooses between two facts for one form field, and it is what a
+ * skip_log row quotes when a run stops. A run that put the wrong graduation
+ * date on a form can then be traced to the document that supplied it without
+ * anyone re-deriving the parse to find out.
+ *
+ * Empty for a resume-sourced entry, which keeps every existing label and every
+ * existing test unchanged: the resume was the only source before this ticket,
+ * so "unlabelled" already means "from the resume".
+ */
+function sourceSuffix(source: DocumentSource | undefined): string {
+  return source === "linkedin" ? " (from their LinkedIn export)" : "";
+}
+
 export function buildFactCatalog(
   profile: ResumeProfile,
   answers: CandidateApplicationAnswers,
@@ -3194,10 +3226,11 @@ export function buildFactCatalog(
   // before they get here, so exposing all of them costs nothing but prompt.
   profile.workHistory.forEach((entry, index) => {
     const where = index === 0 ? "Most recent" : `Job ${index + 1} (older)`;
-    add(`work${index}.employer`, `${where}: employer`, entry.company);
-    add(`work${index}.title`, `${where}: job title`, entry.title);
-    add(`work${index}.dates`, `${where}: dates`, joinDates(entry.startDate, entry.endDate));
-    add(`work${index}.summary`, `${where}: what they did`, entry.summary);
+    const from = sourceSuffix(entry.source);
+    add(`work${index}.employer`, `${where}: employer${from}`, entry.company);
+    add(`work${index}.title`, `${where}: job title${from}`, entry.title);
+    add(`work${index}.dates`, `${where}: dates${from}`, joinDates(entry.startDate, entry.endDate));
+    add(`work${index}.summary`, `${where}: what they did${from}`, entry.summary);
   });
   const experience = totalYearsOfExperience(profile.workHistory);
   if (experience !== null) {
@@ -3209,24 +3242,27 @@ export function buildFactCatalog(
   }
   profile.education.forEach((entry, index) => {
     const where = index === 0 ? "Most recent" : `Education ${index + 1} (older)`;
-    add(`education${index}.school`, `${where}: school`, entry.school);
-    add(`education${index}.degree`, `${where}: degree`, entry.degree);
-    add(`education${index}.discipline`, `${where}: field of study`, entry.discipline);
-    add(`education${index}.endDate`, `${where}: end date`, entry.endDate);
+    const from = sourceSuffix(entry.source);
+    add(`education${index}.school`, `${where}: school${from}`, entry.school);
+    add(`education${index}.degree`, `${where}: degree${from}`, entry.degree);
+    add(`education${index}.discipline`, `${where}: field of study${from}`, entry.discipline);
+    add(`education${index}.endDate`, `${where}: end date${from}`, entry.endDate);
   });
   // Kept under their historical keys as well as the indexed ones above, because
   // these three are what every previous run's cache and every existing test
   // names, and renaming a fact key is a silent behaviour change.
   const school = profile.education[0];
   if (school !== undefined) {
-    add("school", "Most recent school", school.school);
-    add("degree", "Most recent degree", school.degree);
-    add("discipline", "Field of study", school.discipline);
+    const from = sourceSuffix(school.source);
+    add("school", `Most recent school${from}`, school.school);
+    add("degree", `Most recent degree${from}`, school.degree);
+    add("discipline", `Field of study${from}`, school.discipline);
   }
   const job = profile.workHistory[0];
   if (job !== undefined) {
-    add("mostRecentEmployer", "Most recent employer", job.company);
-    add("mostRecentTitle", "Most recent job title", job.title);
+    const from = sourceSuffix(job.source);
+    add("mostRecentEmployer", `Most recent employer${from}`, job.company);
+    add("mostRecentTitle", `Most recent job title${from}`, job.title);
   }
   if (profile.skills.length > 0) {
     add("skills", "Skills and technologies listed on their resume", profile.skills.join(", "));
@@ -6214,7 +6250,23 @@ async function runFill(
     console.log(
       `${LOG} resume: ${resume.pageCount} page(s), ${resume.text.length} characters of text`
     );
-    const profile = await parseResume(resume.text, state.candidate);
+    // JOB-112. The resume PDF is still downloaded every run, because its bytes
+    // are what gets attached to the employer's form and there is nowhere else
+    // to get them. What no longer happens every run is the *parse*: this reads
+    // `resumes.parsed` when it holds a parse of these same two documents, and
+    // falls back to parsing inline and storing the result when it does not.
+    // A row that predates this ticket takes the fallback once and is stored
+    // from then on, which is why no backfill was needed.
+    const profile = await resolveCandidateProfile(
+      supabase,
+      {
+        resumeId: state.candidate.resumeId,
+        resumePath: state.candidate.resumeUrl,
+        linkedinPdfPath: state.candidate.linkedinPdfPath,
+      },
+      resume.text,
+      state.candidate
+    );
     for (const warning of profile.warnings) console.warn(`${LOG} note: ${warning}`);
 
     const coverLetter = input.requiresCoverLetter

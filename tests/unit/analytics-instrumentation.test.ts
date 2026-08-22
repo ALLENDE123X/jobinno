@@ -68,8 +68,25 @@ let profile: Record<string, unknown> | null = {
 let profileUpdateError: { message: string } | null = null;
 let resumeInsertError: { message: string } | null = null;
 
+/** JOB-112. The `resumes.id` the insert hands back, and the parse event's key. */
+const RESUME_ID = "8d3f5c21-0000-4000-8000-0000000000aa";
+
 vi.mock("@/lib/job-search-trigger", () => ({
   requestJobSearch: (userId: string) => requestJobSearch(userId),
+}));
+
+// JOB-112. Stubbed rather than left real for the same reason `requestJobSearch`
+// above is: this file is about which analytics event fires and when, and the
+// real trigger would import the Inngest client and try to send.
+const requestDocumentParse = vi.fn(
+  async (userId: string, resumeId: string): Promise<void> => {
+    void userId;
+    void resumeId;
+  }
+);
+vi.mock("@/lib/candidate-document-trigger", () => ({
+  requestDocumentParse: (userId: string, resumeId: string) =>
+    requestDocumentParse(userId, resumeId),
 }));
 
 // `claimSearchSlot` is one conditional UPDATE against the real `profiles`
@@ -106,7 +123,13 @@ vi.mock("@/lib/supabase/server", () => ({
         select: () => chain,
         update: () => chain,
         eq: () => chain,
-        insert: async () => ({ error: resumeInsertError }),
+        // JOB-112. `submitIntake` now reads the new row's id back, so the
+        // insert chain has to keep chaining rather than resolve on its own.
+        insert: () => chain,
+        single: async () => ({
+          data: resumeInsertError === null ? { id: RESUME_ID } : null,
+          error: resumeInsertError,
+        }),
         maybeSingle: async () => ({ data: profile, error: null }),
         then: (resolve: (value: { error: { message: string } | null }) => unknown) =>
           Promise.resolve(
@@ -134,6 +157,7 @@ beforeEach(() => {
   captureServerEvent.mockClear();
   captureServerEvents.mockClear();
   requestJobSearch.mockClear();
+  requestDocumentParse.mockClear();
   claimSearchSlot.mockClear();
   claimSearchSlot.mockResolvedValue({ allowed: true });
   profileUpdateError = null;
@@ -305,5 +329,9 @@ describe("intake_completed", () => {
 
     expect(result.ok).toBe(false);
     expect(captureServerEvent).not.toHaveBeenCalled();
+    // JOB-112. No row, nothing to parse. Asking for a parse of a resume that
+    // was never stored would be a run somebody has to go and look at, for an
+    // intake that did not happen.
+    expect(requestDocumentParse).not.toHaveBeenCalled();
   });
 });

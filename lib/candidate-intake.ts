@@ -644,8 +644,27 @@ export type CandidateRecord = {
    * spotted in `websiteUrl` or `linkedinUrl` when this is null.
    */
   githubUrl: string | null;
+  /**
+   * JOB-112. `resumes.id` of the row `resumeUrl` came off.
+   *
+   * Carried because `resumes.parsed` is stored per resume row, so reading or
+   * writing it needs the row and not only its path. Also the identity that
+   * makes a re-upload invalidate a parse for free: a new upload is a new row,
+   * and a new row's `parsed` is NULL.
+   */
+  resumeId: string;
   /** Bucket-qualified path, NOT a fetchable URL. */
   resumeUrl: string;
+  /**
+   * JOB-112. `resumes.linkedin_pdf_path`, the candidate's LinkedIn profile
+   * export, or null when they uploaded none.
+   *
+   * Written since JOB-007 and read by nothing until this ticket. Like
+   * `resumeUrl` it is a bucket-qualified path and not a fetchable URL, and it
+   * must never be put on a form: a form asking for LinkedIn wants
+   * `linkedin.com/in/...`, which is `linkedinUrl` above.
+   */
+  linkedinPdfPath: string | null;
   /**
    * `profiles.target_locations`. The only one of actinno's three search
    * preferences that has a column here.
@@ -772,15 +791,29 @@ export function toApplicationAnswers(row: Record<string, unknown>): CandidateApp
 }
 
 /**
+ * JOB-112. The `resumes` row the pipeline will apply with, as `loadActiveResume`
+ * resolved it.
+ *
+ * A record rather than the bare path it used to be, because two more of that
+ * row's columns are now read: its id, which is what `resumes.parsed` is keyed
+ * on, and its LinkedIn export path, which nothing had ever read.
+ */
+export type ActiveResume = {
+  id: string;
+  storagePath: string;
+  linkedinPdfPath: string | null;
+};
+
+/**
  * Row → record. Shared by `loadCandidate` and `findCandidateByEmail`.
  *
- * `resumeUrl` is passed in rather than read off the row, because it lives on a
+ * The resume is passed in rather than read off the row, because it lives on a
  * different table now. Exported so the mapping can be tested against a row
  * shape without a database in the way.
  */
 export function toCandidateRecord(
   row: Record<string, unknown>,
-  resumeUrl: string
+  resume: ActiveResume
 ): CandidateRecord {
   const userId = String(row.id ?? "").trim();
   const applicationEmail = String(row.email ?? "").trim();
@@ -801,7 +834,9 @@ export function toCandidateRecord(
     // JOB-044. Unlike linkedinUrl above, this one has a column and is read
     // from it directly.
     githubUrl: githubUrl !== "" ? githubUrl : null,
-    resumeUrl,
+    resumeId: resume.id,
+    resumeUrl: resume.storagePath,
+    linkedinPdfPath: resume.linkedinPdfPath,
     locations: Array.isArray(row.target_locations) ? row.target_locations.map(String) : null,
     applicationAnswers: toApplicationAnswers(row),
   };
@@ -820,24 +855,33 @@ export function toCandidateRecord(
  * employer's form with no resume to attach has already wasted a browser and an
  * application slot, and the failure is far more legible here.
  */
-async function loadActiveResume(supabase: SupabaseClient, userId: string): Promise<string> {
+async function loadActiveResume(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<ActiveResume> {
   const { data, error } = await supabase
     .from("resumes")
-    .select("storage_path,created_at")
+    .select("id,storage_path,linkedin_pdf_path,created_at")
     .eq("user_id", userId)
     .eq("is_active", true)
     .order("created_at", { ascending: false })
     .limit(1);
   if (error) throw new Error(`resumes lookup failed: ${error.message}`);
 
-  const storagePath = String(data?.[0]?.storage_path ?? "").trim();
+  const row = data?.[0];
+  const storagePath = String(row?.storage_path ?? "").trim();
   if (storagePath === "") {
     throw new Error(
       `No active resumes row for profile ${userId}. Finish onboarding at /onboarding, ` +
         `or attach one from the command line with \`npm run intake\`.`
     );
   }
-  return storagePath;
+  const linkedinPdfPath = String(row?.linkedin_pdf_path ?? "").trim();
+  return {
+    id: String(row?.id ?? "").trim(),
+    storagePath,
+    linkedinPdfPath: linkedinPdfPath === "" ? null : linkedinPdfPath,
+  };
 }
 
 /**

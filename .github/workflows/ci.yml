@@ -124,6 +124,16 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0015_profiles_intake_fields_privileges.sql
 
+      - name: Apply the resumes privilege migration
+        # JOB-112. Same reasoning again, and its own line rather than a glob for
+        # the reason three steps up. This one takes the table wide INSERT and
+        # UPDATE grants on `resumes` away from `authenticated` so that `parsed`,
+        # which now holds the candidate's employment and education history, has
+        # exactly one writer.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0016_resumes_column_privileges.sql
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -228,6 +238,16 @@ jobs:
         run: >-
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0015_profiles_intake_fields_privileges.sql
+
+      - name: Apply the resumes privilege migration
+        # JOB-112. Same reasoning again, and its own line rather than a glob for
+        # the reason three steps up. This one takes the table wide INSERT and
+        # UPDATE grants on `resumes` away from `authenticated` so that `parsed`,
+        # which now holds the candidate's employment and education history, has
+        # exactly one writer.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0016_resumes_column_privileges.sql
 
       - name: Build
         run: npm run build

@@ -38,6 +38,7 @@ import { revalidatePath } from "next/cache";
 
 import { ANALYTICS_EVENT } from "@/lib/analytics/events";
 import { captureServerEvent } from "@/lib/analytics/posthog-server";
+import { requestDocumentParse } from "@/lib/candidate-document-trigger";
 import { recordAttestation } from "@/lib/onboarding/attestation";
 import { intakeFieldErrors, intakeSchema } from "@/lib/onboarding/intake-schema";
 import { RESUMES_BUCKET, createServerClient } from "@/lib/supabase/server";
@@ -105,15 +106,23 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // Written after the profile, deliberately. The other order leaves a resume
   // pointing at a profile that never got its answers, which nothing downstream
   // can tell apart from a half filled form.
-  const { error: resumeError } = await supabase.from("resumes").insert({
-    user_id: user.id,
-    // Bucket qualified, matching the convention `lib/candidate-intake.ts` uses
-    // for every stored resume path: a path to sign a URL from, never a URL.
-    storage_path: `${RESUMES_BUCKET}/${intake.resumePath}`,
-    linkedin_pdf_path: intake.linkedinPdfPath
-      ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`
-      : null,
-  });
+  // JOB-112 added the `select`. The new row's id is what `intake/completed`
+  // carries, so the parse runs against the row this submit created rather than
+  // against whichever row a second lookup would have found — which for someone
+  // re-uploading is a race with their own previous resume.
+  const { data: resumeRow, error: resumeError } = await supabase
+    .from("resumes")
+    .insert({
+      user_id: user.id,
+      // Bucket qualified, matching the convention `lib/candidate-intake.ts` uses
+      // for every stored resume path: a path to sign a URL from, never a URL.
+      storage_path: `${RESUMES_BUCKET}/${intake.resumePath}`,
+      linkedin_pdf_path: intake.linkedinPdfPath
+        ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`
+        : null,
+    })
+    .select("id")
+    .single();
 
   if (resumeError) {
     return { ok: false, message: `Could not save your resume: ${resumeError.message}` };
@@ -175,6 +184,15 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
         : 0,
     },
   });
+
+  // JOB-112. The resume and the LinkedIn export get parsed once, now, rather
+  // than on every application forever. Deliberately last and deliberately not
+  // awaited for its result: this person is waiting on a form submit, and two
+  // PDFs through an LLM is far too slow to hold that open. Nothing they see
+  // next depends on it, and the fill pipeline parses inline anyway when the
+  // column is empty, so a failure here costs one slower first application and
+  // nothing else. That is why it cannot fail the submit.
+  await requestDocumentParse(user.id, String(resumeRow?.id ?? ""));
 
   revalidatePath("/onboarding");
   return { ok: true };

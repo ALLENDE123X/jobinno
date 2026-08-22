@@ -113,6 +113,13 @@
       "when": 1787428051468,
       "tag": "0015_profiles_intake_fields_privileges",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1787443200000,
+      "tag": "0016_resumes_column_privileges",
+      "breakpoints": true
     }
   ]
 }

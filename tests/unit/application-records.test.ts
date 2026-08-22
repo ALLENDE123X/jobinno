@@ -206,7 +206,11 @@ describe("loadCandidate", () => {
   it("maps a null answer to an absent one, never to a no", () => {
     const record = toCandidateRecord(
       { ...profileRow, requires_sponsorship: null, willing_to_relocate: null },
-      "resumes/user/abc.pdf"
+      {
+        id: "1c0ffee0-0000-4000-8000-000000000001",
+        storagePath: "resumes/user/abc.pdf",
+        linkedinPdfPath: null,
+      }
     );
     expect(record.applicationAnswers.workAuthorizedUs).toBe(true);
     expect("requiresSponsorship" in record.applicationAnswers).toBe(false);

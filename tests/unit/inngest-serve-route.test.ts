@@ -118,9 +118,15 @@ describe("the Inngest serve route", () => {
     // existed and no event ever reached it, because nothing sent one. A cron
     // missing from this list has no schedule, so this assertion is the whole of
     // what makes the daily search real.
+    // `parse-candidate-documents` is JOB-112's, and it has the same property as
+    // the two above: `intake/completed` is sent by onboarding and reaches
+    // nothing at all unless this route registers the function that consumes it,
+    // which presents as onboarding succeeding and `resumes.parsed` staying NULL
+    // forever. Exactly the state that ticket exists to fix.
     expect(captured.ids).toEqual([
       "sync-job-boards",
       "schedule-job-searches",
+      "parse-candidate-documents",
       "discover-listings",
       "apply-to-job",
     ]);
@@ -130,7 +136,7 @@ describe("the Inngest serve route", () => {
     const { status, body } = await introspect();
 
     expect(status).toBe(200);
-    expect(body.function_count).toBe(4);
+    expect(body.function_count).toBe(5);
     expect(body.mode).toBe("dev");
     // Present, whatever its value: the handler reports the schema it speaks and
     // a reply without one is not an Inngest introspection response.
