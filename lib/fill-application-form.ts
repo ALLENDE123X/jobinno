@@ -260,10 +260,6 @@ const INSTRUCTIONS = Object.freeze({
     "the SECOND email input on the job application form — the one labeled \"Confirm email\", " +
     "\"Confirm your email\", \"Re-enter email\", \"Repeat email\", or similar. " +
     "NOT the primary email address field.",
-  CITY:
-    "Type \"{value}\" in the City or current location text input on the job application form. " +
-    "If an autocomplete dropdown with city or location suggestions appears after typing, " +
-    "click the first matching suggestion.",
   RESUME_UPLOAD: "the file upload control for the applicant's resume or CV",
   COVER_LETTER_TEXT:
     "the multi-line text box where the applicant types or pastes their cover letter",
@@ -2125,8 +2121,7 @@ const phoneCompare = (value: string): string => value.replace(/\D/g, "").slice(-
 function buildFieldPlan(
   profile: ResumeProfile,
   signals: FormSignals,
-  coverLetter: string | null,
-  currentCity?: string
+  coverLetter: string | null
 ): FieldPlan[] {
   const plan: FieldPlan[] = [];
   const add = (
@@ -2181,13 +2176,20 @@ function buildFieldPlan(
       skipCorroboration: true,
     });
   }
-  // City / current location. Not a signal in FormSignals (adding one would require
-  // a model-call schema change), so present is keyed off having the value itself.
-  // Uses unstructured act() because location pickers are autocomplete fields that
-  // need a type-then-click-suggestion sequence which typeInto cannot handle alone.
-  if (currentCity) {
-    add("city", INSTRUCTIONS.CITY, currentCity, true, { useUnstructuredAct: true });
-  }
+  // JOB-051. There was a "city" entry here that filled the location picker with a
+  // bare `stagehand.act()`, on the reasoning that an autocomplete needs a
+  // type-then-click-suggestion sequence `typeInto` cannot do alone. The reasoning
+  // about the widget was right; using `act()` for it was not. `act()` does not
+  // throw when it changes nothing, and this path had no read back at all, so it
+  // reported the field "filled" on the very run whose captured DOM shows the
+  // board's own "Please enter your location" error against an empty control.
+  //
+  // The location control is a `combobox` to `enumerateFormFields` and is required,
+  // so `fillRemainingFields` now picks it up and drives it through
+  // `chooseFromMenu`, which types, waits for the suggestions to arrive, chooses
+  // one by the widget's own highlight, and reads back what the control ends up
+  // holding. See `contextTerms` at that call site for how one city name shared by
+  // four countries is resolved from what the candidate attested.
   add("phone", INSTRUCTIONS.PHONE, profile.phone, signals.phoneFieldPresent, {
     normalize: phoneCompare,
   });
@@ -4354,6 +4356,15 @@ async function fillRemainingFields(
         field.kind === "combobox" &&
         SCHOOL_FIELD_LABEL_RE.test(field.label) &&
         SCHOOL_FACT_KEY_RE.test(decision?.sourceFact ?? ""),
+      // JOB-051. The country the candidate told us they live in, so a location
+      // search that comes back with the same city name on four continents can
+      // be resolved from what they attested rather than by taking the first
+      // suggestion. `chooseFromMenu` uses it only to break a tie between
+      // options that already contain `value`, so it can never introduce an
+      // answer of its own.
+      contextTerms: [state.applicationAnswers.currentCountry ?? ""].filter(
+        (term) => term !== ""
+      ),
     });
 
     if (outcome.ok) {
@@ -5041,7 +5052,7 @@ async function runBrowserFlow(
 
     await attachFormActionPlan(supabase, session, signals.url);
 
-    const plan = buildFieldPlan(profile, signals, coverLetter, state.applicationAnswers.currentCity);
+    const plan = buildFieldPlan(profile, signals, coverLetter);
     fields.push(...(await fillFields(session, signals.url, plan)));
 
     // The fill is finished before this fires so the report names every field,

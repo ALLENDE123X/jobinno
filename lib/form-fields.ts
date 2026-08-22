@@ -1639,14 +1639,48 @@ async function selectNative(page: Page, field: EnumeratedField, value: string): 
  * control that has no options at all until you type: there the menu is a
  * server's answer to our own query, so accepting an option that *contains* what
  * we asked for ("San Francisco, CA, USA" for "San Francisco") is matching, not
- * guessing — and only when exactly one option contains it.
+ * guessing — and only when one option survives the narrowing below.
+ *
+ * ── Why "exactly one option contains it" was not enough (JOB-051) ────────────
+ * That rule is right about the danger and wrong about how often a real city
+ * name is unique. Greenhouse's location service, asked for "San Francisco",
+ * answers with six suggestions, and *every one of them* contains the query:
+ *
+ *   San Francisco, California, United States
+ *   San Francisco de Macorís, Duarte, Dominican Republic
+ *   San Francisco, Agusan del Sur, Philippines
+ *   San Francisco De Borja, Lima, Peru
+ *   San Francisco, Cebu, Philippines
+ *   South San Francisco, California, United States
+ *
+ * Six matches is not one, so this refused, and the field stayed empty through a
+ * whole run that then failed the board's own validation with "Please enter your
+ * location". Read off the live Virtu posting on 2026-08-22, not imagined.
+ *
+ * So the tie is broken with more of what the candidate actually attested rather
+ * than by taking the first suggestion. `contextTerms` carries those extra
+ * attested strings (the country they told us they live in), and a suggestion
+ * has to earn its place twice over:
+ *
+ *   · its *leading* comma segment must equal the query exactly, which is what
+ *     separates "San Francisco" from "South San Francisco" and from
+ *     "San Francisco de Macorís" — a different city whose name merely starts
+ *     the same way, and
+ *   · every context term must appear somewhere in it, which is what separates
+ *     the California one from the Philippine and Peruvian ones.
+ *
+ * One survivor is a match on two independently attested facts. Anything else is
+ * still -1 and still escalated, so the guard this widens is a guard that now
+ * has more evidence, not a guard that now guesses. Nothing here invents a
+ * location: every term compared came from the candidate's own intake.
  */
 async function chooseFromMenu(
   page: Page,
   field: EnumeratedField,
   value: string,
   allowContains: boolean,
-  allowFreeText: boolean
+  allowFreeText: boolean,
+  contextTerms: readonly string[] = []
 ): Promise<ApplyOutcome> {
   // Choosing an option is idempotent — the same option chosen twice is the same
   // form — so one retry is free, and it is worth having: on a live Greenhouse
@@ -1654,11 +1688,25 @@ async function chooseFromMenu(
   // from the *previous* field and selects nothing at all. A retry is allowed
   // only when the control came back **empty**; a control holding a *different*
   // value is a real mismatch and is escalated, never clicked at again.
-  let outcome = await chooseFromMenuOnce(page, field, value, allowContains, allowFreeText);
+  let outcome = await chooseFromMenuOnce(
+    page,
+    field,
+    value,
+    allowContains,
+    allowFreeText,
+    contextTerms
+  );
   if (!outcome.ok && outcome.readBack === "") {
     await closeMenu(page);
     await page.waitForTimeout(400);
-    outcome = await chooseFromMenuOnce(page, field, value, allowContains, allowFreeText);
+    outcome = await chooseFromMenuOnce(
+      page,
+      field,
+      value,
+      allowContains,
+      allowFreeText,
+      contextTerms
+    );
   }
   return outcome;
 }
@@ -1668,20 +1716,36 @@ async function chooseFromMenuOnce(
   field: EnumeratedField,
   value: string,
   allowContains: boolean,
-  allowFreeText: boolean
+  allowFreeText: boolean,
+  contextTerms: readonly string[] = []
 ): Promise<ApplyOutcome> {
   const wanted = normalizeText(value);
+  const terms = contextTerms
+    .map((term) => normalizeText(term))
+    .filter((term) => term !== "" && term !== wanted);
 
   const pick = (menu: OpenMenu): number => {
     const exact = menu.texts.findIndex((text) => normalizeText(text) === wanted);
     if (exact !== -1) return exact;
     if (!allowContains) return -1;
     const matches = menu.texts
-      .map((text, index) => ({ text, index }))
-      .filter((entry) => normalizeText(entry.text).includes(wanted));
-    // Only when it is unambiguous. Two cities that both contain the query is
-    // exactly the case where a wrong pick is invisible on the screenshot.
-    return matches.length === 1 ? (matches[0]?.index ?? -1) : -1;
+      .map((text, index) => ({ text: normalizeText(text), index }))
+      .filter((entry) => entry.text.includes(wanted));
+    // One option containing the query needs no tie-break: there is nothing to
+    // confuse it with.
+    if (matches.length === 1) return matches[0]?.index ?? -1;
+    if (matches.length === 0) return -1;
+    // Several did. See this function's header: narrowed by the query being the
+    // whole of the suggestion's leading segment AND by every attested context
+    // term appearing in it. Still -1 unless exactly one survives, because two
+    // survivors is exactly the case where a wrong pick is invisible on a
+    // screenshot.
+    const narrowed = matches.filter(
+      (entry) =>
+        normalizeText(entry.text.split(",")[0] ?? "") === wanted &&
+        terms.every((term) => entry.text.includes(term))
+    );
+    return narrowed.length === 1 ? (narrowed[0]?.index ?? -1) : -1;
   };
 
   let menu = await openMenu(page, field);
@@ -1958,7 +2022,17 @@ export async function applyFieldValue(
   page: Page,
   field: EnumeratedField,
   value: string,
-  options: { allowContains?: boolean; allowFreeText?: boolean } = {}
+  options: {
+    allowContains?: boolean;
+    allowFreeText?: boolean;
+    /**
+     * JOB-051. Further strings the candidate attested to, used *only* to break a
+     * tie between several suggestions that all contain `value` — see
+     * `chooseFromMenu`. Never a source of a value in its own right, so a term
+     * that matches nothing changes no outcome.
+     */
+    contextTerms?: readonly string[];
+  } = {}
 ): Promise<ApplyOutcome> {
   switch (field.kind) {
     case "text":
@@ -1973,7 +2047,8 @@ export async function applyFieldValue(
         field,
         value,
         options.allowContains === true,
-        options.allowFreeText === true
+        options.allowFreeText === true,
+        options.contextTerms ?? []
       );
     case "radio":
       return await chooseRadio(page, field, value);
