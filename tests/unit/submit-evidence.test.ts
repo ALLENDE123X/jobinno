@@ -213,16 +213,158 @@ describe("JOB-106: a board that genuinely confirms is still recognised", () => {
     ).toBe(true);
   });
 
-  it("lets the board's own words carry a submission even from a step-shaped page", () => {
-    // `confirmationPresent` stays sufficient on its own. That is deliberate: it
-    // is the strongest signal available, and weakening it is the direction that
-    // gets a real submission recorded as a failure and possibly submitted twice.
-    const confirmedOnAStepUrl = capture({
-      ...AVERY_DENNISON_SCREENING,
+});
+
+/**
+ * JOB-124 — the half of `confirmationPresent` that JOB-106 left unguarded.
+ *
+ * The case below used to assert the opposite, on the reasoning that
+ * `confirmationPresent` is the strongest signal available and that weakening it
+ * is the direction that records a real submission as a failure. The first half
+ * is still true and the second half is still the risk. What the original missed
+ * is that "strongest signal available" is a statement about a *model's reading*
+ * of a page, and it was being allowed to outrank the board's own name for that
+ * page — on the one status nothing downstream ever revisits.
+ *
+ * The pairing is not hypothetical. `AVERY_DENNISON_SCREENING` below is the real
+ * screening capture with `confirmationPresent` flipped, which is exactly what a
+ * model would return for #110's mid-flow "Thank you for finishing the test" on
+ * a page SmartRecruiters itself titles "Preliminary questions".
+ *
+ * What it costs on a board that genuinely confirms is measured rather than
+ * assumed, in the two cases at the end of this block: every receipt shape the
+ * target boards actually render is untouched, and the collisions that do exist
+ * are pinned so that a change to either side of the rule has to notice them.
+ */
+describe("JOB-124: a confirmation claim does not outrank the board's own name for the page", () => {
+  const confirmedOnAStepPage = capture({
+    ...AVERY_DENNISON_SCREENING,
+    confirmationPresent: true,
+    confirmationText: "Your application has been submitted.",
+  });
+
+  it("refuses a terminal `submitted` when the page also reads as a further step", () => {
+    expect(judgeSubmission(confirmedOnAStepPage, FILL_STEP).submitted).toBe(false);
+  });
+
+  it("names the contradiction, so the caller can route it to its own exit", () => {
+    // The caller needs this separately from the other two fields: a page
+    // carrying a confirmation claim must not fall through into ACT-017's
+    // second-click branch, whose entry condition is "no confirmation of any
+    // kind", and must not be described to a human as a page that confirmed
+    // nothing.
+    const verdict = judgeSubmission(confirmedOnAStepPage, FILL_STEP);
+    expect(verdict.confirmationContradicted).toBe(true);
+    expect(verdict.continuedToFurtherStep).toBe(true);
+  });
+
+  it("still reports all four signals, including the one it overruled", () => {
+    // The evidence string is the whole reason a human can reconstruct this
+    // judgement afterwards. Overruling a signal is not a reason to stop
+    // reporting it.
+    const { evidence } = judgeSubmission(confirmedOnAStepPage, FILL_STEP);
+    expect(evidence).toContain("confirmation page: true");
+    expect(evidence).toContain("form gone: false");
+    expect(evidence).toContain("navigated: true");
+    expect(evidence).toContain("destination reads as a further step: true");
+  });
+
+  it("catches the contradiction with no navigation at all", () => {
+    // The in-place wizard: the board never moved, and the tab title is the only
+    // thing saying this is still a step. `readsAsFurtherStep` checks the title
+    // whether or not the URL changed, which is what makes this reachable — and
+    // it is the shape that would otherwise reach the second-click branch.
+    const inPlaceStep = capture({
       confirmationPresent: true,
-      confirmationText: "Your application has been submitted.",
+      confirmationText: "Thank you for finishing the test.",
+      applicationFormStillPresent: false,
+      url: "https://boards.example.com/apply",
+      title: "Additional questions - Software Engineer",
     });
-    expect(judgeSubmission(confirmedOnAStepUrl, FILL_STEP).submitted).toBe(true);
+    const verdict = judgeSubmission(inPlaceStep, "https://boards.example.com/apply");
+    expect(verdict.submitted).toBe(false);
+    expect(verdict.navigated).toBe(false);
+    expect(verdict.confirmationContradicted).toBe(true);
+  });
+
+  it.each([
+    // Every receipt the target boards actually render, and not one of them
+    // reads as a further step — so this change costs nothing on any of them.
+    // The confirmation-destination veto inside `pageReadsAsFurtherStep` reads
+    // the path and the title, and the `samePage` guard covers the boards that
+    // confirm without moving.
+    [
+      "SmartRecruiters /success",
+      "Application submitted! - Software Engineer IV",
+      "https://jobs.smartrecruiters.com/oneclick-ui/company/AveryDennison/publication/x/success",
+      FILL_STEP,
+    ],
+    [
+      "Greenhouse /thank-you",
+      "Thank you for applying",
+      "https://boards.greenhouse.io/acme/jobs/123/thank-you",
+      "https://boards.greenhouse.io/acme/jobs/123",
+    ],
+    [
+      "Lever /apply/thanks",
+      "Thank you | Acme",
+      "https://jobs.lever.co/acme/abc-123/apply/thanks",
+      "https://jobs.lever.co/acme/abc-123/apply",
+    ],
+    [
+      "Workable, confirming in place",
+      "Apply",
+      "https://apply.workable.com/j/A15A62A8BE/apply",
+      "https://apply.workable.com/j/A15A62A8BE/apply",
+    ],
+    [
+      "Ashby, confirming in place",
+      "Application received - Acme",
+      "https://jobs.ashbyhq.com/acme/abc-123/application",
+      "https://jobs.ashbyhq.com/acme/abc-123/application",
+    ],
+    [
+      "a receipt hosted under a step-shaped path",
+      "Application received",
+      "https://boards.example.com/application/questions/confirmation",
+      "https://boards.example.com/application",
+    ],
+  ])("still accepts %s", (_what, title, url, wasAt) => {
+    const receipt = capture({
+      confirmationPresent: true,
+      applicationFormStillPresent: false,
+      url,
+      title,
+    });
+    const verdict = judgeSubmission(receipt, wasAt);
+    expect(verdict.confirmationContradicted).toBe(false);
+    expect(verdict.submitted).toBe(true);
+  });
+
+  it.each([
+    // The two shapes where this does cost something, pinned so they cannot be
+    // changed by accident and so nobody has to rediscover them by reading the
+    // regexes. Both resolve to `submission_unconfirmed`, which is never retried
+    // automatically and which a human is told to look at, so the failure is the
+    // recoverable one. Shape 1 is deliberately not carved out: a step counter
+    // on a page claiming a confirmation is also the exact shape of #110.
+    ["a receipt whose title keeps the step counter", "Step 3 of 3 - Acme Careers", "/apply/done"],
+    [
+      "a step counter and a thank you in the same title",
+      "Step 3 of 3 - Thank you for applying",
+      "/apply/done",
+    ],
+    ["a receipt served at a bare step path under a neutral title", "Acme Careers", "/apply/screening"],
+  ])("withholds `submitted` from %s, and that is the accepted cost", (_what, title, path) => {
+    const receipt = capture({
+      confirmationPresent: true,
+      applicationFormStillPresent: false,
+      url: `https://boards.example.com${path}`,
+      title,
+    });
+    const verdict = judgeSubmission(receipt, "https://boards.example.com/apply");
+    expect(verdict.confirmationContradicted).toBe(true);
+    expect(verdict.submitted).toBe(false);
   });
 });
 
