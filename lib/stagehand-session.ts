@@ -156,6 +156,15 @@ export type OpenBrowserSessionOptions = {
    * `profiles.browserbase_context_id`. Ignored for local browser sessions.
    */
   contextId?: string;
+  /**
+   * When `true`, the Browserbase session is launched without proxies.
+   *
+   * Ashby's spam filter specifically detects proxy IPs and rejects submissions
+   * from them (their rejection page lists "Turn off your VPN or proxy" as the
+   * first suggestion). Setting this disables proxies for Ashby sessions so the
+   * outbound IP is the Browserbase host rather than a proxy node.
+   */
+  disableProxies?: boolean;
 };
 
 // ───────────────────────────────────
@@ -857,7 +866,9 @@ export async function openBrowserSession(
             // for why these are here and what is deliberately not (including
             // `os`, which was here too and broke every session on this plan).
             // `blockAds` (issue #85) is documented in that same comment.
-            proxies: true,
+            // Ashby's spam filter detects proxy IPs and rejects submissions;
+            // `disableProxies` lets the caller opt out for boards known to flag them.
+            proxies: options.disableProxies !== true,
             browserSettings: {
               viewport: BROWSERBASE_VIEWPORT,
               blockAds: true,
