@@ -558,7 +558,20 @@ const APPLICANT_IDENTITY_SLOTS: ReadonlySet<CoreSlot> = new Set<CoreSlot>([
 ]);
 
 /** How many distinct identity fields the DOM must show before it overrules a "no form" read. */
-const MIN_IDENTITY_SLOTS_FOR_FORM = 2;
+export const MIN_IDENTITY_SLOTS_FOR_FORM = 2;
+
+/**
+ * Which of the slots the DOM found are an *applicant's* own fields.
+ *
+ * Exported for JOB-106, which asks the same question on the far side of the
+ * submit click: whether the page a board landed on after the click is still an
+ * application form. Kept as one function rather than copied, so that widening
+ * `APPLICANT_IDENTITY_SLOTS` cannot silently mean two different things on the
+ * two sides of the click.
+ */
+export function applicantIdentitySlots(slots: readonly CoreSlot[]): CoreSlot[] {
+  return slots.filter((slot) => APPLICANT_IDENTITY_SLOTS.has(slot));
+}
 
 /**
  * The counts `querySelectorAll` answers exactly and a model answers
@@ -908,7 +921,7 @@ async function readFormSignals(session: BrowserSession): Promise<FormSignals> {
    * still refused, with the same message it always had.
    */
   const domCoreSlots = await readCoreSlotsFromDom(page);
-  const identitySlots = domCoreSlots.filter((slot) => APPLICANT_IDENTITY_SLOTS.has(slot));
+  const identitySlots = applicantIdentitySlots(domCoreSlots);
   /**
    * A password anywhere on the page vetoes this, and that is not a detail.
    * `reachApplicationForm` stops at a sign-in wall with

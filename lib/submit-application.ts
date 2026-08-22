@@ -73,9 +73,12 @@ import { fileURLToPath } from "node:url";
 import { APPLICATION_STATUS, type ApplicationStatus } from "@/lib/application-status";
 import {
   APPLICATION_CONTROL_RE,
+  MIN_IDENTITY_SLOTS_FOR_FORM,
   SUBMIT_WORD_RE,
+  applicantIdentitySlots,
   describeControl,
   fillApplicationFormRetainingSession,
+  readCoreSlotsFromDom,
   type ControlDescriptor,
   type FillApplicationFormResult,
   type VerificationInput,
@@ -220,6 +223,22 @@ export type ConfirmationCapture = z.infer<typeof ConfirmationSignalsSchema> & {
    * See `boardRejectedAsAutomated`.
    */
   automationRejection: string | null;
+  /**
+   * JOB-106. Whether the DOM — shadow roots included — still shows enough of an
+   * applicant's own boilerplate fields to call this page an application form,
+   * read by JOB-052's `readCoreSlotsFromDom` and judged by JOB-052's own
+   * threshold. A floor under `applicationFormStillPresent`, which is a model's
+   * account of the same page.
+   *
+   * Deliberately without the password veto `readFormSignals` applies to the same
+   * floor. There, the floor can turn a "no form here" into "form here" and so
+   * start a run, and a sign-in page carrying a name box, an email box and a
+   * password box must not be talked into looking like an application form. Here
+   * the floor can only ever *withhold* a `submitted`, so a veto on it could only
+   * ever make this module less cautious, which is the wrong direction on this
+   * side of the click.
+   */
+  identityFieldsPresent: boolean;
 };
 
 const PAGE_TEXT_LENGTH_SCRIPT = `((document.body && document.body.innerText) || '').trim().length`;
@@ -318,7 +337,7 @@ async function readConfirmation(session: BrowserSession): Promise<ConfirmationCa
     ConfirmationSignalsSchema,
     { page }
   );
-  const [url, title, textLength, pageText] = await Promise.all([
+  const [url, title, textLength, pageText, coreSlots] = await Promise.all([
     page.url(),
     page.title(),
     page.evaluate(PAGE_TEXT_LENGTH_SCRIPT).then(
@@ -329,6 +348,9 @@ async function readConfirmation(session: BrowserSession): Promise<ConfirmationCa
       (value) => (typeof value === "string" ? value : ""),
       () => ""
     ),
+    // JOB-106. Never throws: `readCoreSlotsFromDom` reports an unreadable page as
+    // having no fields, and no floor leaves the model's reading exactly as it was.
+    readCoreSlotsFromDom(page),
   ]);
   return {
     ...data,
@@ -337,7 +359,219 @@ async function readConfirmation(session: BrowserSession): Promise<ConfirmationCa
     textLength,
     codePromptInText: CODE_PROMPT_RE.test(pageText),
     automationRejection: boardRejectedAsAutomated(pageText),
+    identityFieldsPresent:
+      applicantIdentitySlots(coreSlots).length >= MIN_IDENTITY_SLOTS_FOR_FORM,
   };
+}
+
+// ───────────────────────────────────
+// JOB-106 — what the page after the click is actually evidence of
+// ───────────────────────────────────
+
+/**
+ * ── The bug this exists for ─────────────────────────────────────────────────
+ * Until JOB-106 the three signals below were read as "any one of these means
+ * submitted", and the third of them was bare navigation. On a single page form
+ * that is a fair proxy, because the only place a board sends you after a
+ * successful submit is a confirmation page. On a **multi step wizard it is
+ * always true**, because advancing a step always navigates.
+ *
+ * Application `1748f995-f91c-4c5b-9062-7fd009d585b1` is what that costs.
+ * A SmartRecruiters oneclick-ui form for Avery Dennison advanced from its fill
+ * step to its screening step, and the run recorded `submitted` — terminal, never
+ * retried — on this evidence, logged verbatim by `succeed()` at the time:
+ *
+ *     confirmation page: false, form gone: false, navigated: true
+ *
+ * Two signals said no. The third said only that the URL had changed. The
+ * destination was `/screening`, titled "Preliminary questions". Nobody received
+ * that application and nothing will ever pick it up again.
+ *
+ * ── Why this is worse than the failure it replaced ──────────────────────────
+ * `succeed()` reasons explicitly about the opposite risk: a row that under
+ * reports a real submission is bad, because something upstream might submit
+ * again. That reasoning is right and is preserved below — `confirmationPresent`
+ * is still sufficient on its own, and a board that legitimately answers a submit
+ * by redirecting to a thank you page is still recognised by two independent
+ * routes. But it is not symmetric. Under reporting is recoverable; this
+ * direction writes the one status that can never be revisited, and
+ * `submission_unconfirmed` already exists for exactly "clicked, outcome
+ * unknown", is never retried automatically, and invites a human to look.
+ *
+ * ── What changed ────────────────────────────────────────────────────────────
+ * Bare navigation no longer carries a submission by itself. What remains is:
+ *
+ *   1. The board saying so in words (`confirmationPresent`), unchanged.
+ *   2. The application form having gone, **and** the place the board went not
+ *      reading as a further step of the same application.
+ *
+ * Nothing here weakens a check. Both surviving routes are strictly narrower than
+ * what they replace.
+ */
+export type SubmissionVerdict = {
+  /** Whether the evidence supports writing the terminal `submitted` status. */
+  submitted: boolean;
+  /** The board put the browser on a different page than the one clicked from. */
+  navigated: boolean;
+  /**
+   * Where the board landed reads as another step of the same application rather
+   * than a receipt. Reported separately from `navigated` so an operator is told
+   * which of the two this was.
+   */
+  continuedToFurtherStep: boolean;
+  /** The signals, in the wording `succeed()` has always logged them in. */
+  evidence: string;
+};
+
+/**
+ * The destination naming itself a completed submission.
+ *
+ * Matched against the URL path and the page title only, never the body text —
+ * body text is what `confirmationPresent` is for, and "please click SUBMIT to
+ * complete your application" is an instruction rather than a receipt.
+ *
+ * This is a **veto on the further-step reading below**, not a route to
+ * `submitted` on its own. Its whole job is to stop a board whose genuine thank
+ * you page happens to live at a step-shaped URL from being mistaken for a step.
+ *
+ * ── Why these are phrases and not words ─────────────────────────────────────
+ * Both halves this is matched against carry the job's own title: a board builds
+ * its tab title as "{step} - {job title} - {company}", and its paths are
+ * routinely slugged from the same string. So a bare `success` here would read
+ * "Customer Success Engineer" as a receipt, a bare `received` or `submitted`
+ * would do the same to any title containing them, and the effect would be this
+ * whole guard switching itself off for a common class of role — restoring the
+ * exact bug for those listings while looking like it was still working. None of
+ * the 966 rows in `jobs` collides today, which is precisely why it would go
+ * unnoticed until it did. Every entry below is therefore either a phrase no job
+ * title contains, or a word no job title contains.
+ */
+const CONFIRMATION_DESTINATION_RE =
+  /thank[-\s_]?you|\bthanks\b|\bconfirmation\b|application[-\s_]+(?:submitted|received|complete)|submitted[-\s_]+successfully|(?:has|have)[-\s_]+been[-\s_]+(?:submitted|received)|submission[-\s_]+received|received[-\s_]+your[-\s_]+application/i;
+
+/**
+ * A path segment that names a further step of an application.
+ *
+ * Grounded rather than guessed. SmartRecruiters' oneclick-ui ships its own route
+ * to title map in its i18n bundle, and it has exactly two entries:
+ * `page.title.prefix.form` = "Easy apply" and `page.title.prefix.screening` =
+ * "Preliminary questions". `/screening` below is that route, read off the board
+ * rather than imagined, and it is the one the failing run landed on.
+ *
+ * The rest are its close cousins across boards, kept to segments that can only
+ * be a step. Deliberately **absent**: `apply`, `form`, `application` and
+ * `review`. Those name the form's own page as often as a step, and this
+ * predicate must never fire on a board that answers a submit in place.
+ */
+const FURTHER_STEP_PATH_RE =
+  /(?:^|\/)(?:screening|screening[-_]questions|questions|additional[-_]?info(?:rmation)?|additional[-_]questions|assessment|eeo|demographics?|voluntary[-_]?(?:self[-_]?identification|disclosures?)|step[-_]?\d*)(?:\/|$)/i;
+
+/**
+ * A page title that names a further step of an application.
+ *
+ * "Preliminary questions" is SmartRecruiters' own string for the screening step,
+ * not a phrase inferred from one capture: it is the value of
+ * `oneclick-ui.page.title.prefix.screening` in the board's shipped i18n bundle,
+ * and the board prefixes the tab title with it on every screening page.
+ *
+ * Checked whether or not the board navigated, because a single page wizard can
+ * advance a step without changing its URL and will still retitle itself. Kept to
+ * names that can only be a further step: "Easy apply" is **not** here, because a
+ * board that confirms in place keeps its original title and would be wrongly
+ * vetoed by it.
+ */
+const FURTHER_STEP_TITLE_RE =
+  /\bpreliminary\s+questions\b|\badditional\s+questions\b|\bscreening\s+questions\b|\badditional\s+information\b|\bstep\s+\d+\s+of\s+\d+\b/i;
+
+/**
+ * The board's validation copy, in its own words, as a sentence that can be
+ * appended to any of the reasons below. Empty when the page showed none.
+ *
+ * One spelling of it, shared by the three exits that quote it, so a change to
+ * how board text is capped or sanitised cannot reach two of them and miss one.
+ */
+function errorsFor(capture: ConfirmationCapture): string {
+  if (!capture.validationErrorsShown) return "";
+  return ` The page is showing errors: ${JSON.stringify(
+    sanitizePageText(capture.validationErrorText, 300)
+  )}.`;
+}
+
+/** The path of a URL, or the whole string when it will not parse as one. */
+function urlPath(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Whether the page the board landed on reads as another step of the same
+ * application rather than as a receipt.
+ *
+ * Exported for the regression test, which pins it against the real Avery
+ * Dennison capture and against the wording SmartRecruiters uses on the page that
+ * genuinely does confirm.
+ */
+export function readsAsFurtherStep(capture: ConfirmationCapture, wasAt: string): boolean {
+  // A board's own name for the step it has put on screen is the most specific
+  // thing either half of this can say, so it is checked first and it wins.
+  // The ordering is deliberate rather than incidental: the two ways of being
+  // wrong here are not equally bad. Reading a step as a receipt writes
+  // `submitted`, which is terminal and never revisited; reading a receipt as a
+  // step writes `submission_unconfirmed`, which a human then looks at. Where the
+  // signals disagree, this yields to the reading whose failure is recoverable.
+  if (FURTHER_STEP_TITLE_RE.test(capture.title)) return true;
+  const path = urlPath(capture.url);
+  // A destination that announces a completed submission is not a further step,
+  // however step-shaped its URL is. Checked against both halves, so that a thank
+  // you page at `/application/questions/confirmation` is not read as a step by
+  // its own path.
+  if (CONFIRMATION_DESTINATION_RE.test(path) || CONFIRMATION_DESTINATION_RE.test(capture.title)) {
+    return false;
+  }
+  // The path is only meaningful when the board actually went somewhere. When it
+  // stayed put, the path under examination is the form's own, and asking whether
+  // it looks like a step is asking about the page we started on.
+  if (samePage(capture.url, wasAt)) return false;
+  return FURTHER_STEP_PATH_RE.test(path);
+}
+
+/**
+ * What the page after the click is evidence of. `wasAt` is the URL the page was
+ * on immediately before the click being judged.
+ *
+ * Pure, and exported, so that the shapes this has to get right are pinned by a
+ * unit test rather than only by a live board.
+ */
+export function judgeSubmission(capture: ConfirmationCapture, wasAt: string): SubmissionVerdict {
+  const navigated = !samePage(capture.url, wasAt);
+  // JOB-052's DOM floor, applied to the model's account of the page. "The form
+  // has gone" is the only remaining route to a terminal `submitted` that does
+  // not go through the board's own words, so it does not get to rest on a
+  // model's reading alone when `querySelectorAll` can contradict it.
+  const formStillPresent = capture.applicationFormStillPresent || capture.identityFieldsPresent;
+  const continuedToFurtherStep = readsAsFurtherStep(capture, wasAt);
+  const evidence =
+    `confirmation page: ${capture.confirmationPresent}, ` +
+    `form gone: ${!formStillPresent}, ` +
+    `navigated: ${navigated}, ` +
+    `destination reads as a further step: ${continuedToFurtherStep}`;
+
+  // The board saying so, in its own words. Unchanged, and still sufficient on
+  // its own: this is the strongest signal there is and the one a board that
+  // redirects to a real thank you page will always produce.
+  if (capture.confirmationPresent) {
+    return { submitted: true, navigated, continuedToFurtherStep, evidence };
+  }
+  // The form has gone and the board did not simply move us along. This is what
+  // catches a genuine confirmation whose wording a model failed to read: a thank
+  // you page has no applicant form on it and does not name itself a step.
+  if (!formStillPresent && !continuedToFurtherStep) {
+    return { submitted: true, navigated, continuedToFurtherStep, evidence };
+  }
+  return { submitted: false, navigated, continuedToFurtherStep, evidence };
 }
 
 // ───────────────────────────────────
@@ -1608,20 +1842,18 @@ async function runSubmitPhase(
   };
 
   /**
-   * The same three-signal test `create-board-account.ts` applies after its
-   * signup submit, with the board's own confirmation wording added as the
-   * strongest of them: a confirmation message, the form having gone, or the
-   * board having moved us somewhere else. None of the three is conclusive alone;
-   * all three absent is a submission that did not take.
+   * The test `create-board-account.ts` applies after its signup submit, with the
+   * board's own confirmation wording as the strongest signal in it.
    *
    * Lifted into a function by ACT-017 so both clicks are judged by exactly the
-   * same rule rather than by two copies of it that can drift. `wasAt` is the URL
-   * the page was on immediately before the click being judged.
+   * same rule rather than by two copies of it that can drift, and moved out to
+   * module scope by JOB-106 so the rule is pinned by a unit test rather than
+   * only by a live board. `judgeSubmission` carries the reasoning; see it for
+   * why bare navigation no longer carries a submission on its own. `wasAt` is
+   * the URL the page was on immediately before the click being judged.
    */
   const looksSubmitted = (capture: ConfirmationCapture, wasAt: string): boolean =>
-    capture.confirmationPresent ||
-    !capture.applicationFormStillPresent ||
-    !samePage(capture.url, wasAt);
+    judgeSubmission(capture, wasAt).submitted;
 
   /**
    * The success exit, shared by both clicks.
@@ -1640,9 +1872,7 @@ async function runSubmitPhase(
     const confirmationRef = buildConfirmationRef(capture);
     console.log(
       `${LOG} submitted (${how}). confirmation_text = ${JSON.stringify(confirmationRef)} ` +
-        `(confirmation page: ${capture.confirmationPresent}, ` +
-        `form gone: ${!capture.applicationFormStillPresent}, ` +
-        `navigated: ${!samePage(capture.url, wasAt)})`
+        `(${judgeSubmission(capture, wasAt).evidence})`
     );
 
     let rowUpdated = false;
@@ -1897,8 +2127,53 @@ async function runSubmitPhase(
       );
     }
 
-    if (looksSubmitted(capture, fill.finalUrl)) {
+    const verdict = judgeSubmission(capture, fill.finalUrl);
+    if (verdict.submitted) {
       return await succeed(capture, fill.finalUrl, `the "${choice.label}" click`);
+    }
+
+    // ══ JOB-106: the board moved us, and did not confirm anything ════════════
+    // Taken before the ACT-017 branch below on purpose, and the condition is
+    // `navigated` rather than `continuedToFurtherStep` for a reason that is
+    // about the branch below rather than about this one. ACT-017 documents its
+    // entry condition as "the form is still on screen, **at the same URL**, with
+    // no confirmation", and that sentence has to stay true of the code. Before
+    // JOB-106 it was true by accident: any navigation was read as a submission,
+    // so nothing that had navigated could reach it. Taking every navigation here
+    // keeps it true on purpose, and keeps the set of pages a second click can
+    // ever be issued on exactly the set ACT-017 reasoned about.
+    //
+    // The status is `submission_unconfirmed` and not `submission_blocked`,
+    // because the submit control was clicked, and rule 2 at the top of this file
+    // admits no exception for a click whose effect merely looked harmless.
+    // Nothing is retried and nothing is clicked again.
+    if (verdict.navigated) {
+      const artifacts = await captureFailurePoint(
+        session,
+        jobApplicationId,
+        verdict.continuedToFurtherStep ? "wizard-advanced" : "navigated-unconfirmed",
+        input.screenshotDir ?? DEFAULT_SCREENSHOT_DIR
+      );
+      const destination =
+        `"${choice.label}" was clicked at "${fill.finalUrl}" and the board moved to ` +
+        `"${capture.url}" (page "${sanitizePageText(capture.title, 200)}")`;
+      return await unconfirmed(
+        withFailureArtifacts(
+          verdict.continuedToFurtherStep
+            ? `${destination}, which reads as a further step of the same application rather than ` +
+                `a confirmation — ${verdict.evidence}.${errorsFor(capture)} The application has ` +
+                `NOT been shown to reach the employer and this row is deliberately not marked as ` +
+                `though it had: a navigation on its own only proves the URL changed, and on a ` +
+                `multi step form it always does. The form was filled correctly and ran out of ` +
+                `steps, so what wants building is the rest of the wizard rather than a fix to the ` +
+                `fill.`
+            : `${destination}, which shows neither a confirmation nor the end of the application ` +
+                `form — ${verdict.evidence}.${errorsFor(capture)} Whether the board received the ` +
+                `application is unknown. A human should check the employer's side before this ` +
+                `listing is run again.`,
+          artifacts
+        )
+      );
     }
 
     // ══ ACT-017: the first click submitted nothing ═══════════════════════════
@@ -1908,11 +2183,7 @@ async function runSubmitPhase(
     // no confirmation of any kind. That is the entire entry condition for a
     // second click, and it is the branch that used to end unconditionally at
     // `unconfirmed()`.
-    const errors = capture.validationErrorsShown
-      ? ` The page is showing errors: ${JSON.stringify(
-          sanitizePageText(capture.validationErrorText, 300)
-        )}.`
-      : "";
+    const errors = errorsFor(capture);
 
     // ══ JOB-026: the board sometimes says why, and it used to go unread ══════
     // Checked before the code prompt reads below, and ahead of them on purpose:
@@ -2156,7 +2427,8 @@ async function runSubmitPhase(
       );
     }
 
-    if (looksSubmitted(resubmitCapture, resubmitFrom)) {
+    const resubmitVerdict = judgeSubmission(resubmitCapture, resubmitFrom);
+    if (resubmitVerdict.submitted) {
       return await succeed(
         resubmitCapture,
         resubmitFrom,
@@ -2164,11 +2436,22 @@ async function runSubmitPhase(
       );
     }
 
-    const resubmitErrors = resubmitCapture.validationErrorsShown
-      ? ` The page is showing errors: ${JSON.stringify(
-          sanitizePageText(resubmitCapture.validationErrorText, 300)
-        )}.`
-      : "";
+    const resubmitErrors = errorsFor(resubmitCapture);
+    // JOB-106, the same rule as after the first click. There is no third click
+    // either way, so this changes only what the row is filed as and what the
+    // person reading it is told — but "the board moved us to another step" and
+    // "the form is still sitting there refusing the code" are different facts
+    // and the message below asserts the second one.
+    if (resubmitVerdict.navigated) {
+      return await unconfirmed(
+        `"${choice.label}" was clicked a second time with the emailed security code entered, and ` +
+          `the board moved to "${resubmitCapture.url}" (page ` +
+          `"${sanitizePageText(resubmitCapture.title, 200)}") without confirming anything — ` +
+          `${resubmitVerdict.evidence}.${resubmitErrors} A navigation on its own is not evidence ` +
+          `the employer received this. There is no third click: a human should look at the board ` +
+          `and at the ACT-006 inbox before anything clicks here again.`
+      );
+    }
     if (resubmitCapture.automationRejection !== null) {
       return await unconfirmed(
         `${AUTOMATION_TAG}: "${choice.label}" was clicked a second time with the emailed ` +
