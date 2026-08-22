@@ -179,6 +179,7 @@ import {
   type ResolvedAction,
 } from "@/lib/stagehand-session";
 import {
+  classifyCoreSlot,
   detectAts,
   fingerprintFormShape,
   loadActionPlan,
@@ -531,7 +532,33 @@ export type FormSignals = ExtractedFormSignals & {
    * deterministic upload path needs the un-merged truth.
    */
   domFileInputCount: number;
+  /**
+   * Which of the boilerplate applicant fields the DOM itself can see, read by
+   * `enumerateFormFields` (shadow roots included) and named by
+   * `classifyCoreSlot`. Reported so the failure message can say what was on the
+   * page rather than only what a model made of it.
+   */
+  domCoreSlots: CoreSlot[];
 };
+
+/**
+ * The fields that make a page an *applicant's* form rather than any other form.
+ *
+ * Deliberately not the whole `CoreSlot` set. A resume dropzone appears on a
+ * "share your CV with us" marketing page, and a LinkedIn box appears in plenty
+ * of profile editors; asking somebody their name and their email address, in
+ * two separate controls on one page, is what an application form does.
+ */
+const APPLICANT_IDENTITY_SLOTS: ReadonlySet<CoreSlot> = new Set<CoreSlot>([
+  "firstName",
+  "lastName",
+  "fullName",
+  "email",
+  "phone",
+]);
+
+/** How many distinct identity fields the DOM must show before it overrules a "no form" read. */
+const MIN_IDENTITY_SLOTS_FOR_FORM = 2;
 
 /**
  * The counts `querySelectorAll` answers exactly and a model answers
@@ -539,16 +566,89 @@ export type FormSignals = ExtractedFormSignals & {
  * reasoning as `create-board-account.ts`'s structural floor: merging with
  * `Math.max` can only ever make this module *more* cautious.
  */
-const STRUCTURAL_FLOOR_SCRIPT = `(() => ({
-  passwordFields: document.querySelectorAll('input[type=password]').length,
-  fileInputs: document.querySelectorAll('input[type=file]').length,
-  textAreas: document.querySelectorAll('textarea').length,
-  iframes: document.querySelectorAll('iframe').length,
-  ordinaryInputs: document.querySelectorAll(
-    'input:not([type=hidden]):not([type=password]):not([type=file]), select'
-  ).length,
-  textLength: ((document.body && document.body.innerText) || '').trim().length
-}))()`;
+const STRUCTURAL_FLOOR_SCRIPT = `(() => {
+  /**
+   * JOB-052. The same query, run against the light document and against every
+   * open shadow root under it.
+   *
+   * \`document.querySelectorAll\` stops at a shadow boundary, so on a board whose
+   * form is web components this counted nothing at all. A SmartRecruiters
+   * oneclick-ui page with ten real controls on screen answered
+   * \`ordinaryInputs: 0\`, and \`document.body.innerText\` — which also does not
+   * reach into a shadow root — answered 418 characters for a full page of form.
+   * Those two numbers are what the "could not reach the form" message quotes and
+   * what \`stillBuilding\` watches to decide the page has settled, so both the
+   * diagnosis and the wait were being made from a reading of an almost empty
+   * document.
+   *
+   * Bounded, because this is polled: the walk stops after \`LIMIT\` elements and
+   * reports what it has. Under-counting is the safe direction for every consumer
+   * — a floor that reads low can only make the module more cautious.
+   */
+  var LIMIT = 12000;
+  var seen = 0;
+  var counts = {
+    passwordFields: 0,
+    fileInputs: 0,
+    textAreas: 0,
+    iframes: 0,
+    ordinaryInputs: 0,
+    textLength: 0
+  };
+  var roots = [document];
+  var visited = new Set();
+  while (roots.length && seen < LIMIT) {
+    var root = roots.pop();
+    if (!root || visited.has(root)) continue;
+    visited.add(root);
+    var all;
+    try { all = root.querySelectorAll('*'); } catch (e) { continue; }
+    for (var i = 0; i < all.length; i++) {
+      if (seen++ >= LIMIT) break;
+      var el = all[i];
+      var inner = el.shadowRoot;
+      if (inner) roots.push(inner);
+      var tag = el.tagName.toLowerCase();
+      var type = (el.getAttribute('type') || '').toLowerCase();
+      if (tag === 'input' && type === 'password') counts.passwordFields++;
+      else if (tag === 'input' && type === 'file') counts.fileInputs++;
+      else if (tag === 'textarea') counts.textAreas++;
+      else if (tag === 'iframe') counts.iframes++;
+      else if (tag === 'select') counts.ordinaryInputs++;
+      else if (tag === 'input' && type !== 'hidden') counts.ordinaryInputs++;
+    }
+  }
+  // Light DOM innerText first, because it is what a person reads and what this
+  // number has always meant; shadow text is added so a component-built page
+  // stops reporting itself as almost empty.
+  var text = ((document.body && document.body.innerText) || '').trim();
+  counts.textLength = text.length;
+  // The walk above is bounded, and one of these counts carries a veto: the
+  // sign-in stop keys off password fields, so a page big enough to exhaust
+  // LIMIT must not be able to hide one by being long. This query is unbounded
+  // and cheap, and covers every password field outside a shadow root, which is
+  // where essentially all of them are.
+  try {
+    var lightPasswords = document.querySelectorAll('input[type=password]').length;
+    if (lightPasswords > counts.passwordFields) counts.passwordFields = lightPasswords;
+  } catch (e) { /* a query that cannot run leaves the walked count standing */ }
+  if (visited.size > 1) {
+    var extra = 0;
+    visited.forEach(function (r) {
+      if (r === document) return;
+      var host = r.host;
+      if (!host) return;
+      try {
+        var t = (host.innerText || '').trim();
+        if (t) extra += t.length;
+      } catch (e) { /* a host that cannot be measured contributes nothing */ }
+    });
+    // Only ever raises it. The settle check compares successive reads, so a
+    // number that moves when the form mounts is the whole point.
+    if (extra > counts.textLength) counts.textLength = extra;
+  }
+  return counts;
+})()`;
 
 type StructuralFloor = {
   passwordFields: number;
@@ -791,8 +891,48 @@ async function readFormSignals(session: BrowserSession): Promise<FormSignals> {
   const floor = await readStructuralFloor(page);
   const [url, title] = await Promise.all([page.url(), page.title()]);
 
+  /**
+   * JOB-052. What the DOM itself says is on this page, as a floor under the
+   * model's judgement — the same rule as the counts above, extended to the one
+   * judgement that decides whether this run gets to start at all.
+   *
+   * `enumerateFormFields` is reused rather than re-implemented: it is already
+   * the module that owns "what controls does this page have", it already walks
+   * open shadow roots, and it contains no model. `classifyCoreSlot` is the
+   * existing vocabulary for turning a label into a boilerplate field name, so
+   * there is one definition of "this is the email box" rather than two.
+   *
+   * This can only ever *add* evidence. `applicationFormPresent` becomes true
+   * when the model missed a form the DOM can prove is there, and stays exactly
+   * as the model reported it otherwise — a page where this finds nothing is
+   * still refused, with the same message it always had.
+   */
+  const domCoreSlots = await readCoreSlotsFromDom(page);
+  const identitySlots = domCoreSlots.filter((slot) => APPLICANT_IDENTITY_SLOTS.has(slot));
+  /**
+   * A password anywhere on the page vetoes this, and that is not a detail.
+   * `reachApplicationForm` stops at a sign-in wall with
+   * `!applicationFormPresent && passwordFieldCount > 0`, so an account-creation
+   * page — which has a name box, an email box and a password box — must not be
+   * talked into looking like an application form by the first two. The wall is
+   * still a wall.
+   */
+  const domSaysForm =
+    floor.passwordFields === 0 &&
+    extracted.passwordFieldCount === 0 &&
+    identitySlots.length >= MIN_IDENTITY_SLOTS_FOR_FORM;
+
+  if (domSaysForm && !extracted.applicationFormPresent) {
+    console.warn(
+      `${session.logTag} the page reader saw no application form at "${url}", but the DOM holds ` +
+        `${identitySlots.length} of an applicant's own fields (${identitySlots.join(", ")}); ` +
+        `treating the form as present on that evidence`
+    );
+  }
+
   return {
     ...extracted,
+    applicationFormPresent: extracted.applicationFormPresent || domSaysForm,
     passwordFieldCount: Math.max(extracted.passwordFieldCount, floor.passwordFields),
     fileInputCount: Math.max(extracted.fileInputCount, floor.fileInputs),
     url,
@@ -801,7 +941,32 @@ async function readFormSignals(session: BrowserSession): Promise<FormSignals> {
     textAreaCount: floor.textAreas,
     iframeCount: floor.iframes,
     domFileInputCount: floor.fileInputs,
+    domCoreSlots,
   };
+}
+
+/**
+ * The boilerplate applicant fields the DOM can see, deduplicated.
+ *
+ * Never throws: `enumerateFormFields` already reports an unreadable page as
+ * having no fields, and a floor that cannot be read is simply no floor, leaving
+ * the model's judgement exactly as it was.
+ */
+export async function readCoreSlotsFromDom(page: Page): Promise<CoreSlot[]> {
+  try {
+    const fields = await enumerateFormFields(page);
+    const slots = new Set<CoreSlot>();
+    for (const field of fields) {
+      // Only a control somebody could actually fill in. A disabled or
+      // already-satisfied box is still evidence that this is the form.
+      if (field.kind === "other") continue;
+      const slot = classifyCoreSlot(field.label);
+      if (slot !== null) slots.add(slot);
+    }
+    return [...slots];
+  } catch {
+    return [];
+  }
 }
 
 // ───────────────────────────────────
@@ -2225,7 +2390,13 @@ async function reachApplicationForm(
       `Could not reach the job application form. Ended at "${signals.url}" ("${signals.title}", ` +
         `${signals.textLength} characters of text) with no application form on screen ` +
         `(password fields: ${signals.passwordFieldCount}, file inputs: ${signals.fileInputCount}, ` +
-        `iframes: ${signals.iframeCount}). ` +
+        `iframes: ${signals.iframeCount}` +
+        // JOB-052. What the DOM itself found, so this message can no longer be
+        // read as "the page was empty" when the page was full of controls the
+        // reader could not see. An empty list here is the honest report that
+        // both the model and the DOM came up with nothing.
+        `, applicant fields the DOM could see: ` +
+        `${signals.domCoreSlots.length === 0 ? "none" : signals.domCoreSlots.join(", ")}). ` +
         // JOB-021. Says that the page was given time, because without it this
         // sentence reads identically for "the board has no form we can use" and
         // "we read a careers SPA before it had mounted one", and those want
