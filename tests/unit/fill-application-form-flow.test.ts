@@ -424,7 +424,14 @@ vi.mock("@supabase/supabase-js", () => {
       },
     ],
     resumes: [
-      { storage_path: "resumes/candidate.pdf", created_at: "2026-01-01T00:00:00.000Z" },
+      {
+        // JOB-112. The row's id and its LinkedIn path are read now, because
+        // `resumes.parsed` is keyed on the first and derived from both.
+        id: "5ca1ab1e-0000-4000-8000-0000000000ff",
+        storage_path: "resumes/candidate.pdf",
+        linkedin_pdf_path: null,
+        created_at: "2026-01-01T00:00:00.000Z",
+      },
     ],
   });
 
@@ -450,30 +457,40 @@ vi.mock("@supabase/supabase-js", () => {
   return { createClient: () => ({ from: (table: string) => builder(table) }) };
 });
 
+const PARSED_PROFILE = {
+  firstName: "Ada",
+  lastName: "Lovelace",
+  email: "candidate@example.com",
+  phone: null,
+  location: null,
+  linkedinUrl: null,
+  websiteUrl: null,
+  githubUrl: null,
+  workHistory: [],
+  education: [],
+  skills: [],
+  resumeStatedEmail: null,
+  warnings: [],
+};
+
 vi.mock("@/lib/resume-parser", () => ({
   loadResume: async () => ({
     bytes: new Uint8Array([37, 80, 68, 70]),
     text: "resume text",
     pageCount: 1,
   }),
-  parseResume: async () => ({
-    firstName: "Ada",
-    lastName: "Lovelace",
-    email: "candidate@example.com",
-    phone: null,
-    location: null,
-    linkedinUrl: null,
-    websiteUrl: null,
-    workHistory: [],
-    education: [],
-    skills: [],
-    resumeStatedEmail: null,
-    warnings: [],
-  }),
   generateCoverLetter: async () => "A cover letter grounded in the intake data.",
   decideFieldAnswers: async () => [],
   generateEssayAnswer: async () => "",
   InjectionSuspectedError: class InjectionSuspectedError extends Error {},
+}));
+
+// JOB-112. The fill pipeline no longer calls `parseResume` directly: it asks
+// for the profile and does not care whether that came out of `resumes.parsed`
+// or out of a fresh parse. Which of the two happened is exercised in
+// `tests/unit/stored-candidate-parse.test.ts`, against the real module.
+vi.mock("@/lib/candidate-documents", () => ({
+  resolveCandidateProfile: async () => PARSED_PROFILE,
 }));
 
 vi.mock("@/lib/stagehand-session", () => ({
