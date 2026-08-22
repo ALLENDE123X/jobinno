@@ -1287,8 +1287,28 @@ const NO_MENU: OpenMenu = {
  * dropdown on the page a list of countries to choose from. Three strategies,
  * narrowest first: what the control says it controls, then the nearest ancestor
  * that actually holds visible options, then (for a menu rendered into a portal
- * at the end of `<body>`) whatever is visible anywhere. Only one menu is ever
- * open at a time, which is what makes the last one safe.
+ * at the end of `<body>`) whatever is visible anywhere.
+ *
+ * ── Why the last two are fenced (JOB-052) ───────────────────────────────────
+ * That third strategy used to be justified by "only one menu is ever open at a
+ * time". It is not true, and the day it was not cost a real application. On
+ * Virtu's Greenhouse form a menu belonging to "Will you be ready for full-time
+ * employment in 2028?" was still open when "What is your expected graduation
+ * year?" was read, and the document-wide sweep handed the graduation-year
+ * control that other question's `Yes / No / Undecided` — verified live, the
+ * read returns exactly those three. Worse, the caller takes options-in-hand as
+ * proof the menu is open, so it never clicked, and the real menu never opened
+ * at all. That is how one run's log came to say the field "offers 3 option(s)"
+ * and then that it "offered no options to choose from": both readings were of
+ * somebody else's menu, or of nothing.
+ *
+ * So the two loose strategies are now fenced twice over. A control whose own
+ * `aria-expanded` says `"false"` has nothing open and reads as empty, whatever
+ * else is on screen; and an option living inside an element some *other*
+ * control claims through `aria-controls`/`aria-owns` is that control's, never
+ * this one's. Both fences only ever remove options that were never this
+ * control's, so the worst they can do is report an empty menu — which the
+ * decision layer already treats as a reason to ask rather than to guess.
  */
 function readOpenMenuInPage(
   controlSelector: string,
@@ -1450,12 +1470,43 @@ function readOpenMenuInPage(
   const control = resolveDeep(controlSelector);
 
   const expanded = control !== null && control.getAttribute("aria-expanded") === "true";
+  // Only an explicit "false" counts as a denial. A widget that declares nothing
+  // at all is still searched for, because plenty of them never set the
+  // attribute and reading their menu is the whole job.
+  const declaredShut = control !== null && control.getAttribute("aria-expanded") === "false";
+
   let nodes: Element[] = [];
 
   // `[role="option"]` is the ARIA spelling; `option` covers a web component
   // that renders a real `<option>`-shaped list inside its own shadow root,
   // which is how SmartRecruiters draws its country picker.
   const OPTION_SEL = '[role="option"]';
+
+  // Every element that some *other* control has claimed as its own popup.
+  const claimed = new Set<string>();
+  for (const owner of deepQueryAll(document, "[aria-controls],[aria-owns]")) {
+    if (owner === control) continue;
+    // Not another control when it wraps this one or sits inside it. A widget
+    // that declares its popup on an outer span while the value lives on the
+    // input this addresses is one control written across two elements, and
+    // treating the outer one as a stranger would fence a control off from its
+    // own menu.
+    if (control !== null && (owner.contains(control) || control.contains(owner))) continue;
+    const ids = `${owner.getAttribute("aria-controls") ?? ""} ${owner.getAttribute("aria-owns") ?? ""}`;
+    for (const id of ids.split(/\s+/)) {
+      if (id !== "") claimed.add(id);
+    }
+  }
+  /** Is this option inside a popup another control has put its name to? */
+  const someoneElses = (node: Element): boolean => {
+    let walk: Element | null = node;
+    while (walk !== null) {
+      if (walk.id !== "" && claimed.has(walk.id)) return true;
+      walk = parentOf(walk);
+    }
+    return false;
+  };
+  const mine = (node: Element): boolean => visible(node) && !someoneElses(node);
 
   const owned = control?.getAttribute("aria-controls") ?? control?.getAttribute("aria-owns") ?? null;
   if (owned !== null && owned !== "" && control !== null) {
@@ -1467,15 +1518,15 @@ function readOpenMenuInPage(
       nodes = deepQueryAll(box, OPTION_SEL).filter(visible);
     }
   }
-  if (nodes.length === 0 && control !== null) {
+  if (nodes.length === 0 && control !== null && !declaredShut) {
     let node: Element | null = parentOf(control);
     for (let depth = 0; node !== null && depth < 7 && nodes.length === 0; depth++) {
-      nodes = deepQueryAll(node, OPTION_SEL).filter(visible);
+      nodes = deepQueryAll(node, OPTION_SEL).filter(mine);
       node = parentOf(node);
     }
   }
-  if (nodes.length === 0) {
-    nodes = deepQueryAll(document, OPTION_SEL).filter(visible);
+  if (nodes.length === 0 && !declaredShut) {
+    nodes = deepQueryAll(document, OPTION_SEL).filter(mine);
   }
 
   /**
@@ -1524,20 +1575,44 @@ function readOpenMenuInPage(
    * options properly — every react-select one does — is matched exactly as
    * before and never reaches this.
    */
-  if (named.length === 0) {
+  /**
+   * A row that is a message about the menu rather than a choice in it.
+   *
+   * JOB-052. react-select draws "No options" and "Loading..." as plain
+   * children of its `role="listbox"` menu list with no role of their own —
+   * exactly the shape the fallback below reports as a row. Verified live on
+   * Virtu's Greenhouse form: typing a year that is not on the list left the
+   * graduation-year control reporting one option called "No options", so a
+   * value that is simply not offered read as a value the form offers strangely.
+   *
+   * Matched on the widget's own class naming, and it only ever removes a row.
+   * A menu left with nothing is reported as offering nothing, which the
+   * decision layer already treats as a reason to ask.
+   */
+  const isNotice = (node: Element): boolean =>
+    /(?:^|[-_ ])(?:menu[-_]notice|no[-_]?options|no[-_]?results|loading)(?:[-_ ]|$)/i.test(
+      typeof node.className === "string" ? node.className : ""
+    );
+
+  if (named.length === 0 && !declaredShut) {
     const boxes: Element[] = [];
     if (control !== null) {
       let node: Element | null = parentOf(control);
       for (let depth = 0; node !== null && depth < 7 && boxes.length === 0; depth++) {
         for (const box of deepQueryAll(node, '[role="listbox"]')) {
-          if (visible(box)) boxes.push(box);
+          // JOB-052. Fenced exactly as the option searches above are, and for
+          // the same reason: this walk climbs well past its own control's
+          // wrapper, so a neighbouring question whose menu happens to be open
+          // is within its reach. A listbox another control has claimed is that
+          // control's, and a control that says its own menu is shut has none.
+          if (visible(box) && !someoneElses(box)) boxes.push(box);
         }
         node = parentOf(node);
       }
     }
     for (const box of boxes) {
       const rows = Array.from(box.children).filter(
-        (row) => visible(row) && deepText(row) !== ""
+        (row) => visible(row) && deepText(row) !== "" && !isNotice(row)
       );
       if (rows.length > 0) {
         named = rows;
@@ -3129,6 +3204,25 @@ async function chooseFromMenuOnce(
   let menu: OpenMenu = NO_MENU;
 
   /**
+   * The fullest list this control has shown at any point in this attempt.
+   *
+   * JOB-052. `menu` below holds the *latest* reading, and `narrow()` replaces
+   * it with whatever survived a typed search — which, for a value that is not
+   * on the list, is nothing at all. Reporting that residue made a control that
+   * had just offered five options read as "the dropdown offered no options to
+   * choose from", and that sentence sent a real investigation after a widget
+   * bug when the truth was that the form does not offer this candidate's
+   * answer: Virtu's "expected graduation year" lists 2026 through 2030 and the
+   * candidate graduates in 2025. Kept so the report below can name the options
+   * a human needs in order to tell those two situations apart.
+   */
+  let offered: OpenMenu = NO_MENU;
+  const remember = (seen: OpenMenu): OpenMenu => {
+    if (seen.texts.length > offered.texts.length) offered = seen;
+    return seen;
+  };
+
+  /**
    * Narrows the menu by typing the value into it, then waits for the list to
    * settle. The string typed here is one this system decided on — an option it
    * read off this page, or a fact about the candidate — so nothing untrusted is
@@ -3143,11 +3237,11 @@ async function chooseFromMenuOnce(
       return pick(menu);
     }
     const deadline = Date.now() + MENU_SEARCH_TIMEOUT_MS;
-    menu = await readOpenMenu(page, field);
+    menu = remember(await readOpenMenu(page, field));
     let found = pick(menu);
     while (found === -1 && Date.now() < deadline) {
       await page.waitForTimeout(MENU_POLL_MS);
-      menu = await readOpenMenu(page, field);
+      menu = remember(await readOpenMenu(page, field));
       found = pick(menu);
     }
     return found;
@@ -3177,7 +3271,7 @@ async function chooseFromMenuOnce(
 
   let openedOnClick = menu.expanded || menu.texts.length > 0;
   if (index === -1) {
-    menu = await openMenu(page, field);
+    menu = remember(await openMenu(page, field));
     openedOnClick = openedOnClick || menu.expanded || menu.texts.length > 0;
     index = menu.count > MAX_UNFILTERED_MENU_OPTIONS ? await narrow() : pick(menu);
     // Either the list was short and the value is not on it, or it is a search
@@ -3186,6 +3280,24 @@ async function chooseFromMenuOnce(
   }
 
   if (index === -1) {
+    /**
+     * The fullest reading available right now, worded for a report: whatever a
+     * search left behind if it left anything, and otherwise the fullest list
+     * this control showed at any point. See `offered` above for why the
+     * difference matters. A function rather than a value because the two
+     * reports below are written either side of one more attempt to see the
+     * list.
+     */
+    const describe = (): { empty: boolean; listed: string } => {
+      const shown = menu.texts.length > 0 ? menu : offered;
+      return {
+        empty: shown.texts.length === 0,
+        listed: `${shown.texts
+          .slice(0, 8)
+          .map((text) => JSON.stringify(text))
+          .join(", ")}${shown.count > 8 ? ", …" : ""}`,
+      };
+    };
     // JOB-044. `allowFreeText` is only ever true for a control the caller has
     // already decided accepts typed text as an answer in its own right —
     // Greenhouse's "School" combobox is the one this was written for, see
@@ -3198,35 +3310,47 @@ async function chooseFromMenuOnce(
     if (allowFreeText) {
       const typed = await readFieldValue(page, field);
       if (normalizeText(typed) === wanted) {
+        const asked = describe();
         await closeMenu(page);
         return {
           ok: true,
           readBack: typed,
           detail:
             `no dropdown option matched "${value}"` +
-            (menu.texts.length === 0
-              ? " (the dropdown offered none)"
-              : ` (offered: ${menu.texts
-                  .slice(0, 8)
-                  .map((text) => JSON.stringify(text))
-                  .join(", ")}${menu.count > 8 ? ", …" : ""})`) +
+            (asked.empty ? " (the dropdown offered none)" : ` (offered: ${asked.listed})`) +
             `; left as typed free text, which this control accepts`,
         };
       }
     }
+
+    // JOB-052. A search that matched nothing leaves an empty menu behind, and
+    // for a control whose options were never harvested that empty menu is the
+    // only reading there is — which is how "2025" against a list running 2026
+    // to 2030 was reported as a dropdown that offered nothing at all. So when
+    // nothing has been seen, the query is taken back out and the control asked
+    // once more, purely so this report can name what it does offer. Nothing is
+    // chosen here and the outcome is a failure either way; only the wording of
+    // it changes, and the person reading it is the one deciding whether this
+    // posting fits them.
+    if (offered.texts.length === 0) {
+      try {
+        await page.locator(field.selector).fill("");
+      } catch {
+        // A control that will not take an empty string has nothing more to say.
+      }
+      menu = remember(await openMenu(page, field));
+    }
+
+    const asked = describe();
     await closeMenu(page);
     return {
       ok: false,
       readBack: await readFieldValue(page, field),
-      detail:
-        menu.texts.length === 0
-          ? openedOnClick
-            ? "the dropdown offered no options to choose from"
-            : `the dropdown could not be opened, and typing "${value}" into it produced no options`
-          : `"${value}" is not one of this dropdown's options (${menu.texts
-              .slice(0, 8)
-              .map((text) => JSON.stringify(text))
-              .join(", ")}${menu.count > 8 ? ", …" : ""})`,
+      detail: asked.empty
+        ? openedOnClick
+          ? "the dropdown offered no options to choose from"
+          : `the dropdown could not be opened, and typing "${value}" into it produced no options`
+        : `"${value}" is not one of this dropdown's options (${asked.listed})`,
     };
   }
 
