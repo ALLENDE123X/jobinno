@@ -33,6 +33,7 @@ import {
   applyFieldValue,
   enumerateFormFields,
   harvestOptions,
+  readFieldValue,
   type EnumeratedField,
 } from "@/lib/form-fields";
 import { type Page } from "@browserbasehq/stagehand";
@@ -664,5 +665,146 @@ describe("JOB-052: one dropdown's open menu is never read as another's", () => {
 
     expect(outcome.ok).toBe(false);
     expect(outcome.detail).toContain("offered no options");
+  });
+});
+
+/**
+ * JOB-107 — reading a web component select's committed selection.
+ *
+ * The shape below is SmartRecruiters' phone country picker, copied off the live
+ * Western Digital form on 2026-08-22 rather than imagined. Three things about it
+ * are load bearing and all three are reproduced here:
+ *
+ *  · the control the enumeration addresses is the *search box*
+ *    (`input[role="combobox"]`, "Search by country/region or code"), and it sits
+ *    inside `spl-dropdown-search`'s own shadow root,
+ *  · the committed selection is painted one level further out, inside the
+ *    `spl-select`'s shadow root, on a node classed `…-selected-value`, and
+ *  · the search box empties itself the moment a selection commits, because
+ *    emptying is what a search box does.
+ *
+ * So the read back that guards every fill saw `""` on a control that had just
+ * been set correctly, and a required field the board validates ("Please provide
+ * a valid phone number") blocked every run. The guard is unchanged. Only the
+ * question it asks the page is.
+ */
+describe("SmartRecruiters phone country: the selection is not on the control", () => {
+  /**
+   * Builds the picker. `selected` is the caption the widget paints, "" for
+   * untouched.
+   *
+   * The 245 country options are here rather than trimmed to two, and they are in
+   * the light DOM *before* the caption, because that ordering is the bug. On the
+   * live board the caption is element 1229 of the 1230 under `spl-select`, so
+   * any reader that walks a bounded number of elements looking for it stops a
+   * thousand short and reports the control as empty. A fixture with two options
+   * would pass against the broken reader.
+   */
+  function phoneCountryPicker(selected: string): void {
+    const select = document.createElement("spl-select");
+    select.setAttribute("value", selected === "" ? "" : "US");
+    // The shadow root holds the widget's chrome; the caption is NOT in here.
+    select.attachShadow({ mode: "open" }).innerHTML =
+      `<spl-internal-form-field></spl-internal-form-field><spl-dropdown></spl-dropdown>`;
+
+    // The search box: a light DOM child of the select, with its own shadow root.
+    const search = document.createElement("spl-dropdown-search");
+    search.setAttribute("slot", "search");
+    const searchRoot = search.attachShadow({ mode: "open" });
+    searchRoot.innerHTML =
+      `<div><input type="text" role="combobox" ` +
+      `aria-label="Search by country/region or code" data-jobinno-field="f7" /></div>`;
+    select.append(search);
+
+    for (let i = 0; i < 245; i++) {
+      const option = document.createElement("spl-select-option");
+      option.setAttribute("value", `C${i}`);
+      option.innerHTML = `<div><span>Country ${i}</span><span>+${i}</span></div>`;
+      select.append(option);
+    }
+
+    // The trigger caption, last, exactly where the board puts it.
+    if (selected !== "") {
+      const trigger = document.createElement("div");
+      trigger.setAttribute("slot", "triggerPrefix");
+      trigger.className = "c-spl-phone-field-selected-value-container";
+      trigger.innerHTML =
+        `<div class="c-spl-phone-field-selected-value-wrapper">` +
+        `<spl-typography-body class="c-spl-phone-field-selected-value">${selected}` +
+        `</spl-typography-body></div>`;
+      select.append(trigger);
+    }
+
+    document.body.append(select);
+  }
+
+  function searchBoxField(): EnumeratedField {
+    return {
+      key: "search by country/region or code",
+      selector: `[data-jobinno-field="f7"]`,
+      activateSelectors: [`[data-jobinno-field="f7"]`],
+      label: "Search by country/region or code",
+      kind: "combobox",
+      required: true,
+      currentValue: "",
+      options: [],
+      optionSelectors: [],
+      optionValues: [],
+      optionsKnown: false,
+      optionsTruncated: false,
+      maxLength: null,
+      helpText: "",
+    };
+  }
+
+  it("reads the caption the widget paints, not the search box it cleared", async () => {
+    phoneCountryPicker("+1");
+    // The search box really is empty. This is the state the old read saw, and
+    // reporting it was not wrong so much as it was the wrong element.
+    const box = (
+      document.querySelector("spl-dropdown-search") as HTMLElement
+    ).shadowRoot?.querySelector("input") as HTMLInputElement;
+    expect(box.value).toBe("");
+
+    expect(await readFieldValue(domPage(), searchBoxField())).toBe("+1");
+  });
+
+  it("still reads empty when nothing has been chosen", async () => {
+    phoneCountryPicker("");
+    expect(await readFieldValue(domPage(), searchBoxField())).toBe("");
+  });
+
+  it("does not answer with the country code no applicant sees", async () => {
+    // The `spl-select` carries `value="US"` while the option chosen reads
+    // "United States +1". Answering with the code would turn a correct
+    // selection into a reported mismatch, so the painted caption is what counts.
+    phoneCountryPicker("+1");
+    expect(await readFieldValue(domPage(), searchBoxField())).not.toBe("US");
+  });
+
+  it("reports the picker the board already set as answered, not as empty", async () => {
+    // The consequence of the old read, and the reason this matters more than a
+    // tidier report: `currentValue === ""` is what the fill uses to decide a
+    // control still needs answering. SmartRecruiters ships this picker already
+    // set to the applicant's country, so reading it as empty made the run open a
+    // dropdown that did not need opening and type into a form that was correct.
+    phoneCountryPicker("+1");
+
+    const fields = await enumerateFormFields(domPage());
+    const picker = fields.find((f) => f.label.includes("Search by country"));
+    expect(picker?.currentValue).toBe("+1");
+  });
+
+  it("survives a custom element whose value is not a string", async () => {
+    // `spl-phone-field` holds the object `{"country":"US"}` on its own `value`.
+    // Calling `.replace` on that threw out of the whole script, which reads
+    // downstream as an empty control rather than as the bug it is.
+    const host = document.createElement("spl-phone-field");
+    host.setAttribute("data-jobinno-field", "f8");
+    (host as unknown as { value: unknown }).value = { country: "US" };
+    document.body.append(host);
+
+    const field = { ...searchBoxField(), selector: `[data-jobinno-field="f8"]` };
+    expect(await readFieldValue(domPage(), field)).toBe("");
   });
 });
