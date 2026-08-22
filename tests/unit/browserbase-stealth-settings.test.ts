@@ -50,7 +50,6 @@ import {
   BROWSERBASE_API_KEY_ENV_VAR,
   BROWSERBASE_PROJECT_ID_ENV_VAR,
   BROWSERBASE_SESSION_TIMEOUT_S,
-  BROWSERBASE_STEALTH_OS,
   BROWSERBASE_VIEWPORT,
   closeBrowserSession,
   openBrowserSession,
@@ -84,7 +83,7 @@ afterEach(() => {
 });
 
 describe("the Browserbase launch call (JOB-046, issue #80)", () => {
-  it("asks for Browserbase's managed proxy and a consistent desktop fingerprint", async () => {
+  it("asks for Browserbase's managed proxy and a consistent viewport", async () => {
     const session = await openBrowserSession({ headless: true, logTag: "[job-046-test]" });
     await closeBrowserSession(session);
 
@@ -96,16 +95,16 @@ describe("the Browserbase launch call (JOB-046, issue #80)", () => {
       proxies: true,
       browserSettings: {
         viewport: BROWSERBASE_VIEWPORT,
-        os: BROWSERBASE_STEALTH_OS,
       },
     });
   });
 
-  it("does not attempt advancedStealth or verified, which the issue left unconfirmed for this plan", async () => {
+  it("does not set os, advancedStealth, or verified — os broke every session on this plan (400: Enterprise-only), and the other two were confirmed gated to Scale", async () => {
     const session = await openBrowserSession({ headless: true, logTag: "[job-046-test]" });
     await closeBrowserSession(session);
 
     const call = launchCalls.args[0] as { browserSettings?: Record<string, unknown> };
+    expect(call.browserSettings).not.toHaveProperty("os");
     expect(call.browserSettings).not.toHaveProperty("advancedStealth");
     expect(call.browserSettings).not.toHaveProperty("verified");
   });

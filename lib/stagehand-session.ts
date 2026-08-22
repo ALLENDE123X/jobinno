@@ -233,21 +233,27 @@ export const BROWSERBASE_SESSION_TIMEOUT_S = 20 * 60;
  * `Playwright: true` framework flag and an identical hardware/GPU
  * fingerprint across sessions.
  *
- * `BROWSERBASE_VIEWPORT` and `BROWSERBASE_STEALTH_OS` exist as their own
- * named constants, following `BROWSERBASE_SESSION_TIMEOUT_S` immediately
- * above, rather than an inline object at the call site, so a future
- * caller — or a test — has one place to read what this pipeline claims to
- * be and one place to change it. The two are picked to agree with each
- * other: a 1080p viewport paired with `windows`, the most common desktop
- * configuration in general web traffic, rather than either value chosen on
- * its own. `advancedStealth` and `verified` are deliberately absent from
- * both: issue #80's investigation confirmed `advancedStealth` is gated to
- * Browserbase's Scale plan and unavailable on this project's current tier
- * (setting it would fail loudly or silently no-op), and left `verified`'s
- * plan-tier availability unconfirmed, so it stays out until someone checks.
+ * `BROWSERBASE_VIEWPORT` exists as its own named constant, following
+ * `BROWSERBASE_SESSION_TIMEOUT_S` immediately above, rather than an inline
+ * object at the call site, so a future caller — or a test — has one place to
+ * read what this pipeline claims to be and one place to change it.
+ *
+ * `browserSettings.os` was here too, set to `"windows"`, until a live test
+ * against the real Browserbase session-create API on this project's actual
+ * plan came back `400 Bad Request: "windows OS is only available for
+ * verified users, which is only available on the Enterprise plan. By
+ * default, we only support Linux."` — confirmed directly, not inferred.
+ * Every session on this project failed to create at all while that setting
+ * was live, which is strictly worse than the fingerprint gap it was meant to
+ * close. Removed rather than left in behind a flag: the whole point of
+ * naming it here was one place to change it, and Linux (Browserbase's
+ * default, unconfigured) is what this project can actually run. Revisit if
+ * the project ever moves to Enterprise. `advancedStealth` and `verified` are
+ * deliberately absent for the same reason `os` almost stayed in by mistake:
+ * issue #80's investigation confirmed `advancedStealth` is Scale-plan-gated,
+ * and `verified` gates `os` the same way `os` alone turned out to require it.
  */
 export const BROWSERBASE_VIEWPORT = { width: 1920, height: 1080 } as const;
-export const BROWSERBASE_STEALTH_OS = "windows" as const;
 
 /**
  * Sessions the local Chromium path may run at once.
@@ -741,11 +747,11 @@ export async function openBrowserSession(
             // way, and its live view is how a run gets watched.
             api_timeout: BROWSERBASE_SESSION_TIMEOUT_S,
             // JOB-046 (issue #80): see `BROWSERBASE_VIEWPORT`'s comment above
-            // for why these three are here and what is deliberately not.
+            // for why these are here and what is deliberately not (including
+            // `os`, which was here too and broke every session on this plan).
             proxies: true,
             browserSettings: {
               viewport: BROWSERBASE_VIEWPORT,
-              os: BROWSERBASE_STEALTH_OS,
             },
           })
         : await localBrowser.launch({ headless: options.headless });
