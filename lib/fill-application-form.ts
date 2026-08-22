@@ -3026,9 +3026,19 @@ function optionSupportsFact(
   factKey: string,
   fieldLabel: string
 ): boolean {
-  const chosen = normalizeText(option);
+  // The enumeration marker a form author typed in front of the option is not
+  // part of what choosing it says — see `stripOptionOrdinal`. Only the marker
+  // is dropped; every word of the option itself is still compared.
+  const chosen = stripOptionOrdinal(normalizeText(option));
   const known = normalizeText(factValue);
   if (chosen === known) return true;
+  // Gated on BOTH the fact key and the field label, exactly as degree
+  // equivalence is below, and never true unless the option and the stored
+  // status name the same status. See `citizenshipClass`.
+  if (CITIZENSHIP_FACT_KEY_RE.test(factKey) && CITIZENSHIP_FIELD_LABEL_RE.test(fieldLabel)) {
+    const chosenStatus = citizenshipClass(chosen);
+    if (chosenStatus !== null && chosenStatus === citizenshipClass(known)) return true;
+  }
   // JOB-022. A resume prints "B.S." and a Greenhouse degree dropdown offers
   // "Bachelor's Degree". Those are the same statement, and the word boundary
   // test below cannot see it because they share no words. On 2026 08 20 that
@@ -3061,6 +3071,94 @@ function optionSupportsFact(
   // typo.
   return containsAtWordBoundary(chosen, known) || containsAtWordBoundary(known, chosen);
 }
+
+/**
+ * The enumeration marker a form author typed in front of an option, if any.
+ *
+ * Deliberately restricted to digits, and deliberately requiring a delimiter and
+ * whitespace after them. A letter marker would be indistinguishable from a real
+ * one-letter option, and this same page's "What is your strongest coding
+ * language?" offers "C" and "C#", so "C) " can never be assumed to be a marker.
+ * The delimiter requirement is what keeps the real numeric options intact: the
+ * ACT list's "36 out of 36" and a GPA list's "3.5" both start with digits and
+ * neither is stripped, because neither has a marker's punctuation after them.
+ */
+const OPTION_ORDINAL_RE = /^\(?\d{1,2}\)\s+|^\d{1,2}[.:]\s+|^\d{1,2}\s+[-–—]\s+/;
+
+/** An option's own words, with any enumeration marker in front of them removed. */
+function stripOptionOrdinal(text: string): string {
+  return text.replace(OPTION_ORDINAL_RE, "").trim();
+}
+
+/**
+ * A citizenship or immigration status as the one status it names, or null when
+ * the text names none of them.
+ *
+ * The same device as `degreeLevel` below and for the same reason, and gated the
+ * same way — see `CITIZENSHIP_FACT_KEY_RE` and `CITIZENSHIP_FIELD_LABEL_RE`. A
+ * board words the status one way and `describeCitizenship` words it another,
+ * and on a real posting the two shared no run of words at all: the option says
+ * "U.S. citizen or national of the United States" and the stored fact says "A
+ * United States citizen or national". Those are the same statement, and
+ * `optionSupportsFact`'s word-boundary test cannot see it, so a citizenship
+ * question the candidate had answered at intake was escalated as unanswerable.
+ *
+ * This is a lookup table, not an inference, and it is not a relaxation of
+ * anything: it can only ever return true when both sides name the SAME status.
+ * Two different statuses still disagree, and text that names no status at all
+ * still supports nothing — "Other (please explain)" classifies as null on
+ * purpose, since it is precisely the option that says nothing.
+ *
+ * Negations are checked first and fail the whole thing closed. A dropdown that
+ * offers "Not a U.S. citizen" must never read as agreeing with a stored
+ * citizen status, and a table of positive phrases would say it does.
+ */
+const CITIZENSHIP_NEGATION_RE = /\b(?:not|non|no|neither|none|other\s+than|nor)\b/;
+
+function citizenshipClass(text: string): string | null {
+  const flat = normalizeText(text)
+    .replace(/[.,'’()]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (flat === "" || CITIZENSHIP_NEGATION_RE.test(flat)) return null;
+  // Ahead of the citizen arm on purpose: a permanent-resident option often
+  // spells out "of the United States" too, and must never fall through to it.
+  if (/\b(?:lawful permanent resident|permanent resident|green card)\b/.test(flat)) {
+    return "permanent_resident";
+  }
+  if (/\brefugee\b/.test(flat)) return "refugee";
+  if (/\basylee\b|\basylum\b/.test(flat)) return "asylee";
+  if (/\bdaca\b|\bdeferred action\b/.test(flat)) return "daca";
+  if (/\bh ?1 ?b\b/.test(flat)) return "h1b";
+  if (/\bf ?1\b|\bstudent visa\b/.test(flat)) return "f1";
+  if (
+    /\b(?:u s|us|usa|united states|american)\b.*\b(?:citizen|citizenship|national)\b/.test(flat) ||
+    /\b(?:citizen|citizenship|national)\b.*\b(?:u s|us|usa|united states)\b/.test(flat)
+  ) {
+    return "us_citizen";
+  }
+  return null;
+}
+
+/**
+ * The fact keys that hold the candidate's own citizenship status, and the only
+ * ones citizenship equivalence runs for. `buildFactCatalog` writes exactly one.
+ * The yes/no restatements derived from it (`isUsCitizen` and the rest) are
+ * deliberately absent: their values are "Yes" and "No", which name no status,
+ * so equivalence has nothing to compare and the ordinary check already handles
+ * them correctly.
+ */
+const CITIZENSHIP_FACT_KEY_RE = /^citizenshipStatus$/;
+
+/**
+ * The field labels a citizenship question is drawn with, and the other half of
+ * the double gate, on the same reasoning as `DEGREE_FIELD_LABEL_RE`: the fact
+ * being about immigration status is not on its own enough, the FIELD has to be
+ * asking about it too. A country dropdown offering "United States" is not a
+ * citizenship question and must not be answered as one.
+ */
+const CITIZENSHIP_FIELD_LABEL_RE =
+  /\b(?:citizen\w*|nationality|immigration\s+status|permanent\s+resident\w*|green\s+card|work\s+authoriz\w*|authoriz\w*\s+to\s+work|visa\s+status|right\s+to\s+work)\b/i;
 
 /**
  * The fact keys that hold a degree, and the only ones degree equivalence runs
@@ -3224,17 +3322,30 @@ function matchOption(
   const exact = options.find((option) => normalizeText(option) === wanted);
   if (exact !== undefined) return exact;
 
+  // Form authors number their own options, and Greenhouse renders what they
+  // typed: a real posting's citizenship question offers "1) U.S. citizen or
+  // national of the United States" through "6) Other (please explain)". The
+  // "1) " is an enumeration marker in front of the option, not part of what
+  // choosing it says, so an answer that matches everything except the marker is
+  // the same answer — and refusing it stopped a question the candidate's own
+  // stored status answers exactly. Required to be unambiguous, on the same
+  // reasoning every other tier here is.
+  const bare = stripOptionOrdinal(wanted);
+  const numbered = options.filter((option) => stripOptionOrdinal(normalizeText(option)) === bare);
+  if (numbered.length === 1) return numbered[0]!;
+  if (numbered.length > 1) return null;
+
   const qualified = options.filter((option) => {
-    const text = normalizeText(option);
-    if (!text.startsWith(wanted)) return false;
-    const rest = text.slice(wanted.length).replace(/^\s+/, "");
+    const text = stripOptionOrdinal(normalizeText(option));
+    if (!text.startsWith(bare)) return false;
+    const rest = text.slice(bare.length).replace(/^\s+/, "");
     return rest.startsWith(",") || rest.startsWith("(");
   });
   if (qualified.length === 1) return qualified[0]!;
   if (qualified.length === 0) return null;
 
   const backed = qualified.filter((option) => {
-    const rest = normalizeText(option).slice(wanted.length);
+    const rest = stripOptionOrdinal(normalizeText(option)).slice(bare.length);
     return corroborants.some((hint) => {
       const clean = normalizeText(hint);
       return clean !== "" && containsAtWordBoundary(rest, clean);
