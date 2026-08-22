@@ -1988,12 +1988,39 @@ function readOpenMenuInPage(
    * Which option the widget itself considers highlighted — the one its own
    * `Enter` would commit.
    *
-   * Three readings, most authoritative first, because no single one of them is
+   * Four readings, most authoritative first, because no single one of them is
    * present on every widget: Greenhouse's react-select leaves
    * `aria-activedescendant` empty and marks the option with a `--is-focused`
    * class instead, while a hand-rolled ARIA combobox does the opposite. -1 when
-   * none of the three says anything, which the caller treats as "unsteerable"
+   * none of the four says anything, which the caller treats as "unsteerable"
    * rather than as "option 0".
+   *
+   * ── JOB-125: -1 is the dangerous answer, not the safe one ──────────────────
+   * `highlightOption` falls back to the WAI-ARIA convention when this reads -1,
+   * and that convention — "the menu opened with nothing highlighted, so option
+   * N is N+1 presses away" — is unverifiable and wrong on any widget that opens
+   * pre-highlighted. It is the whole of issue #97 and it recurred verbatim on
+   * SmartRecruiters, whose `spl-autocomplete` sets no `aria-activedescendant`,
+   * leaves `aria-selected="false"` on every option, and marks its highlight
+   * with the one word this did not know: `active`. Captured live on Avery
+   * Dennison's screening step on 2026-08-22, where the four education options
+   * render as
+   *
+   *   0  High School Diploma/GED   class="c-spl-dropdown-item active" tabindex="0"
+   *   1  Associates Degree         class=" c-spl-dropdown-item "      tabindex="-1"
+   *   2  Bachelors Degree          class=" c-spl-dropdown-item "      tabindex="-1"
+   *   3  Masters/Ph.D +            class=" c-spl-dropdown-item "      tabindex="-1"
+   *
+   * so a chosen "Bachelors Degree" at index 2 was walked three presses from an
+   * already-highlighted option 0 and committed "Masters/Ph.D +" — the option
+   * one past it, on a real employer's form.
+   *
+   * Hence the two readings added below. `active` and `current` join the class
+   * vocabulary, and a roving-tabindex listbox is recognised structurally rather
+   * than by any spelling at all. Both only ever turn a -1 into an index, and an
+   * index this gets wrong costs nothing: `highlightOption` re-reads the
+   * highlight after moving it and refuses to press `Enter` on an option it
+   * could not confirm. A -1 is what has no such check behind it.
    *
    * ── JOB-047: read against the list that is actually reported ───────────────
    * The marker sits on the node carrying `role="option"`, and that node is not
@@ -2024,8 +2051,13 @@ function readOpenMenuInPage(
     return -1;
   };
 
+  // `active` and `current` are the other two words a menu uses for the row its
+  // own `Enter` would take (JOB-125). Deliberately not `selected`: on
+  // react-select `--is-selected` marks the option already *chosen*, which is a
+  // different thing from the one highlighted, and confusing the two would move
+  // the walk by a wrong amount on every Greenhouse dropdown.
   const markedClass = (node: Element): boolean =>
-    /(?:^|[-_ ])(?:is[-_])?(?:focused|highlighted)(?:$|[-_ ])/i.test(
+    /(?:^|[-_ ])(?:is[-_])?(?:focused|highlighted|active|current)(?:$|[-_ ])/i.test(
       typeof node.className === "string" ? node.className : ""
     );
 
@@ -2053,6 +2085,26 @@ function readOpenMenuInPage(
   }
   if (marked === null) {
     marked = markable.find((node) => node.getAttribute("aria-selected") === "true") ?? null;
+  }
+  /**
+   * JOB-125. A roving tabindex: one option holds `tabindex="0"` and every other
+   * one holds a negative tabindex, which is how a listbox that moves real DOM
+   * focus between its rows says which row currently has it.
+   *
+   * Structural rather than a fourth guess at a class name, which is the point —
+   * this is the reading that does not go stale the next time a board invents a
+   * word for "highlighted". Both halves are required: without a parked sibling
+   * a lone `tabindex="0"` is just an ordinary focusable element and means
+   * nothing about a highlight, so a menu that does not use a roving tabindex
+   * still reads -1 here and is treated exactly as it was before.
+   */
+  if (marked === null) {
+    const tabbable = markable.filter((node) => node.getAttribute("tabindex") === "0");
+    const parked = markable.some((node) => {
+      const stop = node.getAttribute("tabindex");
+      return stop !== null && Number(stop) < 0;
+    });
+    if (tabbable.length === 1 && parked) marked = tabbable[0] ?? null;
   }
   const focused = indexOfNamed(marked);
 
@@ -2262,6 +2314,22 @@ async function scrollIfOffscreen(page: Page, selector: string): Promise<void> {
  * The one thing this will not do is press `Enter` on an option it could not
  * confirm is the chosen one. Committing the wrong option is the failure being
  * fixed, and doing it silently is worse than reporting that nothing was chosen.
+ *
+ * ── JOB-125: the blind fallback is looked at again before it is believed ────
+ * The sentence above was not quite true, because the fallback below had no
+ * confirmation behind it at all: when the menu marked no highlight this pressed
+ * `index + 1` times on the old convention and returned `ok: true` without ever
+ * looking. That is exactly how the same off-by-one arrived a second time, on
+ * SmartRecruiters rather than Greenhouse — see `readOpenMenuInPage`'s note on
+ * the `active` class it could not read.
+ *
+ * So the blind walk now reads the highlight once more when it is finished. A
+ * widget that still marks nothing is reported blind exactly as before, since
+ * there is genuinely nothing else to go on and the read back after `Enter`
+ * remains the check. A widget that turns out to mark something after all is no
+ * longer blind, and drops into the same verified steering every other menu
+ * gets — which either confirms the walk landed, corrects it, or refuses to
+ * commit.
  */
 async function highlightOption(
   page: Page,
@@ -2289,14 +2357,27 @@ async function highlightOption(
     return seen;
   };
 
-  const start = await readOpenMenu(page, field, 0);
+  let start = await readOpenMenu(page, field, 0);
   if (start.focused === -1) {
     for (let step = 0; step <= index; step++) await page.keyPress("ArrowDown");
-    return {
-      ok: true,
-      blind: true,
-      detail: "this menu marks no highlighted option, so the arrow walk could not be verified",
-    };
+    // Then look, rather than assume. See this function's JOB-125 note: some
+    // widgets mark nothing until they have been arrowed at, and this is the one
+    // moment where the difference between "unsteerable" and "not asked yet" is
+    // visible.
+    const after = await settledOn(MENU_SETTLE_TIMEOUT_MS);
+    if (after.focused === -1) {
+      return {
+        ok: true,
+        blind: true,
+        detail: "this menu marks no highlighted option, so the arrow walk could not be verified",
+      };
+    }
+    if (normalizeText(after.focusedText) === wanted) {
+      return { ok: true, blind: false, detail: `highlighted "${chosen}"` };
+    }
+    // It marks one, and it is not the chosen option. Fall through and steer it
+    // the verified way from where the highlight actually is.
+    start = after;
   }
 
   // Forward only, and modulo the real option count, because every menu this has
