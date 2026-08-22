@@ -1063,3 +1063,288 @@ describe("counting required questions rather than required elements", () => {
     expect(await countRequiredQuestions(domPage())).toBe(1);
   });
 });
+
+/**
+ * JOB-125 — the education dropdown on the same SmartRecruiters screening step,
+ * in the shape a live capture of 2026-08-22 showed it in.
+ *
+ * The question renders as `<spl-autocomplete minquerylength="0">`, and every
+ * property of it that decides the outcome is here:
+ *
+ *  · The menu is a `<div slot="menu" role="listbox">` two shadow roots away
+ *    from the input that addresses it, so the `aria-controls` lookup finds
+ *    nothing in the input's own root and the option search has to climb.
+ *  · Each row is `spl-select-option` (light DOM, holding the words) wrapping
+ *    `spl-dropdown-item`, whose shadow root holds the `div[role="option"]`
+ *    containing nothing but a slot. Reading down from the role finds "".
+ *  · **The menu opens with the first option already highlighted**, marked with
+ *    the class `active` and a roving `tabindex="0"`, while `aria-selected` is
+ *    `"false"` on all four and `aria-activedescendant` is never set at all.
+ *  · ArrowDown moves that highlight one row and does **not** wrap at the end.
+ *
+ * The last two together are the bug: with no reading that recognised `active`,
+ * `highlightOption` fell back to the WAI-ARIA convention, pressed `index + 1`
+ * times from an already-highlighted option 0, and committed the option after
+ * the chosen one. The four real options are kept verbatim because their
+ * adjacency is the evidence: "Bachelors Degree" is index 2 and the value the
+ * live run read back, "Masters/Ph.D +", is index 3.
+ */
+function splAutocomplete(
+  id: string,
+  question: string,
+  choices: string[],
+  marking: { activeClass: boolean; rovingTabindex: boolean } = {
+    activeClass: true,
+    rovingTabindex: true,
+  }
+): HTMLElement {
+  const host = document.createElement("spl-autocomplete");
+  host.setAttribute("required", "");
+  host.setAttribute("id", id);
+  host.setAttribute("minquerylength", "0");
+  host.setAttribute("aria-label", `Select ${question}`);
+  const outer = host.attachShadow({ mode: "open" });
+
+  const dropdown = document.createElement("spl-dropdown");
+  dropdown.attachShadow({ mode: "open" }).innerHTML =
+    `<div class="c-spl-dropdown"><span class="c-spl-dropdown-trigger" id="spl-0">` +
+    `<slot name="trigger"></slot></span><div class="c-spl-dropdown-menu-wrapper">` +
+    `<div class="c-spl-dropdown-menu"><slot name="menu"></slot></div></div></div>`;
+
+  // The trigger half: a light child of the dropdown, holding the real input
+  // inside yet another shadow root.
+  const trigger = document.createElement("div");
+  trigger.setAttribute("slot", "trigger");
+  trigger.className = "c-spl-autocomplete-trigger";
+  const input = document.createElement("spl-input");
+  input.setAttribute("id", id);
+  input.setAttribute("ariacontrols", `menu-${id}`);
+  input.attachShadow({ mode: "open" }).innerHTML =
+    `<div class="c-spl-input-grid"><div class="c-spl-input-wrapper">` +
+    `<input class="c-spl-input" id="${id}" type="text" role="combobox" ` +
+    `aria-controls="menu-${id}" aria-autocomplete="list" aria-required="true" ` +
+    `aria-expanded="true" data-jobinno-field="edu" /></div></div>`;
+  trigger.append(input);
+
+  // The menu half: the other light child, and the one nothing in the input's
+  // own shadow root can see.
+  const menu = document.createElement("div");
+  menu.setAttribute("slot", "menu");
+  menu.setAttribute("id", `menu-${id}`);
+  menu.setAttribute("role", "listbox");
+  menu.setAttribute("aria-labelledby", "spl-0");
+  choices.forEach((text, index) => {
+    const option = document.createElement("spl-select-option");
+    option.setAttribute("value", `v${index}`);
+    const item = document.createElement("spl-dropdown-item");
+    const first = index === 0;
+    const role = document.createElement("div");
+    role.className =
+      marking.activeClass && first ? "c-spl-dropdown-item active" : " c-spl-dropdown-item ";
+    role.setAttribute("role", "option");
+    role.setAttribute("aria-disabled", "false");
+    role.setAttribute("aria-selected", "false");
+    if (marking.rovingTabindex) role.setAttribute("tabindex", first ? "0" : "-1");
+    role.innerHTML =
+      `<spl-typography-body class="c-spl-dropdown-item__content"><slot></slot></spl-typography-body>`;
+    item.attachShadow({ mode: "open" }).append(role);
+    // The words, in the light DOM, exactly one host below the role node.
+    item.innerHTML = `<div class="c-spl-autocomplete-default-option">${text}</div>`;
+    option.append(item);
+    menu.append(option);
+  });
+
+  dropdown.append(trigger, menu);
+  outer.append(dropdown);
+  host.innerHTML = `<span slot="label-content"> ${question} </span>`;
+  return host;
+}
+
+/** The four options Avery Dennison's step actually offers, in its own order. */
+const EDUCATION_OPTIONS = [
+  "High School Diploma/GED",
+  "Associates Degree",
+  "Bachelors Degree",
+  "Masters/Ph.D +",
+];
+
+/** The record `fillRemainingFields` hands `applyFieldValue` once it has harvested. */
+function educationField(): EnumeratedField {
+  return {
+    key: "please indicate your highest education level completed?",
+    selector: `[data-jobinno-field="edu"]`,
+    activateSelectors: [`[data-jobinno-field="edu"]`],
+    label: "Please indicate your highest education level completed?",
+    kind: "combobox",
+    required: true,
+    currentValue: "",
+    options: [...EDUCATION_OPTIONS],
+    optionSelectors: [],
+    optionValues: [],
+    optionsKnown: true,
+    optionsTruncated: false,
+    maxLength: null,
+    helpText: "",
+  };
+}
+
+/**
+ * A `Page` over this jsdom that models the widget's keyboard, not this repo's
+ * idea of it: ArrowDown moves the `active` class and the roving tabindex one
+ * row forward and stops at the last one, and Enter writes the highlighted row's
+ * words into the input. A fixture that instead moved by whatever
+ * `highlightOption` assumes would pass against the broken code.
+ */
+function autocompletePage(): Page {
+  const rows = (): Element[] => {
+    const host = document.querySelector("spl-autocomplete");
+    const menu = host?.shadowRoot
+      ?.querySelector("spl-dropdown")
+      ?.querySelector('[role="listbox"]');
+    return menu === null || menu === undefined ? [] : Array.from(menu.children);
+  };
+  const roleOf = (row: Element): Element | null =>
+    row.querySelector("spl-dropdown-item")?.shadowRoot?.querySelector('[role="option"]') ?? null;
+  const highlightedAt = (): number =>
+    rows().findIndex((row) => {
+      const role = roleOf(row);
+      return (
+        role !== null &&
+        (/(?:^|\s)active(?:\s|$)/.test(role.className) || role.getAttribute("tabindex") === "0")
+      );
+    });
+  const moveTo = (next: number): void => {
+    rows().forEach((row, index) => {
+      const role = roleOf(row);
+      if (role === null) return;
+      const on = index === next;
+      role.className = on ? "c-spl-dropdown-item active" : " c-spl-dropdown-item ";
+      if (role.getAttribute("tabindex") !== null) role.setAttribute("tabindex", on ? "0" : "-1");
+    });
+  };
+  return {
+    evaluate: async (script: string) => eval(script),
+    locator: () => ({ click: async () => {}, fill: async () => {} }),
+    keyPress: async (key: string) => {
+      const at = highlightedAt();
+      if (key === "ArrowDown") {
+        // No wrap. Verified on the live board: a fifth ArrowDown on a four
+        // option menu leaves the highlight on the fourth.
+        moveTo(Math.min(at + 1, rows().length - 1));
+      } else if (key === "Enter" && at !== -1) {
+        const words = (rows()[at]?.textContent ?? "").replace(/\s+/g, " ").trim();
+        const box = document
+          .querySelector("spl-autocomplete")
+          ?.shadowRoot?.querySelector("spl-dropdown")
+          ?.querySelector("spl-input")
+          ?.shadowRoot?.querySelector("input");
+        if (box !== null && box !== undefined) (box as HTMLInputElement).value = words;
+      }
+    },
+    waitForTimeout: async () => {},
+  } as unknown as Page;
+}
+
+describe("SmartRecruiters education dropdown: the option after the chosen one", () => {
+  beforeEach(() => {
+    let now = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 10_000;
+      return now;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reads all four options through the slot the role node hides them behind", async () => {
+    // Ruling out the hypothesis this was first filed under. The option list is
+    // read correctly and always was: nothing here is blank, partial, or in a
+    // different order from the page. So the wrong option was not chosen because
+    // the right one could not be read.
+    document.body.append(
+      splAutocomplete(
+        "question_3698c9fc",
+        "Please indicate your highest education level completed?",
+        EDUCATION_OPTIONS
+      )
+    );
+
+    const harvested = await harvestOptions(autocompletePage(), educationField());
+
+    expect(harvested.options).toEqual(EDUCATION_OPTIONS);
+    expect(harvested.opened).toBe(true);
+  });
+
+  it("chooses Bachelors Degree, not the Masters/Ph.D + one row below it", async () => {
+    // The production symptom, in the wording it was reported in. Before the
+    // highlight could be read, a chosen index of 2 became three ArrowDown
+    // presses from an already-highlighted option 0 and committed option 3.
+    document.body.append(
+      splAutocomplete(
+        "question_3698c9fc",
+        "Please indicate your highest education level completed?",
+        EDUCATION_OPTIONS
+      )
+    );
+
+    const outcome = await applyFieldValue(
+      autocompletePage(),
+      educationField(),
+      "Bachelors Degree"
+    );
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("Bachelors Degree");
+    expect(outcome.readBack).not.toBe("Masters/Ph.D +");
+    // And it is steered rather than walked blind, which is the difference
+    // between a value confirmed before `Enter` and one only the read back
+    // catches afterwards.
+    expect(outcome.detail).not.toContain("no highlight");
+  });
+
+  it("lands on the first option without pressing past it", async () => {
+    // The other end of the same off-by-one, and the one no accident covers up:
+    // a chosen option 0 used to commit "Associates Degree".
+    document.body.append(
+      splAutocomplete(
+        "question_3698c9fc",
+        "Please indicate your highest education level completed?",
+        EDUCATION_OPTIONS
+      )
+    );
+
+    const outcome = await applyFieldValue(
+      autocompletePage(),
+      educationField(),
+      "High School Diploma/GED"
+    );
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("High School Diploma/GED");
+  });
+
+  it("still steers a menu whose only marker is a roving tabindex", async () => {
+    // The structural reading on its own, with the class vocabulary given
+    // nothing to match. This is the half that does not go stale the next time a
+    // board invents a word for "highlighted".
+    document.body.append(
+      splAutocomplete(
+        "question_3698c9fc",
+        "Please indicate your highest education level completed?",
+        EDUCATION_OPTIONS,
+        { activeClass: false, rovingTabindex: true }
+      )
+    );
+
+    const outcome = await applyFieldValue(
+      autocompletePage(),
+      educationField(),
+      "Bachelors Degree"
+    );
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("Bachelors Degree");
+  });
+});

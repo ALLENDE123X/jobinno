@@ -89,6 +89,13 @@ type MenuBehaviour = {
   initialHighlight?: number;
   /** A widget whose highlight simply refuses to move, for the fail-closed path. */
   highlightStuck?: boolean;
+  /**
+   * JOB-125. A widget that marks nothing until it has been arrowed at, which
+   * reads as "unsteerable" on the first look and is not. The blind fallback used
+   * to walk such a menu on the WAI-ARIA convention and press `Enter` without
+   * ever looking again.
+   */
+  marksHighlightOnlyAfterArrow?: boolean;
 };
 
 /**
@@ -105,8 +112,10 @@ type MenuBehaviour = {
  */
 function fakePage(initialMenu: MenuState, options: MenuBehaviour = {}) {
   const focusSucceeds = options.focusSucceeds ?? true;
+  const marksLate = options.marksHighlightOnlyAfterArrow ?? false;
   const exposesHighlight = options.exposesHighlight ?? false;
   const highlightStuck = options.highlightStuck ?? false;
+  let arrowed = false;
   const menu: MenuState = { ...initialMenu };
   let fieldValue = "";
   // Which option the widget itself has highlighted — the one its `Enter` would
@@ -125,7 +134,8 @@ function fakePage(initialMenu: MenuState, options: MenuBehaviour = {}) {
       // `readOpenMenuInPage` is a named function; `inPageExpression` splices its
       // own `.toString()` into the script, so its name survives verbatim.
       if (script.includes("readOpenMenuInPage")) {
-        const focused = exposesHighlight ? highlighted : -1;
+        const marks = marksLate ? arrowed : exposesHighlight;
+        const focused = marks ? highlighted : -1;
         return {
           ...menu,
           focused,
@@ -166,6 +176,7 @@ function fakePage(initialMenu: MenuState, options: MenuBehaviour = {}) {
     keyPress: vi.fn(async (key: string) => {
       keyPresses.push(key);
       if (key === "ArrowDown") {
+        arrowed = true;
         if (!highlightStuck && menu.texts.length > 0) {
           highlighted = highlighted + 1 >= menu.texts.length ? 0 : highlighted + 1;
         }
@@ -283,6 +294,31 @@ describe("a combobox suggestion is committed with the keyboard, not a click", ()
     expect(outcome.ok).toBe(true);
     expect(outcome.readBack).toBe("Bachelor's Degree");
     expect(outcome.readBack).not.toBe("Certification");
+  });
+
+  it("looks again before believing a walk it made blind", async () => {
+    // JOB-125. The blind fallback returned `ok: true` without ever re-reading,
+    // so a widget that marks nothing on open and marks something once arrowed
+    // at was walked on the WAI-ARIA convention and committed unchecked. Here
+    // that convention is wrong — the menu was already on option 0 — and three
+    // presses land back on "Atlanta, GA" through the wrap. The second look is
+    // what turns that into a correction rather than a wrong value.
+    const texts = ["Atlanta, GA", "Boston, MA", "Seattle, WA"];
+    const { page } = fakePage(
+      { texts, selectors: ["#opt-0", "#opt-1", "#opt-2"], count: 3, expanded: true },
+      { initialHighlight: 0, marksHighlightOnlyAfterArrow: true }
+    );
+
+    const outcome = await applyFieldValue(
+      page as never,
+      field({ label: "Location (City)", selector: "#loc-input", options: texts, optionsKnown: true }),
+      "Seattle, WA"
+    );
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("Seattle, WA");
+    // And it is no longer reported as unverifiable, because it was verified.
+    expect(outcome.detail).not.toContain("no highlight");
   });
 
   it("chooses nothing at all when the highlight will not move onto the option", async () => {
