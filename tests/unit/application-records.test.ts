@@ -221,6 +221,7 @@ describe("updateApplication", () => {
       confirmationText: "REF-1234",
       submittedAt: "2026-08-19T00:00:00.000Z",
       redirectUrl: "https://boards.example.com/thanks",
+      browserbaseSessionId: "bb-session-abc123",
     });
 
     const call = callTo("applications");
@@ -230,6 +231,7 @@ describe("updateApplication", () => {
       confirmation_text: "REF-1234",
       submitted_at: "2026-08-19T00:00:00.000Z",
       redirect_url: "https://boards.example.com/thanks",
+      browserbase_session_id: "bb-session-abc123",
     });
     // Two columns actinno wrote that do not exist here. Writing either would be
     // rejected by PostgREST at runtime and by nothing at compile time.
@@ -241,6 +243,23 @@ describe("updateApplication", () => {
   it("does not issue an UPDATE at all when the patch is empty", async () => {
     await updateApplication(client(), APPLICATION_ID, {});
     expect(calls).toHaveLength(0);
+  });
+
+  // JOB-045. `browserbase_session_id` follows the same "undefined means leave
+  // it out, explicit null means write null" rule every other column here does
+  // — see `patchColumns`. A run with no Browserbase session (the local
+  // Chromium fallback) has to be able to say so on the row rather than the
+  // column just being silently skipped.
+  it("writes an explicit null for browserbaseSessionId rather than omitting the column", async () => {
+    await updateApplication(client(), APPLICATION_ID, {
+      status: "form_filled",
+      browserbaseSessionId: null,
+    });
+
+    expect(callTo("applications").payload).toEqual({
+      status: "form_filled",
+      browserbase_session_id: null,
+    });
   });
 });
 
@@ -384,6 +403,30 @@ describe("recordFailure", () => {
     expect(skip.reason).toBe("captcha");
     // The status is a real one, not an intermediate "waiting for something".
     expect(callTo("applications").payload).not.toEqual({ status: "awaiting_verification" });
+  });
+
+  // JOB-045. `raw_context.browserbaseSessionId` (via `recordSkip`, above) was
+  // the only place this ever landed before — a stop's recording, not the row
+  // itself. When the caller has one to give, it now has to reach both, because
+  // `applications.browserbase_session_id` is meant to answer "which recording
+  // is THIS attempt" for a query against `applications` alone, with no join to
+  // `skip_log` required.
+  it("carries the Browserbase session id onto both the row and the skip log, when the caller has one", async () => {
+    await recordFailure(client(), {
+      applicationId: APPLICATION_ID,
+      jobId: JOB_ID,
+      ats: "greenhouse",
+      status: "form_fill_blocked",
+      message: "captcha_present: an hCaptcha widget is on the application form",
+      browserbaseSessionId: "bb-session-xyz789",
+    });
+
+    expect(callTo("applications").payload).toEqual({
+      status: "form_fill_blocked",
+      browserbase_session_id: "bb-session-xyz789",
+    });
+    const skip = callTo("skip_log").payload as { raw_context: { browserbaseSessionId: string | null } };
+    expect(skip.raw_context.browserbaseSessionId).toBe("bb-session-xyz789");
   });
 
   it("never throws over the original error when the database refuses both writes", async () => {
@@ -623,14 +666,20 @@ liveDbSuite("the columns the code writes exist in the real schema", () => {
          set status = 'submitted',
              confirmation_text = 'REF-1234',
              submitted_at = now(),
-             redirect_url = 'https://boards.example.com/thanks'
+             redirect_url = 'https://boards.example.com/thanks',
+             browserbase_session_id = 'bb-session-live-test'
        where id = ${APPLICATION_ID}`;
 
     const [application] = await sql<
-      { status: string; confirmation_text: string | null }[]
-    >`select status, confirmation_text from public.applications where id = ${APPLICATION_ID}`;
+      { status: string; confirmation_text: string | null; browserbase_session_id: string | null }[]
+    >`select status, confirmation_text, browserbase_session_id from public.applications
+       where id = ${APPLICATION_ID}`;
     expect(application?.status).toBe("submitted");
     expect(application?.confirmation_text).toBe("REF-1234");
+    // JOB-045. Nullable, and this is the migration this proves landed: the
+    // column did not exist before it, and this query would fail against a
+    // database that never got the migration applied.
+    expect(application?.browserbase_session_id).toBe("bb-session-live-test");
   });
 
   it("accepts the skip_log row the failure path writes, column for column", async () => {

@@ -506,6 +506,12 @@ export const applications = pgTable(
     confirmationText: text("confirmation_text"),
     /** Where the board sent the browser after submit, when it sent it anywhere. */
     redirectUrl: text("redirect_url"),
+    /**
+     * The Browserbase session this attempt ran in, when one existed. The
+     * durable, queryable link from a row here to the recording of that
+     * specific run — see JOB-045.
+     */
+    browserbaseSessionId: text("browserbase_session_id"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

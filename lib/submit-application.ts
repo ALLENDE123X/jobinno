@@ -1405,6 +1405,7 @@ async function runSubmitPhase(
       await updateApplication(supabase, jobApplicationId, {
         status: APPLICATION_STATUS.SUBMISSION_UNCONFIRMED,
         submittedAt: new Date().toISOString(),
+        browserbaseSessionId: session.browser.sessionId ?? null,
       });
       rowUpdated = true;
     } catch (err) {
@@ -1479,6 +1480,7 @@ async function runSubmitPhase(
     try {
       await updateApplication(supabase, jobApplicationId, {
         status: APPLICATION_STATUS.SUBMISSION_BLOCKED,
+        browserbaseSessionId: session.browser.sessionId ?? null,
       });
       rowUpdated = true;
     } catch (err) {
@@ -1556,6 +1558,7 @@ async function runSubmitPhase(
         // put, which is itself worth recording: it is the shape of a board that
         // confirms in place rather than on a thank-you page.
         redirectUrl: samePage(capture.url, wasAt) ? null : capture.url,
+        browserbaseSessionId: session.browser.sessionId ?? null,
       });
       rowUpdated = true;
       console.log(
