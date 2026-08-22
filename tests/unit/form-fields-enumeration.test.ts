@@ -27,11 +27,12 @@
  * the size checks, so `getBoundingClientRect` is stubbed to a laptop-plausible
  * size for everything except elements marked `data-test-zero-size`.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   applyFieldValue,
   enumerateFormFields,
+  harvestOptions,
   type EnumeratedField,
 } from "@/lib/form-fields";
 import { type Page } from "@browserbasehq/stagehand";
@@ -391,5 +392,277 @@ describe("a select2 widget: the real select is aria-hidden under painted chrome"
       </div>`;
     const fields = await enumerateFormFields(domPage());
     expect(fields).toHaveLength(0);
+  });
+});
+
+describe("JOB-052: one dropdown's open menu is never read as another's", () => {
+  /**
+   * Virtu's Greenhouse form, reduced to the two controls that collided.
+   *
+   * Every react-select on that page draws the same way: a real `<input
+   * role="combobox">` buried under three wrapper divs, `aria-expanded` on the
+   * input, and — only while the menu is open — an `aria-controls` pointing at
+   * the listbox it rendered. A closed one names no listbox at all, which is
+   * what left the document-wide sweep with nothing to tell one menu from
+   * another.
+   *
+   * Verified against the live board on 2026-08-22: with the "ready for
+   * full-time employment in 2028" menu open, harvesting the graduation-year
+   * control returned `Yes / No / Undecided` and never opened the real menu.
+   */
+  function reactSelect(id: string, label: string, open: { options: string[] } | null): string {
+    const menu =
+      open === null
+        ? ""
+        : `<div class="select__menu"><div class="select__menu-list" role="listbox" id="react-select-${id}-listbox">${open.options
+            .map(
+              (text, i) =>
+                `<div role="option" id="react-select-${id}-option-${i}" class="select__option">${text}</div>`
+            )
+            .join("")}</div></div>`;
+    return `
+      <div class="field-wrapper"><div class="select"><div class="select__container">
+        <label id="${id}-label" for="${id}">${label}<span aria-hidden="true">*</span></label>
+        <div class="select-shell"><div><div class="select__control"><div class="select__value-container">
+          <div class="select__input-container">
+            <input id="${id}" type="text" role="combobox" aria-labelledby="${id}-label"
+                   aria-required="true" aria-autocomplete="list" value=""
+                   aria-expanded="${open === null ? "false" : "true"}"
+                   ${open === null ? "" : `aria-controls="react-select-${id}-listbox"`} />
+          </div>
+        </div></div></div>${menu}</div>
+      </div></div></div>`;
+  }
+
+  function comboboxField(id: string, label: string): EnumeratedField {
+    return {
+      key: label.toLowerCase(),
+      selector: `[id="${id}"]`,
+      activateSelectors: [`[id="${id}"]`, `.select__control`],
+      label,
+      kind: "combobox",
+      required: true,
+      currentValue: "",
+      options: [],
+      optionSelectors: [],
+      optionValues: [],
+      optionsKnown: false,
+      optionsTruncated: false,
+      maxLength: null,
+      helpText: "",
+    };
+  }
+
+  /**
+   * A `Page` over this jsdom that models the two react-select behaviours the
+   * code under test depends on: typing filters the open menu down to what
+   * matches, and Escape clears the search box. Clicking is deliberately inert,
+   * so a test that ends up with options in hand got them from a menu that was
+   * already open rather than from one this fixture opened for it.
+   */
+  function menuPage(): Page {
+    const filter = (query: string): void => {
+      const wanted = query.trim().toLowerCase();
+      for (const option of Array.from(document.querySelectorAll('[role="option"]'))) {
+        const text = (option.textContent ?? "").trim().toLowerCase();
+        option.setAttribute("data-test-zero-size", text.includes(wanted) ? "false" : "true");
+      }
+      // react-select replaces a list that matched nothing with a notice row —
+      // a plain child of the `role="listbox"` menu list, carrying no role of
+      // its own. Modelled because that row is what the reader used to report
+      // as this control's one and only option.
+      for (const list of Array.from(document.querySelectorAll('[role="listbox"]'))) {
+        const matches = Array.from(list.querySelectorAll('[role="option"]')).filter(
+          (option) => option.getAttribute("data-test-zero-size") !== "true"
+        );
+        const existing = list.querySelector(".select__menu-notice--no-options");
+        if (matches.length === 0 && existing === null) {
+          const notice = document.createElement("div");
+          notice.className = "select__menu-notice select__menu-notice--no-options";
+          notice.textContent = "No options";
+          list.append(notice);
+        } else if (matches.length > 0 && existing !== null) {
+          existing.remove();
+        }
+      }
+    };
+    return {
+      evaluate: async (script: string) => eval(script),
+      locator: (selector: string) => ({
+        click: async () => {},
+        fill: async (value: string) => {
+          const el = document.querySelector(selector) as HTMLInputElement | null;
+          if (el !== null) el.value = value;
+          filter(value);
+        },
+      }),
+      keyPress: async (key: string) => {
+        if (key !== "Escape") return;
+        // Escape empties the search box and puts the whole list back, which is
+        // what react-select does and what makes the retry in `chooseFromMenu`
+        // see the same menu the first attempt saw.
+        for (const el of Array.from(document.querySelectorAll('input[role="combobox"]'))) {
+          (el as HTMLInputElement).value = "";
+        }
+        filter("");
+      },
+      waitForTimeout: async () => {},
+    } as unknown as Page;
+  }
+
+  beforeEach(() => {
+    // `openMenu` and `chooseFromMenuOnce` poll real wall-clock deadlines
+    // (1.5s per activation rung, 4s for a typed search). Leaping `Date.now`
+    // collapses those to a couple of iterations, the same device
+    // `tests/unit/form-fields.test.ts` uses for the same reason.
+    let now = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 10_000;
+      return now;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reads nothing for a closed control while another control's menu is open", async () => {
+    document.body.innerHTML =
+      reactSelect("question_36551313002", "What is your expected graduation year?", null) +
+      reactSelect("question_36551314002", "Will you be ready for full-time employment in 2028?", {
+        options: ["Yes", "No", "Undecided"],
+      });
+
+    const harvested = await harvestOptions(
+      menuPage(),
+      comboboxField("question_36551313002", "What is your expected graduation year?")
+    );
+
+    expect(harvested.options).toEqual([]);
+    expect(harvested.opened).toBe(false);
+  });
+
+  it("still reads its own open menu when a second menu is open too", async () => {
+    document.body.innerHTML =
+      reactSelect("question_36551313002", "What is your expected graduation year?", {
+        options: ["2026", "2027", "2028", "2029", "2030"],
+      }) +
+      reactSelect("question_36551314002", "Will you be ready for full-time employment in 2028?", {
+        options: ["Yes", "No", "Undecided"],
+      });
+
+    const harvested = await harvestOptions(
+      menuPage(),
+      comboboxField("question_36551313002", "What is your expected graduation year?")
+    );
+
+    expect(harvested.options).toEqual(["2026", "2027", "2028", "2029", "2030"]);
+  });
+
+  it("still reads a portal menu from a widget that declares no expanded state", async () => {
+    // The case the document-wide sweep exists for, and the one the fence must
+    // not take away: a menu rendered at the end of `<body>`, by a control that
+    // never sets `aria-expanded` and claims nothing through `aria-controls`.
+    document.body.innerHTML = `
+      <label id="tt-label" for="tt">Country</label>
+      <div><input id="tt" type="text" role="combobox" aria-labelledby="tt-label" value="" /></div>
+      <div class="portal-menu">
+        <div role="option">Ireland</div><div role="option">United States</div>
+      </div>`;
+
+    const harvested = await harvestOptions(menuPage(), comboboxField("tt", "Country"));
+
+    expect(harvested.options).toEqual(["Ireland", "United States"]);
+  });
+
+  it("still reads a menu its own outer wrapper declares on its behalf", async () => {
+    // One control written across two elements: the popup is declared on the
+    // painted span, the value lives on the input the field addresses. The
+    // wrapper is not a stranger and the fence must not treat it as one.
+    document.body.innerHTML = `
+      <label id="ss-label" for="ss">Name of School</label>
+      <div class="opener" role="combobox" aria-controls="ss-listbox" aria-expanded="true">
+        <input id="ss" type="text" role="combobox" aria-labelledby="ss-label" value="" />
+      </div>
+      <div id="ss-listbox" role="listbox">
+        <div role="option">Georgia Institute of Technology</div>
+        <div role="option">Georgia State University</div>
+      </div>`;
+
+    const harvested = await harvestOptions(menuPage(), comboboxField("ss", "Name of School"));
+
+    expect(harvested.options).toEqual([
+      "Georgia Institute of Technology",
+      "Georgia State University",
+    ]);
+  });
+
+  it("names the options the control offered, not the empty list a search left", async () => {
+    // The graduation-year failure end to end. 2025 is the candidate's real
+    // graduation year and is genuinely not on this menu, so the value cannot
+    // be applied — the point of the test is that the report says which five
+    // years the form does offer, rather than "offered no options", which is
+    // what a search for a year that is not there leaves behind.
+    document.body.innerHTML = reactSelect(
+      "question_36551313002",
+      "What is your expected graduation year?",
+      { options: ["2026", "2027", "2028", "2029", "2030"] }
+    );
+
+    const outcome = await applyFieldValue(
+      menuPage(),
+      comboboxField("question_36551313002", "What is your expected graduation year?"),
+      "2025"
+    );
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain(`"2025" is not one of this dropdown's options`);
+    expect(outcome.detail).toContain(`"2026"`);
+    expect(outcome.detail).toContain(`"2030"`);
+    expect(outcome.detail).not.toContain("offered no options");
+    // And the notice react-select leaves behind is not one of them.
+    expect(outcome.detail).not.toContain("No options");
+  });
+
+  it("never reports react-select's own no-options notice as an option", async () => {
+    // The listbox fallback reports a menu's rows when they carry no ARIA role,
+    // which is what SmartRecruiters needs and what react-select's "No options"
+    // row looks exactly like. Read as an option it becomes a choice nobody
+    // offered.
+    document.body.innerHTML = reactSelect(
+      "question_36551313002",
+      "What is your expected graduation year?",
+      { options: ["2026", "2027"] }
+    );
+    const list = document.querySelector('[role="listbox"]') as HTMLElement;
+    for (const option of Array.from(list.querySelectorAll('[role="option"]'))) option.remove();
+    const notice = document.createElement("div");
+    notice.className = "select__menu-notice select__menu-notice--no-options";
+    notice.textContent = "No options";
+    list.append(notice);
+
+    const harvested = await harvestOptions(
+      menuPage(),
+      comboboxField("question_36551313002", "What is your expected graduation year?")
+    );
+
+    expect(harvested.options).toEqual([]);
+  });
+
+  it("still says a menu offered nothing when it really offered nothing", async () => {
+    document.body.innerHTML = reactSelect(
+      "question_36551313002",
+      "What is your expected graduation year?",
+      { options: [] }
+    );
+
+    const outcome = await applyFieldValue(
+      menuPage(),
+      comboboxField("question_36551313002", "What is your expected graduation year?"),
+      "2025"
+    );
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("offered no options");
   });
 });
