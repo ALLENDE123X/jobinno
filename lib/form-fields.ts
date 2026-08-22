@@ -471,6 +471,70 @@ function enumerateFieldsInPage(
   };
 
   /**
+   * JOB-121. `textContent`, except that a `<slot>` contributes what is actually
+   * slotted into it.
+   *
+   * `textContent` walks the DOM tree, and a `<slot>` element has no children in
+   * that tree — the nodes it displays live in the *host's* light DOM and are
+   * pulled in only when the browser flattens the two. So on a board that builds
+   * its labels out of web components, every label read by `textContent` comes
+   * back empty. SmartRecruiters' screening step is exactly that: each question
+   * renders as
+   *
+   *   <label for="…"><span class="…-required-group">
+   *     <slot name="label-content"></slot><span aria-hidden="true">*</span>
+   *   </span></label>
+   *
+   * with the question itself sitting outside, in the host's light DOM, as
+   * `<span slot="label-content">What are your Annual Base Salary expectations?</span>`.
+   * `textContent` on that label returns `"*"` and nothing else, which is why a
+   * live capture of the step showed five required questions enumerated with an
+   * empty `label` and reported as `field-6` … `field-10`. `fillRemainingFields`
+   * drops any control whose label is `""`, so those five were read and then
+   * silently skipped — enumerated, never asked, never answered.
+   *
+   * Strictly additive: with no `<slot>` anywhere under `root` this returns
+   * exactly what `textContent` returns, so no board that works today reads
+   * differently. In particular it keeps `aria-hidden` text, unlike `visibleText`
+   * below, because the `*` a form puts in an `aria-hidden` span is often the
+   * only signal that the question is required and `requiredOf` reads it off the
+   * raw label.
+   *
+   * `skip` lets one caller exclude a subtree: see `groupQuestionText`, which
+   * needs a radio group's question without its own answers mixed into it.
+   */
+  const flatText = (
+    root: Element | ShadowRoot,
+    skip?: (element: Element) => boolean
+  ): string => {
+    const parts: string[] = [];
+    let budget = 500;
+    const walk = (node: Node): void => {
+      if (budget <= 0) return;
+      budget--;
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (node.textContent !== null) parts.push(node.textContent);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const element = node as Element;
+      if (skip !== undefined && skip(element)) return;
+      if (element.tagName.toLowerCase() === "slot") {
+        // `flatten` resolves a slot assigned into another slot, and falls back
+        // to the slot's own default content when nothing is assigned — which is
+        // what the browser paints, so it is what a person reads.
+        for (const assigned of (element as HTMLSlotElement).assignedNodes({ flatten: true })) {
+          walk(assigned);
+        }
+        return;
+      }
+      for (const child of Array.from(node.childNodes)) walk(child);
+    };
+    for (const child of Array.from(root.childNodes)) walk(child);
+    return parts.join(" ");
+  };
+
+  /**
    * The text a sighted applicant would actually see inside `root`, skipping
    * any subtree hidden via `display:none`, `visibility:hidden` or
    * `aria-hidden`.
@@ -501,6 +565,15 @@ function enumerateFieldsInPage(
       if (element.getAttribute("aria-hidden") === "true") return;
       const style = window.getComputedStyle(element);
       if (style.display === "none" || style.visibility === "hidden") return;
+      // JOB-121. A `<slot>` shows the host's light DOM, not its own children, so
+      // walking `childNodes` here reads a caption as empty on any board built out
+      // of web components. See `flatText` for the capture that made this matter.
+      if (element.tagName.toLowerCase() === "slot") {
+        for (const assigned of (element as HTMLSlotElement).assignedNodes({ flatten: true })) {
+          walk(assigned);
+        }
+        return;
+      }
       for (const child of Array.from(node.childNodes)) walk(child);
     };
     for (const child of Array.from(root.childNodes)) walk(child);
@@ -720,15 +793,17 @@ function enumerateFieldsInPage(
     if (labelledBy !== null) {
       for (const id of labelledBy.split(/\s+/)) {
         const escaped = id.replace(/["\\]/g, "\\$&");
+        // `flatText` rather than `textContent` (JOB-121): the caption is usually
+        // slotted in from the host's light DOM, and `textContent` cannot see it.
         const target = root.querySelector(`[id="${escaped}"]`);
-        if (target !== null) push(target.textContent);
+        if (target !== null) push(flatText(target));
       }
     }
     const ownId = element.getAttribute("id");
     if (bits.length === 0 && ownId !== null && ownId !== "") {
       const escaped = ownId.replace(/["\\]/g, "\\$&");
       const explicit = root.querySelector(`label[for="${escaped}"]`);
-      if (explicit !== null) push(explicit.textContent);
+      if (explicit !== null) push(flatText(explicit));
     }
     if (bits.length === 0) {
       const wrapping = element.closest("label");
@@ -895,6 +970,9 @@ function enumerateFieldsInPage(
     if (tag === "select") return "select";
     const role = (element.getAttribute("role") ?? "").toLowerCase();
     if (role === "combobox") return "combobox";
+    // JOB-121. A painted radio is a radio. Checked before the `input` bail-out
+    // below, because on a web component board there is no input to bail out to.
+    if (role === "radio") return "radio";
     if (tag !== "input") return "other";
     const type = (element.getAttribute("type") ?? "text").toLowerCase();
     if (type === "file") return "file";
@@ -938,14 +1016,117 @@ function enumerateFieldsInPage(
     return false;
   };
 
+  /** A radio, whether the browser built it or a component painted it. */
+  const isRadioElement = (element: Element): boolean => {
+    if ((element.getAttribute("role") ?? "").toLowerCase() === "radio") return true;
+    return (
+      element.tagName.toLowerCase() === "input" &&
+      (element.getAttribute("type") ?? "").toLowerCase() === "radio"
+    );
+  };
+
+  /**
+   * Is this `[role="radio"]` element decoration painted over a real
+   * `<input type="radio">` this pass is going to read anyway?
+   *
+   * The same idea as `shadowsNativeSelect`, for the same reason: a wrapper that
+   * carries the role while the native input carries the value would otherwise be
+   * reported as a second, undrivable copy of a question that is already read
+   * correctly. Never touches a native input, so a board whose radios are real
+   * inputs is unaffected by this whole branch.
+   */
+  const wrapsNativeRadio = (element: Element): boolean => {
+    if (element.tagName.toLowerCase() === "input") return false;
+    for (const candidate of deepUnder(element, 80)) {
+      if (
+        candidate.tagName.toLowerCase() === "input" &&
+        (candidate.getAttribute("type") ?? "").toLowerCase() === "radio"
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  /** Every painted radio inside `container`, in document order. */
+  const ariaRadiosIn = (container: Element): Element[] =>
+    deepUnder(container, 400).filter(
+      (element) =>
+        (element.getAttribute("role") ?? "").toLowerCase() === "radio" &&
+        element.tagName.toLowerCase() !== "input"
+    );
+
+  /**
+   * JOB-121. The element that owns a painted radio's group.
+   *
+   * A native group is found by its shared `name` attribute. A painted one has no
+   * `name` to share — SmartRecruiters' `spl-radio` carries `role="radio"`,
+   * `aria-checked` and a `value`, and nothing else — so the group is whatever
+   * ancestor holds all of them. Preferring a declared `role="radiogroup"` and
+   * falling back to "the nearest ancestor holding more than one radio" means a
+   * board that labels its group properly is read from its own markup, and one
+   * that does not is still read correctly from its shape.
+   */
+  const radioGroupContainer = (element: Element): Element | null => {
+    let node: Element | null = parentOf(element);
+    for (let depth = 0; node !== null && depth < 5; depth++) {
+      if ((node.getAttribute("role") ?? "").toLowerCase() === "radiogroup") return node;
+      if (ariaRadiosIn(node).length > 1) return node;
+      node = parentOf(node);
+    }
+    return parentOf(element);
+  };
+
+  /**
+   * What one painted radio's answer says, as a person reads it.
+   *
+   * Not `labelOf`: that ladder ends at `questionBlockText`, which for the first
+   * radio in a group returns the *question* sitting above it. Reporting a
+   * group's question as one of its own answers is how issue #94's Lever consent
+   * group came to ask "Yes, I consent" as its question, in the other direction.
+   */
+  const radioOptionName = (element: Element): string => {
+    const bits = [
+      element.getAttribute("aria-label"),
+      element.getAttribute("label"),
+      flatText(element),
+      element.shadowRoot === null ? "" : flatText(element.shadowRoot),
+      element.getAttribute("value"),
+    ];
+    for (const bit of bits) {
+      const text = clean(bit);
+      if (text !== "") return text.slice(0, 120);
+    }
+    return "";
+  };
+
+  /**
+   * A radio group's question, without its own answers folded into it.
+   *
+   * The whole group is one element on this kind of board, so the question and
+   * every option live under the same container and a plain text read returns
+   * "Are you 18 years of age or older? Yes No".
+   */
+  const groupQuestionText = (container: Element): string =>
+    clean(flatText(container, isRadioElement)).slice(0, 300);
+
   // Deliberately no `[role="listbox"]`: that is the *popup* a combobox opens,
   // not a control anybody fills in, and Greenhouse keeps one permanently in the
   // DOM for its phone-country picker. Including it produced a phantom field
   // called "List of countries" on every read of a Discord form.
+  //
+  // `[role="radio"]` is here as of JOB-121. SmartRecruiters' screening step
+  // draws every yes/no question as `<spl-radio-group>` holding `<spl-radio>`
+  // elements, and there is no `<input>`, `<select>` or `<textarea>` anywhere
+  // inside one — so three required questions on the captured step ("Are you 18
+  // years of age or older?", the visa sponsorship question, and the disability
+  // self-identification) were not merely mislabelled, they were structurally
+  // absent from this filter and could never have been enumerated.
   const nodes = everything.filter((element) => {
     const tag = element.tagName.toLowerCase();
     if (tag === "input" || tag === "select" || tag === "textarea") return true;
-    return (element.getAttribute("role") ?? "").toLowerCase() === "combobox";
+    const role = (element.getAttribute("role") ?? "").toLowerCase();
+    return role === "combobox" || role === "radio";
   });
   const seen = new Set<Element>();
   const seenRadioGroups = new Set<string>();
@@ -958,6 +1139,7 @@ function enumerateFieldsInPage(
     const kind = kindOf(element);
     if (kind === "skip") continue;
     if (kind === "combobox" && shadowsNativeSelect(element)) continue;
+    if (kind === "radio" && wrapsNativeRadio(element)) continue;
     if (!isVisible(element)) continue;
 
     const rawLabel = labelOf(element);
@@ -992,30 +1174,80 @@ function enumerateFieldsInPage(
           ? clean(all[select.selectedIndex]?.textContent)
           : "";
     } else if (kind === "radio") {
-      const name = (element as HTMLInputElement).name;
-      if (name !== "") {
-        if (seenRadioGroups.has(name)) continue;
-        seenRadioGroups.add(name);
+      // JOB-121. Two shapes of the same control. A native group is the set of
+      // `<input type="radio">` sharing a `name`; a painted one has no name to
+      // share and is the set of `[role="radio"]` under a common container.
+      const native = element.tagName.toLowerCase() === "input";
+      const name = native ? (element as HTMLInputElement).name : "";
+      let container: Element | null = null;
+      let group: Element[];
+      if (native) {
+        if (name !== "") {
+          if (seenRadioGroups.has(name)) continue;
+          seenRadioGroups.add(name);
+        }
+        // Scoped to the radio's own root: a shadow-hosted group is not in the
+        // light document, and two components can each hold a group of the same
+        // name without being one group.
+        group =
+          name === ""
+            ? [element]
+            : Array.from(
+                rootOf(element).querySelectorAll(
+                  `input[type="radio"][name="${name.replace(/["\\]/g, "\\$&")}"]`
+                )
+              );
+      } else {
+        container = radioGroupContainer(element);
+        const painted = container === null ? [] : ariaRadiosIn(container);
+        group = painted.length > 0 ? painted : [element];
       }
-      // Scoped to the radio's own root: a shadow-hosted group is not in the
-      // light document, and two components can each hold a group of the same
-      // name without being one group.
-      const group = (
-        name === ""
-          ? [element]
-          : Array.from(
-              rootOf(element).querySelectorAll(
-                `input[type="radio"][name="${name.replace(/["\\]/g, "\\$&")}"]`
-              )
-            )
-      ) as HTMLInputElement[];
       for (const radio of group) seen.add(radio);
-      options = group.slice(0, maxOptions).map((radio) => labelOf(radio) || radio.value);
+      options = group
+        .slice(0, maxOptions)
+        .map((radio) =>
+          native
+            ? labelOf(radio) || (radio as HTMLInputElement).value
+            : radioOptionName(radio)
+        );
       optionSelectors = group.slice(0, maxOptions).map((radio) => selectorOf(radio));
       optionsKnown = true;
       optionsTruncated = group.length > options.length;
-      const checked = group.find((radio) => radio.checked);
-      currentValue = checked === undefined ? "" : labelOf(checked) || checked.value;
+      const checked = group.find((radio) =>
+        native
+          ? (radio as HTMLInputElement).checked
+          : radio.getAttribute("aria-checked") === "true"
+      );
+      currentValue =
+        checked === undefined
+          ? ""
+          : native
+            ? labelOf(checked) || (checked as HTMLInputElement).value
+            : radioOptionName(checked);
+      // A painted group carries its own `required`, and the `[role="radiogroup"]`
+      // it renders into carries `aria-required`. Neither is on any individual
+      // radio, so without this every SmartRecruiters yes/no question would be
+      // read as optional and left blank on a form that refuses to submit without
+      // it — the same failure issue #94 found on Workable's hidden mirrors.
+      if (!native && container !== null) {
+        if (
+          container.hasAttribute("required") ||
+          container.getAttribute("aria-required") === "true"
+        ) {
+          required = true;
+        }
+        if (!required) {
+          for (const node of deepUnder(container, 200)) {
+            if (
+              (node.getAttribute("role") ?? "").toLowerCase() === "radiogroup" &&
+              node.getAttribute("aria-required") === "true"
+            ) {
+              required = true;
+              break;
+            }
+          }
+        }
+      }
       // The group's question is not any single radio's own label — that is
       // one of its ANSWERS. Three places boards actually put the question,
       // tried in order (issue #94): a fieldset legend; the element the
@@ -1029,8 +1261,28 @@ function enumerateFieldsInPage(
         const labelledBy = fieldset.getAttribute("aria-labelledby");
         for (const id of (labelledBy ?? "").split(/\s+/)) {
           if (groupLabel !== "" || id === "") continue;
-          const target = document.getElementById(id);
-          if (target !== null) groupLabel = clean(target.textContent);
+          // Scoped to the fieldset's own root and read with `flatText`, for the
+          // two reasons JOB-047 and JOB-121 each found the hard way: an id
+          // inside a shadow root is not in `document`, and a caption made of a
+          // `<slot>` is empty to `textContent`.
+          const target = rootOf(fieldset).querySelector(`[id="${id.replace(/["\\]/g, "\\$&")}"]`);
+          if (target !== null) groupLabel = clean(flatText(target));
+        }
+      }
+      // JOB-121. A painted group's question is written on the container, either
+      // as a name it declares or as the only text under it that is not one of
+      // its own answers.
+      if (groupLabel === "" && container !== null) {
+        for (const candidate of [
+          container.getAttribute("aria-label"),
+          container.getAttribute("label"),
+          groupQuestionText(container),
+        ]) {
+          const text = clean(candidate);
+          if (text !== "") {
+            groupLabel = text;
+            break;
+          }
         }
       }
       if (groupLabel === "") {
@@ -3726,3 +3978,4 @@ export async function applyFieldValue(
       };
   }
 }
+

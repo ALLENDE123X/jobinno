@@ -6733,6 +6733,42 @@ async function runBrowserFlow(
  * elements are folded by their shared `name` before being counted. Anything
  * without a `name` counts once on its own.
  *
+ * ── JOB-121: what this was actually counting ────────────────────────────────
+ * The `name`/`aria-labelledby` fold is the right idea and it is not enough on a
+ * board built out of web components, because there the elements carrying
+ * `required` are not siblings — they are nested inside one another. A captured
+ * read of SmartRecruiters' "Preliminary questions" step returned **29** from the
+ * original version of this script for a page holding **11** required questions,
+ * and the extra 18 were not questions at all. One dropdown is three of them:
+ *
+ *   <spl-autocomplete required name="question_…">      ← the component
+ *     #shadow-root
+ *       <spl-input required type="text">               ← its inner component
+ *         #shadow-root
+ *           <input aria-required="true">               ← the thing holding the value
+ *
+ * and one radio group is two (`<spl-radio-group required>` wrapping a
+ * `<fieldset role="radiogroup" aria-required="true">`), and the EEO block adds
+ * two more wrappers of its own. So the guard was comparing a count of *elements*
+ * against a count of *questions* and the two could never agree, on any board of
+ * this shape, however completely perception read the page.
+ *
+ * The fix is to count only the innermost required element of each nest — the one
+ * actually holding the answer — by dropping any required element that has
+ * another counted required element beneath it. "Beneath" is the **flattened**
+ * tree, not the DOM tree: a component that slots its content in
+ * (`<slot name="content">`) is the visual and semantic parent of what it
+ * displays while being no DOM ancestor of it, and reading the DOM tree alone
+ * left the EEO wrapper looking like a twelfth question. `assignedSlot` is what
+ * makes the walk follow what the browser actually paints.
+ *
+ * This is a correction to *what* is compared, not a relaxation of the
+ * comparison. `assertStepFullyRead` still throws whenever the page shows more
+ * required questions than perception read; on the captured step it now reads 11
+ * against perception's 11 rather than 29 against 8. Counting elements was never
+ * a stricter test, only a noisier one — a guard that fires on every page of a
+ * given shape says nothing about any particular page.
+ *
  * Under-counting is the safe direction, as it is for `STRUCTURAL_FLOOR_SCRIPT`
  * above: this number is compared against what perception managed to read, and a
  * floor that reads low can only make the module less likely to stop.
@@ -6740,10 +6776,9 @@ async function runBrowserFlow(
 const REQUIRED_QUESTION_SCRIPT = `(() => {
   var LIMIT = 12000;
   var seen = 0;
-  var names = new Set();
-  var anonymous = 0;
   var roots = [document];
   var visited = new Set();
+  var required = [];
   while (roots.length && seen < LIMIT) {
     var root = roots.pop();
     if (!root || visited.has(root)) continue;
@@ -6755,15 +6790,37 @@ const REQUIRED_QUESTION_SCRIPT = `(() => {
       var el = all[i];
       var inner = el.shadowRoot;
       if (inner) roots.push(inner);
-      var required = el.getAttribute('aria-required') === 'true' || el.hasAttribute('required');
-      if (!required) continue;
+      var isRequired = el.getAttribute('aria-required') === 'true' || el.hasAttribute('required');
+      if (!isRequired) continue;
       var tag = el.tagName.toLowerCase();
       var type = (el.getAttribute('type') || '').toLowerCase();
       if (tag === 'input' && (type === 'hidden' || type === 'submit' || type === 'button')) continue;
       if (el.getAttribute('aria-hidden') === 'true') continue;
-      var name = el.getAttribute('name') || el.getAttribute('aria-labelledby') || '';
-      if (name) names.add(name); else anonymous++;
+      required.push(el);
     }
+  }
+  // Anything with another required element under it in the flattened tree is a
+  // wrapper around a question, not a question.
+  var counted = new Set(required);
+  var wrappers = new Set();
+  for (var k = 0; k < required.length; k++) {
+    var node = required[k];
+    for (var d = 0; d < 24; d++) {
+      var up = node.assignedSlot;
+      if (!up) up = node.parentElement;
+      if (!up) { var host = node.getRootNode(); up = (host && host.host) ? host.host : null; }
+      if (!up) break;
+      if (counted.has(up)) wrappers.add(up);
+      node = up;
+    }
+  }
+  var names = new Set();
+  var anonymous = 0;
+  for (var m = 0; m < required.length; m++) {
+    var control = required[m];
+    if (wrappers.has(control)) continue;
+    var name = control.getAttribute('name') || control.getAttribute('aria-labelledby') || '';
+    if (name) names.add(name); else anonymous++;
   }
   return names.size + anonymous;
 })()`;
@@ -6775,7 +6832,7 @@ const REQUIRED_QUESTION_SCRIPT = `(() => {
  * evidence" rather than as "none": a guard that treats a failed measurement as a
  * clean bill of health is not a guard.
  */
-async function countRequiredQuestions(page: Page): Promise<number | null> {
+export async function countRequiredQuestions(page: Page): Promise<number | null> {
   try {
     const count = await page.evaluate(REQUIRED_QUESTION_SCRIPT);
     return typeof count === "number" && Number.isFinite(count) ? count : null;
