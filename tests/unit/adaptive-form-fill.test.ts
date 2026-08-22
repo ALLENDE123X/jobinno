@@ -1176,6 +1176,156 @@ describe("degree equivalence stays inside degree fields", () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The real "Citizenship Status" question from a live Greenhouse posting, in the
+// wording that form actually renders. Every option carries the enumeration
+// marker its author typed, and the first option says the same thing the stored
+// `citizenship_status` says in different words and a different order. Both of
+// those defeated the matching, so a question this candidate had answered at
+// intake came back as `needs_attestation`.
+const FREEFORM_CITIZENSHIP_OPTIONS = [
+  "1) U.S. citizen or national of the United States",
+  "2) U.S. lawful permanent resident (green card holder)",
+  "3) Refugee under 8 U.S.C 1157",
+  "4) Asylee under 8 U.S.C 1158",
+  "5) Authorized to work in the United States under the Deferred Action For Childhood Arrivals (DACA Program)",
+  "6) Other (please explain)",
+];
+
+describe("a numbered citizenship option is matched, and only by the citizenship fact", () => {
+  const citizenshipField = (options = FREEFORM_CITIZENSHIP_OPTIONS) =>
+    field({ label: "Citizenship Status", kind: "combobox", options, optionsKnown: true });
+
+  it("chooses the option the stored status names, marker and all", () => {
+    const resolution = resolveDecision(
+      citizenshipField(),
+      decision({
+        fieldKey: "citizenship status",
+        decision: "answer",
+        value: "1) U.S. citizen or national of the United States",
+        sourceFact: "citizenshipStatus",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("1) U.S. citizen or national of the United States");
+    }
+  });
+
+  it("chooses it when the proposal leaves the marker off", () => {
+    const resolution = resolveDecision(
+      citizenshipField(),
+      decision({
+        fieldKey: "citizenship status",
+        decision: "answer",
+        value: "U.S. citizen or national of the United States",
+        sourceFact: "citizenshipStatus",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("1) U.S. citizen or national of the United States");
+    }
+  });
+
+  it("still refuses a status the stored one disagrees with", () => {
+    // A citizen is not a lawful permanent resident, and the option saying so
+    // must not become choosable just because the wording gap was closed.
+    const resolution = resolveDecision(
+      citizenshipField(),
+      decision({
+        fieldKey: "citizenship status",
+        decision: "answer",
+        value: "2) U.S. lawful permanent resident (green card holder)",
+        sourceFact: "citizenshipStatus",
+      }),
+      facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("still refuses an option that names no status at all", () => {
+    const resolution = resolveDecision(
+      citizenshipField(),
+      decision({
+        fieldKey: "citizenship status",
+        decision: "answer",
+        value: "6) Other (please explain)",
+        sourceFact: "citizenshipStatus",
+      }),
+      facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("never reads a negated option as agreeing with the stored status", () => {
+    const resolution = resolveDecision(
+      citizenshipField(["1) A U.S. citizen or national", "2) Not a U.S. citizen or national"]),
+      decision({
+        fieldKey: "citizenship status",
+        decision: "answer",
+        value: "2) Not a U.S. citizen or national",
+        sourceFact: "citizenshipStatus",
+      }),
+      facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("still refuses a fact that is not about citizenship at all", () => {
+    // The allow-list this must not weaken. Closing the wording gap for
+    // `citizenshipStatus` may not open the question to anything else.
+    const resolution = resolveDecision(
+      citizenshipField(),
+      decision({
+        fieldKey: "citizenship status",
+        decision: "answer",
+        value: "1) U.S. citizen or national of the United States",
+        sourceFact: "willingToRelocate",
+      }),
+      facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("does not let citizenship equivalence run on a field that is not asking", () => {
+    // The same double gate degree equivalence has: the fact being a citizenship
+    // status is not enough, the FIELD has to be asking about one.
+    const resolution = resolveDecision(
+      field({ label: "Degree", kind: "combobox", options: FREEFORM_CITIZENSHIP_OPTIONS, optionsKnown: true }),
+      decision({
+        fieldKey: "degree",
+        decision: "answer",
+        value: "1) U.S. citizen or national of the United States",
+        sourceFact: "citizenshipStatus",
+      }),
+      facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("leaves an option that merely starts with digits alone", () => {
+    // The marker rule has to be narrow enough that the ACT list on this same
+    // form survives it: "36 out of 36" starts with a number and is not numbered.
+    const options = ["Did not take", "36 out of 36", "35 out of 36", "34 out of 36"];
+    const resolution = resolveDecision(
+      field({ label: "ACT Score", kind: "combobox", options, optionsKnown: true }),
+      decision({
+        fieldKey: "act score",
+        decision: "infer",
+        value: "35 out of 36",
+        why: "from the resume",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("35 out of 36");
+  });
+});
+
 // ── CONFIRM_EMAIL_RE ────────────────────────────────────────────────────────
 //
 // Confirms that all the common "re-enter your email" label patterns the Workable

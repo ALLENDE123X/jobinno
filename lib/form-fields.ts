@@ -857,9 +857,24 @@ type OpenMenu = {
   count: number;
   /** The control's own `aria-expanded`. True with no options = an async search box. */
   expanded: boolean;
+  /**
+   * Where the widget's own highlight sits, as an index into the full option
+   * list rather than into the capped `texts`, or -1 when the menu marks no
+   * option as highlighted (or marks it in a way this cannot read).
+   */
+  focused: number;
+  /** The highlighted option's own text, so a caller can see what Enter would commit. */
+  focusedText: string;
 };
 
-const NO_MENU: OpenMenu = { texts: [], selectors: [], count: 0, expanded: false };
+const NO_MENU: OpenMenu = {
+  texts: [],
+  selectors: [],
+  count: 0,
+  expanded: false,
+  focused: -1,
+  focusedText: "",
+};
 
 /**
  * Reads the options of the menu belonging to **this** control.
@@ -932,22 +947,48 @@ function readOpenMenuInPage(controlSelector: string, maxOptions: number): OpenMe
     nodes = Array.from(document.querySelectorAll('[role="option"]')).filter(visible);
   }
 
-  const kept = nodes.slice(0, maxOptions);
+  // Which option the widget itself considers highlighted — the one its own
+  // `Enter` would commit. Three readings, most authoritative first, because no
+  // single one of them is present on every widget: Greenhouse's react-select
+  // leaves `aria-activedescendant` empty and marks the option with a
+  // `--is-focused` class instead, while a hand-rolled ARIA combobox does the
+  // opposite. -1 when none of the three says anything, which the caller treats
+  // as "unsteerable" rather than as "option 0".
+  const activeId = control?.getAttribute("aria-activedescendant") ?? "";
+  let focused = -1;
+  if (activeId !== "") focused = nodes.findIndex((node) => node.id === activeId);
+  if (focused === -1) {
+    focused = nodes.findIndex((node) =>
+      /(?:^|[-_ ])(?:is[-_])?(?:focused|highlighted)(?:$|[-_ ])/i.test(
+        typeof node.className === "string" ? node.className : ""
+      )
+    );
+  }
+  if (focused === -1) {
+    focused = nodes.findIndex((node) => node.getAttribute("aria-selected") === "true");
+  }
+
+  // `maxOptions` of 0 is the deliberate cheap read: the highlight without the
+  // per-option xpath walk, for the polling that steers it onto a chosen option.
+  const kept = nodes.slice(0, Math.max(0, maxOptions));
   return {
     texts: kept.map((node) => clean(node.textContent)),
     selectors: kept.map((node) => xpathOf(node)),
     count: nodes.length,
     expanded,
+    focused,
+    focusedText: focused === -1 ? "" : clean(nodes[focused]?.textContent),
   };
 }
 
-async function readOpenMenu(page: Page, field: EnumeratedField): Promise<OpenMenu> {
+async function readOpenMenu(
+  page: Page,
+  field: EnumeratedField,
+  maxOptions: number = MAX_OPTIONS_REPORTED
+): Promise<OpenMenu> {
   try {
     const raw = await page.evaluate(
-      inPageExpression(
-        readOpenMenuInPage,
-        `${jsLiteral(field.selector)}, ${MAX_OPTIONS_REPORTED}`
-      )
+      inPageExpression(readOpenMenuInPage, `${jsLiteral(field.selector)}, ${maxOptions}`)
     );
     const failure = inPageError(raw);
     if (failure !== null) {
@@ -961,6 +1002,8 @@ async function readOpenMenu(page: Page, field: EnumeratedField): Promise<OpenMen
       selectors: Array.isArray(result.selectors) ? result.selectors.map(String) : [],
       count: typeof result.count === "number" ? result.count : result.texts.length,
       expanded: result.expanded === true,
+      focused: typeof result.focused === "number" ? result.focused : -1,
+      focusedText: typeof result.focusedText === "string" ? result.focusedText : "",
     };
   } catch {
     return NO_MENU;
@@ -1104,6 +1147,109 @@ async function scrollIfOffscreen(page: Page, selector: string): Promise<void> {
   } catch {
     // Not worth a line in any report.
   }
+}
+
+/**
+ * Moves a menu's own highlight onto the option at `index`, and reports whether
+ * it actually got there.
+ *
+ * ── Why this is not just "press ArrowDown index + 1 times" ──────────────────
+ * That is what it used to be, on the reasoning quoted at the call site: the
+ * WAI-ARIA combobox pattern opens with nothing highlighted, so the first
+ * ArrowDown lands on option 0. The pattern says so and the comment was right
+ * about the pattern. It is wrong about react-select, which is what Greenhouse
+ * draws every one of its dropdowns with, and which opens with **option 0
+ * already highlighted**. One ArrowDown there moves to option 1, so every
+ * choice this made on a Greenhouse form was the option one past the right one.
+ *
+ * That is not a hypothetical. It is the whole of the 2026-08-22 read-back
+ * failure, verified against the live DOM of a real posting: the degree chosen
+ * one past "Bachelor's Degree" is "Certification", the ACT score chosen one
+ * past "Did not take" is "36 out of 36", and a "Yes" one past on a two-option
+ * question is "No" — which is exactly what those six fields read back as.
+ *
+ * So the position is no longer assumed. It is read off the widget, the walk is
+ * the difference between where the highlight is and where it needs to be, and
+ * the highlight is read again afterwards to confirm it arrived. A widget that
+ * exposes no highlight at all falls back to the old convention, since that is
+ * still the right guess for the pattern it was written from, and the read-back
+ * after `Enter` is still there to catch it being wrong.
+ *
+ * The one thing this will not do is press `Enter` on an option it could not
+ * confirm is the chosen one. Committing the wrong option is the failure being
+ * fixed, and doing it silently is worse than reporting that nothing was chosen.
+ */
+async function highlightOption(
+  page: Page,
+  field: EnumeratedField,
+  index: number,
+  chosen: string
+): Promise<{ ok: boolean; blind: boolean; detail: string }> {
+  const wanted = normalizeText(chosen);
+
+  /**
+   * Polls the highlight briefly, because a keystroke and a re-render race.
+   *
+   * The budget is a parameter because the two callers below want different
+   * ones: the walk that should have landed it is worth waiting on, while each
+   * step of the one-at-a-time fallback is not — sixty steps each waiting out a
+   * full settle budget would be a minute and a half of nothing happening.
+   */
+  const settledOn = async (budgetMs: number): Promise<OpenMenu> => {
+    let seen = await readOpenMenu(page, field, 0);
+    const deadline = Date.now() + budgetMs;
+    while (normalizeText(seen.focusedText) !== wanted && Date.now() < deadline) {
+      await page.waitForTimeout(MENU_POLL_MS);
+      seen = await readOpenMenu(page, field, 0);
+    }
+    return seen;
+  };
+
+  const start = await readOpenMenu(page, field, 0);
+  if (start.focused === -1) {
+    for (let step = 0; step <= index; step++) await page.keyPress("ArrowDown");
+    return {
+      ok: true,
+      blind: true,
+      detail: "this menu marks no highlighted option, so the arrow walk could not be verified",
+    };
+  }
+
+  // Forward only, and modulo the real option count, because every menu this has
+  // been run against wraps from the last option back to the first. A menu that
+  // does not wrap simply stalls on its last option and is caught below.
+  const total = start.count > 0 ? start.count : start.texts.length + 1;
+  const forward = (((index - start.focused) % total) + total) % total;
+  for (let step = 0; step < forward; step++) await page.keyPress("ArrowDown");
+
+  let now = await settledOn(MENU_SETTLE_TIMEOUT_MS);
+  if (normalizeText(now.focusedText) === wanted) {
+    return { ok: true, blind: false, detail: `highlighted "${chosen}"` };
+  }
+
+  // The arithmetic did not land it. Rather than give up on a widget whose
+  // ordering this does not model, walk it one option at a time and stop the
+  // moment the highlight reads what was chosen. Bounded by the option count, so
+  // a menu that never highlights it is a report rather than a spin.
+  for (let step = 0; step < total; step++) {
+    await page.keyPress("ArrowDown");
+    now = await settledOn(MENU_POLL_MS);
+    if (normalizeText(now.focusedText) === wanted) {
+      return {
+        ok: true,
+        blind: false,
+        detail: `highlighted "${chosen}" after stepping through the menu`,
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    blind: false,
+    detail:
+      `the menu's highlight could not be moved onto ${JSON.stringify(chosen.slice(0, 80))} — ` +
+      `it reads ${JSON.stringify(now.focusedText.slice(0, 80))} instead. Nothing was chosen.`,
+  };
 }
 
 /** Closes whatever menu is open, without pressing anything that could submit. */
@@ -1574,11 +1720,9 @@ async function chooseFromMenuOnce(
   // which is what a real keyboard user does and what this control was built
   // to answer to.
   //
-  // WAI-ARIA's combobox pattern starts with nothing highlighted, so the first
-  // `ArrowDown` selects option 0 and the (index + 1)th selects option `index`.
-  // Every combobox this file has been run against follows that convention;
-  // one that does not would report a bare mismatch below rather than a wrong
-  // silent choice, because `readBack` is still checked against `chosen`.
+  // How far to walk is asked of the widget rather than assumed from the ARIA
+  // pattern — see `highlightOption`, which is where the off-by-one that chose
+  // the option after the right one on every Greenhouse dropdown was fixed.
   //
   // Failing closed on `focusElement` itself, rather than firing the arrow keys
   // regardless: an `ArrowDown`/`Enter` sequence goes to whatever element the
@@ -1595,9 +1739,13 @@ async function chooseFromMenuOnce(
       detail: "could not focus the control before selecting the option with the keyboard",
     };
   }
+  let blindWalk = false;
   try {
-    for (let step = 0; step <= index; step++) {
-      await page.keyPress("ArrowDown");
+    const walk = await highlightOption(page, field, index, chosen);
+    blindWalk = walk.blind;
+    if (!walk.ok) {
+      await closeMenu(page);
+      return { ok: false, readBack: await readFieldValue(page, field), detail: walk.detail };
     }
     await page.keyPress("Enter");
   } catch (err) {
@@ -1621,7 +1769,13 @@ async function chooseFromMenuOnce(
   const shown = normalizeText(readBack);
   const wantedOption = normalizeText(chosen);
   if (shown === wantedOption) {
-    return { ok: true, readBack, detail: `chose "${chosen}" and read it back` };
+    return {
+      ok: true,
+      readBack,
+      detail:
+        `chose "${chosen}" and read it back` +
+        (blindWalk ? " (the menu exposed no highlight, so only the read back confirms it)" : ""),
+    };
   }
   // Some widgets display an abbreviation of what was chosen rather than the
   // option's own words — Greenhouse's phone-country picker shows a flag and

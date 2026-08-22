@@ -60,6 +60,29 @@ function field(over: Partial<EnumeratedField> & { label: string; selector: strin
 type MenuState = { texts: string[]; selectors: string[]; count: number; expanded: boolean };
 
 /**
+ * How the fixture's menu behaves, beyond what is in it.
+ *
+ * `exposesHighlight` is the axis the 2026-08-22 Greenhouse fix turned on. A
+ * menu that marks its highlighted option (react-select does, with a
+ * `--is-focused` class) lets `highlightOption` steer by the difference between
+ * where the highlight is and where it needs to be. One that marks nothing
+ * leaves it walking blind on the WAI-ARIA convention, which is the older
+ * behaviour and still has to work.
+ *
+ * `initialHighlight` is the other half: react-select opens with option 0
+ * already highlighted, a pure ARIA combobox opens with nothing highlighted, and
+ * assuming the second while driving the first is precisely what chose the
+ * option after the right one on every dropdown of a real posting.
+ */
+type MenuBehaviour = {
+  focusSucceeds?: boolean;
+  exposesHighlight?: boolean;
+  initialHighlight?: number;
+  /** A widget whose highlight simply refuses to move, for the fail-closed path. */
+  highlightStuck?: boolean;
+};
+
+/**
  * A fake `Page`. `menu` is mutable and read live by every `evaluate` call that
  * matches `readOpenMenuInPage`'s own script, so a test can change what the
  * "page" reports mid-flow the same way `.click()` or `.fill()` below do.
@@ -71,18 +94,19 @@ type MenuState = { texts: string[]; selectors: string[]; count: number; expanded
  * means to test. Defaults to `true` for that reason; the failure path gets its
  * own test below with this set to `false`.
  */
-function fakePage(initialMenu: MenuState, options: { focusSucceeds?: boolean } = {}) {
+function fakePage(initialMenu: MenuState, options: MenuBehaviour = {}) {
   const focusSucceeds = options.focusSucceeds ?? true;
+  const exposesHighlight = options.exposesHighlight ?? false;
+  const highlightStuck = options.highlightStuck ?? false;
   const menu: MenuState = { ...initialMenu };
   let fieldValue = "";
-  // WAI-ARIA's combobox pattern starts with nothing highlighted, which is the
-  // convention `chooseFromMenuOnce` now relies on: the (index + 1)th
-  // `ArrowDown` lands on option `index`, and `Enter` commits whatever is
-  // highlighted at that point. This fixture's own keyboard handling mirrors
-  // that convention rather than the production code, so a real widget that
-  // disagreed with it would show up here as a wrong `readBack`, not a green
-  // test that proves nothing.
-  let highlighted = -1;
+  // Which option the widget itself has highlighted — the one its `Enter` would
+  // commit. This fixture's own keyboard handling models the widget rather than
+  // the production code, so a real widget that disagreed with what
+  // `highlightOption` assumes shows up here as a wrong `readBack` rather than
+  // as a green test that proves nothing. It wraps at the end of the list
+  // because every menu this has been run against does.
+  let highlighted = options.initialHighlight ?? -1;
   const locatorClicks: Record<string, number> = {};
   const locatorFills: string[] = [];
   const keyPresses: string[] = [];
@@ -91,7 +115,14 @@ function fakePage(initialMenu: MenuState, options: { focusSucceeds?: boolean } =
     evaluate: vi.fn(async (script: string) => {
       // `readOpenMenuInPage` is a named function; `inPageExpression` splices its
       // own `.toString()` into the script, so its name survives verbatim.
-      if (script.includes("readOpenMenuInPage")) return { ...menu };
+      if (script.includes("readOpenMenuInPage")) {
+        const focused = exposesHighlight ? highlighted : -1;
+        return {
+          ...menu,
+          focused,
+          focusedText: focused === -1 ? "" : (menu.texts[focused] ?? ""),
+        };
+      }
       // `readFieldValue`'s own script, unique among these for reading the
       // react-select mirror input pattern.
       if (script.includes("aria-hidden")) return fieldValue;
@@ -126,7 +157,9 @@ function fakePage(initialMenu: MenuState, options: { focusSucceeds?: boolean } =
     keyPress: vi.fn(async (key: string) => {
       keyPresses.push(key);
       if (key === "ArrowDown") {
-        highlighted = Math.min(highlighted + 1, menu.texts.length - 1);
+        if (!highlightStuck && menu.texts.length > 0) {
+          highlighted = highlighted + 1 >= menu.texts.length ? 0 : highlighted + 1;
+        }
       } else if (key === "Enter" && highlighted >= 0 && highlighted < menu.texts.length) {
         fieldValue = menu.texts[highlighted]!;
       }
@@ -180,13 +213,89 @@ describe("a combobox suggestion is committed with the keyboard, not a click", ()
       "Seattle, WA"
     );
 
-    expect(outcome).toEqual({ ok: true, readBack: "Seattle, WA", detail: 'chose "Seattle, WA" and read it back' });
+    expect(outcome).toEqual({
+      ok: true,
+      readBack: "Seattle, WA",
+      detail:
+        'chose "Seattle, WA" and read it back ' +
+        "(the menu exposed no highlight, so only the read back confirms it)",
+    });
     // Index 2, so three ArrowDown presses (WAI-ARIA's combobox pattern starts
     // with nothing highlighted) and then one Enter.
     expect(keyPresses).toEqual(["ArrowDown", "ArrowDown", "ArrowDown", "Enter"]);
     // Never a click on anything — the whole point of this fix, and the menu
     // here starts already expanded so not even the activation click ran.
     expect(locatorClicks).toEqual({});
+  });
+
+  it("walks the difference when the menu opens with an option already highlighted", async () => {
+    // The 2026-08-22 Greenhouse bug, at its own level. react-select — which is
+    // what Greenhouse draws every dropdown with — opens with option 0 already
+    // highlighted, so the (index + 1) presses above land one option PAST the
+    // one that was chosen. Here that would have committed a value nobody chose;
+    // steering by the menu's own highlight walks the difference instead.
+    const texts = ["Atlanta, GA", "Boston, MA", "Seattle, WA"];
+    const { page, keyPresses } = fakePage(
+      { texts, selectors: ["#opt-0", "#opt-1", "#opt-2"], count: 3, expanded: true },
+      { exposesHighlight: true, initialHighlight: 0 }
+    );
+
+    const outcome = await applyFieldValue(
+      page as never,
+      field({ label: "Location (City)", selector: "#loc-input", options: texts, optionsKnown: true }),
+      "Seattle, WA"
+    );
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("Seattle, WA");
+    // Two presses, not three: the highlight was already on option 0.
+    expect(keyPresses).toEqual(["ArrowDown", "ArrowDown", "Enter"]);
+  });
+
+  it("chooses the degree that was decided on, not the option after it", async () => {
+    // The production symptom this fix exists for, in the wording it was
+    // reported in: on four separate runs against a real Greenhouse posting the
+    // read back found `degree` holding "Certification" when the decision layer
+    // had chosen "Bachelor's Degree" — the option immediately after it in that
+    // form's own list. Same shape produced "36 out of 36" for a chosen "Did not
+    // take" and "No" for a chosen "Yes".
+    const texts = ["Associate's Degree", "Bachelor's Degree", "Certification", "High School"];
+    const { page } = fakePage(
+      { texts, selectors: ["#d-0", "#d-1", "#d-2", "#d-3"], count: 4, expanded: true },
+      { exposesHighlight: true, initialHighlight: 0 }
+    );
+
+    const outcome = await applyFieldValue(
+      page as never,
+      field({ label: "Degree", selector: "#degree--0", options: texts, optionsKnown: true }),
+      "Bachelor's Degree"
+    );
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("Bachelor's Degree");
+    expect(outcome.readBack).not.toBe("Certification");
+  });
+
+  it("chooses nothing at all when the highlight will not move onto the option", async () => {
+    // Fail closed. A widget whose highlight this cannot steer is a widget whose
+    // `Enter` would commit some other option, and committing the wrong option
+    // silently is the failure being fixed — so nothing is committed and the
+    // caller is told, which routes the field to the ordinary escalation path.
+    const texts = ["Atlanta, GA", "Boston, MA", "Seattle, WA"];
+    const { page, keyPresses } = fakePage(
+      { texts, selectors: ["#opt-0", "#opt-1", "#opt-2"], count: 3, expanded: true },
+      { exposesHighlight: true, initialHighlight: 0, highlightStuck: true }
+    );
+
+    const outcome = await applyFieldValue(
+      page as never,
+      field({ label: "Location (City)", selector: "#loc-input", options: texts, optionsKnown: true }),
+      "Seattle, WA"
+    );
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("could not be moved onto");
+    expect(keyPresses).not.toContain("Enter");
   });
 
   it("fails closed, with no keystrokes sent, when focus never lands on the control", async () => {
