@@ -331,6 +331,21 @@ export const profiles = pgTable(
      */
     lastSearchRequestedAt: timestamp("last_search_requested_at", { withTimezone: true }),
 
+    /**
+     * Browserbase Context ID for this user (issue #88, `BROWSERBASE_CONTEXTS_ENABLED`).
+     *
+     * A Browserbase Context carries cookies, localStorage and other browser
+     * state across sessions, so re-running on the same board does not look like
+     * a cold first visit. Created once per user via the Browserbase Contexts
+     * REST API and stored here so every subsequent session can reuse it.
+     *
+     * Null until the first run that has `BROWSERBASE_CONTEXTS_ENABLED=1` set
+     * and the feature has been activated for that user. Not user-writable: only
+     * the pipeline (service role) sets it, following the same convention as
+     * `stripe_customer_id` above.
+     */
+    browserbaseContextId: text("browserbase_context_id"),
+
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

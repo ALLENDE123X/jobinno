@@ -535,6 +535,64 @@ const CONTENT_ATTACH_TIMEOUT_MS = 20_000;
 const DOM_STABLE_POLL_MS = 500;
 
 /**
+ * Random delay between successive field interactions.
+ *
+ * Breaks the constant-cadence typing pattern that bot detectors key on. The
+ * 300–1200 ms window is wide enough to look human without slowing the run to
+ * the point where the session timeout becomes a concern.
+ */
+function randomInteractionDelayMs(): number {
+  return Math.floor(Math.random() * 901) + 300; // 300–1200 ms
+}
+
+/**
+ * Random dwell time on the warm-up page before navigating to the specific job
+ * URL. Two to four seconds — enough to register as a human browsing the
+ * careers site, not long enough to idle past a Stagehand DOM-settle timeout.
+ */
+function warmUpDwellMs(): number {
+  return Math.floor(Math.random() * 2001) + 2000; // 2000–4000 ms
+}
+
+/**
+ * Derives a "warm-up" URL from a job application URL by stripping trailing
+ * path segments that look like IDs (numeric, UUID) or the literal "apply".
+ *
+ * Exported for unit testing.
+ *
+ * Examples:
+ *   https://company.workable.com/jobs/123456/apply → https://company.workable.com/jobs
+ *   https://boards.greenhouse.io/acme/jobs/12345   → https://boards.greenhouse.io/acme/jobs
+ *   https://jobs.lever.co/acme/abc12345-1234-…     → https://jobs.lever.co/acme
+ *
+ * Returns the original URL unchanged if no strippable suffix is found — the
+ * caller checks for sameness and skips the warm-up navigation in that case.
+ */
+export function deriveWarmUpUrl(applyUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(applyUrl);
+  } catch {
+    return applyUrl;
+  }
+  const segments = url.pathname.split("/").filter(Boolean);
+  while (segments.length > 0) {
+    const last = segments[segments.length - 1];
+    if (
+      /^apply$/i.test(last) || // literal "apply" suffix
+      /^\d+$/.test(last) || // numeric ID
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(last) // UUID v4
+    ) {
+      segments.pop();
+    } else {
+      break;
+    }
+  }
+  if (segments.length === 0) return url.origin;
+  return `${url.origin}/${segments.join("/")}`;
+}
+
+/**
  * How long the page is given to stop changing. Bounded rather than open ended:
  * a board that is still mounting new fields this long after its content attached
  * is not going to be read correctly by waiting longer, and every extra second
@@ -1862,6 +1920,21 @@ async function reachApplicationForm(
   let pageReads = 1;
 
   if (signals === null || !signals.applicationFormPresent) {
+    // ── Warm-up navigation (issue #88) ────────────────────────────────────────
+    // Visit the company's careers/jobs page for 2–4 seconds before the specific
+    // job URL. A cold direct-navigate to a deep apply link is a clear bot signal;
+    // arriving from a parent page that we visibly spent time on is not.
+    const warmUpUrl = deriveWarmUpUrl(state.applyUrl);
+    if (warmUpUrl !== state.applyUrl) {
+      console.log(`${LOG} warm-up navigation → ${warmUpUrl}`);
+      try {
+        await session.page.goto(warmUpUrl, { timeout: NAVIGATION_TIMEOUT_MS });
+        await sleep(warmUpDwellMs());
+      } catch {
+        // Best-effort: if the careers page is unreachable, proceed to the job URL.
+        console.warn(`${LOG} warm-up navigation to ${warmUpUrl} failed — proceeding to job URL`);
+      }
+    }
     console.log(`${LOG} navigate → ${state.applyUrl}`);
     await session.page.goto(state.applyUrl, { timeout: NAVIGATION_TIMEOUT_MS });
     signals = await readFormSignals(session);
@@ -2200,6 +2273,7 @@ async function fillFields(
     }
     const check = checked.check;
 
+    await sleep(randomInteractionDelayMs());
     const used = await typeInto(session, url, field.instruction, field.value);
     const readBack = await readControlValue(session.page, used.selector);
     const matches =
@@ -3765,6 +3839,7 @@ async function fillRemainingFields(
     // authorized to work in the US". Still only when exactly one option contains
     // what they said — see `chooseFromMenu` — so an ambiguous answer comes back
     // to them rather than being resolved for them.
+    await sleep(randomInteractionDelayMs());
     const outcome = await applyFieldValue(session.page, field, supplied, {
       allowContains: OPTION_KINDS.has(field.kind),
     });
@@ -3885,6 +3960,7 @@ async function fillRemainingFields(
       declined = resolution.declined;
     }
 
+    await sleep(randomInteractionDelayMs());
     const outcome = await applyFieldValue(session.page, field, value, {
       // No fixed option list means this is a search control that answers a
       // query rather than a menu with a fixed set — see `chooseFromMenu`.

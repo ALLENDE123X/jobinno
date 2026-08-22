@@ -83,6 +83,7 @@ import {
 import {
   closeBrowserSession,
   samePage,
+  sleep,
   tryResolveAction,
   type BrowserSession,
 } from "@/lib/stagehand-session";
@@ -126,6 +127,14 @@ const INSTRUCTIONS = Object.freeze({
   SUBMIT_APPLICATION:
     "the button that submits the completed job application to the employer, labelled " +
     'something like "Submit Application", "Submit" or "Send Application"',
+  /**
+   * Issue #88: SmartRecruiters shows an intermediate "Review application" /
+   * "Review your application" page before the final submit button. This
+   * instruction clicks through that page to reach the real submit screen.
+   */
+  SMARTRECRUITERS_REVIEW:
+    'the button that advances to the next step, labelled something like "Review application", ' +
+    '"Review your application", "Review", or "Continue"',
 } as const);
 
 const CONFIRMATION_EXTRACT_INSTRUCTION =
@@ -1765,6 +1774,29 @@ async function runSubmitPhase(
       });
     }
 
+    // ── SmartRecruiters intermediate review step (issue #88) ────────────────
+    // SmartRecruiters inserts a "Review application" page between the filled
+    // form and the final submit button. Clicking through it is reversible —
+    // nothing is sent to the employer — so it happens here, before the point
+    // of no return, while a throw is still a safe stop.
+    if (row.ats === "smartrecruiters") {
+      try {
+        await session.stagehand.act(INSTRUCTIONS.SMARTRECRUITERS_REVIEW, {
+          page: session.page,
+        });
+        console.log(`${LOG} clicked through SmartRecruiters review step`);
+      } catch {
+        // The review step is not always present (some SmartRecruiters boards
+        // go straight to submit). A click failure here means either the page
+        // did not have a review button, or the button could not be found. In
+        // either case, proceed: the submit click below will land on whichever
+        // button the page actually shows.
+        console.log(
+          `${LOG} SmartRecruiters review step not found or already past — proceeding to submit`
+        );
+      }
+    }
+
     // ── the point of no return ───────────────────────────────────────────────
     // Everything below this line runs after a real employer may already have a
     // real application. The rules, in order of how much they matter:
@@ -1807,10 +1839,30 @@ async function runSubmitPhase(
       );
     }
 
-    // ── Reading the result. One read; no retry loop on this side either ──────
+    // ── Reading the result ────────────────────────────────────────────────────
+    // Workable's confirmation can arrive asynchronously (overlay appears, URL
+    // changes, or "Thank you" text loads) up to a few seconds after the click.
+    // For Workable we poll for up to 5 s; for all other ATS platforms a single
+    // read is sufficient and avoids unnecessary latency.
+    const WORKABLE_POLL_INTERVAL_MS = 1_000;
+    const WORKABLE_POLL_BUDGET_MS = 5_000;
     let capture: ConfirmationCapture;
     try {
-      capture = await readConfirmation(session);
+      if (row.ats === "workable") {
+        const deadline = Date.now() + WORKABLE_POLL_BUDGET_MS;
+        let lastCapture: ConfirmationCapture | undefined;
+        while (Date.now() < deadline) {
+          const attempt = await readConfirmation(session);
+          lastCapture = attempt;
+          if (looksSubmitted(attempt, fill.finalUrl)) break;
+          if (Date.now() + WORKABLE_POLL_INTERVAL_MS < deadline) {
+            await sleep(WORKABLE_POLL_INTERVAL_MS);
+          }
+        }
+        capture = lastCapture!;
+      } else {
+        capture = await readConfirmation(session);
+      }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return await unconfirmed(

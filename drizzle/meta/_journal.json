@@ -92,6 +92,13 @@
       "when": 1787378646711,
       "tag": "0012_applications_browserbase_session_id",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1787385600000,
+      "tag": "0013_profiles_browserbase_context_id",
+      "breakpoints": true
     }
   ]
 }
