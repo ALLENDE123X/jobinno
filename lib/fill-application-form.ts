@@ -262,6 +262,14 @@ const INSTRUCTIONS = Object.freeze({
   PHONE: "the phone number input on the job application form",
   LINKEDIN: "the LinkedIn profile URL input on the job application form",
   WEBSITE: "the personal website or portfolio URL input on the job application form",
+  CONFIRM_EMAIL:
+    "the SECOND email input on the job application form — the one labeled \"Confirm email\", " +
+    "\"Confirm your email\", \"Re-enter email\", \"Repeat email\", or similar. " +
+    "NOT the primary email address field.",
+  CITY:
+    "Type \"{value}\" in the City or current location text input on the job application form. " +
+    "If an autocomplete dropdown with city or location suggestions appears after typing, " +
+    "click the first matching suggestion.",
   RESUME_UPLOAD: "the file upload control for the applicant's resume or CV",
   COVER_LETTER_TEXT:
     "the multi-line text box where the applicant types or pastes their cover letter",
@@ -540,6 +548,17 @@ const CONTENT_ATTACH_TIMEOUT_MS = 20_000;
 
 /** Gap between two reads of the DOM's own shape while waiting for it to stop moving. */
 const DOM_STABLE_POLL_MS = 500;
+
+/**
+ * Random delay between successive field interactions.
+ *
+ * Breaks the constant-cadence typing pattern that bot detectors key on. The
+ * 300 to 1200 ms window is wide enough to look human without slowing the run
+ * to the point where the session timeout becomes a concern.
+ */
+function randomInteractionDelayMs(): number {
+  return Math.floor(Math.random() * 901) + 300; // 300 to 1200 ms
+}
 
 /**
  * How long the page is given to stop changing. Bounded rather than open ended:
@@ -883,6 +902,8 @@ export const FIELD_KEYWORDS = {
   lastName: /last[\s_-]*name|\bsurname\b|family[\s_-]*name|\blname\b/i,
   fullName: /(full|your|applicant)[\s_-]*name|^\s*name\b/i,
   email: /e-?mail/i,
+  confirmEmail: /confirm[\s_-]*(?:your[\s_-]*)?e-?mail|re-?enter[\s_-]*e-?mail|repeat[\s_-]*e-?mail|verify[\s_-]*e-?mail/i,
+  city: /\bcity\b|\bcurrent[\s_-]*(?:city|location)\b/i,
   phone: /phone|mobile|telephone|\btel\b/i,
   linkedin: /linked-?in/i,
   website: /website|portfolio|personal[\s_-]*(site|url|page)|\bgithub\b/i,
@@ -1996,6 +2017,21 @@ type FieldPlan = {
   multiline: boolean;
   /** Read-back comparison. Boards reformat phone numbers, so not every field compares literally. */
   normalize: (value: string) => string;
+  /**
+   * Skip DOM corroboration for this field. Used for fields whose label inherently overlaps
+   * another key's regex (e.g. "Confirm email" matches both confirmEmail and email), where
+   * the instruction is specific enough to trust Stagehand's observe() result directly.
+   */
+  skipCorroboration?: boolean;
+  /**
+   * Use an unstructured stagehand.act() call (with the value embedded in the instruction)
+   * instead of the observe→corroborate→typeInto pipeline. Required for autocomplete fields
+   * that need a multi-step interaction (type then click suggestion).
+   *
+   * When set, the instruction must be a template where `{value}` is replaced with the
+   * actual value at call time.
+   */
+  useUnstructuredAct?: boolean;
 };
 
 const plainCompare = (value: string): string => value.trim().replace(/\s+/g, " ").toLowerCase();
@@ -2010,7 +2046,8 @@ const phoneCompare = (value: string): string => value.replace(/\D/g, "").slice(-
 function buildFieldPlan(
   profile: ResumeProfile,
   signals: FormSignals,
-  coverLetter: string | null
+  coverLetter: string | null,
+  currentCity?: string
 ): FieldPlan[] {
   const plan: FieldPlan[] = [];
   const add = (
@@ -2018,7 +2055,7 @@ function buildFieldPlan(
     instruction: string,
     value: string | null,
     present: boolean,
-    options: { multiline?: boolean; normalize?: (v: string) => string } = {}
+    options: { multiline?: boolean; normalize?: (v: string) => string; skipCorroboration?: boolean; useUnstructuredAct?: boolean } = {}
   ): void => {
     // A field the form does not have and the resume did not fill is not worth a
     // line in the report. A field the form *does* have but the resume could not
@@ -2032,6 +2069,8 @@ function buildFieldPlan(
       present,
       multiline: options.multiline === true,
       normalize: options.normalize ?? plainCompare,
+      ...(options.skipCorroboration ? { skipCorroboration: true } : {}),
+      ...(options.useUnstructuredAct ? { useUnstructuredAct: true } : {}),
     });
   };
 
@@ -2052,6 +2091,24 @@ function buildFieldPlan(
     !splitName && signals.fullNameFieldPresent
   );
   add("email", INSTRUCTIONS.EMAIL, profile.email, signals.emailFieldPresent);
+  // Many boards (SmartRecruiters, some Workable forms) require a confirm-email
+  // field. Its label always overlaps the primary email regex, so corroboration is
+  // skipped — the specific instruction is what identifies the field instead.
+  // `present: signals.emailFieldPresent` is a proxy: if there is an email field
+  // there may be a confirm-email field. If the form has none, tryResolveAction
+  // returns null and the entry records "not-on-form" without any side effect.
+  if (profile.email) {
+    add("confirmEmail", INSTRUCTIONS.CONFIRM_EMAIL, profile.email, signals.emailFieldPresent, {
+      skipCorroboration: true,
+    });
+  }
+  // City / current location. Not a signal in FormSignals (adding one would require
+  // a model-call schema change), so present is keyed off having the value itself.
+  // Uses unstructured act() because location pickers are autocomplete fields that
+  // need a type-then-click-suggestion sequence which typeInto cannot handle alone.
+  if (currentCity) {
+    add("city", INSTRUCTIONS.CITY, currentCity, true, { useUnstructuredAct: true });
+  }
   add("phone", INSTRUCTIONS.PHONE, profile.phone, signals.phoneFieldPresent, {
     normalize: phoneCompare,
   });
@@ -2155,6 +2212,34 @@ async function fillFields(
       continue;
     }
 
+    // Autocomplete fields (e.g. city location pickers) need a multi-step interaction:
+    // type the value and then click the first suggestion. The structured typeInto
+    // path only handles the type step, so these fields use an unstructured act() call
+    // with the value embedded directly in the instruction.
+    if (field.useUnstructuredAct) {
+      await sleep(randomInteractionDelayMs());
+      const actInstruction = field.instruction.replace("{value}", field.value);
+      try {
+        await session.stagehand.act(actInstruction, { page: session.page });
+        outcomes.push({
+          field: field.key,
+          intended: field.value,
+          outcome: "filled",
+          detail: "filled via unstructured act() (autocomplete interaction)",
+        });
+        console.log(`${LOG} ${field.key}: filled via unstructured act()`);
+      } catch (err) {
+        outcomes.push({
+          field: field.key,
+          intended: field.value,
+          outcome: "not-on-form",
+          detail: `unstructured act() found no matching field: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        console.warn(`${LOG} ${field.key}: unstructured act() failed — ${err instanceof Error ? err.message : String(err)}`);
+      }
+      continue;
+    }
+
     const resolved = await tryResolveAction(session, url, field.instruction);
     if (resolved === null) {
       outcomes.push({
@@ -2166,23 +2251,26 @@ async function fillFields(
       continue;
     }
 
-    const checked = await corroborateResolved(session, url, field, resolved);
-    if (!checked.ok) {
-      // Fail closed at field level: a wrong value in a real employer's form is
-      // worse than a blank one a human can fill in.
-      outcomes.push({
-        field: field.key,
-        intended: field.value,
-        outcome: checked.resolved === null ? "not-on-form" : "skipped",
-        detail:
-          checked.resolved === null
-            ? "no control on the page matched this field"
-            : `not filled — ${checked.why}`,
-      });
-      console.warn(`${LOG} skipping ${field.key}: ${checked.why}`);
-      continue;
+    let checkVia = "instruction (corroboration skipped — label overlaps another key's regex)";
+    if (!field.skipCorroboration) {
+      const checked = await corroborateResolved(session, url, field, resolved);
+      if (!checked.ok) {
+        // Fail closed at field level: a wrong value in a real employer's form is
+        // worse than a blank one a human can fill in.
+        outcomes.push({
+          field: field.key,
+          intended: field.value,
+          outcome: checked.resolved === null ? "not-on-form" : "skipped",
+          detail:
+            checked.resolved === null
+              ? "no control on the page matched this field"
+              : `not filled — ${checked.why}`,
+        });
+        console.warn(`${LOG} skipping ${field.key}: ${checked.why}`);
+        continue;
+      }
+      checkVia = checked.check.via;
     }
-    const check = checked.check;
 
     const used = await typeInto(session, url, field.instruction, field.value);
     const readBack = await readControlValue(session.page, used.selector);
@@ -2195,9 +2283,9 @@ async function fillFields(
       outcome: matches ? "filled" : readBack === null ? "filled" : "mismatch",
       readBack,
       detail: matches
-        ? `filled and read back identical (identified by ${check.via})`
+        ? `filled and read back identical (identified by ${checkVia})`
         : readBack === null
-          ? `filled, but the value could not be read back for confirmation (identified by ${check.via})`
+          ? `filled, but the value could not be read back for confirmation (identified by ${checkVia})`
           : `the control now reads ${JSON.stringify(readBack)}, which is not what was typed`,
     });
     console.log(
@@ -4464,7 +4552,7 @@ async function runBrowserFlow(
 
     await attachFormActionPlan(supabase, session, signals.url);
 
-    const plan = buildFieldPlan(profile, signals, coverLetter);
+    const plan = buildFieldPlan(profile, signals, coverLetter, state.applicationAnswers.currentCity);
     fields.push(...(await fillFields(session, signals.url, plan)));
 
     // The fill is finished before this fires so the report names every field,
