@@ -217,6 +217,39 @@ export const BROWSERBASE_DEFAULT_CONCURRENCY = 3;
 export const BROWSERBASE_SESSION_TIMEOUT_S = 20 * 60;
 
 /**
+ * Proxy and browser-presentation settings passed to Browserbase on every
+ * remote launch, for JOB-046 (issue #80): a real run sent 10 applications
+ * through Ashby-hosted boards across 6 unrelated companies and all 10 came
+ * back rejected with Ashby's own platform-wide "flagged as possible spam"
+ * message. The investigation the issue records traced the only
+ * `browserbase.launch()` call site (right below) and found two plain
+ * absences ranked as the highest-confidence, lowest-effort fix, ahead of
+ * typing cadence and mouse movement, which are separate, higher-effort work
+ * the issue explicitly defers until after this is re-tested: no proxy
+ * configured at all, and no `browserSettings` at all, so every session ran
+ * on whatever Browserbase's bare default happens to be — identically, every
+ * time. A third-party benchmark cited in the issue (moderate confidence, not
+ * first-party proof) found that exact unconfigured default leaking a
+ * `Playwright: true` framework flag and an identical hardware/GPU
+ * fingerprint across sessions.
+ *
+ * `BROWSERBASE_VIEWPORT` and `BROWSERBASE_STEALTH_OS` exist as their own
+ * named constants, following `BROWSERBASE_SESSION_TIMEOUT_S` immediately
+ * above, rather than an inline object at the call site, so a future
+ * caller — or a test — has one place to read what this pipeline claims to
+ * be and one place to change it. The two are picked to agree with each
+ * other: a 1080p viewport paired with `windows`, the most common desktop
+ * configuration in general web traffic, rather than either value chosen on
+ * its own. `advancedStealth` and `verified` are deliberately absent from
+ * both: issue #80's investigation confirmed `advancedStealth` is gated to
+ * Browserbase's Scale plan and unavailable on this project's current tier
+ * (setting it would fail loudly or silently no-op), and left `verified`'s
+ * plan-tier availability unconfirmed, so it stays out until someone checks.
+ */
+export const BROWSERBASE_VIEWPORT = { width: 1920, height: 1080 } as const;
+export const BROWSERBASE_STEALTH_OS = "windows" as const;
+
+/**
  * Sessions the local Chromium path may run at once.
  *
  * Two, and the reason is memory rather than taste, as
@@ -707,6 +740,13 @@ export async function openBrowserSession(
             // mapped to anything: a Browserbase session has no display either
             // way, and its live view is how a run gets watched.
             api_timeout: BROWSERBASE_SESSION_TIMEOUT_S,
+            // JOB-046 (issue #80): see `BROWSERBASE_VIEWPORT`'s comment above
+            // for why these three are here and what is deliberately not.
+            proxies: true,
+            browserSettings: {
+              viewport: BROWSERBASE_VIEWPORT,
+              os: BROWSERBASE_STEALTH_OS,
+            },
           })
         : await localBrowser.launch({ headless: options.headless });
   } catch (err) {
