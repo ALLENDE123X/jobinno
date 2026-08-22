@@ -459,6 +459,12 @@ export default async function Home({
         <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-4 text-sm text-muted-foreground sm:flex-row">
           <p className="font-medium text-foreground">Jobinno</p>
           <p>Applications you did not have to sit through.</p>
+          <a
+            href="mailto:hello@jobinno.app"
+            className="underline underline-offset-3 hover:text-foreground"
+          >
+            hello@jobinno.app
+          </a>
         </div>
       </footer>
     </div>
