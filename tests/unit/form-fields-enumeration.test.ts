@@ -36,6 +36,11 @@ import {
   readFieldValue,
   type EnumeratedField,
 } from "@/lib/form-fields";
+import {
+  assertStepFullyRead,
+  countRequiredQuestions,
+  FormFillBlockedError,
+} from "@/lib/fill-application-form";
 import { type Page } from "@browserbasehq/stagehand";
 
 const realGetBoundingClientRect = Element.prototype.getBoundingClientRect;
@@ -806,5 +811,255 @@ describe("SmartRecruiters phone country: the selection is not on the control", (
 
     const field = { ...searchBoxField(), selector: `[data-jobinno-field="f8"]` };
     expect(await readFieldValue(domPage(), field)).toBe("");
+  });
+});
+
+/**
+ * JOB-121 — SmartRecruiters' screening step, in the shape a live capture of
+ * 2026-08-22 showed it in.
+ *
+ * `oneclick-ui` builds every question out of `spl-*` web components, and two
+ * properties of that build were between this pipeline and a filled screening
+ * form:
+ *
+ *  1. **The caption is slotted.** Each label is
+ *     `<label><span><slot name="label-content"></slot><span aria-hidden>*</span></span></label>`
+ *     inside a shadow root, with the question itself outside it in the host's
+ *     light DOM as `<span slot="label-content">…</span>`. `textContent` on that
+ *     label returns `"*"`, so five required questions on the captured step were
+ *     enumerated with an empty label and reported as `field-6` … `field-10` —
+ *     and `fillRemainingFields` drops any control whose label is `""`, so they
+ *     were read and then silently skipped.
+ *
+ *  2. **The radios are painted.** A yes/no question is `<spl-radio-group>`
+ *     holding `<spl-radio role="radio" aria-checked="false">`, with no
+ *     `<input type="radio">` anywhere inside it. Three required questions on the
+ *     captured step were built this way and could not be enumerated at all.
+ *
+ * The fixtures below are that markup, reduced to the parts that decide the
+ * outcome and with the same nesting: the id, the shadow boundaries, the slot,
+ * the `required` on the component and the `aria-required` on what it renders.
+ */
+function splLabel(id: string): string {
+  return (
+    `<label class="c-spl-form-field-label" for="${id}" id="${id}-label">` +
+    `<span class="c-spl-form-field-label-required-group">` +
+    `<slot name="label-content"></slot>` +
+    `<span class="c-spl-form-field-required-mark" aria-hidden="true">*</span>` +
+    `</span></label>`
+  );
+}
+
+/** `<spl-input required>` — a shadow root, an inner component, a slotted caption. */
+function splInput(id: string, question: string): HTMLElement {
+  const host = document.createElement("spl-input");
+  host.setAttribute("required", "");
+  host.setAttribute("id", id);
+  host.setAttribute("name", id);
+  host.setAttribute("type", "text");
+  const outer = host.attachShadow({ mode: "open" });
+  const inner = document.createElement("spl-internal-form-field");
+  const innerRoot = inner.attachShadow({ mode: "open" });
+  innerRoot.innerHTML = `<div class="c-spl-form-field"><slot name="label"></slot><slot></slot></div>`;
+  inner.innerHTML =
+    splLabel(id) +
+    `<div class="c-spl-input-grid"><div class="c-spl-input-wrapper">` +
+    `<input class="c-spl-input" id="${id}" type="text" aria-required="true" />` +
+    `</div></div>`;
+  outer.append(inner);
+  host.innerHTML = `<span slot="label-content"> ${question} </span>`;
+  return host;
+}
+
+/** `<spl-radio-group required>` — painted radios, no native input in sight. */
+function splRadioGroup(id: string, question: string, answers: string[]): HTMLElement {
+  const host = document.createElement("spl-radio-group");
+  host.setAttribute("required", "");
+  host.setAttribute("id", id);
+  const outer = host.attachShadow({ mode: "open" });
+  const inner = document.createElement("spl-internal-form-field");
+  const innerRoot = inner.attachShadow({ mode: "open" });
+  innerRoot.innerHTML = `<div><slot name="label"></slot><slot></slot></div>`;
+  inner.innerHTML =
+    splLabel(id) +
+    `<fieldset role="radiogroup" class="c-spl-radio-group" aria-labelledby="${id}-label" ` +
+    `aria-required="true"><slot></slot></fieldset>`;
+  outer.append(inner);
+  host.innerHTML = `<span slot="label-content"> ${question} </span>`;
+  answers.forEach((answer, index) => {
+    const radio = document.createElement("spl-radio");
+    radio.setAttribute("role", "radio");
+    radio.setAttribute("aria-checked", "false");
+    radio.setAttribute("label", answer);
+    radio.setAttribute("value", String(index));
+    radio.setAttribute("id", `${id}-answer-${index}`);
+    radio.attachShadow({ mode: "open" }).innerHTML =
+      `<label class="c-spl-form-field-label"><span>${answer}</span></label>` +
+      `<div class="c-spl-radio"><div class="c-spl-radio__ring"></div></div>`;
+    host.append(radio);
+  });
+  return host;
+}
+
+describe("SmartRecruiters screening step: the questions behind a <slot>", () => {
+  it("reads a slotted caption instead of the lone asterisk beside it", async () => {
+    document.body.append(
+      splInput(
+        "question_f4d61863",
+        "What are your Annual Base Salary expectations (please include currency)?"
+      )
+    );
+
+    const fields = await enumerateFormFields(domPage());
+    const salary = fields.find((field) => field.kind === "text");
+    expect(salary?.label).toBe(
+      "What are your Annual Base Salary expectations (please include currency)?"
+    );
+    // The `*` beside the slot is still what marks the question required, and it
+    // must not survive into the label a person is shown.
+    expect(salary?.required).toBe(true);
+    expect(salary?.label).not.toContain("*");
+    // The key is what `needsInput` reports and what `--answer` is keyed on. An
+    // empty label produced `field-6`, which nobody can answer.
+    expect(salary?.key).not.toMatch(/^field-\d+$/);
+  });
+});
+
+describe("SmartRecruiters screening step: radios with no <input> in them", () => {
+  it("enumerates a painted radio group as one required question", async () => {
+    document.body.append(
+      splRadioGroup("spl-form-element_1", "Are you 18 years of age or older?", ["Yes", "No"])
+    );
+
+    const fields = await enumerateFormFields(domPage());
+    expect(fields).toHaveLength(1);
+    expect(fields[0]?.kind).toBe("radio");
+    expect(fields[0]?.label).toBe("Are you 18 years of age or older?");
+    // `required` lives on the component and on the fieldset it renders, never on
+    // any individual radio. Read as optional, the question is left blank on a
+    // form the board will not accept without it.
+    expect(fields[0]?.required).toBe(true);
+    expect(fields[0]?.options).toEqual(["Yes", "No"]);
+    expect(fields[0]?.optionSelectors).toHaveLength(2);
+    expect(fields[0]?.currentValue).toBe("");
+  });
+
+  it("reports the group's question, never one of its own answers", async () => {
+    document.body.append(
+      splRadioGroup(
+        "spl-form-element_4",
+        "Will you now or in the future require sponsorship for an employment visa?",
+        ["Yes", "No"]
+      )
+    );
+
+    const fields = await enumerateFormFields(domPage());
+    expect(fields[0]?.label).not.toBe("Yes");
+    expect(fields[0]?.label).toContain("sponsorship");
+  });
+
+  it("reads the answer the board already selected", async () => {
+    const group = splRadioGroup("spl-form-element_9", "Are you 18 years of age or older?", [
+      "Yes",
+      "No",
+    ]);
+    document.body.append(group);
+    group.querySelectorAll("spl-radio")[0]?.setAttribute("aria-checked", "true");
+
+    const fields = await enumerateFormFields(domPage());
+    expect(fields[0]?.currentValue).toBe("Yes");
+  });
+
+  it("does not report a second copy of a native group that only wears the role", async () => {
+    // A wrapper carrying `role="radio"` over a real `<input type="radio">` is
+    // decoration, and reporting it would produce an undrivable duplicate of a
+    // question that is already read correctly — the same trap `shadowsNativeSelect`
+    // was written for on issue #94.
+    document.body.innerHTML = `
+      <fieldset><legend>Do you have a driving licence?</legend>
+        <div role="radio"><label><input type="radio" name="licence" value="Yes" required /> Yes</label></div>
+        <div role="radio"><label><input type="radio" name="licence" value="No" required /> No</label></div>
+      </fieldset>`;
+
+    const fields = await enumerateFormFields(domPage());
+    expect(fields).toHaveLength(1);
+    expect(fields[0]?.label).toBe("Do you have a driving licence?");
+    expect(fields[0]?.options).toEqual(["Yes", "No"]);
+  });
+});
+
+/**
+ * JOB-121 — the other half of the same page, and the reason the guard could
+ * never have passed on it.
+ *
+ * `countRequiredQuestions` lives in `fill-application-form.ts` and is exercised
+ * here because this is where the real markup is. It is perception in every sense
+ * that matters: a `page.evaluate` over the DOM with no model anywhere near it,
+ * and `assertStepFullyRead` compares its answer against what
+ * `enumerateFormFields` read. The two have to be counting the same thing, and on
+ * the captured SmartRecruiters step they were not: 29 against 8, on a page
+ * holding eleven required questions.
+ */
+describe("counting required questions rather than required elements", () => {
+  it("counts one nested web component question once, not three times", async () => {
+    // `<spl-autocomplete required>` → `<spl-input required>` → `<input
+    // aria-required>` is one question and three required elements. The old count
+    // returned 3 for it and no amount of correct perception could match that.
+    document.body.append(splInput("question_f4d61863", "What are your salary expectations?"));
+
+    expect(await countRequiredQuestions(domPage())).toBe(1);
+    const fields = await enumerateFormFields(domPage());
+    expect(fields.filter((field) => field.required)).toHaveLength(1);
+  });
+
+  it("counts a painted radio group once, and agrees with what perception reads", async () => {
+    document.body.append(
+      splRadioGroup("spl-form-element_1", "Are you 18 years of age or older?", ["Yes", "No"])
+    );
+    document.body.append(
+      splRadioGroup("spl-form-element_4", "Will you require visa sponsorship?", ["Yes", "No"])
+    );
+    document.body.append(splInput("question_f4d61863", "What are your salary expectations?"));
+
+    const pageRequired = await countRequiredQuestions(domPage());
+    const readRequired = (await enumerateFormFields(domPage())).filter(
+      (field) => field.required
+    ).length;
+    expect(pageRequired).toBe(3);
+    expect(readRequired).toBe(3);
+    // The whole point: the guard is quiet because the page is read, not because
+    // it was told to be quiet.
+    expect(() => assertStepFullyRead(pageRequired, readRequired, 2, "https://example.test")).not
+      .toThrow();
+  });
+
+  it("still stops when a required question is genuinely unread", async () => {
+    // A question drawn as something this pass has no branch for at all. The
+    // count sees it, perception does not, and the run must stop.
+    document.body.append(splInput("question_f4d61863", "What are your salary expectations?"));
+    const opaque = document.createElement("sr-question-field-signature");
+    opaque.setAttribute("required", "");
+    opaque.setAttribute("name", "question_signature");
+    document.body.append(opaque);
+
+    const pageRequired = await countRequiredQuestions(domPage());
+    const readRequired = (await enumerateFormFields(domPage())).filter(
+      (field) => field.required
+    ).length;
+    expect(pageRequired).toBe(2);
+    expect(readRequired).toBe(1);
+    expect(() =>
+      assertStepFullyRead(pageRequired, readRequired, 2, "https://example.test")
+    ).toThrow(FormFillBlockedError);
+  });
+
+  it("still folds a native radio group into one question", async () => {
+    document.body.innerHTML = `
+      <fieldset><legend>Do you have a driving licence?</legend>
+        <label><input type="radio" name="licence" value="Yes" required /> Yes</label>
+        <label><input type="radio" name="licence" value="No" required /> No</label>
+      </fieldset>`;
+
+    expect(await countRequiredQuestions(domPage())).toBe(1);
   });
 });
