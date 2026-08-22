@@ -70,6 +70,18 @@ const h = vi.hoisted(() => {
   const state = {
     /** Flipped by the click, exactly as the real page would be. */
     manualEntryClicked: false,
+    /**
+     * Whether the *DOM* holds an application form, as distinct from whether the
+     * page reader says it does.
+     *
+     * JOB-052 made those two separable, because on a web component board they
+     * genuinely came apart: `enumerateFormFields` found ten controls on a page
+     * the reader reported as having no form. A test that means "there really is
+     * no form" has to say so here as well as in `signalsOverride`, or its DOM
+     * still holds First Name, Last Name and Email and the premise is not what
+     * the fixture is describing.
+     */
+    domHasForm: true,
     /** What `tryResolveAction` answers for an instruction. */
     resolve: manualEntryOnly,
     /** The last value `typeInto` was given, which is what the page reads back. */
@@ -229,7 +241,7 @@ const h = vi.hoisted(() => {
   });
 
   /** A self hosted careers page: no ids anywhere, so every selector is an XPath. */
-  const formControls = () => [
+  const formControls = () => (!state.domHasForm ? [] : [
     control("First Name", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[1]/input[1]"),
     control("Last Name", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[2]/input[1]"),
     control("Email", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[3]/input[1]"),
@@ -242,7 +254,7 @@ const h = vi.hoisted(() => {
           ),
         ]
       : []),
-  ];
+  ]);
 
   /** The fixed shape every test that is not about hydration reads. */
   const settledFloor = (): StructuralFloor => ({
@@ -1117,6 +1129,46 @@ describe("a careers page that is still hydrating when the browser arrives", () =
     expect(h.state.extractCalls).toBeGreaterThan(1);
   });
 
+  it("fills a form the page reader missed but the DOM can prove is there", async () => {
+    // JOB-052, and the Avery Dennison SmartRecruiters page it came from. Every
+    // control on that form lives in a shadow root, so the light-DOM counts the
+    // failure message quotes read 0 inputs and 418 characters of text, and the
+    // reader — which had every chance to see it — reported no application form
+    // on a page that was plainly one. `enumerateFormFields` finds First Name,
+    // Last Name and Email there, and those are the DOM's own words, not a
+    // model's opinion of them.
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: false,
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_filled");
+    expect(result.blockedReason).toBeNull();
+  });
+
+  it("does not mistake a sign-in wall for the form it stands in front of", async () => {
+    // The account-creation shape: a name box, an email box and a password box.
+    // Two identity fields is the bar the DOM floor clears, so without the
+    // password veto this page would be talked into looking like an application
+    // form and `reachApplicationForm` would walk straight past the sign-in stop
+    // that exists to catch it.
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: false,
+      passwordFieldCount: 1,
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    // Stopped *at the wall*, positively, rather than merely not reaching the
+    // other message: a negative assertion here would pass for any failure at all.
+    expect(result.blockedReason).toContain("A sign-in form is in front of the application");
+    expect(result.blockedReason).toContain("Nothing was typed.");
+  });
+
   it("still fails closed, and bounded, when there really is no form", async () => {
     // The control. A retry loop that never gives up would turn a listing this
     // product cannot apply to into a run that never ends, and a guard that can
@@ -1126,6 +1178,12 @@ describe("a careers page that is still hydrating when the browser arrives", () =
       applicationFormPresent: false,
       applyControlPresent: false,
     });
+    // JOB-052. Said in the DOM as well as in the reader, because those are two
+    // separate sources now and this test is about the case where *neither* has
+    // a form. With the DOM still holding First Name, Last Name and Email this
+    // fixture would be describing the Avery Dennison page instead — a form the
+    // reader missed — which is the opposite case and is pinned below.
+    h.state.domHasForm = false;
 
     const result = await run();
 
