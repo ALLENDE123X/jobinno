@@ -174,9 +174,16 @@ export const DECLINE_OPTION_RE =
  * Ticking one of these on somebody's behalf is making a commitment in their
  * name, which is a different act from reporting where they live. They are always
  * escalated to the user, never inferred.
+ *
+ * `acknowledg\w*` and `privacy polic\w*` carry the `\w*` because they are
+ * stems: the trailing `\b` after the group otherwise demands the alternative
+ * end at a word boundary, so the bare stems could never match the
+ * "acknowledgement" or "privacy policy" a real form writes (found on issue
+ * #94 when Lever's processing-consent card, whose only consent-flavoured
+ * words are "candidate privacy policy", failed to match this).
  */
 export const CONSENT_FIELD_RE =
-  /\b(agree|agreement|consent|certify|certification|acknowledg|attest|authorize|terms|privacy polic|i confirm|declaration)\b/i;
+  /\b(agree|agreement|consent|certify|certification|acknowledg\w*|attest|authorize|terms|privacy polic\w*|i confirm|i understand|declaration)\b/i;
 
 /** Comparison form for labels, options and values. Never used for display. */
 export function normalizeText(value: string): string {
@@ -272,9 +279,30 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
    * react-select combobox's real `<input>` is a two-pixel grid cell inside a
    * full-width control box. Rejecting it on its own dimensions would make every
    * dropdown on a modern ATS invisible to this pass.
+   *
+   * One carve-out (issue #94): a styled radio or checkbox hides its native
+   * input from the accessibility tree (`aria-hidden="true"`, opacity 0) and
+   * paints its own control inside the same wrapping `<label>` — Workable
+   * renders every yes/no radio group this way, which made whole *required*
+   * groups invisible to this pass, so nothing filled them and every submit
+   * click failed the board's own validation with the form still on screen.
+   * The native input is still what a click toggles and what the form reads,
+   * so when its wrapping label is really on screen, the control is visible in
+   * every sense that matters here. Deliberately narrow: only radio/checkbox
+   * inputs, only through a visible wrapping label — a combobox's hidden
+   * mirror input carries no type and stays invisible, as it should.
    */
   const isVisible = (element: Element): boolean => {
-    if (element.getAttribute("aria-hidden") === "true") return false;
+    if (element.getAttribute("aria-hidden") === "true") {
+      const type = (element.getAttribute("type") ?? "").toLowerCase();
+      if (type !== "radio" && type !== "checkbox") return false;
+      const wrap = element.closest("label");
+      if (wrap === null || wrap.getAttribute("aria-hidden") === "true") return false;
+      const wrapStyle = window.getComputedStyle(wrap);
+      if (wrapStyle.display === "none" || wrapStyle.visibility === "hidden") return false;
+      const box = rectOf(wrap);
+      return box.w >= 8 && box.h >= 8;
+    }
     const style = window.getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden") return false;
     let node: Element | null = element;
@@ -380,6 +408,42 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
     return out;
   };
 
+  /**
+   * The visible caption block preceding a control that has no label of its
+   * own.
+   *
+   * Lever's custom "additional questions" cards draw the question as a plain
+   * `<div class="application-label"><div class="text">…</div></div>` followed
+   * by a sibling `<div class="application-field">` holding the control — no
+   * `label[for]`, no wrapping label, no legend anywhere (issue #94). Those
+   * fields fell all the way through to their `name` attribute and were
+   * reported as "cards[uuid][field0]", which no model or person can answer.
+   *
+   * This climbs a few ancestors and reads the nearest preceding sibling that
+   * shows text and holds no form control of its own. A caption never holds a
+   * control, and a preceding sibling that does hold one is a *different*
+   * question's block — everything before it belongs to that question, so the
+   * walk stops rather than skipping past it and attributing someone else's
+   * caption to this control.
+   */
+  const questionBlockText = (element: Element): string => {
+    const holdsControl = (node: Element): boolean =>
+      node.matches("input,select,textarea,button") ||
+      node.querySelector('input,select,textarea,button,[role="combobox"]') !== null;
+    let node: Element | null = element;
+    for (let depth = 0; node !== null && depth < 5; depth++) {
+      let sibling: Element | null = node.previousElementSibling;
+      while (sibling !== null) {
+        if (holdsControl(sibling)) return "";
+        const text = clean(visibleText(sibling));
+        if (text !== "") return text;
+        sibling = sibling.previousElementSibling;
+      }
+      node = node.parentElement;
+    }
+    return "";
+  };
+
   const labelOf = (element: Element): string => {
     const bits: string[] = [];
     const push = (value: string | null | undefined): void => {
@@ -413,6 +477,14 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
     }
     if (bits.length === 0) {
       push(element.getAttribute("aria-label"));
+    }
+    // Before surrendering to a placeholder or a raw name attribute: the
+    // question may be drawn as a plain block of text above the control
+    // rather than as anything label-shaped. See `questionBlockText`.
+    if (bits.length === 0) {
+      push(questionBlockText(element));
+    }
+    if (bits.length === 0) {
       push(element.getAttribute("placeholder"));
       push(element.getAttribute("name"));
     }
@@ -506,8 +578,8 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
     if (!isVisible(element)) continue;
 
     const rawLabel = labelOf(element);
-    const label = clean(rawLabel.replace(/[*✱]+\s*$/, "").replace(/\(required\)\s*$/i, ""));
-    const required =
+    let label = clean(rawLabel.replace(/[*✱]+\s*$/, "").replace(/\(required\)\s*$/i, ""));
+    let required =
       (element as HTMLInputElement).required === true ||
       element.getAttribute("aria-required") === "true" ||
       /[*✱]\s*$/.test(rawLabel) ||
@@ -554,11 +626,31 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
       optionsTruncated = group.length > options.length;
       const checked = group.find((radio) => radio.checked);
       currentValue = checked === undefined ? "" : labelOf(checked) || checked.value;
-      // The group's question is the fieldset legend, not the first radio's label.
+      // The group's question is not any single radio's own label — that is
+      // one of its ANSWERS. Three places boards actually put the question,
+      // tried in order (issue #94): a fieldset legend; the element the
+      // fieldset is aria-labelledby (Workable's yes/no questions); the
+      // caption block preceding the group's container (Lever's
+      // multiple-choice cards). Before this, a Lever consent group reported
+      // its own first option, "Yes, I consent", as the question it asked.
       const fieldset = element.closest("fieldset");
-      const legend = fieldset?.querySelector("legend");
-      const groupLabel = clean(legend?.textContent);
+      let groupLabel = clean(fieldset?.querySelector("legend")?.textContent);
+      if (groupLabel === "" && fieldset !== null) {
+        const labelledBy = fieldset.getAttribute("aria-labelledby");
+        for (const id of (labelledBy ?? "").split(/\s+/)) {
+          if (groupLabel !== "" || id === "") continue;
+          const target = document.getElementById(id);
+          if (target !== null) groupLabel = clean(target.textContent);
+        }
+      }
+      if (groupLabel === "") {
+        const first = group[0];
+        groupLabel = questionBlockText(first === undefined ? element : first);
+      }
       if (groupLabel !== "") {
+        required =
+          required || /[*✱]\s*$/.test(groupLabel) || /\(required\)/i.test(groupLabel);
+        label = clean(groupLabel.replace(/[*✱]+\s*$/, "").replace(/\(required\)\s*$/i, ""));
         const first = group[0];
         selector = first === undefined ? selector : selectorOf(first);
         activateSelectors = [selector];
@@ -566,6 +658,26 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
     } else if (kind === "checkbox") {
       currentValue = (element as HTMLInputElement).checked ? "checked" : "";
       optionsKnown = true;
+      // A card checkbox's wrapping label often holds only the box's own
+      // caption ("I Understand", "English (ENG)") while the actual question
+      // sits in the caption block above the group (Lever cards, issue #94).
+      // When the label is exactly that wrapping caption, prefix the question,
+      // so the report says what is being agreed to or selected rather than
+      // just the tick's own word. Only the wrapping-label case: a checkbox
+      // with a real label[for] or aria-labelledby already says what it means.
+      {
+        const wrap = element.closest("label");
+        if (wrap !== null && clean(visibleText(wrap)) === rawLabel) {
+          const block = questionBlockText(wrap);
+          if (block !== "") {
+            required =
+              required || /[*✱]\s*$/.test(block) || /\(required\)/i.test(block);
+            label = clean(
+              `${block} ${label}`.replace(/[*✱]+/g, " ").replace(/\(required\)/gi, " ")
+            );
+          }
+        }
+      }
     } else if (kind === "combobox") {
       currentValue = comboboxValue(element);
       // Left unknown on purpose: the option list of a scripted dropdown is not
@@ -574,6 +686,25 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
       // fields that actually need it.
       optionsKnown = false;
       activateSelectors = activationLadder(element);
+      // A scripted dropdown's requiredness often lives on the hidden mirror
+      // input the widget keeps for native form validation, not on the search
+      // input a person types into — Workable marks only the mirror, so every
+      // required Workable dropdown read as optional and was left blank
+      // (issue #94). `comboboxValue` already trusts that same mirror for the
+      // control's current value; trust it for `required` the same way.
+      if (!required) {
+        let shell: Element | null = element;
+        for (let depth = 0; shell !== null && depth < 5; depth++) {
+          const mirror = shell.querySelector('input[aria-hidden="true"][tabindex="-1"]');
+          if (mirror !== null) {
+            required =
+              (mirror as HTMLInputElement).required === true ||
+              mirror.getAttribute("aria-required") === "true";
+            break;
+          }
+          shell = shell.parentElement;
+        }
+      }
     } else if (kind === "file") {
       const input = element as HTMLInputElement;
       currentValue = input.files !== null && input.files.length > 0 ? `${input.files.length} file(s)` : "";
@@ -1122,22 +1253,116 @@ async function fillText(page: Page, field: EnumeratedField, value: string): Prom
 }
 
 /**
+ * Finds the one option of a native `<select>` whose visible text says `wanted`,
+ * against the select's **full live list** rather than the truncated prefix the
+ * enumeration reported.
+ *
+ * Exists for issue #94: Lever's university dropdown holds 3,302 options, the
+ * enumeration reports the first 60, and a school anywhere past "B" could never
+ * be chosen even when the decision layer proposed its exact wording. Matching
+ * here is the same normalized equality `selectNative` already applies — an
+ * option that is not literally on the live list still cannot be chosen, and an
+ * ambiguous match (two options with the same normalized text) is refused
+ * rather than resolved.
+ *
+ * Serialised into the page (see `enumerateFieldsInPage`), so it is
+ * self-contained on purpose.
+ */
+function matchSelectOptionInPage(
+  controlSelector: string,
+  wanted: string
+): { matches: number; value: string; text: string } {
+  const norm = (value: string): string =>
+    value
+      .normalize("NFC")
+      .replace(/[‘’]/g, "'")
+      .replace(/[“”]/g, '"')
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+
+  let control: Element | null = null;
+  try {
+    const path = controlSelector.startsWith("xpath=")
+      ? controlSelector.slice("xpath=".length)
+      : controlSelector;
+    control =
+      path.startsWith("/") || path.startsWith("(")
+        ? (document.evaluate(path, document, null, 9, null).singleNodeValue as Element | null)
+        : document.querySelector(controlSelector);
+  } catch {
+    control = null;
+  }
+  if (control === null || control.tagName.toLowerCase() !== "select") {
+    return { matches: 0, value: "", text: "" };
+  }
+
+  const target = norm(wanted);
+  const hits: { value: string; text: string }[] = [];
+  for (const option of Array.from((control as HTMLSelectElement).options)) {
+    const text = (option.textContent ?? "").replace(/\s+/g, " ").trim();
+    if (option.value !== "" && text !== "" && norm(text) === target) {
+      hits.push({ value: option.value, text });
+    }
+  }
+  const first = hits[0];
+  return {
+    matches: hits.length,
+    value: first === undefined ? "" : first.value,
+    text: first === undefined ? "" : first.text,
+  };
+}
+
+/**
  * A native `<select>`: one structured call, one read-back.
  *
  * The visible text is translated to the option's `value` attribute first,
  * because that is what the browser's own selection API takes — and the
- * translation is a lookup in a list read off this same page, not a guess.
+ * translation is a lookup in a list read off this same page, not a guess. When
+ * the reported list is a truncated prefix of a longer one, the lookup falls
+ * back to the select's full live list (`matchSelectOptionInPage`) before
+ * giving up — still an exact normalized match against options the DOM itself
+ * offers, never an invention.
  */
 async function selectNative(page: Page, field: EnumeratedField, value: string): Promise<ApplyOutcome> {
   const index = field.options.findIndex((option) => normalizeText(option) === normalizeText(value));
-  if (index === -1) {
+  let optionValue = index === -1 ? "" : field.optionValues[index] ?? "";
+  if (index === -1 && field.optionsTruncated) {
+    let live: { matches: number; value: string; text: string } | null = null;
+    try {
+      const raw = await page.evaluate(
+        inPageExpression(
+          matchSelectOptionInPage,
+          `${jsLiteral(field.selector)}, ${jsLiteral(value)}`
+        )
+      );
+      if (inPageError(raw) === null && raw !== null && typeof raw === "object") {
+        live = raw as { matches: number; value: string; text: string };
+      }
+    } catch {
+      live = null;
+    }
+    if (live !== null && live.matches === 1 && live.value !== "") {
+      optionValue = live.value;
+    } else if (live !== null && live.matches > 1) {
+      return {
+        ok: false,
+        readBack: await readFieldValue(page, field),
+        detail:
+          `too ambiguous to choose between: ${live.matches} of this dropdown's options ` +
+          `read "${value}"`,
+      };
+    }
+  }
+  if (index === -1 && optionValue === "") {
     return {
       ok: false,
       readBack: await readFieldValue(page, field),
-      detail: `"${value}" is not one of this dropdown's options`,
+      detail:
+        `"${value}" is not one of this dropdown's options` +
+        (field.optionsTruncated ? " (checked against the full live list, not only the reported prefix)" : ""),
     };
   }
-  const optionValue = field.optionValues[index] ?? "";
   if (optionValue === "") {
     return {
       ok: false,
