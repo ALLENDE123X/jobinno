@@ -1,0 +1,1 @@
+ALTER TABLE "applications" ADD COLUMN "browserbase_session_id" text;

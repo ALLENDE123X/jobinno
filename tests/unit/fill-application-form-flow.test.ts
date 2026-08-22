@@ -106,6 +106,13 @@ const h = vi.hoisted(() => {
     writes: [] as { table: string; op: "update" | "insert"; values: unknown }[],
     /** How many times a browser was opened. */
     browsersOpened: 0,
+    /**
+     * JOB-045. What `session.browser.sessionId` answers with once a browser is
+     * open — a real run's Browserbase session id, or null on the local Chromium
+     * fallback. Read live via a getter on `session.browser` below, so a test can
+     * flip it after `reset()` and still see its own value.
+     */
+    browserbaseSessionId: "bb_test_session_1" as string | null,
 
     // ── JOB-021: a page that arrives in pieces ────────────────────────────
     /**
@@ -159,6 +166,7 @@ const h = vi.hoisted(() => {
     state.resumeAttachments = 0;
     state.writes = [];
     state.browsersOpened = 0;
+    state.browserbaseSessionId = "bb_test_session_1";
     state.floors = null;
     state.domReads = 0;
     state.lastFloor = null;
@@ -293,7 +301,15 @@ const h = vi.hoisted(() => {
   const session = {
     logTag: "[test]",
     actionPlan: null as unknown,
-    browser: {},
+    // A getter, not a plain literal: the object below is built once, at module
+    // load, and a plain `{ sessionId: state.browserbaseSessionId }` would freeze
+    // whatever that was at that instant rather than tracking `reset()` or a test
+    // that sets it afterward.
+    browser: {
+      get sessionId() {
+        return state.browserbaseSessionId;
+      },
+    },
     page,
     stagehand: {
       extract: async () => {
@@ -698,6 +714,13 @@ describe("an apply URL that does not belong to the board it came from", () => {
     // In particular the row never passed through `filling_form`, because nothing
     // was ever filled.
     expect(statuses).not.toContain("filling_form");
+    // JOB-045: nothing to carry either. This throws out of `loadApplicationState`,
+    // before a browser — and so before a Browserbase session — ever exists.
+    expect(h.state.browsersOpened).toBe(0);
+    const [blockedWrite] = h.state.writes.filter(
+      (write) => write.table === "applications" && write.op === "update"
+    );
+    expect(blockedWrite!.values).not.toHaveProperty("browserbase_session_id");
 
     // And the reason, in the one place this schema keeps reasons.
     const skips = h.state.writes.filter(
@@ -726,6 +749,45 @@ describe("an apply URL that does not belong to the board it came from", () => {
     expect(result.status).toBe("form_filled");
     expect(result.blockedReason).toBeNull();
     expect(h.state.browsersOpened).toBe(1);
+  });
+});
+
+/**
+ * JOB-045. `runBrowserFlow` opens the browser and learns its Browserbase
+ * session id (`session.browser.sessionId`) before it writes anything else to
+ * `applications` — but that id has to reach the row through `updateApplication`
+ * like any other column, and the point of this block is that it actually does,
+ * at exactly the write where it first becomes available and not before.
+ */
+describe("the Browserbase session id, once the browser has opened", () => {
+  const applicationsWrites = () =>
+    h.state.writes.filter((write) => write.table === "applications" && write.op === "update");
+
+  it("is absent from the write made before a browser exists, and present on every write after", async () => {
+    const result = await run();
+    expect(result.status).toBe("form_filled");
+
+    const writes = applicationsWrites();
+    // `filling_form` is written before `openBrowserSession` is ever called — see
+    // `runFill` — so it has nothing to carry.
+    expect((writes[0]!.values as { status?: string }).status).toBe("filling_form");
+    expect(writes[0]!.values).not.toHaveProperty("browserbase_session_id");
+
+    // `form_filled` is written after `runBrowserFlow` returns the id in its
+    // report, and now carries it.
+    expect((writes[1]!.values as { status?: string }).status).toBe("form_filled");
+    expect((writes[1]!.values as { browserbase_session_id?: string | null }).browserbase_session_id).toBe(
+      "bb_test_session_1"
+    );
+  });
+
+  it("is null on the row rather than missing, on the local Chromium fallback", async () => {
+    h.state.browserbaseSessionId = null;
+
+    await run();
+
+    const writes = applicationsWrites();
+    expect((writes[1]!.values as { browserbase_session_id?: string | null }).browserbase_session_id).toBeNull();
   });
 });
 
@@ -822,6 +884,17 @@ describe("a listing that redirects the browser somewhere else", () => {
     expect(skipRows()[0]!.ats).toBe("greenhouse");
     expect(skipRows()[0]!.job_id).toBe(h.JOB_ID);
     expect(skipRows()[0]!.raw_context.message).toContain("attacker.example");
+
+    // JOB-045. Unlike the pre-browser refusal above, this stop happens inside
+    // `runBrowserFlow` — `assertStillOnTheBoard` throws after the session is
+    // already open — so `recordFailure` is handed a Browserbase session id, and
+    // it now has to land on the row and not only in `skip_log.raw_context`.
+    const applicationsWrites = h.state.writes.filter(
+      (write) => write.table === "applications" && write.op === "update"
+    );
+    expect(
+      (applicationsWrites[1]!.values as { browserbase_session_id?: string | null }).browserbase_session_id
+    ).toBe("bb_test_session_1");
   });
 
   it("stops before the resume is uploaded when the page moves mid form", async () => {

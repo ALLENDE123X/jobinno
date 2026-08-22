@@ -83,6 +83,12 @@ export type ApplicationPatch = {
   submittedAt?: string | null;
   /** Where the board sent the browser after submit, when it sent it anywhere. */
   redirectUrl?: string | null;
+  /**
+   * `applications.browserbase_session_id`: the Browserbase session this
+   * attempt ran in, when one existed. The durable, queryable link from a row
+   * here to the recording of that specific run — see JOB-045.
+   */
+  browserbaseSessionId?: string | null;
 };
 
 /** `ApplicationPatch` → the row shape, dropping anything the caller left out. */
@@ -92,6 +98,8 @@ function patchColumns(patch: ApplicationPatch): Record<string, unknown> {
   if (patch.confirmationText !== undefined) row.confirmation_text = patch.confirmationText;
   if (patch.submittedAt !== undefined) row.submitted_at = patch.submittedAt;
   if (patch.redirectUrl !== undefined) row.redirect_url = patch.redirectUrl;
+  if (patch.browserbaseSessionId !== undefined)
+    row.browserbase_session_id = patch.browserbaseSessionId;
   return row;
 }
 
@@ -328,7 +336,8 @@ export type FailureInput = Omit<SkipInput, "reason"> & {
 };
 
 /**
- * Records a terminal failure: the status on the row, the reason in the log.
+ * Records a terminal failure: the status (and, when known, the Browserbase
+ * session) on the row, the reason in the log.
  *
  * Best-effort, and never throws over the original error. That property is
  * carried over verbatim from actinno's `recordFailure` and is worth restating,
@@ -339,6 +348,12 @@ export type FailureInput = Omit<SkipInput, "reason"> & {
  *
  * The status is written first. If only one of the two writes lands, the more
  * useful survivor is the one that stops the row being picked up again.
+ *
+ * `browserbaseSessionId` was already flowing into `skip_log.raw_context`
+ * below (see `SkipInput`) before JOB-045 — it just never reached this row.
+ * Left off the patch entirely when the caller left it `undefined` (a stop
+ * that happened before any browser existed), rather than writing a `null`
+ * over whatever the row already held.
  */
 export async function recordFailure(
   supabase: SupabaseClient,
@@ -349,7 +364,11 @@ export async function recordFailure(
 
   if (input.applicationId !== null) {
     try {
-      await updateApplication(supabase, input.applicationId, { status: input.status });
+      const patch: ApplicationPatch = { status: input.status };
+      if (input.browserbaseSessionId !== undefined) {
+        patch.browserbaseSessionId = input.browserbaseSessionId;
+      }
+      await updateApplication(supabase, input.applicationId, patch);
       console.error(
         `${log} applications ${input.applicationId} → ${input.status} (${reason}): ${input.message}`
       );

@@ -1626,6 +1626,7 @@ async function completeVerification(
   // to a credential the board has already burned.
   await updateApplication(supabase, state.jobApplicationId, {
     status: APPLICATION_STATUS.EMAIL_VERIFIED,
+    browserbaseSessionId: session.browser.sessionId ?? null,
   });
   console.log(`${LOG} applications ${state.jobApplicationId} → ${APPLICATION_STATUS.EMAIL_VERIFIED}`);
 
@@ -4358,6 +4359,7 @@ async function runFill(
     try {
       await updateApplication(supabase, jobApplicationId, {
         status: APPLICATION_STATUS.FORM_FILLED,
+        browserbaseSessionId: report.browserbaseSessionId,
       });
     } catch (err) {
       // A retained session is live at this point and nothing downstream will
