@@ -2891,8 +2891,9 @@ const DEGREE_FIELD_LABEL_RE =
   /\b(degree|qualification|education\s+level|level\s+of\s+(?:education|study)|highest\s+(?:degree|education|level))\b/i;
 
 /**
- * JOB-044. The field labels a school question is drawn with, and the only ones
- * `inferOrAsk` will type free text into when nothing on the menu matches.
+ * JOB-044. The field labels a school question is drawn with, and one half of
+ * the double gate `inferOrAsk` and its caller use to decide when to type free
+ * text into a combobox that nothing on the menu matches.
  *
  * Deliberately narrow, on the same reasoning as `DEGREE_FIELD_LABEL_RE`: a
  * combobox is a text input with a suggestion list layered on top, and typing
@@ -2902,8 +2903,30 @@ const DEGREE_FIELD_LABEL_RE =
  * the candidate's school never appears among its suggestions — but a Location
  * or Country combobox does not, and leaving unselected free text in one of
  * those puts a value on the form nothing chose.
+ *
+ * Label alone is not enough, which review of this same ticket caught before
+ * it shipped, on the same reasoning `DEGREE_FIELD_LABEL_RE` was already double
+ * gated for below: a university's own Greenhouse posting can ask which
+ * "School" or "College" a role belongs to — an org-structure question about
+ * the employer, not the candidate — and that field's label matches this regex
+ * just as well as "What school did you attend?" does. See `SCHOOL_FACT_KEY_RE`
+ * for the other half.
  */
 const SCHOOL_FIELD_LABEL_RE = /\b(school|university|college)\b/i;
+
+/**
+ * JOB-044. The fact keys that hold the candidate's own school, and the only
+ * ones `SCHOOL_FIELD_LABEL_RE`'s free-text fallback may run for.
+ *
+ * Paired with `SCHOOL_FIELD_LABEL_RE` the same way `DEGREE_FACT_KEY_RE` is
+ * paired with `DEGREE_FIELD_LABEL_RE`, and for the same reason: the label
+ * alone cannot tell "which school did you attend" apart from an employer's own
+ * "which School is this role in" question, so the fact backing the proposed
+ * value has to actually be the candidate's education before free text is
+ * allowed onto the form. `buildFactCatalog` writes `school` and
+ * `educationN.school`.
+ */
+const SCHOOL_FACT_KEY_RE = /(?:^|\.)school$/;
 
 /**
  * Which level of degree a string names, or null when it names none.
@@ -3187,7 +3210,18 @@ function inferOrAsk(
       // exactly this field shape, which is what lets the control keep the
       // typed value instead of requiring a click on an option that does not
       // exist.
-      if (field.kind === "combobox" && SCHOOL_FIELD_LABEL_RE.test(field.label)) {
+      //
+      // Gated on the fact key too, not just the label — see `SCHOOL_FACT_KEY_RE`.
+      // Label alone cannot tell a "which school did you attend" question apart
+      // from a university employer's own "which School/College is this role
+      // in" org-structure question, and `proposed` typed as free text onto the
+      // wrong one of those states something about the employer's org chart,
+      // not the candidate.
+      if (
+        field.kind === "combobox" &&
+        SCHOOL_FIELD_LABEL_RE.test(field.label) &&
+        SCHOOL_FACT_KEY_RE.test(decision?.sourceFact ?? "")
+      ) {
         return {
           kind: "apply",
           value: proposed,
@@ -3761,7 +3795,8 @@ async function fillRemainingFields(
   // ── Step 6: policy, then action, then read-back ──────────────────────────
   let generated = 0;
   for (const field of undecided) {
-    const resolution = resolveDecision(field, byKey.get(field.key), factsByKey);
+    const decision = byKey.get(field.key);
+    const resolution = resolveDecision(field, decision, factsByKey);
 
     if (resolution.kind === "skip") {
       record(field, "skipped", null, `left blank — ${resolution.why}`);
@@ -3823,10 +3858,16 @@ async function fillRemainingFields(
       // No fixed option list means this is a search control that answers a
       // query rather than a menu with a fixed set — see `chooseFromMenu`.
       allowContains: OPTION_KINDS.has(field.kind) && field.options.length === 0,
-      // JOB-044. Scoped to school-shaped comboboxes by label, same as the
-      // resolution that produced `value` above — see `SCHOOL_FIELD_LABEL_RE`
-      // and `chooseFromMenu`'s own comment on what this permits.
-      allowFreeText: field.kind === "combobox" && SCHOOL_FIELD_LABEL_RE.test(field.label),
+      // JOB-044. Scoped to school-shaped comboboxes by label AND by the fact
+      // key that backed `value`, same double gate as the resolution that
+      // produced `value` above — see `SCHOOL_FIELD_LABEL_RE`, `SCHOOL_FACT_KEY_RE`,
+      // and `chooseFromMenu`'s own comment on what this permits. The label
+      // alone would also let free text through on an employer's own "School"
+      // or "College" org-structure field, which is not what `value` answers.
+      allowFreeText:
+        field.kind === "combobox" &&
+        SCHOOL_FIELD_LABEL_RE.test(field.label) &&
+        SCHOOL_FACT_KEY_RE.test(decision?.sourceFact ?? ""),
     });
 
     if (outcome.ok) {

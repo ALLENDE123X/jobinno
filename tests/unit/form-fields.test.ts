@@ -63,8 +63,16 @@ type MenuState = { texts: string[]; selectors: string[]; count: number; expanded
  * A fake `Page`. `menu` is mutable and read live by every `evaluate` call that
  * matches `readOpenMenuInPage`'s own script, so a test can change what the
  * "page" reports mid-flow the same way `.click()` or `.fill()` below do.
+ *
+ * `focusSucceeds` controls what `focusElement`'s own script reports back —
+ * `applyFieldValue` now reads that return value rather than assuming it, so a
+ * fixture that always answered `null` (falsy) would make every test exercise
+ * the "focus did not land" failure path instead of the keyboard commit it
+ * means to test. Defaults to `true` for that reason; the failure path gets its
+ * own test below with this set to `false`.
  */
-function fakePage(initialMenu: MenuState) {
+function fakePage(initialMenu: MenuState, options: { focusSucceeds?: boolean } = {}) {
+  const focusSucceeds = options.focusSucceeds ?? true;
   const menu: MenuState = { ...initialMenu };
   let fieldValue = "";
   // WAI-ARIA's combobox pattern starts with nothing highlighted, which is the
@@ -93,8 +101,12 @@ function fakePage(initialMenu: MenuState) {
         const index = menu.selectors.indexOf(scriptSelector(script));
         return index === -1 ? "" : menu.texts[index];
       }
-      // `focusElement`, `scrollIntoView`, `scrollIfOffscreen` — none of their
-      // return values are read by any caller.
+      // `focusElement`'s script — the only one of these three whose caller
+      // reads the return value, since this fix. Matched on `.focus(`, which is
+      // unique to this script among everything `form-fields.ts` evaluates.
+      if (script.includes(".focus(")) return focusSucceeds;
+      // `scrollIntoView`, `scrollIfOffscreen` — neither return value is read
+      // by any caller.
       return null;
     }),
     locator: vi.fn((selector: string) => ({
@@ -175,6 +187,42 @@ describe("a combobox suggestion is committed with the keyboard, not a click", ()
     // Never a click on anything — the whole point of this fix, and the menu
     // here starts already expanded so not even the activation click ran.
     expect(locatorClicks).toEqual({});
+  });
+
+  it("fails closed, with no keystrokes sent, when focus never lands on the control", async () => {
+    // A code-review fix on this same ticket: `focusElement` used to be awaited
+    // without checking what it returned, so a focus that silently failed to
+    // land still let `ArrowDown`/`Enter` fire at whatever the page happened to
+    // have focused instead — the same "click didn't register" failure mode
+    // this whole keyboard path exists to avoid, just moved one step earlier.
+    const { page, keyPresses } = fakePage(
+      {
+        texts: ["Atlanta, GA", "Boston, MA", "Seattle, WA"],
+        selectors: ["#opt-0", "#opt-1", "#opt-2"],
+        count: 3,
+        expanded: true,
+      },
+      { focusSucceeds: false }
+    );
+
+    const outcome = await applyFieldValue(
+      page as never,
+      field({ label: "Location (City)", selector: "#loc-input", options: ["Atlanta, GA", "Boston, MA", "Seattle, WA"], optionsKnown: true }),
+      "Seattle, WA"
+    );
+
+    expect(outcome).toEqual({
+      ok: false,
+      readBack: "",
+      detail: "could not focus the control before selecting the option with the keyboard",
+    });
+    // No ArrowDown, no Enter — nothing was sent to whatever had focus instead.
+    // `chooseFromMenu`'s own retry (a fresh attempt when the first comes back
+    // both not-ok and empty, which this does) means `closeMenu`'s "Escape" is
+    // legitimately in here more than once; that retry is not what this test is
+    // about; the keyboard selection itself never firing is.
+    expect(keyPresses).not.toContain("ArrowDown");
+    expect(keyPresses).not.toContain("Enter");
   });
 });
 

@@ -828,6 +828,37 @@ describe("a school combobox with no matching option is answered as free text", (
     expect(resolution.kind).not.toBe("apply");
   });
 
+  it("still asks about a School-labelled combobox when the proposed value is not the candidate's own school", () => {
+    // Review of this same ticket caught the gap `DEGREE_FIELD_LABEL_RE` was
+    // already double gated against: a label containing "School"/"University"/
+    // "College" is not always asking which school the candidate attended. A
+    // university's own Greenhouse posting can ask which "School" or "College"
+    // a role belongs to — an org-structure question about the *employer* — and
+    // that field's label matches `SCHOOL_FIELD_LABEL_RE` exactly as well as a
+    // real "What school did you attend?" does. Free text may only land when
+    // the proposed value is actually backed by the candidate's own school fact,
+    // not merely when the label contains the word.
+    const resolution = resolveDecision(
+      field({
+        label: "School",
+        kind: "combobox",
+        options: ["School of Engineering", "School of Business"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "school",
+        decision: "answer",
+        value: "Georgia Institute of Technology",
+        // Not a school fact — the model named the wrong kind of fact to back
+        // this org-structure question, same shape as the "MA"-for-degree case
+        // `DEGREE_FACT_KEY_RE` protects against.
+        sourceFact: "currentCity",
+      }),
+      facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
   it("does not type free text into a native select labelled School", () => {
     // A native <select> cannot hold a value nobody chose from its own list, so
     // the fallback stays scoped to `kind: "combobox"` even when the label says

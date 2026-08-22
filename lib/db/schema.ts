@@ -291,8 +291,8 @@ export const profiles = pgTable(
      * has not filled this in yet.
      *
      * Owned by the person, not by us, so it is granted to `authenticated` in
-     * `drizzle/0010_profiles_github_url.sql` alongside the column itself,
-     * following the rule `drizzle/0003_profiles_column_privileges.sql` states:
+     * `drizzle/0011_profiles_github_url_privileges.sql`, following the rule
+     * `drizzle/0003_profiles_column_privileges.sql` states:
      * a new column is not writable by a user session until the migration that
      * adds it grants it by name.
      */

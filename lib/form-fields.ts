@@ -874,8 +874,13 @@ async function scrollIntoView(page: Page, selector: string): Promise<void> {
  * click that opened its menu in the first place (`openMenu`'s own
  * `activateSelectors` click), but neither of those is guaranteed for every
  * path that reaches here, so this makes it true rather than assuming it.
+ *
+ * Returns whether focus actually landed, so a caller that is about to fire
+ * keystrokes at "whatever has focus" can find out first — see the caller in
+ * `chooseFromMenuOnce`, which used to await this without checking and send
+ * `ArrowDown`/`Enter` blind.
  */
-async function focusElement(page: Page, selector: string): Promise<void> {
+async function focusElement(page: Page, selector: string): Promise<boolean> {
   const script = `(() => {
     const sel = ${jsLiteral(selector)};
     const path = sel.startsWith("xpath=") ? sel.slice(6) : sel;
@@ -890,9 +895,10 @@ async function focusElement(page: Page, selector: string): Promise<void> {
     return true;
   })()`;
   try {
-    await page.evaluate(script);
+    const focused = await page.evaluate(script);
+    return focused === true;
   } catch {
-    // Not worth a line in any report.
+    return false;
   }
 }
 
@@ -1311,8 +1317,23 @@ async function chooseFromMenuOnce(
   // Every combobox this file has been run against follows that convention;
   // one that does not would report a bare mismatch below rather than a wrong
   // silent choice, because `readBack` is still checked against `chosen`.
+  //
+  // Failing closed on `focusElement` itself, rather than firing the arrow keys
+  // regardless: an `ArrowDown`/`Enter` sequence goes to whatever element the
+  // page happens to have focused, and with nothing focused (or focus left on
+  // the wrong control) that is exactly the "click didn't register" failure
+  // mode this whole keyboard path exists to avoid, just relocated one step
+  // earlier and left unreported.
+  const focused = await focusElement(page, field.selector);
+  if (!focused) {
+    await closeMenu(page);
+    return {
+      ok: false,
+      readBack: "",
+      detail: "could not focus the control before selecting the option with the keyboard",
+    };
+  }
   try {
-    await focusElement(page, field.selector);
     for (let step = 0; step <= index; step++) {
       await page.keyPress("ArrowDown");
     }
