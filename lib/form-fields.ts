@@ -237,11 +237,80 @@ type RawField = {
  * Written as a real function rather than a template string for the same reason
  * `describeControlInPage` is — so the compiler checks it.
  */
-function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[] {
+function enumerateFieldsInPage(
+  maxFields: number,
+  maxOptions: number,
+  handleAttr: string
+): RawField[] {
   const out: RawField[] = [];
+  let handleCount = 0;
 
   const clean = (value: string | null | undefined): string =>
     (value ?? "").replace(/\s+/g, " ").trim();
+
+  /**
+   * JOB-047. The element above this one, crossing out of an open shadow root
+   * when there is nothing left inside it.
+   *
+   * Every ancestor walk in this function used to be `node.parentElement`, which
+   * returns null at the top of a shadow root and therefore stopped dead one
+   * element inside a web component. On a board built out of custom elements that
+   * is the very first step, so visibility, labelling and the activation ladder
+   * all gave up before they had seen anything real.
+   */
+  const parentOf = (node: Element): Element | null => {
+    if (node.parentElement !== null) return node.parentElement;
+    const root = node.getRootNode();
+    return root instanceof ShadowRoot ? root.host : null;
+  };
+
+  /**
+   * Every element in the document **and** in every open shadow root under it.
+   *
+   * `document.querySelectorAll` stops at a shadow boundary, and on a board whose
+   * form is web components that means it reports nothing at all: SmartRecruiters
+   * renders every input inside an `spl-input` / `spl-autocomplete` /
+   * `spl-date-picker` shadow root, so a live read of a real RRS Group listing
+   * enumerated **zero** controls while the form on screen had ten. Closed shadow
+   * roots stay invisible, which is correct — a closed root is not scriptable by
+   * anyone, including a real assistive technology.
+   */
+  const deepAll = (): Element[] => {
+    const found: Element[] = [];
+    const stack: (Document | ShadowRoot)[] = [document];
+    const seen = new Set<Document | ShadowRoot>();
+    while (stack.length > 0) {
+      const root = stack.pop();
+      if (root === undefined || seen.has(root)) continue;
+      seen.add(root);
+      for (const element of Array.from(root.querySelectorAll("*"))) {
+        found.push(element);
+        const inner = (element as HTMLElement).shadowRoot;
+        if (inner !== null && inner !== undefined) stack.push(inner);
+      }
+    }
+    return found;
+  };
+
+  const everything = deepAll();
+  /**
+   * Handles are stable across passes, and that is deliberate.
+   *
+   * This form gets enumerated several times in one run — before a repeating
+   * section's `Add`, after it, and again once the answers are in — and the
+   * caller tells "a control I have already seen" from "a control that has just
+   * mounted" by comparing selectors. Reissuing handles on every pass renumbered
+   * every control in document order, so inserting one subform made *every*
+   * field on the page look new. Keeping the handle an element already carries
+   * makes that comparison mean what it says, and costs nothing: the selector
+   * still resolves to the same element, which is all a selector has to do.
+   */
+  for (const element of everything) {
+    const existing = element.getAttribute(handleAttr);
+    if (existing === null) continue;
+    const already = Number(existing.replace(/^f/, ""));
+    if (Number.isFinite(already) && already > handleCount) handleCount = already;
+  }
 
   const xpathOf = (element: Element): string => {
     const parts: string[] = [];
@@ -264,15 +333,54 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
    * otherwise. Ids survive a React re-render that reorders siblings; XPath does
    * not, which matters because a decision is made between reading the page and
    * writing to it.
+   *
+   * JOB-047 adds a third form and tightens the first.
+   *
+   * The tightening: uniqueness is now counted across the shadow roots too. A
+   * SmartRecruiters `spl-input` carries the *same* id as the real `<input>`
+   * inside its shadow root, so `[id="first-name-input"]` matches two elements
+   * once a selector engine can see both — and Playwright's can. Counting only
+   * the light document would have reported that as unique and handed the action
+   * layer a selector that resolves to two nodes, which is a strict-mode failure
+   * rather than a wrong field, but a failure all the same.
+   *
+   * The third form: an element inside an open shadow root has no XPath anybody
+   * can use — Playwright's XPath engine does not cross a shadow boundary — so it
+   * is stamped with a handle attribute and addressed by that. The stamp is an
+   * attribute on a control this module is about to read and write anyway; it
+   * carries no meaning to the page, and every handle is reassigned from scratch
+   * on each pass (see `clearHandles` below) so a stale one from an earlier read
+   * can never be resolved by accident.
    */
   const selectorOf = (element: Element): string => {
     const id = element.getAttribute("id");
     if (id !== null && id !== "" && !/["\\\n\r]/.test(id)) {
       try {
-        if (document.querySelectorAll(`[id="${id}"]`).length === 1) return `[id="${id}"]`;
+        const selector = `[id="${id}"]`;
+        let matches = 0;
+        for (const candidate of everything) {
+          if (candidate.matches(selector)) matches++;
+          if (matches > 1) break;
+        }
+        if (matches === 1) return selector;
       } catch {
-        // A malformed id that breaks the selector parser. Fall through to XPath.
+        // A malformed id that breaks the selector parser. Fall through.
       }
+    }
+    if (element.getRootNode() !== document) {
+      // Idempotent within a pass, and that is load bearing rather than tidy.
+      // `activationLadder` asks for the control's own selector a second time,
+      // and a second *fresh* stamp overwrote the first: the field was reported
+      // under the handle it no longer carried, so every combobox on a web
+      // component board resolved to nothing. Caught by a live run against
+      // SmartRecruiters, where the City control could not be found by the
+      // selector this module had just minted for it.
+      const existing = element.getAttribute(handleAttr);
+      if (existing !== null && existing !== "") return `[${handleAttr}="${existing}"]`;
+      handleCount++;
+      const handle = `f${handleCount}`;
+      element.setAttribute(handleAttr, handle);
+      return `[${handleAttr}="${handle}"]`;
     }
     return xpathOf(element);
   };
@@ -350,7 +458,7 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
     for (let depth = 0; node !== null && depth < 4; depth++) {
       const { w, h } = rectOf(node);
       if (w >= 8 && h >= 8) return true;
-      node = node.parentElement;
+      node = parentOf(node);
     }
     return false;
   };
@@ -392,6 +500,65 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
     return parts.join(" ");
   };
 
+  /** The words that mean a control sends the application. See `holdsSubmitControl`. */
+  const SUBMITTISH = /\b(submit|send|apply|application|finish|complete)\w*\b/i;
+
+  /**
+   * Everything under `node`, shadow roots included. Bounded, because this runs
+   * once per rung of every control's activation ladder.
+   */
+  const deepUnder = (node: Element, limit: number): Element[] => {
+    const found: Element[] = [];
+    const stack: (Element | ShadowRoot)[] = [node];
+    // The node's own shadow root counts as "under" it. See `deepQueryAll`.
+    const own = (node as HTMLElement).shadowRoot;
+    if (own !== null && own !== undefined) stack.push(own);
+    const seen = new Set<Element | ShadowRoot>();
+    while (stack.length > 0 && found.length < limit) {
+      const root = stack.pop();
+      if (root === undefined || seen.has(root)) continue;
+      seen.add(root);
+      let children: Element[];
+      try {
+        children = Array.from(root.querySelectorAll("*"));
+      } catch {
+        continue;
+      }
+      for (const child of children) {
+        found.push(child);
+        const inner = (child as HTMLElement).shadowRoot;
+        if (inner !== null && inner !== undefined) stack.push(inner);
+        if (found.length >= limit) break;
+      }
+    }
+    return found;
+  };
+
+  /**
+   * The words a person would use to name this control, including the ones its
+   * host element carries.
+   *
+   * A web component button is an empty `<button>` in a shadow root with a
+   * `<slot>` in it; the caption ("Add", "Save", "Next") lives on the light-DOM
+   * host, and so does the `aria-label`. Reading only the element itself sees an
+   * unnamed button on every such board, which for `holdsSubmitControl` means
+   * failing to recognise a submit control — the one direction this must never
+   * be wrong in.
+   */
+  const controlWords = (element: Element): string => {
+    const bits = [
+      element.textContent ?? "",
+      element.getAttribute("aria-label") ?? "",
+      element.getAttribute("value") ?? "",
+    ];
+    const root = element.getRootNode();
+    if (root instanceof ShadowRoot) {
+      const host = root.host;
+      bits.push(host.textContent ?? "", host.getAttribute("aria-label") ?? "");
+    }
+    return clean(bits.join(" ")).slice(0, 300);
+  };
+
   /**
    * Does this element contain something that would submit the application?
    *
@@ -407,16 +574,27 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
    * button whose words read like sending an application. The cost of being wrong
    * in this direction is one dropdown that has to be escalated to the user; the
    * cost of being wrong in the other is an application sent by accident.
+   *
+   * JOB-047 makes it see through open shadow roots, in both directions. It now
+   * finds a `<button type="submit">` that a web component keeps inside its own
+   * shadow root, and it reads a shadow button's caption off the light-DOM host
+   * that slots it in. Both were invisible before, which means on a board like
+   * SmartRecruiters this guard was reporting "no submit control here" about a
+   * section that had one. Strictly more refusals than the previous version, and
+   * that is the safe direction.
    */
   const holdsSubmitControl = (node: Element): boolean => {
-    if (node.querySelector('input[type="submit"],button[type="submit"]') !== null) return true;
-    const buttons = node.querySelectorAll('button,[role="button"],input[type="button"]');
-    for (const button of Array.from(buttons)) {
-      const words = clean(
-        `${button.textContent ?? ""} ${button.getAttribute("aria-label") ?? ""} ` +
-          `${button.getAttribute("value") ?? ""}`
-      );
-      if (/\b(submit|send|apply|application|finish|complete)\w*\b/i.test(words)) return true;
+    for (const candidate of deepUnder(node, 400)) {
+      const tag = candidate.tagName.toLowerCase();
+      const type = (candidate.getAttribute("type") ?? "").toLowerCase();
+      if (type === "submit" && (tag === "input" || tag === "button")) return true;
+      const isButtonish =
+        tag === "button" ||
+        (candidate.getAttribute("role") ?? "").toLowerCase() === "button" ||
+        (tag === "input" && type === "button") ||
+        /(^|-)button$/.test(tag);
+      if (!isButtonish) continue;
+      if (SUBMITTISH.test(controlWords(candidate))) return true;
     }
     return false;
   };
@@ -431,7 +609,7 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
    */
   const activationLadder = (element: Element): string[] => {
     const out: string[] = [selectorOf(element)];
-    let node: Element | null = element.parentElement;
+    let node: Element | null = parentOf(element);
     for (let depth = 0; node !== null && depth < 6 && out.length < 5; depth++) {
       const box = rectOf(node);
       if (
@@ -444,7 +622,7 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
         const selector = selectorOf(node);
         if (!out.includes(selector)) out.push(selector);
       }
-      node = node.parentElement;
+      node = parentOf(node);
     }
     return out;
   };
@@ -497,29 +675,52 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
         }
         sibling = sibling.previousElementSibling;
       }
-      node = node.parentElement;
+      node = parentOf(node);
     }
     return "";
+  };
+
+  /**
+   * JOB-047. A label lives in the same root as the thing it labels.
+   *
+   * `document.getElementById` and `document.querySelector` only ever search the
+   * light document, so for a control inside a shadow root they answer about the
+   * wrong tree entirely — they find nothing, or worse, they find a same-id
+   * element belonging to a different component. Scoped to the control's own root
+   * these are byte-identical for a light-DOM control (its root *is* the
+   * document) and correct for a shadow one, where SmartRecruiters keeps a real
+   * `<label for="first-name-input">First name*</label>` right beside the input.
+   */
+  const rootOf = (element: Element): Document | ShadowRoot => {
+    const root = element.getRootNode();
+    return root instanceof ShadowRoot ? root : document;
   };
 
   const labelOf = (element: Element): string => {
     const bits: string[] = [];
     const push = (value: string | null | undefined): void => {
       const text = clean(value);
-      if (text !== "") bits.push(text);
+      // Deduplicated, because several of the fallbacks below are read together
+      // and a control whose `aria-label` and `placeholder` say the same thing
+      // came back with its caption twice: "Search by country/region or code
+      // Search by country/region or code". That string becomes the field's key
+      // and the question a person gets asked, so the repetition is not cosmetic.
+      if (text !== "" && !bits.includes(text)) bits.push(text);
     };
+    const root = rootOf(element);
 
     const labelledBy = element.getAttribute("aria-labelledby");
     if (labelledBy !== null) {
       for (const id of labelledBy.split(/\s+/)) {
-        const target = document.getElementById(id);
+        const escaped = id.replace(/["\\]/g, "\\$&");
+        const target = root.querySelector(`[id="${escaped}"]`);
         if (target !== null) push(target.textContent);
       }
     }
     const ownId = element.getAttribute("id");
     if (bits.length === 0 && ownId !== null && ownId !== "") {
       const escaped = ownId.replace(/["\\]/g, "\\$&");
-      const explicit = document.querySelector(`label[for="${escaped}"]`);
+      const explicit = root.querySelector(`label[for="${escaped}"]`);
       if (explicit !== null) push(explicit.textContent);
     }
     if (bits.length === 0) {
@@ -546,7 +747,45 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
       push(element.getAttribute("placeholder"));
       push(element.getAttribute("name"));
     }
+    // The host of a web component is where its caption is declared — an
+    // `spl-input` carries `label="Company"` and slots it into its own shadow
+    // root. Read last, so a real `<label>` always wins.
+    if (bits.length === 0) {
+      let node: Element | null = element;
+      for (let depth = 0; node !== null && bits.length === 0 && depth < 3; depth++) {
+        const holder = node.getRootNode();
+        if (!(holder instanceof ShadowRoot)) break;
+        node = holder.host;
+        push(node.getAttribute("label"));
+        push(node.getAttribute("aria-label"));
+      }
+    }
     return bits.join(" ").slice(0, 300);
+  };
+
+  /**
+   * Whether the control says it must be answered, asking its host too.
+   *
+   * A web component takes `required` on the custom element and does not always
+   * mirror it onto the real input inside — SmartRecruiters mirrors it as
+   * `aria-required` on some controls and as nothing at all on its date pickers.
+   * A required field read as optional is a blank box on a submitted
+   * application, so this asks every level that could be carrying the flag.
+   */
+  const requiredOf = (element: Element, rawLabel: string): boolean => {
+    if ((element as HTMLInputElement).required === true) return true;
+    if (element.getAttribute("aria-required") === "true") return true;
+    if (/[*✱]\s*$/.test(rawLabel) || /\(required\)/i.test(rawLabel)) return true;
+    let node: Element | null = element;
+    for (let depth = 0; node !== null && depth < 3; depth++) {
+      const holder = node.getRootNode();
+      if (!(holder instanceof ShadowRoot)) break;
+      node = holder.host;
+      if (node.hasAttribute("required") || node.getAttribute("aria-required") === "true") {
+        return true;
+      }
+    }
+    return false;
   };
 
   const helpOf = (element: Element): string => {
@@ -648,9 +887,11 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
   // not a control anybody fills in, and Greenhouse keeps one permanently in the
   // DOM for its phone-country picker. Including it produced a phantom field
   // called "List of countries" on every read of a Discord form.
-  const nodes = Array.from(
-    document.querySelectorAll('input,select,textarea,[role="combobox"]')
-  );
+  const nodes = everything.filter((element) => {
+    const tag = element.tagName.toLowerCase();
+    if (tag === "input" || tag === "select" || tag === "textarea") return true;
+    return (element.getAttribute("role") ?? "").toLowerCase() === "combobox";
+  });
   const seen = new Set<Element>();
   const seenRadioGroups = new Set<string>();
 
@@ -665,12 +906,12 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
     if (!isVisible(element)) continue;
 
     const rawLabel = labelOf(element);
+    // `let`, because the Workable and Lever passes below refine both (issue #94).
+    // `requiredOf` is the same four tests this used to inline, plus a walk up
+    // the host chain for a web component that takes `required` on the custom
+    // element and does not mirror it inward (JOB-047).
     let label = clean(rawLabel.replace(/[*✱]+\s*$/, "").replace(/\(required\)\s*$/i, ""));
-    let required =
-      (element as HTMLInputElement).required === true ||
-      element.getAttribute("aria-required") === "true" ||
-      /[*✱]\s*$/.test(rawLabel) ||
-      /\(required\)/i.test(rawLabel);
+    let required = requiredOf(element, rawLabel);
 
     let options: string[] = [];
     let optionSelectors: string[] = [];
@@ -701,10 +942,17 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
         if (seenRadioGroups.has(name)) continue;
         seenRadioGroups.add(name);
       }
+      // Scoped to the radio's own root: a shadow-hosted group is not in the
+      // light document, and two components can each hold a group of the same
+      // name without being one group.
       const group = (
         name === ""
           ? [element]
-          : Array.from(document.querySelectorAll(`input[type="radio"][name="${name.replace(/["\\]/g, "\\$&")}"]`))
+          : Array.from(
+              rootOf(element).querySelectorAll(
+                `input[type="radio"][name="${name.replace(/["\\]/g, "\\$&")}"]`
+              )
+            )
       ) as HTMLInputElement[];
       for (const radio of group) seen.add(radio);
       options = group.slice(0, maxOptions).map((radio) => labelOf(radio) || radio.value);
@@ -826,6 +1074,70 @@ function jsLiteral(value: string): string {
 }
 
 /**
+ * JOB-047. The attribute this module stamps on a control it can only address by
+ * a stamp.
+ *
+ * An element inside an open shadow root has no XPath a driver can follow \u2014
+ * Playwright's XPath engine does not cross a shadow boundary, while its CSS
+ * engine does \u2014 so `enumerateFieldsInPage` marks such a control and reports
+ * `[data-jobinno-field="fN"]` as its selector. Exported because the tests pin
+ * the shape, and because a reader grepping for this attribute in a page dump
+ * should be able to find where it comes from.
+ */
+export const FIELD_HANDLE_ATTR = "data-jobinno-field";
+
+/** The same idea for one option inside an open dropdown. See `readOpenMenuInPage`. */
+export const OPTION_HANDLE_ATTR = "data-jobinno-option";
+
+/** And for the control that adds an entry to a repeating section. See `enumerateRepeatingSectionsInPage`. */
+export const SECTION_HANDLE_ATTR = "data-jobinno-section";
+
+/**
+ * The element lookup every evaluated script in this file shares, as source text.
+ *
+ * Spliced in rather than imported, because these scripts are strings sent to a
+ * browser that has never heard of this module. It was six near-identical copies
+ * before JOB-047 and each one would have needed the same shadow-root fix.
+ *
+ * Three selector shapes, in the order they are tried:
+ *
+ *  \u00b7 An XPath, which addresses the light document only. Unchanged, and still
+ *    the fallback `selectorOf` reaches for on an ordinary board.
+ *  \u00b7 A CSS selector that matches in the light document. Unchanged.
+ *  \u00b7 A CSS selector that matches nothing in the light document, which is then
+ *    looked for inside every open shadow root, deepest last. That is the branch
+ *    a stamped handle takes, and the branch that makes a web-component board
+ *    readable at all.
+ */
+const RESOLVE_IN_PAGE_SRC = `((sel) => {
+  const path = sel.startsWith("xpath=") ? sel.slice(6) : sel;
+  if (path.startsWith("/") || path.startsWith("(")) {
+    try { return document.evaluate(path, document, null, 9, null).singleNodeValue; }
+    catch { return null; }
+  }
+  try {
+    const light = document.querySelector(sel);
+    if (light) return light;
+  } catch { return null; }
+  const stack = [document];
+  const seen = new Set();
+  while (stack.length) {
+    const root = stack.pop();
+    if (seen.has(root)) continue;
+    seen.add(root);
+    let hosts;
+    try { hosts = root.querySelectorAll("*"); } catch { continue; }
+    for (const host of hosts) {
+      const inner = host.shadowRoot;
+      if (!inner) continue;
+      try { const hit = inner.querySelector(sel); if (hit) return hit; } catch { return null; }
+      stack.push(inner);
+    }
+  }
+  return null;
+})`;
+
+/**
  * Wraps a local function's source into an expression the browser can evaluate.
  *
  * Two things it fixes, both of which cost this repo a silent failure:
@@ -881,7 +1193,10 @@ export async function enumerateFormFields(page: Page): Promise<EnumeratedField[]
   let raw: RawField[];
   try {
     const result = await page.evaluate(
-      inPageExpression(enumerateFieldsInPage, `${MAX_FIELDS}, ${MAX_OPTIONS_REPORTED}`)
+      inPageExpression(
+        enumerateFieldsInPage,
+        `${MAX_FIELDS}, ${MAX_OPTIONS_REPORTED}, ${jsLiteral(FIELD_HANDLE_ATTR)}`
+      )
     );
     const failure = inPageError(result);
     if (failure !== null) throw new Error(failure);
@@ -975,9 +1290,19 @@ const NO_MENU: OpenMenu = {
  * at the end of `<body>`) whatever is visible anywhere. Only one menu is ever
  * open at a time, which is what makes the last one safe.
  */
-function readOpenMenuInPage(controlSelector: string, maxOptions: number): OpenMenu {
+function readOpenMenuInPage(
+  controlSelector: string,
+  maxOptions: number,
+  optionAttr: string
+): OpenMenu {
   const clean = (value: string | null | undefined): string =>
     (value ?? "").replace(/\s+/g, " ").trim();
+
+  const parentOf = (node: Element): Element | null => {
+    if (node.parentElement !== null) return node.parentElement;
+    const root = node.getRootNode();
+    return root instanceof ShadowRoot ? root.host : null;
+  };
 
   const xpathOf = (element: Element): string => {
     const parts: string[] = [];
@@ -995,76 +1320,323 @@ function readOpenMenuInPage(controlSelector: string, maxOptions: number): OpenMe
     return `xpath=/${parts.join("/")}`;
   };
 
-  const visible = (node: Element): boolean => {
-    const box = node.getBoundingClientRect();
-    return box.width > 0 && box.height > 0;
+  /**
+   * How to address one option again in a moment, when it is time to click it.
+   *
+   * An XPath for a light-DOM option, exactly as before. A stamped handle for one
+   * inside a shadow root, because no XPath reaches there — see
+   * `FIELD_HANDLE_ATTR`. Stamps are cleared and reissued on every read, so the
+   * "did the option under this selector move?" check in `chooseFromMenuOnce`
+   * still compares against a freshly resolved element rather than a stale mark.
+   */
+  let stamped = 0;
+  const addressOf = (element: Element): string => {
+    if (element.getRootNode() === document) return xpathOf(element);
+    stamped++;
+    const handle = `o${stamped}`;
+    element.setAttribute(optionAttr, handle);
+    return `[${optionAttr}="${handle}"]`;
+  };
+  /**
+   * Every stamp from the previous menu is cleared before this menu is read.
+   *
+   * Handles are positional (`o1`, `o2`, …) and a page holds more than one
+   * dropdown, so without this an option left marked `o3` by the job-title menu
+   * was still carrying that mark when the institution menu stamped its own
+   * `o3`. The re-read in `chooseFromMenuOnce` then resolved the *other* one, and
+   * reported that "the option to click moved" — the guard did its job and the
+   * required Institution field was left empty for a reason that was entirely
+   * this function's fault. Seen on a live SmartRecruiters run, where the
+   * position that should have read "Georgia Institute of Technology" read
+   * "AI Engineer".
+   */
+  const clearStaleStamps = (): void => {
+    for (const marked of deepQueryAll(document, `[${optionAttr}]`)) {
+      marked.removeAttribute(optionAttr);
+    }
   };
 
-  let control: Element | null = null;
-  try {
-    const path = controlSelector.startsWith("xpath=")
-      ? controlSelector.slice("xpath=".length)
-      : controlSelector;
-    control =
-      path.startsWith("/") || path.startsWith("(")
-        ? (document.evaluate(path, document, null, 9, null).singleNodeValue as Element | null)
-        : document.querySelector(controlSelector);
-  } catch {
-    control = null;
-  }
+  /**
+   * `root.querySelectorAll(sel)` plus everything in every open shadow root at or
+   * under it.
+   *
+   * "At or under" is load bearing and was the bug. This used to enter the shadow
+   * root of every *descendant* it walked past but never the shadow root of the
+   * element it was handed — so an ancestor walk that arrived at
+   * `spl-autocomplete` and asked it for its options got nothing, because the
+   * menu is inside that element's own shadow root and the walk had already
+   * decided to look only below it. City was unfillable for this one reason: the
+   * suggestions were rendered, visible and correct, and this function was
+   * standing on top of them looking down.
+   */
+  const deepQueryAll = (root: Document | ShadowRoot | Element, sel: string): Element[] => {
+    const found: Element[] = [];
+    let budget = 12_000;
+    const visit = (node: Element): void => {
+      if (budget-- <= 0) return;
+      try {
+        if (node.matches(sel)) found.push(node);
+      } catch {
+        return;
+      }
+      const inner = (node as HTMLElement).shadowRoot;
+      if (inner !== null && inner !== undefined) {
+        for (const kid of Array.from(inner.children)) visit(kid);
+      }
+      for (const kid of Array.from(node.children)) visit(kid);
+    };
+    if (root instanceof Element) visit(root);
+    else for (const kid of Array.from(root.children)) visit(kid);
+    return found;
+  };
+
+  const resolveDeep = (sel: string): Element | null => {
+    const path = sel.startsWith("xpath=") ? sel.slice("xpath=".length) : sel;
+    if (path.startsWith("/") || path.startsWith("(")) {
+      try {
+        return document.evaluate(path, document, null, 9, null).singleNodeValue as Element | null;
+      } catch {
+        return null;
+      }
+    }
+    try {
+      const light = document.querySelector(sel);
+      if (light !== null) return light;
+    } catch {
+      return null;
+    }
+    const hits = deepQueryAll(document, sel);
+    return hits[0] ?? null;
+  };
+
+  /**
+   * On screen, counting what is rendered *inside* the element too.
+   *
+   * A web component option is frequently a zero-box wrapper whose caption is
+   * slotted or drawn a shadow root further down — SmartRecruiters nests
+   * `spl-select-option` → `spl-dropdown-item` → `div[role="option"]` and paints
+   * the words at the bottom, so the node carrying the ARIA role measures
+   * nothing at all. Rejecting it on its own box hid every option on the page.
+   */
+  const visible = (node: Element): boolean => {
+    const box = node.getBoundingClientRect();
+    if (box.width > 0 && box.height > 0) return true;
+    for (const inner of deepQueryAll(node, "*").slice(0, 40)) {
+      const innerBox = inner.getBoundingClientRect();
+      if (innerBox.width > 0 && innerBox.height > 0) return true;
+    }
+    return false;
+  };
+
+  /**
+   * The words an applicant reads on this option, wherever they are declared.
+   *
+   * `textContent` stops at a shadow boundary, so on a component-built menu it
+   * returns "" for every row. This walks into the open roots as well, which is
+   * what makes an option matchable by the value the decision layer chose.
+   */
+  const deepText = (node: Element): string => {
+    const own = clean(node.textContent);
+    if (own !== "") return own;
+    const parts: string[] = [];
+    for (const inner of deepQueryAll(node, "*").slice(0, 60)) {
+      if (inner.children.length > 0) continue;
+      const text = clean(inner.textContent);
+      if (text !== "") parts.push(text);
+    }
+    return clean(parts.join(" "));
+  };
+
+  const control = resolveDeep(controlSelector);
 
   const expanded = control !== null && control.getAttribute("aria-expanded") === "true";
   let nodes: Element[] = [];
 
+  // `[role="option"]` is the ARIA spelling; `option` covers a web component
+  // that renders a real `<option>`-shaped list inside its own shadow root,
+  // which is how SmartRecruiters draws its country picker.
+  const OPTION_SEL = '[role="option"]';
+
   const owned = control?.getAttribute("aria-controls") ?? control?.getAttribute("aria-owns") ?? null;
-  if (owned !== null && owned !== "") {
-    const box = document.getElementById(owned);
+  if (owned !== null && owned !== "" && control !== null) {
+    const root = control.getRootNode();
+    const scope = root instanceof ShadowRoot ? root : document;
+    const escaped = owned.replace(/["\\]/g, "\\$&");
+    const box = scope.querySelector(`[id="${escaped}"]`);
     if (box !== null) {
-      nodes = Array.from(box.querySelectorAll('[role="option"]')).filter(visible);
+      nodes = deepQueryAll(box, OPTION_SEL).filter(visible);
     }
   }
   if (nodes.length === 0 && control !== null) {
-    let node: Element | null = control.parentElement;
+    let node: Element | null = parentOf(control);
     for (let depth = 0; node !== null && depth < 7 && nodes.length === 0; depth++) {
-      nodes = Array.from(node.querySelectorAll('[role="option"]')).filter(visible);
-      node = node.parentElement;
+      nodes = deepQueryAll(node, OPTION_SEL).filter(visible);
+      node = parentOf(node);
     }
   }
   if (nodes.length === 0) {
-    nodes = Array.from(document.querySelectorAll('[role="option"]')).filter(visible);
+    nodes = deepQueryAll(document, OPTION_SEL).filter(visible);
   }
 
-  // Which option the widget itself considers highlighted — the one its own
-  // `Enter` would commit. Three readings, most authoritative first, because no
-  // single one of them is present on every widget: Greenhouse's react-select
-  // leaves `aria-activedescendant` empty and marks the option with a
-  // `--is-focused` class instead, while a hand-rolled ARIA combobox does the
-  // opposite. -1 when none of the three says anything, which the caller treats
-  // as "unsteerable" rather than as "option 0".
-  const activeId = control?.getAttribute("aria-activedescendant") ?? "";
-  let focused = -1;
-  if (activeId !== "") focused = nodes.findIndex((node) => node.id === activeId);
-  if (focused === -1) {
-    focused = nodes.findIndex((node) =>
-      /(?:^|[-_ ])(?:is[-_])?(?:focused|highlighted)(?:$|[-_ ])/i.test(
-        typeof node.className === "string" ? node.className : ""
-      )
+  /**
+   * The element that actually *is* this option, when the ARIA role is on an
+   * inner node and the caption is on an outer one.
+   *
+   * A web component menu row is often `spl-select-option` (light DOM, holding
+   * the words) wrapping `spl-dropdown-item` whose shadow root holds the
+   * `div[role="option"]` with nothing in it but a `<slot>`. Slotted content
+   * lives at the host, not at the slot, so reading down from the role finds an
+   * empty string however deep it walks — SmartRecruiters' phone-country picker
+   * reported 244 nameless options for exactly this reason, and a menu whose
+   * options cannot be read is a menu nothing can be chosen from. Walking *up*
+   * to the nearest ancestor that carries the words is the only direction the
+   * caption is in.
+   *
+   * Bounded, and refuses any ancestor that covers more than this one option, so
+   * it can never promote a whole menu into a single row.
+   */
+  const namedOption = (node: Element): Element | null => {
+    if (deepText(node) !== "") return node;
+    let up: Element | null = parentOf(node);
+    for (let depth = 0; up !== null && depth < 4; depth++) {
+      const text = deepText(up);
+      if (text !== "" && text.length <= 200 && deepQueryAll(up, OPTION_SEL).length <= 1) return up;
+      up = parentOf(up);
+    }
+    return null;
+  };
+
+  // An option nobody can read is not an option this can choose. Dropping the
+  // blank ones here rather than downstream is what lets the listbox fallback
+  // below know that the ARIA pass genuinely found nothing usable.
+  let named = nodes
+    .map((node) => namedOption(node))
+    .filter((node): node is Element => node !== null);
+
+  /**
+   * The fallback for a menu that names its rows without `role="option"`.
+   *
+   * SmartRecruiters' location and job-title autocompletes render a visible
+   * `[role="listbox"]` whose children are the suggestions, and put the ARIA
+   * role on an inner node that is neither painted nor named. The rows are
+   * plainly there and plainly clickable; only the attribute this used to key
+   * on is in the wrong place. Tried second, so a board that does label its
+   * options properly — every react-select one does — is matched exactly as
+   * before and never reaches this.
+   */
+  if (named.length === 0) {
+    const boxes: Element[] = [];
+    if (control !== null) {
+      let node: Element | null = parentOf(control);
+      for (let depth = 0; node !== null && depth < 7 && boxes.length === 0; depth++) {
+        for (const box of deepQueryAll(node, '[role="listbox"]')) {
+          if (visible(box)) boxes.push(box);
+        }
+        node = parentOf(node);
+      }
+    }
+    for (const box of boxes) {
+      const rows = Array.from(box.children).filter(
+        (row) => visible(row) && deepText(row) !== ""
+      );
+      if (rows.length > 0) {
+        named = rows;
+        break;
+      }
+    }
+  }
+
+  /**
+   * Which option the widget itself considers highlighted — the one its own
+   * `Enter` would commit.
+   *
+   * Three readings, most authoritative first, because no single one of them is
+   * present on every widget: Greenhouse's react-select leaves
+   * `aria-activedescendant` empty and marks the option with a `--is-focused`
+   * class instead, while a hand-rolled ARIA combobox does the opposite. -1 when
+   * none of the three says anything, which the caller treats as "unsteerable"
+   * rather than as "option 0".
+   *
+   * ── JOB-047: read against the list that is actually reported ───────────────
+   * The marker sits on the node carrying `role="option"`, and that node is not
+   * always the one this reports as the option. `namedOption` promotes a role
+   * node whose caption lives on an outer element, and the listbox fallback
+   * reports rows that carry no role at all. So the marked element is found
+   * first and *then* mapped onto `named` by walking up from it — which is a
+   * no-op on every widget where the two are the same element, and is what keeps
+   * `focused` an index into the same array `texts` and `selectors` come from.
+   *
+   * That agreement is the whole point. `highlightOption` walks the difference
+   * between this index and the target index, so an index measured against a
+   * different list than the one the target came from would move the highlight
+   * by a wrong amount — the same class of error as the off-by-one it was
+   * written to fix, arriving from the other side.
+   */
+  const namedIndex = new Map<Element, number>();
+  named.forEach((node, at) => namedIndex.set(node, at));
+
+  /** The reported option that this marked element belongs to, or -1. */
+  const indexOfNamed = (marked: Element | null): number => {
+    let node: Element | null = marked;
+    for (let depth = 0; node !== null && depth < 6; depth++) {
+      const at = namedIndex.get(node);
+      if (at !== undefined) return at;
+      node = parentOf(node);
+    }
+    return -1;
+  };
+
+  const markedClass = (node: Element): boolean =>
+    /(?:^|[-_ ])(?:is[-_])?(?:focused|highlighted)(?:$|[-_ ])/i.test(
+      typeof node.className === "string" ? node.className : ""
     );
+
+  // Searched over the role nodes and the reported rows together: the marker can
+  // be on either, depending on which of the two paths above produced `named`.
+  const markable = nodes.concat(named);
+
+  let marked: Element | null = null;
+  const activeId = control?.getAttribute("aria-activedescendant") ?? "";
+  if (activeId !== "") {
+    const escaped = activeId.replace(/["\\]/g, "\\$&");
+    const root = control === null ? document : control.getRootNode();
+    const scope = root instanceof ShadowRoot ? root : document;
+    marked = scope.querySelector(`[id="${escaped}"]`) ?? deepQueryAll(document, `[id="${escaped}"]`)[0] ?? null;
   }
-  if (focused === -1) {
-    focused = nodes.findIndex((node) => node.getAttribute("aria-selected") === "true");
+  if (marked === null) marked = markable.find((node) => markedClass(node)) ?? null;
+  if (marked === null) {
+    // A row whose marker is on something inside it rather than on itself.
+    for (const row of named) {
+      if (deepQueryAll(row, "*").slice(0, 40).some((inner) => markedClass(inner))) {
+        marked = row;
+        break;
+      }
+    }
   }
+  if (marked === null) {
+    marked = markable.find((node) => node.getAttribute("aria-selected") === "true") ?? null;
+  }
+  const focused = indexOfNamed(marked);
 
   // `maxOptions` of 0 is the deliberate cheap read: the highlight without the
-  // per-option xpath walk, for the polling that steers it onto a chosen option.
-  const kept = nodes.slice(0, Math.max(0, maxOptions));
+  // per-option address walk, for the polling that steers it onto a chosen
+  // option. Stamps are left alone on that read for the same reason — the caller
+  // is mid-choice and still holding the selectors from the full read.
+  const kept = named.slice(0, Math.max(0, maxOptions));
+  if (maxOptions > 0) clearStaleStamps();
   return {
-    texts: kept.map((node) => clean(node.textContent)),
-    selectors: kept.map((node) => xpathOf(node)),
-    count: nodes.length,
+    texts: kept.map((node) => deepText(node)),
+    selectors: kept.map((node) => addressOf(node)),
+    count: named.length,
     expanded,
     focused,
-    focusedText: focused === -1 ? "" : clean(nodes[focused]?.textContent),
+    // `deepText`, not `textContent`: on a web component menu the highlighted
+    // row's own text node is empty and the caption is a shadow root or two
+    // away. `highlightOption` steers by comparing this against the chosen
+    // option's text, so measuring it differently from the way `texts` above is
+    // measured would make every such option unconfirmable and therefore
+    // unchoosable.
+    focusedText: focused === -1 ? "" : deepText(named[focused] as Element),
   };
 }
 
@@ -1075,7 +1647,12 @@ async function readOpenMenu(
 ): Promise<OpenMenu> {
   try {
     const raw = await page.evaluate(
-      inPageExpression(readOpenMenuInPage, `${jsLiteral(field.selector)}, ${maxOptions}`)
+      // `maxOptions` is the caller's, not the constant: `highlightOption` polls
+      // with 0 to read the highlight without paying for the address walk.
+      inPageExpression(
+        readOpenMenuInPage,
+        `${jsLiteral(field.selector)}, ${maxOptions}, ${jsLiteral(OPTION_HANDLE_ATTR)}`
+      )
     );
     const failure = inPageError(raw);
     if (failure !== null) {
@@ -1143,13 +1720,7 @@ async function openMenu(page: Page, field: EnumeratedField): Promise<OpenMenu> {
 async function scrollIntoView(page: Page, selector: string): Promise<void> {
   const script = `(() => {
     const sel = ${jsLiteral(selector)};
-    const path = sel.startsWith("xpath=") ? sel.slice(6) : sel;
-    let el = null;
-    try {
-      el = (path.startsWith("/") || path.startsWith("("))
-        ? document.evaluate(path, document, null, 9, null).singleNodeValue
-        : document.querySelector(sel);
-    } catch { return false; }
+    const el = ${RESOLVE_IN_PAGE_SRC}(sel);
     if (!el || !el.scrollIntoView) return false;
     el.scrollIntoView({ block: "center", inline: "nearest" });
     return true;
@@ -1181,13 +1752,7 @@ async function scrollIntoView(page: Page, selector: string): Promise<void> {
 async function focusElement(page: Page, selector: string): Promise<boolean> {
   const script = `(() => {
     const sel = ${jsLiteral(selector)};
-    const path = sel.startsWith("xpath=") ? sel.slice(6) : sel;
-    let el = null;
-    try {
-      el = (path.startsWith("/") || path.startsWith("("))
-        ? document.evaluate(path, document, null, 9, null).singleNodeValue
-        : document.querySelector(sel);
-    } catch { return false; }
+    const el = ${RESOLVE_IN_PAGE_SRC}(sel);
     if (!el || !el.focus) return false;
     el.focus();
     return true;
@@ -1214,13 +1779,7 @@ async function focusElement(page: Page, selector: string): Promise<boolean> {
 async function scrollIfOffscreen(page: Page, selector: string): Promise<void> {
   const script = `(() => {
     const sel = ${jsLiteral(selector)};
-    const path = sel.startsWith("xpath=") ? sel.slice(6) : sel;
-    let el = null;
-    try {
-      el = (path.startsWith("/") || path.startsWith("("))
-        ? document.evaluate(path, document, null, 9, null).singleNodeValue
-        : document.querySelector(sel);
-    } catch { return false; }
+    const el = ${RESOLVE_IN_PAGE_SRC}(sel);
     if (!el || !el.getBoundingClientRect) return false;
     const r = el.getBoundingClientRect();
     const h = window.innerHeight || document.documentElement.clientHeight;
@@ -1370,6 +1929,774 @@ export async function harvestOptions(
 }
 
 // ───────────────────────────────────
+// Repeating subforms — a required section whose fields do not exist yet
+// ───────────────────────────────────
+
+/**
+ * JOB-047. A required section that holds a list of entries and starts empty.
+ *
+ * ── Why this needed anything new ────────────────────────────────────────────
+ * Everything else in this module rests on one assumption: the control is on the
+ * page, so it can be read and then written to. A repeating subform breaks it.
+ * SmartRecruiters' "Experience *" and "Education *" are a heading, an `Add`
+ * button and a validation message reading "Please provide at least one work
+ * experience entry" — and no inputs whatsoever until `Add` is pressed. There is
+ * nothing for `enumerateFormFields` to find, nothing for `decideFieldAnswers`
+ * to answer, and nothing for `applyFieldValue` to write to, so a form with two
+ * of these could never be completed however good the rest of the pipeline was.
+ *
+ * The fix keeps the three concerns apart rather than fusing them. This file
+ * *finds* such a section (DOM only, no model) and *presses* its add control
+ * (a deterministic click, no model). The fields that then mount are ordinary
+ * fields: they go through `enumerateFormFields`, `decideFieldAnswers` and
+ * `applyFieldValue` exactly as any other control on the page would, which is
+ * why there is no second decision mechanism here and no page text ever becomes
+ * an instruction.
+ */
+export type RepeatingSection = {
+  /** Normalised heading, e.g. `"experience"`. Stable across reads of the same form. */
+  key: string;
+  /** The heading a sighted applicant reads, with any required marker stripped. */
+  heading: string;
+  /** The control that mounts one more entry. Guarded — see `pressAddEntry`. */
+  addSelector: string;
+  /** The section's own box, for scoping the commit control and the re-read. */
+  containerSelector: string;
+  /** The board's own words for why this section is not satisfied yet, if it is showing them. */
+  message: string;
+};
+
+/** More than this many repeating sections on one form is not a form this fills. */
+const MAX_REPEATING_SECTIONS = 6;
+
+/**
+ * A control that adds another entry, by the words on it.
+ *
+ * Anchored at the start so that "Add" and "+ Add another" match while "Address"
+ * does not, and so that a button whose caption merely *contains* the word (for
+ * instance "Upload and add to application") cannot claim to be one — that one
+ * would be refused by the submit guard anyway, and it is better to be refused
+ * twice than once.
+ */
+export const ADD_ENTRY_CONTROL_RE =
+  /^\+?\s*add\b(?!\s*ress)(\s+(another|more|an|a|new|entry|item|row))?\b/i;
+
+/**
+ * A control that commits the entry currently being edited.
+ *
+ * Deliberately narrow, and deliberately does not include "continue", "next",
+ * "done and submit" or anything else that could plausibly move the whole
+ * application forward rather than the one subform. Everything matched here is
+ * additionally required to sit inside a section that `holdsSubmitControl` has
+ * already cleared, and is re-checked against the submit words immediately
+ * before it is pressed.
+ */
+export const COMMIT_ENTRY_CONTROL_RE = /^(save|done|add)\b/i;
+
+/**
+ * The board saying, in its own words, that this section needs at least one entry.
+ *
+ * Matched only to decide that a section is required and unsatisfied. The text is
+ * never handed to anything that can act on it, and never reaches a model.
+ */
+export const AT_LEAST_ONE_ENTRY_RE =
+  /\bat\s+least\s+one\b[^.!?]{0,40}\b(entry|entries|item|record|position|role|job|school|degree)\b/i;
+
+type RawSection = {
+  heading: string;
+  addSelector: string;
+  containerSelector: string;
+  message: string;
+};
+
+/**
+ * Serialised into the page, so it must be self-contained. Same rules as
+ * `enumerateFieldsInPage`, and the same shadow-root walk, for the same reason:
+ * on the board this was written for, the add control's caption lives on a light
+ * DOM host and its real `<button>` lives in a shadow root.
+ */
+function enumerateRepeatingSectionsInPage(
+  maxSections: number,
+  handleAttr: string
+): RawSection[] {
+  const out: RawSection[] = [];
+  const clean = (value: string | null | undefined): string =>
+    (value ?? "").replace(/\s+/g, " ").trim();
+
+  const parentOf = (node: Element): Element | null => {
+    if (node.parentElement !== null) return node.parentElement;
+    const root = node.getRootNode();
+    return root instanceof ShadowRoot ? root.host : null;
+  };
+
+  const deepUnder = (node: Element | Document, limit: number): Element[] => {
+    const found: Element[] = [];
+    const stack: (Element | Document | ShadowRoot)[] = [node];
+    // The node's own shadow root counts as "under" it. See `deepQueryAll`.
+    const own = (node as HTMLElement).shadowRoot;
+    if (own !== null && own !== undefined) stack.push(own);
+    const seen = new Set<Element | Document | ShadowRoot>();
+    while (stack.length > 0 && found.length < limit) {
+      const root = stack.pop();
+      if (root === undefined || seen.has(root)) continue;
+      seen.add(root);
+      let children: Element[];
+      try {
+        children = Array.from(root.querySelectorAll("*"));
+      } catch {
+        continue;
+      }
+      for (const child of children) {
+        found.push(child);
+        const inner = (child as HTMLElement).shadowRoot;
+        if (inner !== null && inner !== undefined) stack.push(inner);
+        if (found.length >= limit) break;
+      }
+    }
+    return found;
+  };
+
+  const controlWords = (element: Element): string => {
+    const bits = [
+      element.textContent ?? "",
+      element.getAttribute("aria-label") ?? "",
+      element.getAttribute("value") ?? "",
+      element.getAttribute("title") ?? "",
+    ];
+    const root = element.getRootNode();
+    if (root instanceof ShadowRoot) {
+      bits.push(root.host.textContent ?? "", root.host.getAttribute("aria-label") ?? "");
+    }
+    return clean(bits.join(" ")).slice(0, 200);
+  };
+
+  const SUBMITTISH = /\b(submit|send|apply|application|finish|complete)\w*\b/i;
+  const ADDISH = /^\+?\s*add\b(?!\s*ress)(\s+(another|more|an|a|new|entry|item|row))?\b/i;
+  const AT_LEAST_ONE =
+    /\bat\s+least\s+one\b[^.!?]{0,40}\b(entry|entries|item|record|position|role|job|school|degree)\b/i;
+
+  const isButtonish = (element: Element): boolean => {
+    const tag = element.tagName.toLowerCase();
+    const type = (element.getAttribute("type") ?? "").toLowerCase();
+    return (
+      tag === "button" ||
+      tag === "a" ||
+      (element.getAttribute("role") ?? "").toLowerCase() === "button" ||
+      (tag === "input" && (type === "button" || type === "submit")) ||
+      /(^|-)button$/.test(tag)
+    );
+  };
+
+  /** Identical in intent to `enumerateFieldsInPage`'s guard of the same name. */
+  const holdsSubmitControl = (node: Element): boolean => {
+    for (const candidate of deepUnder(node, 400)) {
+      const tag = candidate.tagName.toLowerCase();
+      const type = (candidate.getAttribute("type") ?? "").toLowerCase();
+      if (type === "submit" && (tag === "input" || tag === "button")) return true;
+      if (!isButtonish(candidate)) continue;
+      if (SUBMITTISH.test(controlWords(candidate))) return true;
+    }
+    return false;
+  };
+
+  const visible = (element: Element): boolean => {
+    if (element.getAttribute("aria-hidden") === "true") return false;
+    const style = window.getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const box = element.getBoundingClientRect();
+    if (box.width > 0 && box.height > 0) return true;
+    for (const inner of deepUnder(element, 30)) {
+      const innerBox = inner.getBoundingClientRect();
+      if (innerBox.width > 0 && innerBox.height > 0) return true;
+    }
+    return false;
+  };
+
+  const HEADING_SEL = 'h1,h2,h3,h4,h5,h6,legend,[role="heading"],[data-test*="title" i]';
+  const headingIn = (node: Element): string => {
+    for (const candidate of deepUnder(node, 200)) {
+      if (!candidate.matches(HEADING_SEL)) continue;
+      const text = clean(candidate.textContent);
+      if (text !== "" && text.length <= 80) return text;
+    }
+    return "";
+  };
+
+  let stamped = 0;
+  const stamp = (element: Element, prefix: string): string => {
+    const existing = element.getAttribute(handleAttr);
+    if (existing !== null && existing !== "") return `[${handleAttr}="${existing}"]`;
+    stamped++;
+    const handle = `${prefix}${stamped}`;
+    element.setAttribute(handleAttr, handle);
+    return `[${handleAttr}="${handle}"]`;
+  };
+
+  const everything = deepUnder(document, 8000);
+  for (const element of everything) {
+    if (element.hasAttribute(handleAttr)) element.removeAttribute(handleAttr);
+  }
+
+  /**
+   * The add controls in `node`, counted the way a person would count them.
+   *
+   * A web component add button is two or three nested button-ish elements
+   * wrapped around one real `<button>` — `oc-button` around `spl-button` around
+   * `button` — and all three match. Only the outermost is a control; the rest
+   * are its packaging. Counting elements instead of controls made every section
+   * look as if it held three add buttons, which is the number this uses to
+   * decide it has climbed out of one section and into the whole form.
+   */
+  const addControlsIn = (node: Element | Document): Element[] => {
+    const matches = deepUnder(node, 1500).filter(
+      (element) => isButtonish(element) && visible(element) && ADDISH.test(controlWords(element))
+    );
+    const inner = new Set<Element>();
+    for (const match of matches) {
+      for (const descendant of deepUnder(match, 50)) inner.add(descendant);
+    }
+    return matches.filter((match) => !inner.has(match));
+  };
+
+  // An add control is the anchor: it is the one thing a repeating section
+  // always has and an ordinary section never does.
+  for (const adder of addControlsIn(document)) {
+    if (out.length >= maxSections) break;
+
+    // Never a control that submits, however it is worded, and never one whose
+    // words say both "add" and something that sends the application.
+    if (SUBMITTISH.test(controlWords(adder))) continue;
+    if (holdsSubmitControl(adder)) continue;
+
+    // Climb to the first ancestor that carries a heading. On this board that is
+    // the header *row* — the flex box holding the title beside the Add button —
+    // which is emphatically not the section: the entries mount in a sibling
+    // below it, so stopping here left the commit control outside the container
+    // and `pressCommitEntry` reported a section whose only buttons were Add.
+    let container: Element | null = parentOf(adder);
+    let heading = "";
+    for (let depth = 0; container !== null && depth < 8; depth++) {
+      heading = headingIn(container);
+      if (heading !== "") break;
+      container = parentOf(container);
+    }
+    if (container === null || heading === "") continue;
+
+    // Then keep climbing for as long as the ancestor is still *this* section:
+    // same heading, still exactly one add control, still no submit control. The
+    // first ancestor that fails is the one that has swallowed the next section
+    // or the form itself, and the last one that passed is the section's own box.
+    for (let depth = 0; depth < 8; depth++) {
+      const next = parentOf(container);
+      if (next === null) break;
+      if (headingIn(next) !== heading) break;
+      if (addControlsIn(next).length !== 1) break;
+      if (holdsSubmitControl(next)) break;
+      container = next;
+    }
+
+    const text = clean(container.textContent).slice(0, 1200);
+    const message = AT_LEAST_ONE.test(text) ? clean((text.match(AT_LEAST_ONE) ?? [""])[0]) : "";
+    const markedRequired = /[*✱]/.test(heading) || /\(required\)/i.test(heading);
+    // A section is one this must fill only if the board says so: either it is
+    // showing its own "at least one entry" complaint, or its heading carries a
+    // required marker. An optional "Add a reference" section is left alone.
+    if ((message === "" && !markedRequired) || holdsSubmitControl(container)) continue;
+
+    out.push({
+      heading: clean(heading.replace(/[*✱]+/g, "").replace(/\(required\)/i, "")),
+      addSelector: stamp(adder, "a"),
+      containerSelector: stamp(container, "s"),
+      message,
+    });
+  }
+
+  return out;
+}
+
+/**
+ * Every required repeating section on the page, or none.
+ *
+ * Never throws, for the same reason `enumerateFormFields` does not: a page this
+ * cannot read is a page with no repeating sections, and the caller decides what
+ * that means. Reporting a section that is not one costs a click on a control
+ * this has already refused to believe is a submit button; missing one costs an
+ * application that cannot be completed.
+ */
+export async function enumerateRepeatingSections(page: Page): Promise<RepeatingSection[]> {
+  let raw: RawSection[];
+  try {
+    const result = await page.evaluate(
+      inPageExpression(
+        enumerateRepeatingSectionsInPage,
+        `${MAX_REPEATING_SECTIONS}, ${jsLiteral(SECTION_HANDLE_ATTR)}`
+      )
+    );
+    const failure = inPageError(result);
+    if (failure !== null) throw new Error(failure);
+    raw = Array.isArray(result) ? (result as RawSection[]) : [];
+  } catch (err) {
+    console.warn(
+      `[form-fields] could not read the form's repeating sections (treating it as having none): ` +
+        `${err instanceof Error ? err.message : String(err)}`
+    );
+    return [];
+  }
+
+  const used = new Map<string, number>();
+  const sections: RepeatingSection[] = [];
+  for (const entry of raw) {
+    if (typeof entry?.addSelector !== "string" || entry.addSelector === "") continue;
+    const heading = typeof entry.heading === "string" ? entry.heading.slice(0, 120) : "";
+    const base = normalizeText(heading).slice(0, 60) || `section-${sections.length + 1}`;
+    const seen = used.get(base) ?? 0;
+    used.set(base, seen + 1);
+    sections.push({
+      key: seen === 0 ? base : `${base} #${seen + 1}`,
+      heading,
+      addSelector: entry.addSelector,
+      containerSelector:
+        typeof entry.containerSelector === "string" ? entry.containerSelector : entry.addSelector,
+      message: typeof entry.message === "string" ? entry.message.slice(0, 200) : "",
+    });
+  }
+  return sections;
+}
+
+/** What one control looks like at the moment somebody is about to press it. */
+type PressCandidate = { found: boolean; words: string; submitish: boolean };
+
+/**
+ * Reads a control's own words back out of the page, right before it is clicked.
+ *
+ * This is the guard, and it is deliberately taken *at the last moment* rather
+ * than trusted from the enumeration pass. A form re-renders between a read and a
+ * click — that is the premise of half the comments in this file — and "the
+ * button that was called Add when we looked" is not the same claim as "the
+ * button that is called Add now". `assertNotAnApplicationSubmit` in
+ * `fill-application-form.ts` applies the identical rule to the controls that
+ * module presses.
+ */
+function describePressableInPage(selector: string): PressCandidate {
+  const clean = (value: string | null | undefined): string =>
+    (value ?? "").replace(/\s+/g, " ").trim();
+
+  const resolveDeep = (sel: string): Element | null => {
+    try {
+      const light = document.querySelector(sel);
+      if (light !== null) return light;
+    } catch {
+      return null;
+    }
+    const stack: (Document | ShadowRoot)[] = [document];
+    const seen = new Set<Document | ShadowRoot>();
+    while (stack.length > 0) {
+      const root = stack.pop();
+      if (root === undefined || seen.has(root)) continue;
+      seen.add(root);
+      let hosts: Element[];
+      try {
+        hosts = Array.from(root.querySelectorAll("*"));
+      } catch {
+        continue;
+      }
+      for (const host of hosts) {
+        const inner = (host as HTMLElement).shadowRoot;
+        if (inner === null || inner === undefined) continue;
+        try {
+          const hit = inner.querySelector(sel);
+          if (hit !== null) return hit;
+        } catch {
+          return null;
+        }
+        stack.push(inner);
+      }
+    }
+    return null;
+  };
+
+  const element = resolveDeep(selector);
+  if (element === null) return { found: false, words: "", submitish: false };
+
+  const bits = [
+    element.textContent ?? "",
+    element.getAttribute("aria-label") ?? "",
+    element.getAttribute("value") ?? "",
+    element.getAttribute("title") ?? "",
+  ];
+  const root = element.getRootNode();
+  if (root instanceof ShadowRoot) {
+    bits.push(root.host.textContent ?? "", root.host.getAttribute("aria-label") ?? "");
+  }
+  const words = clean(bits.join(" ")).slice(0, 200);
+  const submitish = /\b(submit|send|apply|application|finish|complete)\w*\b/i.test(words);
+  // A `type="submit"` anywhere under it, whatever it says on the outside.
+  let typedSubmit = false;
+  try {
+    typedSubmit =
+      element.matches('input[type="submit"],button[type="submit"]') ||
+      element.querySelector('input[type="submit"],button[type="submit"]') !== null;
+  } catch {
+    typedSubmit = true;
+  }
+  return { found: true, words, submitish: submitish || typedSubmit };
+}
+
+async function pressGuarded(
+  page: Page,
+  selector: string,
+  allowed: RegExp,
+  what: string
+): Promise<ApplyOutcome> {
+  let described: PressCandidate;
+  try {
+    const raw = await page.evaluate(
+      inPageExpression(describePressableInPage, jsLiteral(selector))
+    );
+    const failure = inPageError(raw);
+    if (failure !== null) throw new Error(failure);
+    described = raw as PressCandidate;
+  } catch (err) {
+    return {
+      ok: false,
+      readBack: "",
+      detail: `could not re-read the ${what} control before pressing it: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+
+  if (!described.found) {
+    return { ok: false, readBack: "", detail: `the ${what} control is no longer on the page` };
+  }
+  // Fail closed, loudly. Refusing here leaves a required section unfilled and
+  // the run escalates; not refusing here could send somebody's application.
+  if (described.submitish) {
+    return {
+      ok: false,
+      readBack: described.words,
+      detail:
+        `refused to press the ${what} control: it now reads ` +
+        `${JSON.stringify(described.words.slice(0, 80))}, which could submit the application`,
+    };
+  }
+  if (!allowed.test(described.words)) {
+    return {
+      ok: false,
+      readBack: described.words,
+      detail:
+        `refused to press the ${what} control: it reads ` +
+        `${JSON.stringify(described.words.slice(0, 80))}, which is not a ${what} control`,
+    };
+  }
+
+  await scrollIntoView(page, selector);
+  try {
+    await page.locator(selector).click();
+  } catch (err) {
+    return {
+      ok: false,
+      readBack: described.words,
+      detail: `could not press the ${what} control: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+  return { ok: true, readBack: described.words, detail: `pressed ${JSON.stringify(described.words.slice(0, 40))}` };
+}
+
+/**
+ * Presses one repeating section's add control, so its entry's fields mount.
+ *
+ * The only new click this module has learned, and it is the narrowest one that
+ * could work: a control the perception pass already matched against
+ * `ADD_ENTRY_CONTROL_RE` and cleared through the same submit guard the
+ * activation ladder uses, re-read and re-checked at the instant of the press.
+ */
+export async function pressAddEntry(page: Page, section: RepeatingSection): Promise<ApplyOutcome> {
+  return await pressGuarded(page, section.addSelector, ADD_ENTRY_CONTROL_RE, "add entry");
+}
+
+/**
+ * Presses the control that commits the entry that is currently being edited.
+ *
+ * Scoped to the section's own container, so the only candidates are controls
+ * that belong to the subform. SmartRecruiters will not count an experience entry
+ * at all until its "Save experience entry" button is pressed — the fields can be
+ * filled perfectly and the section still reports itself empty — so this is the
+ * step that turns a filled subform into an entry the board acknowledges.
+ *
+ * Returns `ok: false` with a reason when there is nothing to press, which is the
+ * correct answer for a board that commits an entry as it is typed.
+ */
+export async function pressCommitEntry(
+  page: Page,
+  section: RepeatingSection
+): Promise<ApplyOutcome> {
+  // Any suggestion list still hanging open is shut first. A click lands on
+  // whatever is *painted* at the control's centre, and the last field in one of
+  // these subforms is routinely a location autocomplete whose open menu covers
+  // the Save button directly below it. This is also the one moment where Escape
+  // is unambiguously safe: every field in the entry has already been written and
+  // read back.
+  await closeMenu(page);
+  await page.waitForTimeout(MENU_POLL_MS);
+
+  const first = await pressCommitEntryOnce(page, section);
+  if (!first.ok) return first;
+
+  // The read-back. A committed entry takes its edit form off the page and leaves
+  // a summary in its place, so a commit control still standing there means the
+  // press changed nothing — which is exactly what a live run did, silently,
+  // while reporting that it had pressed Save. One retry, because committing the
+  // same entry twice is the same entry, and because the first press sometimes
+  // lands while the widget is still settling from the last field written into
+  // it. Then it is reported honestly either way.
+  await page.waitForTimeout(MENU_SETTLE_TIMEOUT_MS);
+  const stillThere = await findCommitControl(page, section);
+  if (stillThere === null || stillThere.selector === "") return first;
+
+  const second = await pressCommitEntryOnce(page, section);
+  if (!second.ok) return second;
+  await page.waitForTimeout(MENU_SETTLE_TIMEOUT_MS);
+  const stillThereAgain = await findCommitControl(page, section);
+  if (stillThereAgain === null || stillThereAgain.selector === "") return second;
+  return {
+    ok: false,
+    readBack: second.readBack,
+    detail:
+      `pressed ${JSON.stringify(second.readBack.slice(0, 40))} twice and the entry's own form is ` +
+      `still on the page, so nothing was committed`,
+  };
+}
+
+/** The commit control lookup, or null when the page could not be read. */
+async function findCommitControl(
+  page: Page,
+  section: RepeatingSection
+): Promise<CommitLookup | null> {
+  try {
+    const raw = await page.evaluate(
+      inPageExpression(
+        findCommitControlInPage,
+        `${jsLiteral(section.containerSelector)}, ${jsLiteral(SECTION_HANDLE_ATTR)}`
+      )
+    );
+    const failure = inPageError(raw);
+    if (failure !== null) throw new Error(failure);
+    return raw as CommitLookup;
+  } catch {
+    return null;
+  }
+}
+
+async function pressCommitEntryOnce(
+  page: Page,
+  section: RepeatingSection
+): Promise<ApplyOutcome> {
+  let lookup: CommitLookup;
+  try {
+    const raw = await page.evaluate(
+      inPageExpression(
+        findCommitControlInPage,
+        `${jsLiteral(section.containerSelector)}, ${jsLiteral(SECTION_HANDLE_ATTR)}`
+      )
+    );
+    const failure = inPageError(raw);
+    if (failure !== null) throw new Error(failure);
+    lookup = raw as CommitLookup;
+  } catch (err) {
+    return {
+      ok: false,
+      readBack: "",
+      detail: `could not look for a control that commits the entry: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+  if (!lookup.containerFound) {
+    return {
+      ok: false,
+      readBack: "",
+      detail: `the "${section.heading}" section is no longer on the page`,
+    };
+  }
+  if (lookup.selector === "") {
+    // Said with the evidence, because "no Save button" and "a Save button this
+    // refused to press" are different facts and only one of them is a bug here.
+    return {
+      ok: false,
+      readBack: "",
+      detail:
+        `this section has no control that commits an entry` +
+        (lookup.considered.length === 0
+          ? " (it holds no pressable controls at all)"
+          : ` (its controls read: ${lookup.considered
+              .map((text) => JSON.stringify(text))
+              .join(", ")})`),
+    };
+  }
+  return await pressGuarded(page, lookup.selector, COMMIT_ENTRY_CONTROL_RE, "commit entry");
+}
+
+/** What the search for a commit control found, and what it had to look at. */
+type CommitLookup = { selector: string; containerFound: boolean; considered: string[] };
+
+/** Finds the save/done control inside one section, and stamps it. Self-contained. */
+function findCommitControlInPage(containerSelector: string, handleAttr: string): CommitLookup {
+  const clean = (value: string | null | undefined): string =>
+    (value ?? "").replace(/\s+/g, " ").trim();
+
+  const deepUnder = (node: Element | Document, limit: number): Element[] => {
+    const found: Element[] = [];
+    const stack: (Element | Document | ShadowRoot)[] = [node];
+    // The node's own shadow root counts as "under" it. See `deepQueryAll`.
+    const own = (node as HTMLElement).shadowRoot;
+    if (own !== null && own !== undefined) stack.push(own);
+    const seen = new Set<Element | Document | ShadowRoot>();
+    while (stack.length > 0 && found.length < limit) {
+      const root = stack.pop();
+      if (root === undefined || seen.has(root)) continue;
+      seen.add(root);
+      let children: Element[];
+      try {
+        children = Array.from(root.querySelectorAll("*"));
+      } catch {
+        continue;
+      }
+      for (const child of children) {
+        found.push(child);
+        const inner = (child as HTMLElement).shadowRoot;
+        if (inner !== null && inner !== undefined) stack.push(inner);
+        if (found.length >= limit) break;
+      }
+    }
+    return found;
+  };
+
+  const resolveDeep = (sel: string): Element | null => {
+    try {
+      const light = document.querySelector(sel);
+      if (light !== null) return light;
+    } catch {
+      return null;
+    }
+    for (const candidate of deepUnder(document, 8000)) {
+      const inner = (candidate as HTMLElement).shadowRoot;
+      if (inner === null || inner === undefined) continue;
+      try {
+        const hit = inner.querySelector(sel);
+        if (hit !== null) return hit;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
+
+  const considered: string[] = [];
+  const container = resolveDeep(containerSelector);
+  if (container === null) return { selector: "", containerFound: false, considered };
+
+  const words = (element: Element): string => {
+    const bits = [
+      element.textContent ?? "",
+      element.getAttribute("aria-label") ?? "",
+      element.getAttribute("value") ?? "",
+    ];
+    const root = element.getRootNode();
+    if (root instanceof ShadowRoot) {
+      bits.push(root.host.textContent ?? "", root.host.getAttribute("aria-label") ?? "");
+    }
+    return clean(bits.join(" ")).slice(0, 200);
+  };
+
+  const SUBMITTISH = /\b(submit|send|apply|application|finish|complete)\w*\b/i;
+  const COMMITISH = /^(save|done|add)\b/i;
+  const ADDISH = /^\+?\s*add\b(?!\s*ress)(\s+(another|more|an|a|new|entry|item|row))?\b/i;
+
+  const visible = (element: Element): boolean => {
+    if (element.getAttribute("aria-hidden") === "true") return false;
+    const style = window.getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const box = element.getBoundingClientRect();
+    if (box.width > 0 && box.height > 0) return true;
+    for (const inner of deepUnder(element, 20)) {
+      const innerBox = inner.getBoundingClientRect();
+      if (innerBox.width > 0 && innerBox.height > 0) return true;
+    }
+    return false;
+  };
+
+  let best: Element | null = null;
+  for (const candidate of deepUnder(container, 600)) {
+    const tag = candidate.tagName.toLowerCase();
+    const type = (candidate.getAttribute("type") ?? "").toLowerCase();
+    const buttonish =
+      tag === "button" ||
+      (candidate.getAttribute("role") ?? "").toLowerCase() === "button" ||
+      (tag === "input" && type === "button") ||
+      /(^|-)button$/.test(tag);
+    if (!buttonish || type === "submit") continue;
+    if (!visible(candidate)) continue;
+    const text = words(candidate);
+    if (considered.length < 12 && text !== "") considered.push(text.slice(0, 40));
+    if (SUBMITTISH.test(text)) continue;
+    // The add control also starts with "Add", and pressing it again would open
+    // a second blank entry rather than commit the one being edited.
+    if (ADDISH.test(text)) continue;
+    if (!COMMITISH.test(text)) continue;
+    // The outermost match wins: it is the one whose box a click lands inside.
+    if (best === null || best.contains(candidate)) best = candidate;
+  }
+  if (best === null) return { selector: "", containerFound: true, considered };
+
+  // Every previous commit stamp is cleared before this one is issued.
+  //
+  // The stamp used to be the fixed string "c1", which collided the moment a
+  // form had two of these sections: Education's commit lookup marked its own
+  // Save button "c1" while Experience's Save was already carrying "c1", and the
+  // selector then resolved to whichever came first in the document. A live run
+  // pressed "Save experience entry" twice and never saved the education entry
+  // at all — and the log said "pressed Save Save experience entry" under the
+  // Education heading, which is exactly the kind of quietly wrong thing this
+  // file's read-backs exist to make visible.
+  //
+  // Only commit stamps are cleared: the add control and the section container
+  // carry values under the same attribute and are still in use.
+  for (const marked of deepUnder(document, 8000)) {
+    const value = marked.getAttribute(handleAttr);
+    if (value !== null && value.startsWith("c")) marked.removeAttribute(handleAttr);
+  }
+  best.setAttribute(handleAttr, "c1");
+  return { selector: `[${handleAttr}="c1"]`, containerFound: true, considered };
+}
+
+/**
+ * Whether the section is still complaining that it has no entries.
+ *
+ * The read-back for adding an entry, and the same idea as `readFieldValue`: the
+ * board's own validation is the only authority on whether what was typed counted.
+ */
+export async function sectionStillUnsatisfied(
+  page: Page,
+  section: RepeatingSection
+): Promise<boolean> {
+  const script = `(() => {
+    const sel = ${jsLiteral(section.containerSelector)};
+    const el = ${RESOLVE_IN_PAGE_SRC}(sel);
+    if (!el) return false;
+    const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+    return ${AT_LEAST_ONE_ENTRY_RE.toString()}.test(text);
+  })()`;
+  try {
+    return (await page.evaluate(script)) === true;
+  } catch {
+    return false;
+  }
+}
+
+// ───────────────────────────────────
 // Action — one decided value into one control
 // ───────────────────────────────────
 
@@ -1384,13 +2711,7 @@ export type ApplyOutcome = {
 export async function readFieldValue(page: Page, field: EnumeratedField): Promise<string> {
   const script = `(() => {
     const sel = ${jsLiteral(field.selector)};
-    const path = sel.startsWith("xpath=") ? sel.slice(6) : sel;
-    let el = null;
-    try {
-      el = (path.startsWith("/") || path.startsWith("("))
-        ? document.evaluate(path, document, null, 9, null).singleNodeValue
-        : document.querySelector(sel);
-    } catch { return ""; }
+    const el = ${RESOLVE_IN_PAGE_SRC}(sel);
     if (!el) return "";
     const clean = (v) => (v || "").replace(/\\s+/g, " ").trim();
     const tag = el.tagName.toLowerCase();
@@ -1422,18 +2743,53 @@ export async function readFieldValue(page: Page, field: EnumeratedField): Promis
   }
 }
 
-/** One element's own visible text, for confirming what is about to be clicked. */
+/**
+ * One element's own visible text, for confirming what is about to be clicked.
+ *
+ * JOB-047 makes it walk open shadow roots when the element itself reads empty,
+ * which is the same definition of "an option's words" that the menu read used
+ * (`deepText`, inside the enumeration script). The two have to agree: this read
+ * is what confirms the option at a position is still the one that was chosen,
+ * so measuring text differently from the read that chose it reports every web
+ * component menu row as having silently turned into an empty string. That is
+ * exactly what a live run said about SmartRecruiters' country picker — "that
+ * position now reads "" rather than "United States"" — for a menu that was
+ * sitting there perfectly readable.
+ *
+ * The explanation lives here rather than inside the evaluated string on
+ * purpose. `tests/unit/form-fields.test.ts` decides which of this file's
+ * scripts it was handed by looking for a substring unique to that script, and a
+ * comment that names another one of them makes the fixture answer as the wrong
+ * script. Which it duly did.
+ */
 async function readElementText(page: Page, selector: string): Promise<string> {
   const script = `(() => {
     const sel = ${jsLiteral(selector)};
-    const path = sel.startsWith("xpath=") ? sel.slice(6) : sel;
-    let el = null;
-    try {
-      el = (path.startsWith("/") || path.startsWith("("))
-        ? document.evaluate(path, document, null, 9, null).singleNodeValue
-        : document.querySelector(sel);
-    } catch { return ""; }
-    return el ? (el.textContent || "").replace(/\\s+/g, " ").trim() : "";
+    const el = ${RESOLVE_IN_PAGE_SRC}(sel);
+    if (!el) return "";
+    const clean = (v) => (v || "").replace(/\\s+/g, " ").trim();
+    const own = clean(el.textContent);
+    if (own) return own;
+    const parts = [];
+    const stack = [el];
+    const seen = new Set();
+    let budget = 200;
+    while (stack.length && budget-- > 0) {
+      const node = stack.pop();
+      if (!node || seen.has(node)) continue;
+      seen.add(node);
+      let kids = [];
+      try { kids = Array.from(node.children || []); } catch { kids = []; }
+      const inner = node.shadowRoot;
+      if (inner) { try { kids = kids.concat(Array.from(inner.children || [])); } catch {} }
+      if (kids.length === 0) {
+        const text = clean(node.textContent);
+        if (text) parts.push(text);
+        continue;
+      }
+      for (const kid of kids) stack.push(kid);
+    }
+    return clean(parts.reverse().join(" "));
   })()`;
   try {
     const text = await page.evaluate(script);
@@ -1720,9 +3076,31 @@ async function chooseFromMenuOnce(
   contextTerms: readonly string[] = []
 ): Promise<ApplyOutcome> {
   const wanted = normalizeText(value);
+  /**
+   * The attested terms, each already split into the spellings that count as it.
+   *
+   * JOB-047. `contextTerms` is ANDed — every term has to appear — which is what
+   * makes one survivor mean "matched on two independently attested facts". That
+   * is right, and it is also why a second spelling of the *same* fact cannot
+   * simply be added to the list: "United States" and "US" are one fact, and
+   * requiring both would reject every option that spells it either way.
+   *
+   * So a term may carry its equivalent spellings separated by `|`, and is
+   * satisfied when any one of them appears. A term with no `|` in it behaves
+   * exactly as it did. This is not a widening of what counts as evidence — the
+   * same one fact is still required — it is the difference between recognising
+   * that fact on a board that writes "San Francisco, California, United States"
+   * and on one that writes "San Francisco, CA, US". SmartRecruiters writes the
+   * second, and the country term never matched it.
+   */
   const terms = contextTerms
-    .map((term) => normalizeText(term))
-    .filter((term) => term !== "" && term !== wanted);
+    .map((term) =>
+      term
+        .split("|")
+        .map((spelling) => normalizeText(spelling))
+        .filter((spelling) => spelling !== "" && spelling !== wanted)
+    )
+    .filter((spellings) => spellings.length > 0);
 
   const pick = (menu: OpenMenu): number => {
     const exact = menu.texts.findIndex((text) => normalizeText(text) === wanted);
@@ -1743,19 +3121,12 @@ async function chooseFromMenuOnce(
     const narrowed = matches.filter(
       (entry) =>
         normalizeText(entry.text.split(",")[0] ?? "") === wanted &&
-        terms.every((term) => entry.text.includes(term))
+        terms.every((spellings) => spellings.some((spelling) => entry.text.includes(spelling)))
     );
     return narrowed.length === 1 ? (narrowed[0]?.index ?? -1) : -1;
   };
 
-  let menu = await openMenu(page, field);
-  if (!menu.expanded && menu.texts.length === 0) {
-    return {
-      ok: false,
-      readBack: await readFieldValue(page, field),
-      detail: "the dropdown could not be opened",
-    };
-  }
+  let menu: OpenMenu = NO_MENU;
 
   /**
    * Narrows the menu by typing the value into it, then waits for the list to
@@ -1782,11 +3153,37 @@ async function chooseFromMenuOnce(
     return found;
   };
 
-  let index =
-    menu.count > MAX_UNFILTERED_MENU_OPTIONS ? await narrow() : pick(menu);
-  // Either the list was short and the value is not on it, or it is a search
-  // control that had nothing in it until it was asked a question.
-  if (index === -1) index = await narrow();
+  /**
+   * JOB-047. A search control is asked its question before it is poked.
+   *
+   * `openMenu` clicks its way up the activation ladder and then reads. For a
+   * menu with a fixed list that is the only thing that can work, and it is
+   * unchanged below. For a control whose list *is* a server's answer to a
+   * query, clicking first is at best a wasted round trip and at worst the thing
+   * that breaks it: SmartRecruiters' location autocomplete declares
+   * `minquerylength="3"`, so a click leaves it collapsed and empty, and five
+   * clicks up the ladder leave it collapsed, empty, and no longer where the
+   * first click found it. The required City field came back "the dropdown could
+   * not be opened" on every live run, while typing into that same control by
+   * hand produced eight suggestions every time.
+   *
+   * So: if this control's options were not known in advance, type the value and
+   * see what comes back. If nothing does, the click ladder still runs exactly as
+   * it did, and a control that genuinely needs a click to open is filled the way
+   * it always was. Nothing is skipped; one thing is tried first.
+   */
+  const isSearchControl = !field.optionsKnown || field.options.length === 0;
+  let index = isSearchControl ? await narrow() : -1;
+
+  let openedOnClick = menu.expanded || menu.texts.length > 0;
+  if (index === -1) {
+    menu = await openMenu(page, field);
+    openedOnClick = openedOnClick || menu.expanded || menu.texts.length > 0;
+    index = menu.count > MAX_UNFILTERED_MENU_OPTIONS ? await narrow() : pick(menu);
+    // Either the list was short and the value is not on it, or it is a search
+    // control that had nothing in it until it was asked a question.
+    if (index === -1) index = await narrow();
+  }
 
   if (index === -1) {
     // JOB-044. `allowFreeText` is only ever true for a control the caller has
@@ -1823,7 +3220,9 @@ async function chooseFromMenuOnce(
       readBack: await readFieldValue(page, field),
       detail:
         menu.texts.length === 0
-          ? "the dropdown offered no options to choose from"
+          ? openedOnClick
+            ? "the dropdown offered no options to choose from"
+            : `the dropdown could not be opened, and typing "${value}" into it produced no options`
           : `"${value}" is not one of this dropdown's options (${menu.texts
               .slice(0, 8)
               .map((text) => JSON.stringify(text))

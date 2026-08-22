@@ -36,7 +36,16 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { applyFieldValue, type EnumeratedField } from "@/lib/form-fields";
+import {
+  applyFieldValue,
+  pressAddEntry,
+  pressCommitEntry,
+  ADD_ENTRY_CONTROL_RE,
+  AT_LEAST_ONE_ENTRY_RE,
+  COMMIT_ENTRY_CONTROL_RE,
+  type EnumeratedField,
+  type RepeatingSection,
+} from "@/lib/form-fields";
 
 /** One control, with the boring parts of `EnumeratedField` filled in. */
 function field(over: Partial<EnumeratedField> & { label: string; selector: string }): EnumeratedField {
@@ -437,6 +446,45 @@ describe("a location search whose suggestions all contain the query", () => {
     expect(SAN_FRANCISCO_SUGGESTIONS).not.toContain(outcome.readBack);
   });
 
+  it("recognises the attested country however the board abbreviates it", async () => {
+    // JOB-047. SmartRecruiters' location service writes the same six-suggestion
+    // answer as "San Francisco, CA, US". A context term of only "United States"
+    // matches none of them, so the required City field stayed empty on every
+    // run. One term carrying its equivalent spellings resolves it, and it is
+    // still the one attested fact being required.
+    const { page } = searchMenu([
+      "San Francisco, CA, US",
+      "San Francisco, Caraga, Philippines",
+      "San Francisco, Cordoba, Argentina",
+      "South San Francisco, CA, US",
+    ]);
+
+    const outcome = await applyFieldValue(page as never, locationField(), "San Francisco", {
+      allowContains: true,
+      contextTerms: ["United States|USA|US"],
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("San Francisco, CA, US");
+  });
+
+  it("still requires the one attested fact when a term carries several spellings", async () => {
+    // The alternation must not become "any of these is optional": none of these
+    // suggestions is in the country the candidate attested to, so the answer is
+    // still no.
+    const { page } = searchMenu([
+      "San Francisco, Caraga, Philippines",
+      "San Francisco, Cordoba, Argentina",
+    ]);
+
+    const outcome = await applyFieldValue(page as never, locationField(), "San Francisco", {
+      allowContains: true,
+      contextTerms: ["United States|USA|US"],
+    });
+
+    expect(outcome.ok).toBe(false);
+  });
+
   it("does not settle for a city whose name merely starts the same way", async () => {
     // "South San Francisco, California, United States" contains the query and
     // contains the country, so only the leading-segment rule excludes it. Here
@@ -504,5 +552,190 @@ describe("a location search whose suggestions all contain the query", () => {
     );
 
     expect(outcome.ok).toBe(false);
+  });
+});
+
+/**
+ * JOB-047 — the repeating-subform predicates and the guard on the one new click
+ * this module learned.
+ *
+ * The DOM half (walking open shadow roots, finding the section box that holds
+ * both the heading and the entry form) cannot be tested here and is not
+ * pretended to be: it runs inside a real browser against a real board, and the
+ * PR says which live listing it was proven against. What *is* testable in
+ * isolation is the part that decides whether a control may be pressed at all,
+ * and that is the part where being wrong sends somebody's application.
+ */
+describe("recognising a repeating section's own controls", () => {
+  it("matches the add controls a board actually renders", () => {
+    for (const words of [
+      "Add",
+      "+ Add",
+      "Add another",
+      "Add another entry",
+      "add more",
+      "Add a new row",
+      "Add Add experience entry",
+    ]) {
+      expect(ADD_ENTRY_CONTROL_RE.test(words)).toBe(true);
+    }
+  });
+
+  it("does not mistake other buttons for one", () => {
+    // "Address" is the one that matters: it is a word this would have matched
+    // on a bare `/add/` and it names a field, not a control.
+    for (const words of [
+      "Address",
+      "Address line 2",
+      "Upload",
+      "Submit application",
+      "Apply now",
+      "Save",
+      "Next",
+    ]) {
+      expect(ADD_ENTRY_CONTROL_RE.test(words)).toBe(false);
+    }
+  });
+
+  it("matches a control that commits one entry, and nothing that advances the form", () => {
+    for (const words of ["Save", "Save experience entry", "Done", "Add entry"]) {
+      expect(COMMIT_ENTRY_CONTROL_RE.test(words)).toBe(true);
+    }
+    // None of these commits a subform. Two of them submit an application.
+    for (const words of ["Next", "Continue", "Submit", "Submit application", "Finish", "Cancel"]) {
+      expect(COMMIT_ENTRY_CONTROL_RE.test(words)).toBe(false);
+    }
+  });
+
+  it("reads the board's own complaint that a section is empty", () => {
+    for (const message of [
+      "Please provide at least one work experience entry",
+      "Please provide at least one education entry",
+      "You must add at least one entry",
+      "Add at least one position",
+    ]) {
+      expect(AT_LEAST_ONE_ENTRY_RE.test(message)).toBe(true);
+    }
+    // Not every sentence with "at least one" in it is this.
+    for (const message of [
+      "Password must contain at least one number",
+      "Select at least one of the checkboxes below",
+    ]) {
+      expect(AT_LEAST_ONE_ENTRY_RE.test(message)).toBe(false);
+    }
+  });
+});
+
+/**
+ * A `Page` that reports one control's words and records what was pressed.
+ *
+ * `commitSticks` models what a board does when Save works: the entry's edit form
+ * (and with it the Save button) comes off the page, which is the only evidence
+ * `pressCommitEntry` has that anything was committed. Set it false for the board
+ * behaviour that made this read-back necessary — a press that is accepted,
+ * reported, and changes nothing.
+ */
+function pressablePage(words: string, options: { found?: boolean; commitSticks?: boolean } = {}) {
+  const found = options.found ?? true;
+  const commitSticks = options.commitSticks ?? true;
+  const clicked: string[] = [];
+  const page = {
+    evaluate: vi.fn(async (script: string) => {
+      if (script.includes("findCommitControlInPage")) {
+        const gone = commitSticks && clicked.length > 0;
+        return {
+          selector: gone ? "" : '[data-jobinno-section="c1"]',
+          containerFound: true,
+          considered: [words],
+        };
+      }
+      if (script.includes("describePressableInPage")) {
+        return {
+          found,
+          words,
+          submitish: /\b(submit|send|apply|application|finish|complete)\w*\b/i.test(words),
+        };
+      }
+      return null;
+    }),
+    locator: vi.fn((selector: string) => ({
+      click: vi.fn(async () => {
+        clicked.push(selector);
+      }),
+    })),
+    keyPress: vi.fn(async () => {}),
+    waitForTimeout: vi.fn(async () => {}),
+  };
+  return { page, clicked };
+}
+
+const SECTION: RepeatingSection = {
+  key: "experience",
+  heading: "Experience",
+  addSelector: '[data-jobinno-section="a1"]',
+  containerSelector: '[data-jobinno-section="s2"]',
+  message: "Please provide at least one work experience entry",
+};
+
+describe("the guard on pressing a repeating section's controls", () => {
+  it("presses an add control that still reads like one", async () => {
+    const { page, clicked } = pressablePage("Add Add experience entry");
+    const outcome = await pressAddEntry(page as never, SECTION);
+    expect(outcome.ok).toBe(true);
+    expect(clicked).toEqual(['[data-jobinno-section="a1"]']);
+  });
+
+  it("refuses, without clicking, when the control now reads like a submit", async () => {
+    // The whole reason the words are re-read at the moment of the press rather
+    // than trusted from the enumeration pass: a form re-renders between the two,
+    // and "the button that was called Add when we looked" is a different claim
+    // from "the button that is called Add now".
+    const { page, clicked } = pressablePage("Submit application");
+    const outcome = await pressAddEntry(page as never, SECTION);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("could submit the application");
+    expect(clicked).toEqual([]);
+  });
+
+  it("refuses, without clicking, when the control is not an add control at all", async () => {
+    const { page, clicked } = pressablePage("Delete this entry");
+    const outcome = await pressAddEntry(page as never, SECTION);
+    expect(outcome.ok).toBe(false);
+    expect(clicked).toEqual([]);
+  });
+
+  it("refuses, without clicking, when the control has gone", async () => {
+    const { page, clicked } = pressablePage("Add", { found: false });
+    const outcome = await pressAddEntry(page as never, SECTION);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("no longer on the page");
+    expect(clicked).toEqual([]);
+  });
+
+  it("holds the commit control to the same rule", async () => {
+    const { page, clicked } = pressablePage("Save Save experience entry");
+    const outcome = await pressCommitEntry(page as never, SECTION);
+    expect(outcome.ok).toBe(true);
+    expect(clicked).toEqual(['[data-jobinno-section="c1"]']);
+  });
+
+  it("reports a commit that was pressed and changed nothing", async () => {
+    // The read-back that a live SmartRecruiters run made necessary: the Save
+    // button was found, pressed, and reported pressed, and the experience entry
+    // was still sitting in edit mode at the end of the run. Two presses and the
+    // form still there is the honest answer, not a success.
+    const { page, clicked } = pressablePage("Save Save experience entry", { commitSticks: false });
+    const outcome = await pressCommitEntry(page as never, SECTION);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("still on the page");
+    expect(clicked).toHaveLength(2);
+  });
+
+  it("refuses to commit through a control that submits the application", async () => {
+    const { page, clicked } = pressablePage("Save and submit application");
+    const outcome = await pressCommitEntry(page as never, SECTION);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("could submit the application");
+    expect(clicked).toEqual([]);
   });
 });
