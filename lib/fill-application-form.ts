@@ -2440,6 +2440,24 @@ export const LEGAL_ATTESTATION_RE =
   /\b(?:work(?:ing)?\s+authoriz\w*|authoriz\w*\s+to\s+work|right\s+to\s+work|legally\s+(?:authoriz\w*|entitled|permitted|eligible)|citizen\w*|nationality|permanent\s+resident\w*|green\s+card|visa|sponsor\w*|immigration|work\s+permit|security\s+clearance|clearance\s+eligib\w*|clearance|export\s+control\w*|itar|u\.?\s?s\.?\s+person|felony|felonies|misdemean\w*|convict\w*|criminal\s+(?:history|record|background|conviction\w*)|background\s+check)\b/i;
 
 /**
+ * A proposed value that announces the absence of an answer instead of being
+ * one: "Not provided", "N/A", "Unknown", "None", "TBD", a lone dash.
+ *
+ * Anchored end to end on purpose. It has to catch a whole value that is
+ * nothing but filler while never touching a real answer that happens to
+ * contain one of these words — "None of the above" is a real option on
+ * Anduril's export control question, "Not applicable to my situation, because
+ * ..." is a real sentence somebody might genuinely write, and a street called
+ * "Unknown Road" is a real address. Only the bare placeholder matches.
+ *
+ * See `inferOrAsk`, the one place this is consulted, for the real run that
+ * made it necessary and for why it is scoped to typed text rather than to
+ * options a form itself offers.
+ */
+export const NON_ANSWER_RE =
+  /^[\s.,'"-]*(?:n\s*\/?\s*a|not\s+applicable|not\s+provided|not\s+specified|not\s+available|not\s+stated|no\s+answer|none|nil|null|unknown|unspecified|undisclosed|tbd|to\s+be\s+determined|prefer\s+not\s+to\s+say|-+|—+)[\s.,'"-]*$/i;
+
+/**
  * The only facts allowed to answer a legal attestation.
  *
  * ── Added after review on this PR, and it is the most important line here ───
@@ -3385,6 +3403,35 @@ function inferOrAsk(
   if (!field.required) return { kind: "skip", why };
 
   const proposed = decision?.value?.trim() ?? "";
+  // A proposal that is not an answer but an admission of not having one.
+  //
+  // Found on a real Belvedere Trading run (2026 08 22): the candidate's
+  // intake stores a city and a country but no street address and no postal
+  // code, so the model answered two REQUIRED fields with the literal string
+  // "Not provided", this function typed it, and the board refused the
+  // submission with the form still on screen. Filler is not a best effort
+  // answer, it is the absence of one wearing an answer's clothes, and typing
+  // it into a real employer's form under a real person's name is exactly what
+  // HARD STOP 9 forbids: if the intake does not support an honest answer, the
+  // question goes to the candidate.
+  //
+  // Scoped to text this system would TYPE. A menu that offers "N/A" as one of
+  // its own options is a different thing entirely: choosing an option the
+  // employer wrote is answering their question in their own words, so the
+  // option paths below are deliberately not gated on this.
+  if (
+    proposed !== "" &&
+    !OPTION_KINDS.has(field.kind) &&
+    NON_ANSWER_RE.test(proposed)
+  ) {
+    return askOrSkip(
+      field,
+      `${why}; the only answer available was ${JSON.stringify(proposed.slice(0, 40))}, which ` +
+        `states that nothing is known rather than answering, and filler is not put on a real ` +
+        `employer's form`,
+      question
+    );
+  }
   if (proposed !== "") {
     if (OPTION_KINDS.has(field.kind) && field.optionsKnown && field.options.length > 0) {
       // Through `matchOption` rather than an exact compare of its own, which is

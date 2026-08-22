@@ -317,3 +317,79 @@ describe("a truncated native select falls back to its full live list", () => {
     expect(select.value).toBe("");
   });
 });
+
+describe("a select2 widget: the real select is aria-hidden under painted chrome", () => {
+  /**
+   * Lever's `university` field type, as the failure capture of application
+   * c32122c7 shows it: the native `<select>` carrying every school is
+   * `aria-hidden="true" tabindex="-1"`, and two spans with role="combobox"
+   * are painted over it. The placeholder Lever uses is the word "Other", so
+   * an unanswered control even looks answered on a screenshot.
+   */
+  const SELECT2 = `
+    <li class="application-question custom-question"><div>
+      <div class="application-label full-width university">
+        <div class="text">Name of School<span class="required">✱</span></div>
+      </div>
+      <div class="application-field full-width required-field"><div class="application-university">
+        <div class="bb-custom-select-container bb-customSelect">
+          <span class="bb-custom-select-opener" role="combobox" aria-expanded="false" tabindex="0"><span>Other</span></span>
+          <select data-qa="university-dropdown" name="cards[6d127747][field9]" id="university-picker"
+                  data-placeholder="Other" required tabindex="-1"
+                  class="select2-hidden-accessible" aria-hidden="true">
+            <option value="">Other</option>
+            <option value="Aalborg University">Aalborg University</option>
+            <option value="Georgia Institute of Technology">Georgia Institute of Technology</option>
+          </select>
+          <span class="select2 select2-container"><span class="selection">
+            <span class="select2-selection select2-selection--single" role="combobox" aria-expanded="false" tabindex="0">
+              <span class="select2-selection__rendered"><span class="select2-selection__placeholder">Other</span></span>
+            </span>
+          </span></span>
+        </div>
+      </div></div>
+    </div></li>`;
+
+  it("reports the native select once, required, and not the painted spans", async () => {
+    document.body.innerHTML = `<ul>${SELECT2}</ul>`;
+    const fields = await enumerateFormFields(domPage());
+    expect(fields).toHaveLength(1);
+    expect(fields[0]?.kind).toBe("select");
+    expect(fields[0]?.label).toBe("Name of School");
+    expect(fields[0]?.required).toBe(true);
+    expect(fields[0]?.options).toContain("Georgia Institute of Technology");
+  });
+
+  it("selects the school on the native control the form actually posts", async () => {
+    document.body.innerHTML = `<ul>${SELECT2}</ul>`;
+    const fields = await enumerateFormFields(domPage());
+    const school = fields[0];
+    if (school === undefined) throw new Error("no field enumerated");
+    const outcome = await applyFieldValue(domPage(), school, "Georgia Institute of Technology");
+    expect(outcome.ok).toBe(true);
+    const native = document.getElementById("university-picker") as HTMLSelectElement;
+    expect(native.value).toBe("Georgia Institute of Technology");
+  });
+
+  it("still reports a real input[role=combobox], which is not chrome", async () => {
+    // Workable and react-select drive a genuine input; only non form control
+    // spans shadowing a select are dropped.
+    document.body.innerHTML = `
+      <span id="CA_9_label"><strong>How did you hear about us?</strong></span>
+      <div><input role="combobox" aria-labelledby="CA_9_label" id="input_CA_9" type="text" /></div>`;
+    const fields = await enumerateFormFields(domPage());
+    expect(fields).toHaveLength(1);
+    expect(fields[0]?.kind).toBe("combobox");
+  });
+
+  it("still skips a select that is genuinely hidden rather than merely painted over", async () => {
+    document.body.innerHTML = `
+      <div data-test-zero-size="true">
+        <select name="ghost" aria-hidden="true" data-test-zero-size="true">
+          <option value="a">A</option>
+        </select>
+      </div>`;
+    const fields = await enumerateFormFields(domPage());
+    expect(fields).toHaveLength(0);
+  });
+});

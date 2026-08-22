@@ -171,7 +171,7 @@ export type KnownApplicationStatus = ApplicationStatus;
  * this is what refuses.
  */
 export const BANNED_KEY_RE =
-  /(gender|\bsex\b|race|ethnic|hispanic|latin|veteran|disabilit|orientation|lgbt|queer|transgender|self[_\s-]?identif|demographic|citizenship|sponsorship|work[_\s-]?authoriz|visa|f1[_\s-]?status|email|full[_\s-]?name|first[_\s-]?name|last[_\s-]?name|resume|\bcv\b|cover[_\s-]?letter|phone|address|birth|\bdob\b|\bssn\b|salary|\bpay\b|company|job[_\s-]?title|answer|question|body|content|linkedin[_\s-]?url)/i;
+  /(gender|\bsex\b|race|ethnic|hispanic|latin|veteran|militar|armed[_\s-]?forces|disabilit|orientation|lgbt|queer|transgender|self[_\s-]?identif|demographic|citizenship|sponsorship|work[_\s-]?authoriz|visa|f1[_\s-]?status|email|full[_\s-]?name|first[_\s-]?name|last[_\s-]?name|resume|\bcv\b|cover[_\s-]?letter|phone|address|birth|\bdob\b|\bssn\b|salary|\bpay\b|company|job[_\s-]?title|answer|question|body|content|linkedin[_\s-]?url)/i;
 
 /** Anything shaped like an email address, wherever it turns up in a value. */
 const EMAIL_LIKE_RE = /[^\s@]+@[^\s@]+\.[^\s@]+/;

@@ -1451,3 +1451,139 @@ describe("a consent statement drawn as a typed field is never model-written", ()
     if (resolution.kind === "apply") expect(resolution.value).toBe("Yes");
   });
 });
+
+// ── Issue #94 follow up: filler is not an answer ────────────────────────────
+//
+// On the real Belvedere Trading run of 2026 08 22 (application c32122c7) the
+// model answered two REQUIRED fields the intake cannot support, Street Address
+// and Zip Code, with the literal string "Not provided". The pipeline typed it
+// and the board refused the submission. Filler on a real employer's form under
+// a real person's name is what HARD STOP 9 forbids, so a proposal that only
+// announces the absence of an answer now escalates to the candidate.
+describe("a proposed value that is not an answer but an admission", () => {
+  const addressField = () => field({ label: "Street Address", kind: "text", required: true });
+
+  for (const filler of ["Not provided", "N/A", "n/a", "Unknown", "None", "TBD", "-", "  none  "]) {
+    it(`escalates rather than typing ${JSON.stringify(filler)} into a required text field`, () => {
+      const resolution = resolveDecision(
+        addressField(),
+        decision({ fieldKey: "street address", decision: "infer", value: filler }),
+        facts()
+      );
+      expect(resolution.kind).toBe("ask");
+    });
+  }
+
+  it("still types a real answer into the same field", () => {
+    const resolution = resolveDecision(
+      field({ label: "City they live in", kind: "text", required: true }),
+      decision({ fieldKey: "city they live in", decision: "infer", value: "San Francisco" }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("San Francisco");
+  });
+
+  it("does not mistake a real answer that merely contains one of the words", () => {
+    // "None of the above" is a real option on Anduril's export control
+    // question, and a sentence that starts by saying something is not
+    // applicable is still a written answer.
+    const resolution = resolveDecision(
+      field({ label: "Describe any work restrictions", kind: "textarea", required: true }),
+      decision({
+        fieldKey: "describe any work restrictions",
+        decision: "infer",
+        value: "Not applicable to this role, since the position is fully on site.",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+  });
+
+  it("leaves a menu's own N/A option alone, since choosing it answers the question", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Do you currently have pending offers from other employers?",
+        kind: "radio",
+        options: ["Yes", "No", "N/A"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({
+        fieldKey: "do you currently have pending offers from other employers?",
+        decision: "infer",
+        value: "N/A",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("N/A");
+  });
+
+  it("skips rather than asks when the unanswerable field is optional", () => {
+    const resolution = resolveDecision(
+      field({ label: "Street Address", kind: "text", required: false }),
+      decision({ fieldKey: "street address", decision: "infer", value: "Not provided" }),
+      facts()
+    );
+    expect(resolution.kind).toBe("skip");
+  });
+});
+
+// ── HARD STOP 10: veteran status by any wording ─────────────────────────────
+//
+// Found while triaging Point72's Greenhouse form, which asks "Have you served
+// in the military?" — a protected characteristic that EEO_FIELD_RE did not
+// match, so it would have been answered by a model and sent to an employer.
+describe("a veteran status question is caught whatever a board calls it", () => {
+  for (const label of [
+    "Have you served in the military?",
+    "Military service status",
+    "Are you a protected veteran?",
+    "Veteran Status",
+    "Have you served in the armed forces?",
+  ]) {
+    it(`treats ${JSON.stringify(label)} as a demographic question`, () => {
+      expect(isAttestationField(label)).toBe(true);
+    });
+  }
+
+  it("declines it through the control's own decline option rather than answering", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Have you served in the military?",
+        kind: "select",
+        options: ["Yes", "No", "I decline to self identify"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({
+        fieldKey: "have you served in the military?",
+        decision: "answer",
+        value: "No",
+        sourceFact: "currentCountry",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("I decline to self identify");
+      expect(resolution.declined).toBe(true);
+    }
+  });
+
+  it("does not answer one that offers no way to decline", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Have you served in the military?",
+        kind: "radio",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "have you served in the military?", decision: "infer", value: "No" }),
+      facts()
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+});
