@@ -5303,6 +5303,338 @@ export function blockedForAnswers(needsInput: readonly NeedsInputItem[], url: st
 // The resume file
 // ───────────────────────────────────
 
+/**
+ * JOB-053. One `input[type=file]`, addressable again after the fact.
+ *
+ * `region` is the enclosing labelled upload block — Greenhouse's
+ * `<div role="group" aria-labelledby="upload-label-resume">` — and it exists
+ * because the input itself does not survive being used. See
+ * `confirmAttachment`.
+ */
+type FileUploadControl = { selector: string; region: string | null };
+
+/**
+ * Every `input[type=file]` in the top-level document that can be addressed
+ * again by a plain CSS selector, paired with that selector and its region.
+ *
+ * Serialised into the page by `listFileUploadControls`, so the same rule
+ * `describeControlInPage` lives under applies: self-contained, no imports, no
+ * closure over anything in this module.
+ *
+ * Two decisions worth keeping:
+ *
+ *  · **An attribute selector rather than `#id`.** A Greenhouse `id` is
+ *    `resume`, but a board that generates ids can hand back
+ *    `question_35956410002` or something with a colon or a dot in it, and those
+ *    are CSS combinators inside an `#id`. `[id="…"]` takes a quoted string, so
+ *    there is nothing to escape beyond the quote and the backslash.
+ *
+ *  · **Uniqueness is verified rather than assumed.** Duplicate ids are invalid
+ *    HTML and boards ship them anyway. A selector that resolves to anything
+ *    other than this one element is discarded, so a selector that survives
+ *    here addresses exactly the element it was built from.
+ *
+ * An input with neither an id nor a name contributes nothing and is simply
+ * absent from the list. That is not a failure: the caller falls through to the
+ * paths that were already there.
+ */
+function fileUploadControlsInPage(): FileUploadControl[] {
+  const quote = (value: string): string => `"${value.replace(/["\\]/g, "\\$&")}"`;
+  const uniquely = (element: Element, attempts: string[]): string | null => {
+    for (const attempt of attempts) {
+      let matches: Element[];
+      try {
+        matches = Array.from(document.querySelectorAll(attempt));
+      } catch {
+        continue;
+      }
+      if (matches.length === 1 && matches[0] === element) return attempt;
+    }
+    return null;
+  };
+
+  const controls: FileUploadControl[] = [];
+  for (const element of Array.from(document.querySelectorAll("input[type=file]"))) {
+    const id = element.getAttribute("id");
+    const name = element.getAttribute("name");
+    const selector = uniquely(element, [
+      ...(id ? [`input[type=file][id=${quote(id)}]`] : []),
+      ...(name ? [`input[type=file][name=${quote(name)}]`] : []),
+    ]);
+    if (selector === null) continue;
+
+    // The nearest ancestor that carries an identifier of its own, and that is
+    // still recognisably *this upload's* block rather than the page around it.
+    //
+    // Both bounds matter, because the only thing the caller does with this is
+    // ask whether the file name now appears inside it. A region that reached
+    // the whole form would answer yes for a file attached to any field on it,
+    // which is the same class of mistake as the one this ticket is about:
+    //
+    //  · never a landmark or the form itself, whatever ids they carry;
+    //  · never a block holding another file input, so "the resume is in here"
+    //    cannot be satisfied by some other upload's chip;
+    //  · at most a few hops, so an unlabelled widget gives up rather than
+    //    climbing until something happens to have an id.
+    let region: string | null = null;
+    let ancestor = element.parentElement;
+    for (let hops = 0; hops < 6 && ancestor !== null && region === null; hops += 1) {
+      const tag = ancestor.tagName.toLowerCase();
+      const tooWide = tag === "form" || tag === "body" || tag === "html" || tag === "main";
+      const uploads = ancestor.querySelectorAll("input[type=file]");
+      if (!tooWide && uploads.length === 1 && uploads[0] === element) {
+        const labelledBy = ancestor.getAttribute("aria-labelledby");
+        const ancestorId = ancestor.getAttribute("id");
+        region = uniquely(ancestor, [
+          ...(labelledBy ? [`[aria-labelledby=${quote(labelledBy)}]`] : []),
+          ...(ancestorId ? [`[id=${quote(ancestorId)}]`] : []),
+        ]);
+      }
+      ancestor = ancestor.parentElement;
+    }
+    controls.push({ selector, region });
+  }
+  return controls;
+}
+
+/**
+ * Never throws and never fails a run: a page this cannot read reports no file
+ * inputs, and every caller treats that as "use the paths that were already
+ * here" rather than as an error. Same rule as `describeControl`, for the same
+ * reason — a perception failure must not be able to stop an application that
+ * the model-driven path would have filled correctly.
+ */
+async function listFileUploadControls(page: Page): Promise<FileUploadControl[]> {
+  try {
+    const result = await page.evaluate(inPageExpression(fileUploadControlsInPage, ""));
+    const failure = inPageError(result);
+    if (failure !== null) {
+      console.warn(`${LOG} could not enumerate the page's file inputs: ${failure}`);
+      return [];
+    }
+    if (!Array.isArray(result)) return [];
+    return result.flatMap((entry): FileUploadControl[] => {
+      const raw = entry as Partial<FileUploadControl> | null;
+      if (!raw || typeof raw.selector !== "string" || raw.selector === "") return [];
+      return [{ selector: raw.selector, region: typeof raw.region === "string" ? raw.region : null }];
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * JOB-053. The file upload control that the **DOM itself** says is the resume,
+ * or null when the DOM does not say so unambiguously.
+ *
+ * ── The bug this exists for ─────────────────────────────────────────────────
+ * Greenhouse renders its resume and its cover letter uploads as two visually
+ * identical "Attach" buttons. `observe()` is asked for "the file upload control
+ * for the applicant's resume or CV" and answers with a ranked list, of which
+ * `resolveAction` takes the first — and on a real Virtu Financial posting the
+ * first was the **cover letter** input. The identification guard in
+ * `attachResume` caught it and refused, correctly, because the control
+ * described itself as `"cover_letter | Attach | Attach"`. But refusing is the
+ * consolation prize: 87% of the Greenhouse listings in the `jobs` table carry
+ * two or more file inputs, so a first-match resolver is a coin flip on the
+ * overwhelming majority of the board.
+ *
+ * The two controls are not actually alike. Greenhouse gives them
+ * `id="resume"` and `id="cover_letter"`, wraps each in
+ * `<div role="group" aria-labelledby="upload-label-resume">` with a visible
+ * "Resume/CV" or "Cover Letter" caption, and hangs a
+ * `<label for="resume">Attach</label>` off each — so `describeControl` already
+ * reads back `"resume | Attach | Attach"` for one and
+ * `"cover_letter | Attach | Attach"` for the other. Every one of the 131
+ * multi-upload Greenhouse forms sampled for this ticket had a file input whose
+ * id named the resume. The information was there the whole time; nothing was
+ * looking at it.
+ *
+ * ── Why this raises the bar rather than lowering it ─────────────────────────
+ * This is the same evidence `attachResume`'s guard tests, read from the same
+ * `describeControl`, and applied *more* strictly: a candidate has to match
+ * `FIELD_KEYWORDS.resume` **and** match no other field's pattern, which is the
+ * conflict rule `corroborate()` enforces for text fields and which the upload
+ * guard did not have. A control that says "resume" and "cover letter" at once
+ * is rejected here rather than uploaded into.
+ *
+ * The strictness is free, and that is the design: every way this can decline to
+ * answer falls through to the observe-and-corroborate path that was already
+ * there, with its refusal intact. So a wrong answer here costs a model call,
+ * and there is no input this accepts that the guard downstream would not also
+ * have accepted.
+ */
+export async function resumeUploadFromDom(
+  page: Page
+): Promise<{ selector: string; haystack: string; region: string | null } | null> {
+  const controls = await listFileUploadControls(page);
+  if (controls.length === 0) return null;
+
+  const identified: { selector: string; haystack: string; region: string | null }[] = [];
+  for (const control of controls) {
+    const descriptor = await describeControl(page, control.selector);
+    // No labelling at all is no evidence at all. `corroborate()` falls back to
+    // the reader's description in that case; there is no reader here, so the
+    // only honest answer is to leave this control to the path that has one.
+    if (!descriptor.found || descriptor.haystack === "") continue;
+    if (!FIELD_KEYWORDS.resume.test(descriptor.haystack)) continue;
+    const conflicts = (Object.keys(FIELD_KEYWORDS) as FieldKey[]).filter(
+      (other) => other !== "resume" && FIELD_KEYWORDS[other].test(descriptor.haystack)
+    );
+    if (conflicts.length > 0) {
+      console.warn(
+        `${LOG} ignoring the file input at ${control.selector}: it describes itself as ` +
+          `${JSON.stringify(descriptor.haystack)}, which reads as ${conflicts.join("/")} as ` +
+          `well as the resume`
+      );
+      continue;
+    }
+    identified.push({ ...control, haystack: descriptor.haystack });
+  }
+
+  if (identified.length === 1) return identified[0]!;
+  if (identified.length > 1) {
+    // Two controls on one form both claiming to be the resume. Nothing here can
+    // choose between them honestly, and choosing by document order is exactly
+    // the failure this function was written to end.
+    console.warn(
+      `${LOG} ${identified.length} file inputs each describe themselves as the resume ` +
+        `(${identified.map((entry) => JSON.stringify(entry.haystack)).join(", ")}); leaving the ` +
+        `choice to a live observation`
+    );
+  }
+  return null;
+}
+
+/**
+ * How long `confirmAttachment` will wait for a board to say, in its own words,
+ * that the file arrived. Never reached on the success path, where a control
+ * that still holds the file answers on the first read.
+ */
+const ATTACHMENT_CONFIRM_BUDGET_MS = 6_000;
+const ATTACHMENT_CONFIRM_POLL_MS = 400;
+
+/** Said in two places, and it has to be the same sentence in both. */
+const COULD_NOT_RE_READ =
+  `the control could not be re-read to confirm (the board replaced it once the file was set, ` +
+  `or the form is inside an iframe or a web component's shadow DOM)`;
+
+/** What the page could be got to say about the file after it was set. */
+type Attachment =
+  | { confirmed: true; how: string }
+  | { confirmed: false; blocking: true; why: string }
+  | { confirmed: false; blocking: false; why: string };
+
+/**
+ * JOB-053. Whether the file really landed, asked of the page rather than
+ * inferred from the fact that `setInputFiles` did not throw.
+ *
+ * ── What the old check could and could not see ──────────────────────────────
+ * It asked the input how many files it holds, and since JOB-047 it asks the
+ * page for the file name too before calling zero a failure. Both of those
+ * questions are the right ones and both survive here unchanged. What neither
+ * could survive is the input **not being there any more**, and on Greenhouse it
+ * never is: the moment a file is set, the widget unmounts the
+ * `<input type="file">` and renders a chip in its place —
+ *
+ *   <div class="file-upload__filename"><p>PRANAV-LENDE-Resume.pdf</p>
+ *        <button aria-label="Remove file">…</button></div>
+ *
+ * — so `describeControl` answered `found: false` and the outcome degraded to
+ * "could not be re-read to confirm" on every Greenhouse run there has ever
+ * been. The file header blamed an iframe for that; verified against the live
+ * Virtu form for this ticket, the form is not in an iframe and the control is
+ * simply gone. The comment is corrected accordingly.
+ *
+ * ── What replaces it ────────────────────────────────────────────────────────
+ * The file name the board now displays. JOB-047 had already established that
+ * this is the second, independent question worth asking, for the neighbouring
+ * case where the control is *present* and honestly reports zero files because a
+ * component read the File, uploaded it itself and reset the input —
+ * SmartRecruiters does exactly that. `pageShowsFileName` is its answer and is
+ * used unchanged here.
+ *
+ * What JOB-053 adds is a **narrower** place to look first. `region` is the
+ * upload's own labelled block, so a hit there is the stronger of the two
+ * claims: it says the resume is on the resume row, which is the exact thing
+ * this ticket exists because the resolver got wrong. The page wide search stays
+ * as the fallback, because plenty of boards render their chip outside anything
+ * this can address.
+ *
+ * ── What is asked when ──────────────────────────────────────────────────────
+ * Both are positive evidence and neither is a relaxation: the board has to be
+ * showing the exact file name that was just set.
+ *
+ *  · Control present, holding files — confirmed on the first read, no waiting.
+ *  · Control present, holding none — JOB-047's rule, and still a hard stop when
+ *    nothing on the page names the file.
+ *  · Control gone — reports rather than blocks when nothing names the file.
+ *    Boards that show a tick, a spinner or nothing at all are ordinary, and
+ *    turning an unrecognised chip into a blocked application would trade this
+ *    ticket's bug for a worse one.
+ *
+ * The waiting is new and applies to both of the last two. A board that uploads
+ * the file itself before rendering its chip has a network round trip to make
+ * first, so "is the name on the page yet" is not a question with an immediate
+ * answer. Measured on the live Virtu form: the `<input>` is already detached at
+ * +0ms, the block still reads "Resume/CV*" at +500ms, and reads
+ * "Resume/CV*PRANAV-LENDE-Resume.pdf" by +2000ms. Reading once called that a
+ * file that had not landed. Waiting cannot turn a failure into a pass — the
+ * verdict when the budget runs out is the one a single read would have given.
+ */
+export async function confirmAttachment(
+  page: Page,
+  selector: string,
+  region: string | null,
+  fileName: string
+): Promise<Attachment> {
+  const after = await describeControl(page, selector);
+  // A control that is still on the page answers `files.length` the instant the
+  // file is set, so the success path is decided on the first read and waits for
+  // nothing.
+  if (after.found && after.attachedFiles > 0) {
+    return { confirmed: true, how: `the control confirms ${after.attachedFiles} file(s)` };
+  }
+  // `-1` is `describeControl`'s "this element has no `files` property at all",
+  // which is a different statement from "it holds none" and is not evidence
+  // either way. JOB-047's stop is written against `=== 0` for that reason and
+  // stays written against it; there is nothing here for a wait to resolve.
+  if (after.found && after.attachedFiles !== 0) {
+    return { confirmed: false, blocking: false, why: COULD_NOT_RE_READ };
+  }
+
+  const deadline = Date.now() + ATTACHMENT_CONFIRM_BUDGET_MS;
+  for (;;) {
+    if (region !== null) {
+      const block = await describeControl(page, region);
+      if (block.found && block.text.includes(fileName)) {
+        return {
+          confirmed: true,
+          how: `the upload's own block now shows ${JSON.stringify(fileName)}`,
+        };
+      }
+    }
+    if (await pageShowsFileName(page, fileName)) {
+      return { confirmed: true, how: `the page shows ${JSON.stringify(fileName)}` };
+    }
+    if (Date.now() >= deadline) break;
+    await sleep(ATTACHMENT_CONFIRM_POLL_MS);
+  }
+
+  // JOB-047's hard stop, unchanged: a control that is there and says it holds
+  // nothing, on a page that never names the file, did not take the upload.
+  if (after.found) {
+    return {
+      confirmed: false,
+      blocking: true,
+      why:
+        `the control still reports no attached file and the page does not show ` +
+        `${JSON.stringify(fileName)} anywhere`,
+    };
+  }
+  return { confirmed: false, blocking: false, why: COULD_NOT_RE_READ };
+}
+
 /** `Ada Lovelace` → `Ada-Lovelace-Resume.pdf`. What a recruiter sees in their inbox. */
 function resumeFileName(profile: ResumeProfile): string {
   const stem = [profile.firstName, profile.lastName]
@@ -5323,11 +5655,15 @@ async function attachResume(
 
   // Checked here as well as at the download, because this is the last point
   // before the bytes leave for a real employer and the read-back below cannot
-  // be relied on to notice: Greenhouse renders its form inside an iframe, so
-  // `describeControl` cannot see the control afterwards and the "still reports
-  // no attached file" check silently degrades to "could not confirm". An empty
-  // attachment is worse than a blocked run — a submitted application with no
-  // resume on it cannot be un-sent.
+  // always be relied on to notice: on Greenhouse the upload widget unmounts its
+  // `<input type="file">` the instant a file is set, so `describeControl` finds
+  // nothing afterwards and the "still reports no attached file" check has
+  // nothing to test. (This comment used to say the form was in an iframe;
+  // JOB-053 checked the live Virtu form and it is not — the control is simply
+  // replaced. `confirmAttachment` now recovers most of that lost read-back from
+  // the file name the board displays in its place.) An empty attachment is
+  // worse than a blocked run — a submitted application with no resume on it
+  // cannot be un-sent.
   if (bytes.byteLength === 0) {
     throw new FormFillBlockedError(
       `The resume to attach is 0 bytes. An application with an empty resume attached is worse ` +
@@ -5335,14 +5671,49 @@ async function attachResume(
     );
   }
 
-  // The deterministic path first: exactly one file input on the page needs no
-  // model at all, and Greenhouse's standard form is exactly that shape once the
-  // cover letter is a textarea.
+  // The deterministic paths first, cheapest and least inferential to most.
   let selector: string;
   let via: string;
-  if (signals.domFileInputCount === 1) {
+  let region: string | null = null;
+  const named = await resumeUploadFromDom(session.page);
+  if (named !== null) {
+    // JOB-053. The DOM names exactly one of its file inputs the resume, so
+    // there is nothing to infer and no model in the path at all. Ahead of the
+    // single-input shortcut below on purpose: when a page has one file input
+    // and that input names itself, this addresses it by that name rather than
+    // by whatever `input[type=file]` happens to resolve to, and it carries the
+    // upload's own block along with it, which is what `confirmAttachment` reads
+    // the result out of once the board takes the control away.
+    selector = named.selector;
+    region = named.region;
+    via = `the file input the page itself names the resume (${JSON.stringify(named.haystack.slice(0, 80))})`;
+  } else if (signals.domFileInputCount === 1) {
     // The whole page has exactly one real `input[type=file]`, so there is
     // nothing to identify and no model in the path at all.
+    //
+    // JOB-053 added the one check this had none of. "Nothing to identify" is
+    // true when the control is unlabelled, which is the case this path was
+    // written for, and false when the page's only upload names itself the cover
+    // letter — a shape that arises the moment a board renders the resume box as
+    // parse-my-resume text and leaves the cover letter as the only real file
+    // input. Uploading a candidate's resume into a cover letter field cannot be
+    // taken back and is a worse outcome for them than a stopped run, so the
+    // count on its own is no longer enough. Deliberately narrow: an unlabelled
+    // input still takes this path, and only a positive statement that this is a
+    // *different* named field stops it.
+    const only = await describeControl(session.page, "input[type=file]");
+    if (
+      only.found &&
+      only.haystack !== "" &&
+      !FIELD_KEYWORDS.resume.test(only.haystack) &&
+      FIELD_KEYWORDS.coverLetter.test(only.haystack)
+    ) {
+      throw new FormFillBlockedError(
+        `The only file upload on the form at "${url}" describes itself as ` +
+          `${JSON.stringify(only.haystack)}, which is the cover letter field rather than the ` +
+          `resume. Refusing to upload the candidate's resume into it. Nothing was submitted.`
+      );
+    }
     selector = "input[type=file]";
     via = "the page's only file input (no inference needed)";
   } else {
@@ -5417,21 +5788,12 @@ async function attachResume(
     );
   }
 
-  const after = await describeControl(session.page, selector);
-  // JOB-047. A component that consumes the file and resets its own input reads
-  // back as zero files however well the upload went, so the board's own
-  // rendering of the file name is asked as a second, independent question
-  // before this is called a failure. Both silent means it failed.
-  let shownOnPage = false;
-  if (after.found && after.attachedFiles === 0) {
-    shownOnPage = await pageShowsFileName(session.page, fileName);
-    if (!shownOnPage) {
-      throw new FormFillBlockedError(
-        `The resume was set on the upload control found via ${via}, but the control still ` +
-          `reports no attached file and the page does not show "${fileName}" anywhere. ` +
-          `Nothing was submitted.`
-      );
-    }
+  const attachment = await confirmAttachment(session.page, selector, region, fileName);
+  if (!attachment.confirmed && attachment.blocking) {
+    throw new FormFillBlockedError(
+      `The resume was set on the upload control found via ${via}, but ${attachment.why}. ` +
+        `Nothing was submitted.`
+    );
   }
 
   console.log(`${LOG} resume attached as "${fileName}" (${bytes.byteLength} bytes) via ${via}`);
@@ -5439,20 +5801,10 @@ async function attachResume(
     field: "resume",
     intended: fileName,
     outcome: "filled",
-    detail:
-      after.attachedFiles > 0
-        ? `attached via ${via}; the control confirms ${after.attachedFiles} file(s)`
-        : shownOnPage
-          ? `attached via ${via}; the control reports no file because it hands the upload off ` +
-            `itself, and the page shows "${fileName}"`
-          : `attached via ${via}; the control could not be re-read to confirm (the form is ` +
-            `probably inside an iframe)`,
-    readBack:
-      after.attachedFiles > 0
-        ? `${after.attachedFiles} file(s)`
-        : shownOnPage
-          ? fileName
-          : null,
+    detail: attachment.confirmed
+      ? `attached via ${via}; ${attachment.how}`
+      : `attached via ${via}; ${attachment.why}`,
+    readBack: attachment.confirmed ? attachment.how : null,
   };
 }
 
