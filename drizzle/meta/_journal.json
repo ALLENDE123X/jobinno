@@ -99,6 +99,20 @@
       "when": 1787385600000,
       "tag": "0013_profiles_browserbase_context_id",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1787428001108,
+      "tag": "0014_profiles_intake_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1787428051468,
+      "tag": "0015_profiles_intake_fields_privileges",
+      "breakpoints": true
     }
   ]
 }

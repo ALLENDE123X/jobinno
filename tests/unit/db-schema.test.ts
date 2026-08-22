@@ -61,9 +61,17 @@ const PROFILE_SYSTEM_COLUMNS = [
  * has to stay able to edit. `id` is here because the `with check` on
  * `profiles_update_own` already pins it to `auth.uid()`, so a grant on it
  * cannot move a row to another owner.
+ *
+ * The eight JOB-101 added are all on this side, and every one of them is an
+ * answer the person gives about themselves at intake. A security clearance
+ * status and a home address are sensitive, which is an argument for who may
+ * READ them and never an argument for taking away the owner's ability to
+ * correct their own record.
  */
 const PROFILE_USER_COLUMNS = [
   "citizenship_status",
+  "clearance_eligibility",
+  "clearance_level_held",
   "created_at",
   "current_city",
   "current_country",
@@ -72,10 +80,16 @@ const PROFILE_USER_COLUMNS = [
   "f1_status",
   "github_url",
   "grad_date",
+  "high_school_grad_year",
+  "high_school_name",
   "id",
+  "needs_sponsorship_non_us",
+  "postal_code",
   "requires_sponsorship",
+  "street_address",
   "target_locations",
   "updated_at",
+  "visa_status",
   "willing_to_relocate",
   "work_authorized_us",
 ] as const;

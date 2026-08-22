@@ -80,6 +80,20 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
       target_locations: intake.targetLocations,
       grad_date: intake.gradDate,
       earliest_start: intake.earliestStart,
+      // JOB-101. Every one of these is read back by `CANDIDATE_COLUMNS` in
+      // `lib/candidate-intake.ts` and has a fact in `buildFactCatalog`, which is
+      // the whole point of the ticket: the four columns JOB-022 found were
+      // written here and read nowhere had cost 18 stopped applications in a
+      // single day, and adding a ninth column to this list without doing the
+      // other two steps would rebuild that exact failure.
+      clearance_eligibility: intake.clearanceEligibility,
+      clearance_level_held: intake.clearanceLevelHeld,
+      needs_sponsorship_non_us: intake.needsSponsorshipNonUs,
+      visa_status: intake.visaStatus,
+      high_school_name: intake.highSchoolName,
+      high_school_grad_year: intake.highSchoolGradYear,
+      street_address: intake.streetAddress,
+      postal_code: intake.postalCode,
       updated_at: new Date().toISOString(),
     })
     .eq("id", user.id);
@@ -141,8 +155,13 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   //
   // `intake` is in scope and holds this person's citizenship status, F1 status,
   // work authorization, sponsorship need, city, country, graduation date and
-  // the path to their resume. None of it is sent. Two facts about the shape of
-  // the answers go out, neither of which describes the person: whether a
+  // the path to their resume, and since JOB-101 their security clearance
+  // eligibility, the clearance level they have held, their visa status, their
+  // high school and their home address as well. None of it is sent, and the new
+  // ones least of all: a clearance status and a street address are exactly the
+  // kind of thing that must not leave for an analytics pipeline. Two facts
+  // about the shape of the answers go out, neither of which describes the
+  // person: whether a
   // LinkedIn export was attached, and how many locations they named.
   // `lib/analytics/events.ts` records why the work authorization fields in
   // particular are excluded rather than merely omitted.

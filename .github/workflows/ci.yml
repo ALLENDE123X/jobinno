@@ -114,6 +114,16 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0011_profiles_github_url_privileges.sql
 
+      - name: Apply the JOB-101 intake field privilege migration
+        # JOB-101. Same reasoning again, and the same rule: this one grants the
+        # eight columns `0014_profiles_intake_fields.sql` added, which the
+        # `drizzle-kit push` step has already created by the time this runs.
+        # There is still deliberately no glob over `drizzle/`; a new privilege
+        # migration gets its own line here, on purpose.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0015_profiles_intake_fields_privileges.sql
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -208,6 +218,16 @@ jobs:
         run: >-
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0011_profiles_github_url_privileges.sql
+
+      - name: Apply the JOB-101 intake field privilege migration
+        # JOB-101. Same reasoning again, and the same rule: this one grants the
+        # eight columns `0014_profiles_intake_fields.sql` added, which the
+        # `drizzle-kit push` step has already created by the time this runs.
+        # There is still deliberately no glob over `drizzle/`; a new privilege
+        # migration gets its own line here, on purpose.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0015_profiles_intake_fields_privileges.sql
 
       - name: Build
         run: npm run build
