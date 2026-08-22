@@ -152,9 +152,19 @@ const MENU_SETTLE_TIMEOUT_MS = 1_500;
  * decision call — so the "never assert a demographic identity for a real person"
  * rule does not depend on a model having read its instructions properly. A field
  * matching this can only ever be declined, asked about, or left alone.
+ *
+ * `military` and `armed forces` are here because a board does not have to use
+ * the word "veteran" to be asking veteran status: Point72's Greenhouse form
+ * asks "Have you served in the military?", which this pattern used to miss
+ * entirely, leaving a protected characteristic to be answered by a model and
+ * transmitted to an employer. Veteran status is never inferred and never sent,
+ * whatever a form calls it. A defense employer asking about experience with
+ * military customers is caught by this too and is escalated rather than
+ * answered, which is the safe direction to be wrong in and the same trade
+ * `holdsSubmitControl` below makes.
  */
 export const EEO_FIELD_RE =
-  /\b(gender|sex|race|races|ethnicity|ethnic|hispanic|latino|latinx|veteran|disabilit\w*|sexual orientation|lgbt\w*|queer|transgender|self[-\s]?identif\w*|demographic\w*)\b/i;
+  /\b(gender|sex|race|races|ethnicity|ethnic|hispanic|latino|latinx|veteran|militar\w*|armed forces|disabilit\w*|sexual orientation|lgbt\w*|queer|transgender|self[-\s]?identif\w*|demographic\w*)\b/i;
 
 /**
  * An option that answers "I would rather not say" — which is a truthful answer
@@ -291,9 +301,40 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
    * every sense that matters here. Deliberately narrow: only radio/checkbox
    * inputs, only through a visible wrapping label — a combobox's hidden
    * mirror input carries no type and stays invisible, as it should.
+   *
+   * A second carve-out of the same shape, for a select2-style widget: the
+   * real `<select>` is marked `aria-hidden="true"` and `tabindex="-1"` while
+   * a `<span role="combobox">` is painted over it. Lever's `university` field
+   * type is built exactly this way, and the consequence was a required
+   * dropdown holding 2,965 real schools that this pass never saw at all — it
+   * saw only the undrivable span, so the control sat on its empty
+   * placeholder (which Lever words "Other", so it even *looked* answered)
+   * and the board refused every submit. A `<select>` carrying real options is
+   * the control the form reads whatever the accessibility tree says, so it is
+   * visible here when its own widget box is on screen. The decorative span is
+   * dropped instead; see `shadowsNativeSelect`.
    */
   const isVisible = (element: Element): boolean => {
     if (element.getAttribute("aria-hidden") === "true") {
+      if (element.tagName.toLowerCase() === "select") {
+        if ((element as HTMLSelectElement).options.length === 0) return false;
+        // Bounded to the widget's own wrapper, and explicitly never `body` or
+        // `html`: those always have a real box, so walking into them would
+        // make EVERY aria-hidden select on the page count as visible, which
+        // is the opposite of a test.
+        let node: Element | null = element.parentElement;
+        for (let depth = 0; node !== null && depth < 3; depth++) {
+          const tag = node.tagName.toLowerCase();
+          if (tag === "body" || tag === "html") return false;
+          const box = rectOf(node);
+          if (box.w >= 8 && box.h >= 8) {
+            const style = window.getComputedStyle(node);
+            return style.display !== "none" && style.visibility !== "hidden";
+          }
+          node = node.parentElement;
+        }
+        return false;
+      }
       const type = (element.getAttribute("type") ?? "").toLowerCase();
       if (type !== "radio" && type !== "checkbox") return false;
       const wrap = element.closest("label");
@@ -427,16 +468,33 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
    * caption to this control.
    */
   const questionBlockText = (element: Element): string => {
-    const holdsControl = (node: Element): boolean =>
-      node.matches("input,select,textarea,button") ||
-      node.querySelector('input,select,textarea,button,[role="combobox"]') !== null;
+    const FORM_CONTROLS = "input,select,textarea,button";
+    const WIDGET_CHROME = '[role="combobox"],[role="listbox"]';
+    /** A different question's block. Everything before it belongs to it. */
+    const holdsFormControl = (node: Element): boolean =>
+      node.matches(FORM_CONTROLS) || node.querySelector(FORM_CONTROLS) !== null;
+    /**
+     * This widget's own painted decoration: a `role` that says "combobox"
+     * with no real form control anywhere inside it. select2 puts one of these
+     * immediately before the `<select>` it decorates, showing the current
+     * selection, and Lever words the empty one "Other" — so reading it as a
+     * caption made a school dropdown's question the single word "Other"
+     * (issue #94). Skipped rather than stopped at: the real caption is
+     * further back, past the chrome, and it is still this control's own.
+     */
+    const isWidgetChrome = (node: Element): boolean =>
+      (node.matches(WIDGET_CHROME) || node.querySelector(WIDGET_CHROME) !== null) &&
+      !holdsFormControl(node);
+
     let node: Element | null = element;
     for (let depth = 0; node !== null && depth < 5; depth++) {
       let sibling: Element | null = node.previousElementSibling;
       while (sibling !== null) {
-        if (holdsControl(sibling)) return "";
-        const text = clean(visibleText(sibling));
-        if (text !== "") return text;
+        if (holdsFormControl(sibling)) return "";
+        if (!isWidgetChrome(sibling)) {
+          const text = clean(visibleText(sibling));
+          if (text !== "") return text;
+        }
         sibling = sibling.previousElementSibling;
       }
       node = node.parentElement;
@@ -558,6 +616,34 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
     return "text";
   };
 
+  /**
+   * Is this `[role="combobox"]` element mere chrome painted over a real
+   * `<select>` that this pass is going to read anyway?
+   *
+   * select2 and Lever's own `bb-customSelect` both wrap one native `<select>`
+   * in one or more spans carrying `role="combobox"`. Those spans hold no
+   * options, cannot be filled and cannot be `selectOption`ed; the `<select>`
+   * beside them is the actual control. Reporting them as fields produced two
+   * or three phantom duplicates of one question, each unanswerable, and the
+   * real dropdown was the one thing missing (issue #94).
+   *
+   * Only ever drops a NON form control: a real `<input role="combobox">`,
+   * which is what Workable and react-select use and what `chooseFromMenu`
+   * drives by typing, is never touched by this.
+   */
+  const shadowsNativeSelect = (element: Element): boolean => {
+    const tag = element.tagName.toLowerCase();
+    if (tag === "input" || tag === "select" || tag === "textarea") return false;
+    if (element.querySelector("select") !== null) return true;
+    let node: Element | null = element.parentElement;
+    for (let depth = 0; node !== null && depth < 3; depth++) {
+      const select = node.querySelector("select");
+      if (select !== null) return true;
+      node = node.parentElement;
+    }
+    return false;
+  };
+
   // Deliberately no `[role="listbox"]`: that is the *popup* a combobox opens,
   // not a control anybody fills in, and Greenhouse keeps one permanently in the
   // DOM for its phone-country picker. Including it produced a phantom field
@@ -575,6 +661,7 @@ function enumerateFieldsInPage(maxFields: number, maxOptions: number): RawField[
 
     const kind = kindOf(element);
     if (kind === "skip") continue;
+    if (kind === "combobox" && shadowsNativeSelect(element)) continue;
     if (!isVisible(element)) continue;
 
     const rawLabel = labelOf(element);
