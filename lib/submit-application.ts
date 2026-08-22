@@ -103,6 +103,12 @@ import { createGmailClient } from "@/lib/future-gmail/gmail-client";
 // `fill-application-form.ts`; both now come from here, along with the skip
 // logging that replaced actinno's `error_message` column.
 import { recordSkipQuietly, updateApplication } from "@/lib/application-records";
+// JOB-113. A consent banner pinned to the bottom of the viewport is exactly
+// where a submit control lands after the minimum scroll that brings it into
+// view, and a click that hits the banner instead is reported as a click that
+// happened and a submission that was never confirmed. See that module's header
+// for the measurements off the live page.
+import { dismissConsentBanner, type ConsentBannerOutcome } from "@/lib/consent-banner";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 const LOG = "[act-008]";
@@ -1657,6 +1663,23 @@ async function runSubmitPhase(
   let submitControlLabel: string | null = null;
 
   /**
+   * JOB-113. What was on top of the page when this run reached the submit
+   * control, and what was done about it.
+   *
+   * Carried out here rather than left in the log so the "clicked, and nothing
+   * happened" branch can say which of the two it was. That branch has always
+   * had to choose between "the board rejected this" and "the click never
+   * reached the button", with no way to tell them apart; a banner that was
+   * present and could not be dismissed is the second, and one that was never
+   * there rules it out. Both readings are worth having on the row.
+   */
+  let consentBanner: ConsentBannerOutcome = {
+    present: false,
+    action: "none",
+    detail: "not reached",
+  };
+
+  /**
    * The one variable that decides which kind of failure this run can report.
    *
    * Set to `true` on the line *before* the click is issued, never after. That
@@ -1976,6 +1999,22 @@ async function runSubmitPhase(
       console.log(`${LOG} submit control chosen: "${choice.label}" — ${choice.note}`);
     }
 
+    // ── Anything sitting on top of the page ──────────────────────────────────
+    // JOB-113. Done here, before the submit control is located rather than just
+    // before it is clicked, because dismissing a banner reflows the bottom of
+    // the page — so the selector resolved below describes the layout the click
+    // will actually meet.
+    //
+    // This clicks something, which on this file's terms needs saying plainly: it
+    // is not on the submission path and it cannot become one. The only controls
+    // it will press are ones whose own DOM text reads as a refusal or a close
+    // and does not read as an acceptance, `assertNotAnApplicationSubmit`'s
+    // sibling check in spirit; `SUBMIT_WORD_RE` shares no vocabulary with
+    // either. It cannot throw, so it cannot stop a run whose form is filled and
+    // correct, and whatever it did is carried to the end of this function so the
+    // outcome can say so.
+    consentBanner = await dismissConsentBanner(session, fill.finalUrl);
+
     // ── Where that control is, according to the browser ──────────────────────
     // A constant instruction, so nothing page-derived reaches a model, and
     // `resolveAction`'s cache means a re-run on the same board replays the same
@@ -2255,7 +2294,10 @@ async function runSubmitPhase(
                   `read of it says a code was emailed. `
                 : "") +
             `"Most likely" is not "certainly", so this is not being retried: a human should look ` +
-            `at the board before anything clicks here again.`,
+            `at the board before anything clicks here again. ` +
+            // JOB-113. The one fact that separates "the board said no" from
+            // "the click never got there", recorded whichever way it went.
+            `Page furniture: ${consentBanner.detail}.`,
           artifacts
         )
       );
