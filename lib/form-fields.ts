@@ -191,9 +191,37 @@ export const DECLINE_OPTION_RE =
  * "acknowledgement" or "privacy policy" a real form writes (found on issue
  * #94 when Lever's processing-consent card, whose only consent-flavoured
  * words are "candidate privacy policy", failed to match this).
+ *
+ * ── Issue #100: the wordings this used to miss ───────────────────────────────
+ * A live Avery Dennison run ticked a box reading "By checking this box you
+ * declare that you have read and understood the Privacy Notice" and reported
+ * nothing, because this pattern matched no part of that sentence. Three near
+ * misses, each one word away from a term already here:
+ *
+ *  · `declaration` was here, `declare` was not. A form writes the verb far more
+ *    often than the noun, so the stem `declar\w*` replaces both.
+ *  · `privacy polic\w*` was here, "Privacy Notice" was not. The same document
+ *    under a different masthead, and boards use "notice" and "statement" as
+ *    freely as "policy".
+ *  · `i understand` was here, "read and understood" was not, because the
+ *    sentence is written in the second person and puts "and" in the middle.
+ *
+ * The lesson generalises past those three strings, and it is why item 2 of that
+ * issue does not rely on this pattern at all: a regex only ever holds the
+ * wordings somebody thought of. This one is now wide enough for the agreements
+ * seen in production, and it is still not the thing standing between a real
+ * person and an assertion made in their name. See `fallbackRefusalReason` in
+ * `fill-application-form.ts` for what is.
+ *
+ * Two deliberate narrowings, so that widening does not start catching ordinary
+ * questions. `certify` stays spelled out rather than becoming `certif\w*`,
+ * because "certificate" is a skills question ("Do you hold an AWS
+ * certificate?") and not an agreement. And "have read" is bound to a pronoun,
+ * so "I have read" and "you have read" match while "which of these have you
+ * read" does not.
  */
 export const CONSENT_FIELD_RE =
-  /\b(agree|agreement|consent|certify|certification|acknowledg\w*|attest|authorize|terms|privacy polic\w*|i confirm|i understand|declaration)\b/i;
+  /\b(agree|agreement|consent\w*|certify|certifies|certifying|certification|acknowledg\w*|attest\w*|authorize|terms|privacy\s+(?:polic\w*|notice\w*|statement\w*)|data\s+protection|gdpr|(?:i|you|we)\s+confirm|(?:i|you|we)\s+understand|(?:i|you|we)\s+have\s+read|read\s+and\s+(?:underst\w*|accept\w*|agree\w*)|declar\w*)\b/i;
 
 /** Comparison form for labels, options and values. Never used for display. */
 export function normalizeText(value: string): string {
