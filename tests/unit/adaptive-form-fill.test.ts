@@ -665,6 +665,76 @@ describe("additionalAnswers may never decide a demographic or consent field", ()
     }
   });
 
+  // ── JOB-132 ───────────────────────────────────────────────────────────────
+  // The consent carve-out above tested wording alone, and wording alone cannot
+  // tell "do you agree to this" from "are you subject to one of these". The
+  // label below is verbatim from a real Avery Dennison screening step and
+  // matches `CONSENT_FIELD_RE` on exactly one word: "agreement", the noun
+  // naming a document the question asks about.
+
+  it("applies a supplied answer to a factual question that merely mentions an agreement", () => {
+    const nonCompete = field({
+      label:
+        "Are you currently subject to a non compete, non-solicit or other similar clause in " +
+        "your employment contract with your current or a previous employer, and if so, could " +
+        "you provide this agreement as part of the recruitment process?",
+      kind: "combobox",
+      required: true,
+      options: [
+        "No, I'm not currently subject to a non complete or other similar clause.",
+        "Yes, and I would be able to supply that as part of the recruitment process.",
+        "Yes, but I would not be able to supply that as part of the recruitment process.",
+      ],
+      optionsKnown: true,
+    });
+    // The key is the one a previous run printed for this field, so this answer
+    // is provably responsive to this exact escalation.
+    const resolution = resolveAdditionalAnswer(nonCompete, {
+      "are you currently subject to a non compete, non-solicit or other similar clause ":
+        "No, I'm not currently subject to a non complete or other similar clause.",
+    });
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe(
+        "No, I'm not currently subject to a non complete or other similar clause."
+      );
+    }
+  });
+
+  it("still refuses a consent radio group, where choosing an option is the act of consenting", () => {
+    // Lever draws processing consent as a two-option radio rather than a box.
+    // Choosing here is agreeing, so the shape test must keep catching it.
+    const consentRadio = field({
+      label: "Do you consent to us processing your personal data for this application?",
+      kind: "radio",
+      required: true,
+      options: ["Yes, I consent", "No, I do not consent"],
+      optionsKnown: true,
+    });
+    const resolution = resolveAdditionalAnswer(consentRadio, {
+      "do you consent to us processing your personal data": "Yes, I consent",
+    });
+    expect(resolution.kind).toBe("refused");
+    if (resolution.kind === "refused") {
+      expect(resolution.category).toBe("consent, agreement or certification field");
+    }
+  });
+
+  it("still refuses an agreement checkbox even when the supplied key matches it exactly", () => {
+    // The strongest provenance a supplied answer can have does not buy the
+    // right to tick a box. `resolveDecision`'s own deterministic policy still
+    // owns that decision, which is the whole point of the carve-out.
+    const terms = field({
+      label: "I agree to the Terms of Service and Privacy Policy",
+      kind: "checkbox",
+      required: true,
+    });
+    const resolution = resolveAdditionalAnswer(terms, {
+      "i agree to the terms of service and privacy policy": "Yes",
+    });
+    expect(resolution.kind).toBe("refused");
+  });
+
   it("still applies a fuzzy-matched answer to an ordinary required field", () => {
     // The common case this whole pass exists for. A real additionalAnswers
     // entry, keyed close to but not identical to the field's own label, still
