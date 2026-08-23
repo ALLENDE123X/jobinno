@@ -134,6 +134,16 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0016_resumes_column_privileges.sql
 
+      - name: Apply the JOB-134 answer memory privilege migration
+        # JOB-134. Same reasoning again, and its own line rather than a glob for
+        # the reason four steps up. This one grants the four intake columns
+        # `0017_profiles_answer_memory.sql` added and deliberately leaves
+        # `stored_answers` ungranted; see that file for why the fifth column is
+        # not on the list.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0018_profiles_answer_memory_privileges.sql
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -248,6 +258,16 @@ jobs:
         run: >-
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0016_resumes_column_privileges.sql
+
+      - name: Apply the JOB-134 answer memory privilege migration
+        # JOB-134. Same reasoning again, and its own line rather than a glob for
+        # the reason four steps up. This one grants the four intake columns
+        # `0017_profiles_answer_memory.sql` added and deliberately leaves
+        # `stored_answers` ungranted; see that file for why the fifth column is
+        # not on the list.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0018_profiles_answer_memory_privileges.sql
 
       - name: Build
         run: npm run build

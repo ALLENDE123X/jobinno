@@ -277,6 +277,15 @@ function printReport(result: FillApplicationFormResult): void {
       }
       console.log(`      re-run with: --answer ${JSON.stringify(`${item.key}=<answer>`)}`);
     }
+    // JOB-134. Worth saying out loud on a terminal, because it changes what the
+    // person is being asked for: this is a one time answer and not a per
+    // application chore. Anything supplied is written to
+    // `profiles.stored_answers` before the browser opens, and every later
+    // application for this person starts with it already in hand.
+    console.log(
+      "\n  answers given with --answer are remembered against this profile, so the next\n" +
+        "  application will not stop on the same question"
+    );
   }
 
   if (result.submitControlLabels.length > 0) {

@@ -47,6 +47,7 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { parseStoredAnswers, type StoredAnswer } from "@/lib/candidate-answers";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 export const RESUMES_BUCKET = "resumes";
@@ -219,6 +220,30 @@ export type CandidateApplicationAnswers = {
   streetAddress?: string;
   /** `profiles.postal_code`, the other half. */
   postalCode?: string;
+  /**
+   * ── JOB-134: four more, added on the same evidence as JOB-101's eight ─────
+   *
+   * The rule JOB-022 wrote down still governs, and adding a thirteenth means
+   * doing all three steps: a key here, a read in `toApplicationAnswers`, a name
+   * in `CANDIDATE_COLUMNS`, and a fact in `buildFactCatalog`. A column intake
+   * writes and the fill layer never sees is worse than no column, because the
+   * person answered the question and nothing asked the database for the answer.
+   *
+   * Two of them are tri-state in a way the others are not, and it is worth
+   * saying here rather than only in the schema: `relativesAtTargetEmployers`
+   * and `previouslyEmployedAtTargetEmployers` are statements about every
+   * employer the person might apply to, so only `false` is reusable as an
+   * answer to a form's question about one named company. `true` produces no
+   * fact and the question is still put to the candidate. See `buildFactCatalog`.
+   */
+  /** `profiles.subject_to_restrictive_covenant`. Non-compete, non-solicit, and the rest. */
+  subjectToRestrictiveCovenant?: boolean;
+  /** `profiles.relatives_at_target_employers`. False is reusable, true is not. */
+  relativesAtTargetEmployers?: boolean;
+  /** `profiles.previously_employed_at_target_employers`. Same asymmetry. */
+  previouslyEmployedAtTargetEmployers?: boolean;
+  /** `profiles.salary_expectation`, in the candidate's own words. */
+  salaryExpectation?: string;
 };
 
 /** `CandidateApplicationAnswers` → the row shape, dropping anything unstated. */
@@ -276,6 +301,21 @@ function applicationAnswerColumns(
   if (street !== null) row.street_address = street;
   const postal = normalizeOptionalText(answers.postalCode);
   if (postal !== null) row.postal_code = postal;
+  // JOB-134. The same rule a fourth time: unstated is left out entirely rather
+  // than written as NULL, so a caller who says nothing about a non-compete
+  // cannot blank an answer already stored.
+  if (typeof answers.subjectToRestrictiveCovenant === "boolean") {
+    row.subject_to_restrictive_covenant = answers.subjectToRestrictiveCovenant;
+  }
+  if (typeof answers.relativesAtTargetEmployers === "boolean") {
+    row.relatives_at_target_employers = answers.relativesAtTargetEmployers;
+  }
+  if (typeof answers.previouslyEmployedAtTargetEmployers === "boolean") {
+    row.previously_employed_at_target_employers =
+      answers.previouslyEmployedAtTargetEmployers;
+  }
+  const salary = normalizeOptionalText(answers.salaryExpectation);
+  if (salary !== null) row.salary_expectation = salary;
   return row;
 }
 
@@ -689,6 +729,17 @@ export type CandidateRecord = {
    * rather than a guess on a real application.
    */
   applicationAnswers: CandidateApplicationAnswers;
+  /**
+   * JOB-134. Every question this person has answered that intake never asked,
+   * newest first, from `profiles.stored_answers`.
+   *
+   * Separate from `applicationAnswers` above rather than folded into it,
+   * because the two are different kinds of thing. That one is a fixed set of
+   * questions with known shapes, asked once at intake; this is an open ended
+   * log keyed by whatever a board happened to call the field. Empty means this
+   * person has never had a run stop on a question, or has never answered one.
+   */
+  storedAnswers: StoredAnswer[];
 };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -712,14 +763,20 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * through `toApplicationAnswers`, since it is a stated fact about the
  * candidate rather than an answer collected for a specific form question.
  *
- * The trailing eight are JOB-101's, and they are the whole reason that ticket
- * touched three files rather than one: a column intake writes and this literal
- * does not name is a question the person answered and the form filler never
- * sees. Keep them in step with `toApplicationAnswers` below and with
+ * The next eight after that are JOB-101's, and they are the whole reason that
+ * ticket touched three files rather than one: a column intake writes and this
+ * literal does not name is a question the person answered and the form filler
+ * never sees. Keep them in step with `toApplicationAnswers` below and with
  * `buildFactCatalog` in `lib/fill-application-form.ts`.
+ *
+ * The trailing five are JOB-134's. Four are intake answers and follow that same
+ * rule exactly; `stored_answers` is the odd one out and is read straight onto
+ * `CandidateRecord.storedAnswers` rather than through `toApplicationAnswers`,
+ * because it is not one answer of a known shape but the log of every question
+ * this person has answered that intake never asked.
  */
 const CANDIDATE_COLUMNS =
-  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start,github_url,clearance_eligibility,clearance_level_held,needs_sponsorship_non_us,visa_status,high_school_name,high_school_grad_year,street_address,postal_code";
+  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start,github_url,clearance_eligibility,clearance_level_held,needs_sponsorship_non_us,visa_status,high_school_name,high_school_grad_year,street_address,postal_code,subject_to_restrictive_covenant,relatives_at_target_employers,previously_employed_at_target_employers,salary_expectation,stored_answers";
 
 /**
  * Row → the answers that were actually recorded.
@@ -787,6 +844,23 @@ export function toApplicationAnswers(row: Record<string, unknown>): CandidateApp
   if (street !== "") answers.streetAddress = street;
   const postal = typeof row.postal_code === "string" ? row.postal_code.trim() : "";
   if (postal !== "") answers.postalCode = postal;
+  // JOB-134. The same rule a fourth time. It reads as repetitive and it is
+  // written out anyway, because the one thing that must not happen to these
+  // four is a NULL becoming a "No": nobody has told us whether this person is
+  // under a non-compete, and "we were never told" is the state that makes the
+  // question reach them rather than a real employer's form.
+  if (typeof row.subject_to_restrictive_covenant === "boolean") {
+    answers.subjectToRestrictiveCovenant = row.subject_to_restrictive_covenant;
+  }
+  if (typeof row.relatives_at_target_employers === "boolean") {
+    answers.relativesAtTargetEmployers = row.relatives_at_target_employers;
+  }
+  if (typeof row.previously_employed_at_target_employers === "boolean") {
+    answers.previouslyEmployedAtTargetEmployers =
+      row.previously_employed_at_target_employers;
+  }
+  const salary = typeof row.salary_expectation === "string" ? row.salary_expectation.trim() : "";
+  if (salary !== "") answers.salaryExpectation = salary;
   return answers;
 }
 
@@ -839,6 +913,11 @@ export function toCandidateRecord(
     linkedinPdfPath: resume.linkedinPdfPath,
     locations: Array.isArray(row.target_locations) ? row.target_locations.map(String) : null,
     applicationAnswers: toApplicationAnswers(row),
+    // JOB-134. Validated rather than cast: this column is JSON, so the only
+    // thing its type guarantees is that it parsed. `parseStoredAnswers` drops
+    // anything malformed, and a NULL column reads as an empty list, which is
+    // why no backfill was needed for rows that predate it.
+    storedAnswers: parseStoredAnswers(row.stored_answers),
   };
 }
 

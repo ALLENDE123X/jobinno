@@ -192,6 +192,16 @@ export function IntakeForm({ userId }: { userId: string }) {
   const [earliestStart, setEarliestStart] = useState("");
   const [highSchoolName, setHighSchoolName] = useState("");
   const [highSchoolGradYear, setHighSchoolGradYear] = useState("");
+  // JOB-134. The four questions real screening steps kept stopping on.
+  const [subjectToRestrictiveCovenant, setSubjectToRestrictiveCovenant] =
+    useState<YesNo>("");
+  const [relativesAtTargetEmployers, setRelativesAtTargetEmployers] =
+    useState<YesNo>("");
+  const [
+    previouslyEmployedAtTargetEmployers,
+    setPreviouslyEmployedAtTargetEmployers,
+  ] = useState<YesNo>("");
+  const [salaryExpectation, setSalaryExpectation] = useState("");
   const [resumeFile, setResumeFile] = useState<File | null>(null);
   const [linkedinFile, setLinkedinFile] = useState<File | null>(null);
   const [attestation, setAttestation] = useState(false);
@@ -257,6 +267,12 @@ export function IntakeForm({ userId }: { userId: string }) {
         highSchoolGradYear: /^\d+$/.test(highSchoolGradYear.trim())
           ? Number(highSchoolGradYear.trim())
           : highSchoolGradYear,
+        subjectToRestrictiveCovenant: toBoolean(subjectToRestrictiveCovenant),
+        relativesAtTargetEmployers: toBoolean(relativesAtTargetEmployers),
+        previouslyEmployedAtTargetEmployers: toBoolean(
+          previouslyEmployedAtTargetEmployers
+        ),
+        salaryExpectation,
         resumePath,
         linkedinPdfPath,
         attestation,
@@ -582,6 +598,52 @@ export function IntakeForm({ userId }: { userId: string }) {
             value={highSchoolGradYear}
             onChange={(event) => setHighSchoolGradYear(event.target.value)}
             placeholder="2022"
+          />
+        </Field>
+      </section>
+
+      <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
+        <h2 className="text-lg font-medium">Screening questions</h2>
+        <p className="text-muted-foreground text-sm">
+          Almost every employer asks these somewhere in the application. Answer
+          them once here and we will not stop to ask you again.
+        </p>
+
+        <YesNoField
+          label="Are you under a non compete or non solicitation agreement"
+          value={subjectToRestrictiveCovenant}
+          onChange={setSubjectToRestrictiveCovenant}
+          error={errors.subjectToRestrictiveCovenant}
+          hint="This is about an agreement with a previous employer. If you are under one, say yes. We will still come back to you if a form asks for the details."
+        />
+
+        <YesNoField
+          label="Do you have relatives working at any company you might apply to"
+          value={relativesAtTargetEmployers}
+          onChange={setRelativesAtTargetEmployers}
+          error={errors.relativesAtTargetEmployers}
+          hint="Forms ask this about themselves, one company at a time. A no here answers all of them. A yes means we ask you about the specific company when it comes up."
+        />
+
+        <YesNoField
+          label="Have you ever worked at any company you might apply to"
+          value={previouslyEmployedAtTargetEmployers}
+          onChange={setPreviouslyEmployedAtTargetEmployers}
+          error={errors.previouslyEmployedAtTargetEmployers}
+          hint="Same as above. A no answers every version of this question, and a yes means we ask you which company when a form wants to know."
+        />
+
+        <Field
+          label="What you expect to be paid"
+          htmlFor="salary"
+          error={errors.salaryExpectation}
+          hint="In your own words. A number, a range, or something like negotiable. We never make one up for you."
+        >
+          <Input
+            id="salary"
+            value={salaryExpectation}
+            onChange={(event) => setSalaryExpectation(event.target.value)}
+            placeholder="$120,000, or negotiable"
           />
         </Field>
       </section>

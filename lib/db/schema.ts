@@ -429,6 +429,104 @@ export const profiles = pgTable(
     postalCode: text("postal_code"),
 
     /**
+     * ── JOB-134: the questions every employer asks and nothing had stored ───
+     *
+     * Same rule as the JOB-101 block above, and added on the same evidence: a
+     * required field on a real employer's form had no stored answer behind it
+     * and stopped the run. On the Avery Dennison screening step 9 of 11
+     * required questions were answered from stored facts and the two that were
+     * not were sponsorship and a non-compete, both asked by close to every US
+     * employer. Sponsorship already had its columns; this block is the rest.
+     *
+     * All four belong to the person rather than to us, so all four are granted
+     * to `authenticated` by name in
+     * `drizzle/0018_profiles_answer_memory_privileges.sql`.
+     */
+
+    /**
+     * Whether a previous employer's contract still binds them: a non-compete, a
+     * non-solicitation clause, or any other restrictive covenant.
+     *
+     * A legal attestation, and stored under the rule `LEGAL_ATTESTATION_RE` in
+     * `lib/fill-application-form.ts` states rather than around it. That comment
+     * used to say no stored fact could ever back one of these questions, and it
+     * was right at the time for the right reason: the system held no such fact,
+     * so anything answering the question would have been a guess. JOB-134
+     * changes the premise and not the rule, exactly as JOB-101 did for security
+     * clearance. `ATTESTATION_FACT_SCOPES` now names this topic and admits this
+     * one column and nothing else, so a sponsorship answer still cannot back a
+     * non-compete question and this answer still cannot back anything else.
+     * Criminal history still admits nothing at all, and always will.
+     *
+     * Null means never asked, which stays a question put to the candidate.
+     */
+    subjectToRestrictiveCovenant: boolean("subject_to_restrictive_covenant"),
+
+    /**
+     * "Do you have any relatives employed by this company?", asked on a large
+     * share of Greenhouse and SmartRecruiters screening steps.
+     *
+     * Read the question this column actually asks, because it is deliberately
+     * not the one the form asks. The form asks about ONE named employer; this
+     * asks whether the person has relatives at ANY employer they might apply
+     * to. Only one of the two answers is reusable, and that asymmetry is
+     * enforced in `buildFactCatalog`: false produces a fact, because "none at
+     * any of them" truthfully answers the question for every company; true
+     * produces no fact at all, because which company matters and only the
+     * person can say. So a "yes" here still escalates, per company, which is
+     * correct rather than a shortfall.
+     */
+    relativesAtTargetEmployers: boolean("relatives_at_target_employers"),
+
+    /**
+     * "Have you ever been employed by this company?". The same shape as the
+     * column above and the same asymmetry, for the same reason: false is a
+     * statement about every employer at once and answers the form's question;
+     * true is a statement about one of them and escalates.
+     */
+    previouslyEmployedAtTargetEmployers: boolean(
+      "previously_employed_at_target_employers"
+    ),
+
+    /**
+     * What the person expects to be paid, in their own words.
+     *
+     * Free text and never a number anything derives, because HARD STOP 9 names
+     * salary expectations outright as something no model may compose.
+     * "$120,000", "market rate for a new grad in San Francisco" and
+     * "negotiable" are all real answers to this question and only the person
+     * can give any of them.
+     */
+    salaryExpectation: text("salary_expectation"),
+
+    /**
+     * Every question this person has answered that intake never asked, kept so
+     * that the next application does not ask it again. JOB-134 item 1.
+     *
+     * An array of `{question, answer, topic, answeredAt}` objects, written and
+     * read through `lib/candidate-answers.ts` and capped at
+     * `STORED_ANSWER_LIMIT`. `question` is the form's own label, which is the
+     * same string `needsInput[].key` reports and `additionalAnswers` is keyed
+     * on, so a stored answer re-enters the fill exactly as a freshly supplied
+     * one does and every guard in front of it runs unchanged.
+     *
+     * ── Why this one is NOT granted to `authenticated` ─────────────────────
+     * Unlike the four columns above it, this is not a field on a form somebody
+     * fills in. It is free text that goes into the prompt deciding what gets
+     * typed onto a real employer's application, and
+     * `0016_resumes_column_privileges.sql` settled the same question for
+     * `resumes.parsed` the same way and for the same reason. The pipeline
+     * writes it with the service role, from an answer the person gave. The in
+     * app surface for answering a pending question, which is issue #134 item 4
+     * and is not built here, wants a server action that validates rather than a
+     * direct column grant.
+     *
+     * Null on every existing row, which `parseStoredAnswers` reads as an empty
+     * list. Nothing needs backfilling.
+     */
+    storedAnswers: jsonb("stored_answers"),
+
+    /**
      * When the person confirmed their intake is accurate and authorized us to
      * apply on their behalf. Added by JOB-007.
      *

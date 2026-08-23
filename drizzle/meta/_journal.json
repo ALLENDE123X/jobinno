@@ -120,6 +120,20 @@
       "when": 1787443200000,
       "tag": "0016_resumes_column_privileges",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1787529600000,
+      "tag": "0017_profiles_answer_memory",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1787529660000,
+      "tag": "0018_profiles_answer_memory_privileges",
+      "breakpoints": true
     }
   ]
 }
