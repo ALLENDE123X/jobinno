@@ -66,6 +66,7 @@
  */
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { type Page } from "@browserbasehq/stagehand";
 import { z } from "zod";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -248,6 +249,12 @@ export type ConfirmationCapture = z.infer<typeof ConfirmationSignalsSchema> & {
    * side of the click.
    */
   identityFieldsPresent: boolean;
+  /**
+   * JOB-133. The wait that ran between the click and this reading. Undefined on
+   * a capture built by hand, which is every capture in a unit test; set at both
+   * of the two places a real post-click reading is taken.
+   */
+  settle?: SettleWindow;
 };
 
 const PAGE_TEXT_LENGTH_SCRIPT = `((document.body && document.body.innerText) || '').trim().length`;
@@ -371,6 +378,309 @@ async function readConfirmation(session: BrowserSession): Promise<ConfirmationCa
     identityFieldsPresent:
       applicantIdentitySlots(coreSlots).length >= MIN_IDENTITY_SLOTS_FOR_FORM,
   };
+}
+
+// ───────────────────────────────────
+// JOB-133 — looking after the board has finished moving, not before
+// ───────────────────────────────────
+
+/**
+ * ── The run that caused this ────────────────────────────────────────────────
+ * Application `634828a1-35a3-4453-8ded-0a9e35878825` is this project's first
+ * genuinely confirmed submission — Avery Dennison / Vestcom on SmartRecruiters,
+ * verified afterwards by the board's own `/success` page and by the employer's
+ * confirmation email 54 seconds later. It was recorded as
+ * `submission_unconfirmed`, `submitted: false`.
+ *
+ * The payload it wrote contradicts itself, and the contradiction is the clock:
+ *
+ *   · `unconfirmedReason` cites the form "still on screen" at `.../screening`,
+ *     the page `readConfirmation` read;
+ *   · `finalUrl`, re-read moments later by `finish()`, is `.../success`;
+ *   · the employer's own confirmation email arrived 54 seconds later.
+ *
+ * Nothing about the detection was wrong. `pageReadsAsFurtherStep` reads that
+ * `/success` page correctly, and JOB-124 pinned it against exactly this board's
+ * receipt. The check simply ran before SmartRecruiters had finished navigating
+ * to it, and judged a page the board had already left.
+ *
+ * How far before is worth stating precisely, because the ticket's own estimate
+ * of three seconds is the gap between two artifact timestamps rather than the
+ * gap that matters, and the artifacts say it was very much smaller. The
+ * no-confirmation capture stamped `03:51:44.553` is **already the success
+ * page** — its DOM dump holds `<oc-success-page>` and its screenshot is
+ * byte-for-byte identical to the final one stamped `03:51:47` — and it runs
+ * immediately after the reading, with only a field enumeration and one page
+ * evaluate in between. So the board landed within a few hundred milliseconds of
+ * being read, which is the near miss this has to be built for.
+ *
+ * ── Why this is a timing fix and nothing else ───────────────────────────────
+ * The bar for what counts as a confirmation is not touched here, and must not
+ * be. This decides **when** the page is read; `judgeSubmission` still decides
+ * what the reading means, by exactly the rule JOB-106, JOB-124 and JOB-126
+ * left it with. A wait cannot turn a page that says nothing into a receipt.
+ * That separation is the whole safety argument, and it is why the predicate
+ * below can reuse `pageReadsAsFurtherStep` without widening anything: here it
+ * only ever answers "has the board landed somewhere yet", and the answer only
+ * ever decides whether to stop waiting.
+ *
+ * ── Why polling and not a sleep ─────────────────────────────────────────────
+ * JOB-120 hit this class of bug at the consent banner and fixed it the same
+ * way: a `Deny` click that genuinely worked still read as "banner present" on
+ * the first look and cleared about a second later, so the read back was changed
+ * to poll rather than peek. See `waitForConsentOverlayGone` in
+ * `lib/consent-banner.ts`. A fixed sleep would pay the full cost on every board
+ * including the ones that redirect instantly; this stops the moment the board
+ * has landed, so a receipt that appears in 200ms costs one poll.
+ *
+ * ── What it costs when the board never goes anywhere ────────────────────────
+ * The full window, in wall clock, and that is deliberate. A board that answers
+ * in place renders its answer asynchronously too, whether the answer is a
+ * validation error or a confirmation overlay, so the same wait gives that
+ * render time to land before a model is asked to describe it. Spending it here
+ * as one bounded wait, rather than as the repeated `readConfirmation` calls the
+ * Workable branch used to make, is also strictly cheaper: the polls below read
+ * a URL and a title, and the model is called once, at the end.
+ *
+ * ── The size of the window, and why the number is not load bearing ──────────
+ * Eight seconds. It is not derived from the run above, because that run cannot
+ * yield it: the board landed just after a full model extraction had already
+ * elapsed since the click, and how long that extraction took is nowhere in the
+ * artifacts. Any window is therefore a guess at a number nobody has measured,
+ * so this is sized as "comfortably longer than a page load, short enough to
+ * spend on a board that rejected the application", and `readSettledConfirmation`
+ * below is what makes being wrong about it recoverable rather than final.
+ *
+ * It is recorded in the evidence string on every outcome rather than left to be
+ * inferred, so the next occurrence arrives with the number that produced it
+ * attached and this can be retuned from data instead of from argument.
+ */
+const SUBMIT_SETTLE_BOUNDS = Object.freeze({ budgetMs: 8_000, pollMs: 250 });
+
+export type SettleBounds = { budgetMs: number; pollMs: number };
+
+/** What one wait for the board to stop moving actually did. */
+export type SettlePoll = {
+  /** Wall clock spent waiting before the page was read, in milliseconds. */
+  waitedMs: number;
+  /** The bound that wait was given, so a `budget` exit is self describing. */
+  budgetMs: number;
+  /** How many times the URL and the tab title were read during the wait. */
+  looks: number;
+  /**
+   * Why the wait ended.
+   *
+   *   · `landed`     the board navigated somewhere that does not read as
+   *                  another step of the same application. This is the early
+   *                  exit, and the case JOB-133 exists for.
+   *   · `budget`     the window ran out with the browser still on the page it
+   *                  was clicked from, or on a further step of it.
+   *   · `unreadable` the page could not be read at all. `readConfirmation` is
+   *                  left to be the call that reports that, since the caller
+   *                  already knows how to describe its failure.
+   */
+  exit: "landed" | "budget" | "unreadable";
+};
+
+/** The whole of the waiting and reading that produced one capture. */
+export type SettleWindow = SettlePoll & {
+  /**
+   * How many times the page was read to produce this capture. Two when the
+   * board moved while the first reading was being taken; never more. See
+   * `readSettledConfirmation`.
+   */
+  reads: number;
+};
+
+/**
+ * Waits for the post-click navigation to settle, then lets the caller read.
+ *
+ * `wasAt` is the URL the page was on immediately before the click. Never
+ * throws: an unreadable page ends the wait rather than the run, because every
+ * caller of this is already past the point of no return and the one thing that
+ * must not happen there is an exception escaping toward something that could
+ * retry.
+ *
+ * `bounds` is a parameter so the loop can be pinned by a unit test without
+ * spending the real window in wall clock. Nothing in the pipeline passes it and
+ * nothing should: the production window is the constant above, and the value
+ * actually used is written into the evidence string either way.
+ */
+export async function waitForPostClickSettle(
+  page: Page,
+  wasAt: string,
+  bounds: SettleBounds = SUBMIT_SETTLE_BOUNDS
+): Promise<SettlePoll> {
+  const startedAt = Date.now();
+  const deadline = startedAt + bounds.budgetMs;
+  let looks = 0;
+  let exit: SettlePoll["exit"] = "budget";
+  for (;;) {
+    let url: string;
+    let title: string;
+    try {
+      [url, title] = await Promise.all([page.url(), page.title()]);
+    } catch {
+      exit = "unreadable";
+      break;
+    }
+    looks += 1;
+    // The early exit, and the only positive signal this loop knows. Navigation
+    // is required: a board that confirms in place never changes its URL, so
+    // there is nothing here that could tell its receipt from its error page,
+    // and guessing is precisely what this module does not do. A destination
+    // that still reads as a further step is not a landing either — that is the
+    // wizard advance JOB-106 filed correctly, and waiting out the rest of the
+    // window on it is what catches the board that goes on to a receipt, which
+    // is what the Avery Dennison run did from `/screening`.
+    if (!samePage(url, wasAt) && !pageReadsAsFurtherStep(title, url, wasAt)) {
+      exit = "landed";
+      break;
+    }
+    if (Date.now() + bounds.pollMs >= deadline) break;
+    await sleep(bounds.pollMs);
+  }
+  return { waitedMs: Date.now() - startedAt, budgetMs: bounds.budgetMs, looks, exit };
+}
+
+/** The page's URL, or null when the browser will not say. Never throws. */
+async function urlNow(page: Page): Promise<string | null> {
+  try {
+    return await page.url();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Waits for the board to settle, reads the page, and reads it again if the
+ * board moved while it was being read.
+ *
+ * ── Why the second reading exists ───────────────────────────────────────────
+ * Because the window above is a bet, for the reason set out over it: the Avery
+ * Dennison artifacts fix when the board landed relative to the *reading* — a
+ * few hundred milliseconds after it — and not relative to the click, which is
+ * what a window is measured from. A window alone would be this fix resting on
+ * a number nobody has measured.
+ *
+ * This is what makes the bet unnecessary. A reading taken off a page the board
+ * has since left is stale by definition, and that is checkable for the cost of
+ * one URL read: if the browser is somewhere else afterwards, the reading
+ * described a page that no longer exists, so it is taken again. The window
+ * above is what makes this rare rather than what makes it correct.
+ *
+ * ── What it is not ──────────────────────────────────────────────────────────
+ * Not a retry, and not a second chance at a verdict it did not like. Nothing
+ * here clicks, nothing here judges, and the trigger is the board moving rather
+ * than the answer being unwelcome — a page that stays put is read exactly once
+ * whatever it said. The cap is two readings, so this cannot become a loop that
+ * keeps looking until it sees something it prefers, which is the shape JOB-126
+ * and JOB-109 exist to keep out of this file.
+ *
+ * Throws only what `readConfirmation` throws, which both call sites already
+ * catch and report as a page that could not be read.
+ *
+ * `deps` is the seam the unit test drives this through, so the sequence below
+ * is pinned by a test rather than only by a live board: the real window would
+ * cost eight seconds of wall clock per case, and the real reading would cost a
+ * model call. Nothing in the pipeline passes it, both defaults are the real
+ * things, and neither can move what counts as a confirmation — one is a clock
+ * and the other is the same `readConfirmation` every path uses.
+ */
+export async function readSettledConfirmation(
+  session: BrowserSession,
+  wasAt: string,
+  what: string,
+  deps: {
+    read: (session: BrowserSession) => Promise<ConfirmationCapture>;
+    bounds: SettleBounds;
+  } = { read: readConfirmation, bounds: SUBMIT_SETTLE_BOUNDS }
+): Promise<ConfirmationCapture> {
+  const first = await waitForPostClickSettle(session.page, wasAt, deps.bounds);
+  console.log(
+    `${LOG} waited ${first.waitedMs}ms of ${first.budgetMs}ms for the board to settle after ` +
+      `${what} (${first.looks} look(s), ended: ${first.exit})`
+  );
+  const capture = await deps.read(session);
+
+  const movedTo = await urlNow(session.page);
+  if (movedTo === null || samePage(movedTo, capture.url)) {
+    return { ...capture, settle: { ...first, reads: 1 } };
+  }
+
+  console.log(
+    `${LOG} the board moved from ${JSON.stringify(capture.url)} to ${JSON.stringify(movedTo)} ` +
+      `while that reading was being taken, so the reading describes a page it has left. ` +
+      `Waiting again and reading once more; this is the second and last reading.`
+  );
+  const second = await waitForPostClickSettle(session.page, capture.url, deps.bounds);
+  console.log(
+    `${LOG} waited a further ${second.waitedMs}ms of ${second.budgetMs}ms ` +
+      `(${second.looks} look(s), ended: ${second.exit})`
+  );
+  const settled = await deps.read(session);
+  return {
+    ...settled,
+    settle: {
+      waitedMs: first.waitedMs + second.waitedMs,
+      budgetMs: first.budgetMs + second.budgetMs,
+      looks: first.looks + second.looks,
+      exit: second.exit,
+      reads: 2,
+    },
+  };
+}
+
+/**
+ * JOB-133's last line: the invariant that would have caught JOB-133 itself.
+ *
+ * The payload that run wrote contradicted itself inside one object. The reason
+ * string cited the form still on screen at `.../screening`; `finalUrl`, re-read
+ * by `finish()` a moment later off the same browser, was `.../success`. Nobody
+ * was told. It was found because a human read the JSON and noticed, which is
+ * not a mechanism.
+ *
+ * So the disagreement is checked for and written down. `judgedAt` is the page
+ * the reason string describes and `nowAt` is where the browser is by the time
+ * the row is written; if those are different pages, the judgement was made
+ * against a view the board had already left.
+ *
+ * ── What this deliberately does not do ──────────────────────────────────────
+ * It does not change the verdict, and it must not be made to. Deciding that a
+ * submission happened because the URL moved afterwards is exactly the bare
+ * navigation inference JOB-106 removed, and this runs on a path where the
+ * verdict is already `submission_unconfirmed`, which is never retried and
+ * always invites a human. The settle window and the re-read above are what stop
+ * a stale reading being acted on; this is what makes one visible on the day
+ * something gets past both.
+ *
+ * A null on either side produces no annotation, which is the same thing as
+ * agreeing: there is nothing to compare, and a browser that has gone away is
+ * not evidence that the page moved.
+ */
+export function describeStaleJudgement(judgedAt: string | null, nowAt: string | null): string {
+  if (judgedAt === null || nowAt === null || samePage(nowAt, judgedAt)) return "";
+  return (
+    ` NOTE (JOB-133): by the time this was recorded the browser was at ${JSON.stringify(nowAt)}, ` +
+    `which is not the page the reason above describes (${JSON.stringify(judgedAt)}). The board ` +
+    `was still moving when it was read, so treat that description as stale and check the final ` +
+    `screenshot and the page now at ${JSON.stringify(nowAt)} before concluding anything about ` +
+    `this row.`
+  );
+}
+
+/**
+ * The window, in the evidence string, on every outcome it produced.
+ *
+ * Empty for a capture taken without one, which is every capture a unit test
+ * builds by hand, so the strings those pin stay the strings they pinned.
+ */
+function describeSettle(settle: SettleWindow | undefined): string {
+  if (settle === undefined) return "";
+  return (
+    `, read after waiting ${settle.waitedMs}ms of a ${settle.budgetMs}ms window ` +
+    `(${settle.looks} look(s), ended: ${settle.exit}, readings: ${settle.reads})`
+  );
 }
 
 // ───────────────────────────────────
@@ -557,15 +867,23 @@ export function judgeSubmission(capture: ConfirmationCapture, wasAt: string): Su
   // model's reading alone when `querySelectorAll` can contradict it.
   const formStillPresent = capture.applicationFormStillPresent || capture.identityFieldsPresent;
   const continuedToFurtherStep = readsAsFurtherStep(capture, wasAt);
-  // Unchanged, and deliberately so: all four signals, in the wording `succeed()`
-  // has always logged them in. What a human needs from this line is the ability
-  // to reconstruct the judgement, which means it has to keep reporting the
-  // signal that was overruled as loudly as the ones that agreed.
+  // All four signals, in the wording `succeed()` has always logged them in.
+  // What a human needs from this line is the ability to reconstruct the
+  // judgement, which means it has to keep reporting the signal that was
+  // overruled as loudly as the ones that agreed.
+  //
+  // JOB-133 appends a fifth fact, and it is there because the four above were
+  // not enough to diagnose the run that ticket is named for: every one of them
+  // was correct about the page that was read, and the page that was read was
+  // the wrong one. *When* the reading was taken is part of what the reading
+  // means, so it is written down next to it rather than reconstructed later
+  // from file timestamps by someone who already suspects the answer.
   const evidence =
     `confirmation page: ${capture.confirmationPresent}, ` +
     `form gone: ${!formStillPresent}, ` +
     `navigated: ${navigated}, ` +
-    `destination reads as a further step: ${continuedToFurtherStep}`;
+    `destination reads as a further step: ${continuedToFurtherStep}` +
+    describeSettle(capture.settle);
   // JOB-124. The model says receipt, the board's own URL and tab title say step.
   // Split out so the caller can route it rather than infer it; see the field.
   const confirmationContradicted = capture.confirmationPresent && continuedToFurtherStep;
@@ -1712,6 +2030,15 @@ async function runSubmitPhase(
   /** ACT-017. Null until the board demands a code; the report of that leg after. */
   let securityCode: SecurityCodeReport | null = null;
 
+  /**
+   * JOB-133. The URL of the page the last post-click reading was taken from,
+   * which is the page every reason string below that quotes a capture is
+   * describing. Null until such a reading exists.
+   *
+   * See `describeStaleJudgement`.
+   */
+  let judgedAtUrl: string | null = null;
+
   /** Assembles a result, reading the page and saving a screenshot best-effort. */
   const finish = async (terminal: {
     status: ApplicationStatus;
@@ -1744,6 +2071,15 @@ async function runSubmitPhase(
   };
 
   /**
+   * `describeStaleJudgement` against this run's own browser. Never throws:
+   * `urlNow` reports a browser that has gone away as null, and this runs ahead
+   * of the write that records an irreversible click, which it is not allowed to
+   * be the reason does not happen.
+   */
+  const describeStalePage = async (): Promise<string> =>
+    describeStaleJudgement(judgedAtUrl, await urlNow(session.page));
+
+  /**
    * The post-click exit. Records `submission_unconfirmed`, and **swallows a
    * failure to record it**.
    *
@@ -1756,7 +2092,11 @@ async function runSubmitPhase(
    * than allowed to become an exception.
    */
   const unconfirmed = async (why: string): Promise<SubmitApplicationResult> => {
-    const message = `${UNCONFIRMED_TAG}: ${why}`;
+    // JOB-133. `why` describes the page a capture was read off; this appends
+    // the board's disagreement with it, when there is one. Never replaces it:
+    // the reason a human is given has to stay the reason the code acted on.
+    const reported = `${why}${await describeStalePage()}`;
+    const message = `${UNCONFIRMED_TAG}: ${reported}`;
     let rowUpdated = false;
     try {
       // Status first and on its own, so that the write which stops this row
@@ -1807,7 +2147,7 @@ async function runSubmitPhase(
     });
     console.error(
       `${LOG} ══ SUBMIT CLICKED, OUTCOME UNKNOWN ═══════════════════════════════\n` +
-        `${LOG} ${why}\n` +
+        `${LOG} ${reported}\n` +
         `${LOG} Do NOT re-run this listing until a human has checked whether an\n` +
         `${LOG} application already exists at the employer.\n` +
         `${LOG} ══════════════════════════════════════════════════════════════════`
@@ -1818,7 +2158,7 @@ async function runSubmitPhase(
       confirmationRef: null,
       confirmation: null,
       blockedReason: null,
-      unconfirmedReason: why,
+      unconfirmedReason: reported,
       rowUpdated,
     });
   };
@@ -1872,19 +2212,11 @@ async function runSubmitPhase(
     });
   };
 
-  /**
-   * The test `create-board-account.ts` applies after its signup submit, with the
-   * board's own confirmation wording as the strongest signal in it.
-   *
-   * Lifted into a function by ACT-017 so both clicks are judged by exactly the
-   * same rule rather than by two copies of it that can drift, and moved out to
-   * module scope by JOB-106 so the rule is pinned by a unit test rather than
-   * only by a live board. `judgeSubmission` carries the reasoning; see it for
-   * why bare navigation no longer carries a submission on its own. `wasAt` is
-   * the URL the page was on immediately before the click being judged.
-   */
-  const looksSubmitted = (capture: ConfirmationCapture, wasAt: string): boolean =>
-    judgeSubmission(capture, wasAt).submitted;
+  // ACT-017's `looksSubmitted` wrapper lived here, and JOB-133 removed it with
+  // the Workable poll that was its last caller. Both clicks call
+  // `judgeSubmission` directly, which is what that wrapper existed to guarantee
+  // — one rule, not two copies free to drift — so nothing about how a
+  // submission is judged changed when it went.
 
   /**
    * The success exit, shared by both clicks.
@@ -2142,29 +2474,24 @@ async function runSubmitPhase(
     }
 
     // ── Reading the result ────────────────────────────────────────────────────
-    // Workable's confirmation can arrive asynchronously (overlay appears, URL
-    // changes, or "Thank you" text loads) up to a few seconds after the click.
-    // For Workable we poll for up to 5 s; for all other ATS platforms a single
-    // read is sufficient and avoids unnecessary latency.
-    const WORKABLE_POLL_INTERVAL_MS = 1_000;
-    const WORKABLE_POLL_BUDGET_MS = 5_000;
+    // JOB-133. Wait for the board to finish moving before asking what it says,
+    // because the run that ticket is named for asked about three seconds too
+    // early and filed a real submission as a failure. The reasoning, the window
+    // and why this cannot loosen what counts as a confirmation are all at
+    // `waitForPostClickSettle`.
+    //
+    // This replaces a Workable-only poll that called `readConfirmation` up to
+    // five times over five seconds, waiting for that board's asynchronous
+    // in-place confirmation. Nothing it covered is lost. Its budget was five
+    // seconds and this window is eight, so the single reading below is taken
+    // strictly later than the last reading that poll could have taken, on
+    // Workable and on every other board — and the polls that get it there read
+    // a URL and a title rather than calling a model, so the board that used to
+    // cost five extractions now costs one.
     let capture: ConfirmationCapture;
     try {
-      if (row.ats === "workable") {
-        const deadline = Date.now() + WORKABLE_POLL_BUDGET_MS;
-        let lastCapture: ConfirmationCapture | undefined;
-        while (Date.now() < deadline) {
-          const attempt = await readConfirmation(session);
-          lastCapture = attempt;
-          if (looksSubmitted(attempt, fill.finalUrl)) break;
-          if (Date.now() + WORKABLE_POLL_INTERVAL_MS < deadline) {
-            await sleep(WORKABLE_POLL_INTERVAL_MS);
-          }
-        }
-        capture = lastCapture!;
-      } else {
-        capture = await readConfirmation(session);
-      }
+      capture = await readSettledConfirmation(session, fill.finalUrl, "the submit click");
+      judgedAtUrl = capture.url;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return await unconfirmed(
@@ -2506,9 +2833,15 @@ async function runSubmitPhase(
     }
     securityCode.resubmitted = true;
 
+    // JOB-133, the same wait as after the first click and for the same reason.
+    // A board that answers a resubmit by redirecting to its receipt has exactly
+    // as much of a head start on the reading as one answering a first click,
+    // and this leg has less margin for getting it wrong: there is no third
+    // click, so a receipt missed here is missed for good.
     let resubmitCapture: ConfirmationCapture;
     try {
-      resubmitCapture = await readConfirmation(session);
+      resubmitCapture = await readSettledConfirmation(session, resubmitFrom, "the resubmit click");
+      judgedAtUrl = resubmitCapture.url;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return await unconfirmed(
