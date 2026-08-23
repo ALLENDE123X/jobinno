@@ -97,9 +97,20 @@
  * When a required field cannot be answered truthfully the run does not guess and
  * does not silently skip: it returns `needsInput`, a structured list of what it
  * still needs, alongside everything it did fill. The caller asks the user, then
- * re-invokes with `additionalAnswers` and it finishes. That loop is stateless —
- * nothing is stored between the two calls, and the keys are derived from the
- * form's own labels so the second run recomputes them identically.
+ * re-invokes with `additionalAnswers` and it finishes. The *resume* half of that
+ * loop is still stateless: no session handle, no pending-question record, and
+ * the keys are derived from the form's own labels so the second run recomputes
+ * them identically.
+ *
+ * JOB-134 changed one thing about it, and only one. The answer itself is now
+ * kept, on `profiles.stored_answers`, so that the next employer asking the same
+ * question does not stop the next application. Everything a stored answer then
+ * has to get past to reach a form is what it always was — `matchAdditionalAnswer`
+ * still has to find it, `resolveAdditionalAnswer` still refuses to let it decide
+ * a demographic or consent field, the attestation ladder still decides which
+ * facts may back which questions, and the value is still read back out of the
+ * control afterwards. Nothing downstream can tell a stored answer from one that
+ * arrived a second ago, which is the property that made this safe to add.
  *
  * ── Why this is one self-contained, re-entrant call ─────────────────────────
  * Inngest steps are independently retried and resumed, and a Playwright/Stagehand
@@ -224,6 +235,17 @@ import {
   type FormFieldKind,
 } from "@/lib/form-fields";
 import { loadCandidate, type CandidateApplicationAnswers } from "@/lib/candidate-intake";
+// JOB-134. The candidate's own answers to questions intake never asked, kept
+// against their profile instead of living for one invocation. This module owns
+// no policy from that file and that file owns none from this one: it decides
+// which stored answers are the same answer, and everything about whether an
+// answer may go on a form is still decided here.
+import {
+  rememberAnswers,
+  sameStoredAnswers,
+  withStoredAnswers,
+  type StoredAnswer,
+} from "@/lib/candidate-answers";
 // JOB-004. Both copies of `updateApplication` and `recordFailure` that the port
 // carried are gone; this module and `submit-application.ts` share one now. See
 // that file's header for why a failure is two writes here and was one there.
@@ -1704,6 +1726,15 @@ export type FillApplicationFormInput = {
    * Values are typed into a real employer's form verbatim (sanitised to one
    * line), or, for a dropdown, matched against the options the page offers. An
    * answer that matches no option is reported back rather than approximated.
+   *
+   * ── JOB-134: what is passed here is added to, not replaced ────────────────
+   * Whatever a caller supplies is folded together with the answers this person
+   * has given before, from `profiles.stored_answers`, and the supplied ones win
+   * every collision — in value and in iteration order, since
+   * `matchAdditionalAnswer` walks the map and takes the first key that matches.
+   * Somebody answering a question again right now is correcting the record, not
+   * competing with it. A caller that supplies nothing still gets everything
+   * this person has ever answered, which is the point of the ticket.
    */
   additionalAnswers?: Record<string, string>;
 };
@@ -1856,6 +1887,16 @@ type ApplicationState = {
    * that into a question for the candidate rather than a value on a form.
    */
   applicationAnswers: CandidateApplicationAnswers;
+  /**
+   * JOB-134. Every question this person has answered that intake never asked,
+   * from `profiles.stored_answers`, newest first.
+   *
+   * Held on the state rather than read where it is needed for the same reason
+   * `applicationAnswers` is: the run needs it in two places, once to fold into
+   * this run's `additionalAnswers` and once to write back with whatever this
+   * run learned, and reading it twice would let the two disagree.
+   */
+  storedAnswers: StoredAnswer[];
 };
 
 /**
@@ -1996,6 +2037,7 @@ async function loadApplicationState(
       linkedinPdfPath: candidate.linkedinPdfPath,
     },
     applicationAnswers: candidate.applicationAnswers,
+    storedAnswers: candidate.storedAnswers,
   };
 }
 
@@ -2978,6 +3020,18 @@ const ATTESTATION_FACT_SCOPES: readonly [RegExp, RegExp][] = [
     /\b(?:security\s+clearance|clearance\s+eligib\w*|clearance)\b/i,
     /^(?:clearanceEligibility|clearanceLevelHeld|holdsActiveUsClearance|isEligibleForUsClearance|hasEverHeldUsClearance)$/,
   ],
+  // JOB-134. Restrictive covenants, admitting exactly one fact: the answer the
+  // candidate gave at intake to this exact question. The header above says this
+  // topic could only ever reach step 2 or step 3 of the ladder, and the reason
+  // it gave was that "this system holds no such fact". That premise is what
+  // changed, not the rule — the same move JOB-101 made for security clearance,
+  // whose list was empty for the same reason and is no longer. What has not
+  // changed: a sponsorship fact still cannot answer a non-compete question, and
+  // `restrictiveCovenant` still cannot answer anything except this one.
+  [
+    /\b(?:non[-\s]?compet\w*|noncompet\w*|non[-\s]?solicit\w*|nonsolicit\w*|restrictive\s+covenant\w*)\b/i,
+    /^restrictiveCovenant$/,
+  ],
   [
     /\b(?:felony|felonies|misdemean\w*|convict\w*|criminal\s+(?:history|record|background|conviction\w*)|background\s+check)\b/i,
     /^$/,
@@ -3322,6 +3376,58 @@ export function buildFactCatalog(
     "visaStatus",
     "Their current visa status, in their own words, as stated at intake",
     answers.visaStatus
+  );
+
+  // ── JOB-134: the four questions every employer asks and nothing stored ───
+  //
+  // Same shape as the JOB-022 and JOB-101 blocks above and added on the same
+  // evidence: a required field on a real employer's form had no stored answer
+  // behind it, so the run stopped and the candidate was asked something they
+  // will be asked again by the next employer and the one after that.
+  //
+  // The restrictive covenant answer is a legal attestation and arrives under
+  // the rule rather than around it: `attestationFactAllowed` scopes it to a
+  // non-compete or non-solicit question and to nothing else, and scopes every
+  // other fact out of that question. Both values are stated, because "No, I am
+  // not under one" and "Yes, I am" are equally the candidate's own answer and
+  // an employer asking has a right to either.
+  add(
+    "restrictiveCovenant",
+    "Subject to a non-compete, non-solicitation or other restrictive covenant from a previous employer",
+    yesNo(answers.subjectToRestrictiveCovenant)
+  );
+  // ── The two that only speak when the answer is "no" ──────────────────────
+  //
+  // These are the one asymmetry in this whole catalogue and it is deliberate.
+  // The form asks about ONE named employer ("do you have relatives employed by
+  // Avery Dennison?"); intake asks about ALL of them ("do you have relatives
+  // employed by any company you might apply to?"). "None of them" entails "not
+  // this one", so a false answer truthfully answers every employer's version of
+  // the question. "Some of them" entails nothing at all about this employer, so
+  // there is no fact to write and the question goes to the candidate, which is
+  // exactly where a question only they can answer belongs. Writing a "Yes" here
+  // would be the system telling an employer something nobody told it.
+  if (answers.relativesAtTargetEmployers === false) {
+    add(
+      "noRelativesAtThisEmployer",
+      "Has no relatives or immediate family employed at any company they are applying to, this one included",
+      "No"
+    );
+  }
+  if (answers.previouslyEmployedAtTargetEmployers === false) {
+    add(
+      "noPriorEmploymentAtThisEmployer",
+      "Has never previously been employed by any company they are applying to, this one included",
+      "No"
+    );
+  }
+  // HARD STOP 9 names salary expectations outright as something no model may
+  // compose, which is why this is the candidate's own words and never a number
+  // derived from a title, a location or a market rate.
+  add(
+    "salaryExpectation",
+    "Salary or compensation they expect, in their own words, as stated at intake",
+    answers.salaryExpectation
   );
 
   add("highSchoolName", "The high school they attended", answers.highSchoolName);
@@ -3678,7 +3784,47 @@ function totalYearsOfExperience(history: readonly { startDate: string | null; en
  * something. That way "are you legally authorized to work in the united states
  * for our company?" is answered by the shorter question a caller echoed back,
  * while two unrelated one-word labels can never collide.
+ *
+ * ── JOB-134: both sides now have to look like a question ────────────────────
+ * The rule already said "only for keys long enough for that to mean something",
+ * and the code checked only that the SUPPLIED key cleared ten characters. That
+ * was defensible while the supplied map held two or three answers a caller had
+ * just been handed about the page in front of them. It is not defensible now
+ * that the map also holds every question this person has ever answered, because
+ * a long question contains a great many short strings. "How many years of
+ * experience do you have with Python?" contains "python", and it contains
+ * "experience", and on containment alone the number 4 would have been typed
+ * into a field labelled either.
+ *
+ * So the floor applies to both sides, and both sides also have to be more than
+ * a word or two. A question is a phrase; "Experience" is a column heading, and
+ * it clears ten characters on its own.
+ *
+ * What this deliberately is NOT is a rule about how much of one string the
+ * other covers. That was the first attempt and it broke JOB-132's own case: a
+ * `needsInput` key is capped, real screening labels are not, and the Avery
+ * Dennison non-compete question is a 240 character label whose key is the first
+ * 80 of it. A proportion rule reads the candidate's own answer to that exact
+ * escalation as a partial match and drops it, which is the bug JOB-132 exists
+ * to have fixed.
+ *
+ * A tightening rather than a trade. The exact-match pass above is untouched, so
+ * a short field key that IS one of these questions still matches; a short field
+ * key that merely appears inside one now goes to the decision call, where the
+ * fact's label quotes the question it answered and `optionSupportsFact` still
+ * has to agree before anything is typed.
  */
+const MIN_FUZZY_ANSWER_KEY_LENGTH = 10;
+const MIN_FUZZY_ANSWER_KEY_WORDS = 3;
+
+/** Whether a key reads as a question somebody asked rather than as a heading. */
+function readsAsAQuestion(key: string): boolean {
+  return (
+    key.length >= MIN_FUZZY_ANSWER_KEY_LENGTH &&
+    key.split(/\s+/).filter(Boolean).length >= MIN_FUZZY_ANSWER_KEY_WORDS
+  );
+}
+
 function matchAdditionalAnswer(
   field: EnumeratedField,
   additionalAnswers: Record<string, string>
@@ -3691,9 +3837,10 @@ function matchAdditionalAnswer(
     if (candidate === "" || value.trim() === "") continue;
     if (candidate === wanted || candidate === label) return value.trim();
   }
+  if (!readsAsAQuestion(wanted)) return null;
   for (const [key, value] of Object.entries(additionalAnswers)) {
     const candidate = normalizeText(key);
-    if (candidate.length < 10 || value.trim() === "") continue;
+    if (!readsAsAQuestion(candidate) || value.trim() === "") continue;
     if (wanted.includes(candidate) || candidate.includes(wanted)) return value.trim();
   }
   return null;
@@ -6512,6 +6659,47 @@ export async function fillApplicationFormRetainingSession(
   return await runFill(input, true);
 }
 
+/**
+ * JOB-134. Writes the person's answer memory back to `profiles.stored_answers`.
+ *
+ * Never throws. A run that cannot write this column has still been handed the
+ * answers it needs for the application in front of it, and failing the fill
+ * because a note could not be filed would turn a working application into a
+ * blocked one — which is the opposite of what this ticket is for. The cost of a
+ * failed write is that the same question gets asked once more.
+ *
+ * The whole list is written rather than an append, because `rememberAnswers`
+ * has already decided what the list is: one entry per question, newest first,
+ * capped. Two runs for the same person racing here is the ordinary case (the
+ * pipeline fans out), and last writer wins is the right outcome for it — both
+ * writers hold the same stored history and differ only by whatever this
+ * particular run was told, so the loser's answers are still in the winner's
+ * list unless the two runs were told different things about the same question,
+ * in which case the newer of the two is the one to keep anyway.
+ */
+async function persistStoredAnswers(
+  supabase: SupabaseClient,
+  candidateId: string,
+  answers: readonly StoredAnswer[]
+): Promise<void> {
+  try {
+    const { error } = await supabase
+      .from("profiles")
+      .update({ stored_answers: answers })
+      .eq("id", candidateId);
+    if (error !== null) throw new Error(error.message);
+    console.log(
+      `${LOG} remembered ${answers.length} answer(s) for profile ${candidateId} — the next ` +
+        `application will not ask them again`
+    );
+  } catch (err) {
+    console.warn(
+      `${LOG} could not write profiles.stored_answers for ${candidateId}, continuing without ` +
+        `remembering: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
 async function runFill(
   input: FillApplicationFormInput,
   retainSession: boolean
@@ -6554,6 +6742,35 @@ async function runFill(
     `${LOG} applications ${jobApplicationId} — ${state.company} / ${state.jobTitle} ` +
       `(status "${state.status}")`
   );
+
+  // ── JOB-134: an answer the candidate gave once is still their answer ──────
+  //
+  // Two halves, and they run here rather than deeper in for one reason each.
+  //
+  // The write runs before the browser opens, so that an answer somebody typed
+  // survives a run that later fails on a CAPTCHA, a bot wall or a board being
+  // down. Nothing about this application has to succeed for the person to have
+  // told us something true about themselves, and losing it because the page did
+  // not load would be the exact bug this ticket exists to close, one layer
+  // down. It is also why a failed write does not stop the run: the answers are
+  // in hand for this application either way, and the cost of not persisting
+  // them is being asked once more, not a wrong value on a form.
+  //
+  // The merge happens once, here, so that both places `additionalAnswers`
+  // reaches the fill — the first pass and each wizard step — see the same map.
+  // Nothing downstream can tell a stored answer from one supplied a second ago,
+  // and nothing downstream should: `resolveAdditionalAnswer`, the attestation
+  // ladder, `optionSupportsFact` and the read-back all run over it unchanged.
+  const supplied = input.additionalAnswers ?? {};
+  const remembered = rememberAnswers(state.storedAnswers, supplied, { now: new Date() });
+  if (!sameStoredAnswers(remembered, state.storedAnswers)) {
+    await persistStoredAnswers(supabase, state.candidateId, remembered);
+    state.storedAnswers = remembered;
+  }
+  const filling: FillApplicationFormInput = {
+    ...input,
+    additionalAnswers: withStoredAnswers(state.storedAnswers, supplied),
+  };
 
   try {
     // ── Everything that touches untrusted text happens here, before a browser
@@ -6605,7 +6822,9 @@ async function runFill(
     const { report, session } = await runBrowserFlow(
       supabase,
       state,
-      input,
+      // `filling`, not `input`: this is the one carrying the stored answers
+      // folded in, and `advanceThroughWizard` reads them off the same object.
+      filling,
       resume.bytes,
       profile,
       coverLetter,

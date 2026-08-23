@@ -168,12 +168,16 @@ describe("loadCandidate", () => {
     // added `github_url` on the same reasoning, and JOB-101 the eight after it
     // on exactly the same reasoning again: a clearance eligibility written at
     // intake and absent from this line is a question the candidate answered
-    // that no form ever gets told about.
+    // that no form ever gets told about. JOB-134's trailing five are four more
+    // of exactly that plus `stored_answers`, which is the log of every question
+    // this person has answered that intake never asked.
     expect(callTo("profiles").columns).toBe(
       "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country," +
         "current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start," +
         "github_url,clearance_eligibility,clearance_level_held,needs_sponsorship_non_us," +
-        "visa_status,high_school_name,high_school_grad_year,street_address,postal_code"
+        "visa_status,high_school_name,high_school_grad_year,street_address,postal_code," +
+        "subject_to_restrictive_covenant,relatives_at_target_employers," +
+        "previously_employed_at_target_employers,salary_expectation,stored_answers"
     );
     expect(callTo("profiles").filters).toContainEqual(["eq", "id", USER_ID]);
 

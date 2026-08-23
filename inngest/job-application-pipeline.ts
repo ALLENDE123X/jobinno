@@ -227,9 +227,18 @@ export type JobApplicationRequestedData = {
    *
    * Optional, and additive on purpose: an event sent without it behaves exactly
    * as it did before. Its presence is what turns a run that stopped at
-   * `form_fill_blocked` into one that finishes, without any state having been
-   * kept in between — the caller asked the person, and re-sends the same event
-   * with the answers attached.
+   * `form_fill_blocked` into one that finishes — the caller asked the person,
+   * and re-sends the same event with the answers attached.
+   *
+   * ── JOB-134: an event without this is no longer an event with no answers ──
+   * The resume half of that loop is still stateless: no session handle, no
+   * pending-question record, and the keys are re-derived from the form's own
+   * labels. What is no longer stateless is the ANSWER. ACT-007 writes whatever
+   * arrives here to `profiles.stored_answers` before it opens a browser, and
+   * folds everything that person has ever answered back in on the way past, so
+   * an event sent without this field still carries their whole history.
+   * Anything sent here wins every collision with it, because somebody answering
+   * a question again right now is correcting the record.
    */
   additionalAnswers?: Record<string, string>;
 };

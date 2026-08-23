@@ -272,6 +272,13 @@ describe("intake_completed", () => {
       earliestStart: "2027-06-01",
       highSchoolName: "Northview High School",
       highSchoolGradYear: 2022,
+      // JOB-134. None of these four is sent to analytics either, and the salary
+      // expectation and the non-compete answer least of all — see the note in
+      // `app/onboarding/actions.ts` about what deliberately does not leave.
+      subjectToRestrictiveCovenant: false,
+      relativesAtTargetEmployers: false,
+      previouslyEmployedAtTargetEmployers: false,
+      salaryExpectation: "$120,000, or negotiable",
       resumePath: `${SESSION_USER}/${RESUME_OBJECT}.pdf`,
       attestation: true,
       ...overrides,

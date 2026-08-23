@@ -95,6 +95,22 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
       high_school_grad_year: intake.highSchoolGradYear,
       street_address: intake.streetAddress,
       postal_code: intake.postalCode,
+      // JOB-134. Four more, and the same rule the JOB-101 comment above states:
+      // every one of these is read back by `CANDIDATE_COLUMNS` in
+      // `lib/candidate-intake.ts` and has a fact in `buildFactCatalog`. They are
+      // here because the pipeline had to stop and ask a real person each of
+      // them on a real board, and a question answered once here is a question
+      // the next user never reaches.
+      //
+      // `stored_answers` is deliberately not written here. It is the pipeline's
+      // record of questions this form did not ask, written with the service
+      // role, and `authenticated` holds no grant on it. See
+      // `drizzle/0018_profiles_answer_memory_privileges.sql`.
+      subject_to_restrictive_covenant: intake.subjectToRestrictiveCovenant,
+      relatives_at_target_employers: intake.relativesAtTargetEmployers,
+      previously_employed_at_target_employers:
+        intake.previouslyEmployedAtTargetEmployers,
+      salary_expectation: intake.salaryExpectation,
       updated_at: new Date().toISOString(),
     })
     .eq("id", user.id);
@@ -167,7 +183,8 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // the path to their resume, and since JOB-101 their security clearance
   // eligibility, the clearance level they have held, their visa status, their
   // high school and their home address as well. None of it is sent, and the new
-  // ones least of all: a clearance status and a street address are exactly the
+  // ones least of all: a clearance status, a street address and, since JOB-134,
+  // a salary expectation and whether a non-compete binds them are exactly the
   // kind of thing that must not leave for an analytics pipeline. Two facts
   // about the shape of the answers go out, neither of which describes the
   // person: whether a

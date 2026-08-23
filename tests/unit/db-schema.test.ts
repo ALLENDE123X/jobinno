@@ -47,12 +47,23 @@ const RLS_TABLES = TABLES;
  * completion gate on `/onboarding`. `stripe_customer_id` was added by JOB-010
  * and classified here rather than granted, because which Stripe customer a
  * person pays as is our record and not theirs.
+ *
+ * `stored_answers` (JOB-134) is here for a different reason from the rest, and
+ * it is the one worth reading. It genuinely holds the person's own answers, so
+ * by the ownership test above it looks like it belongs on the other list. It is
+ * on this one because it is not a field on a form somebody fills in: it is free
+ * text that becomes a fact in the prompt deciding what gets typed onto a real
+ * employer's application, which is exactly the surface
+ * `0016_resumes_column_privileges.sql` closed on `resumes.parsed`. The pipeline
+ * writes it with the service role, from an answer the person gave in response
+ * to a question a real form really asked.
  */
 const PROFILE_SYSTEM_COLUMNS = [
   "applications_cap",
   "applications_used",
   "attested_at",
   "plan",
+  "stored_answers",
   "stripe_customer_id",
 ] as const;
 
@@ -67,6 +78,16 @@ const PROFILE_SYSTEM_COLUMNS = [
  * status and a home address are sensitive, which is an argument for who may
  * READ them and never an argument for taking away the owner's ability to
  * correct their own record.
+ *
+ * Four of JOB-134's five are on this side for the same reason, and the fifth is
+ * the interesting one. `stored_answers` is deliberately absent, and this test
+ * is what proves the grant was actually withheld rather than merely intended:
+ * it is not a field on the intake form, it is free text that becomes a fact in
+ * the prompt deciding what gets typed onto a real employer's application, which
+ * is the surface `0016_resumes_column_privileges.sql` closed on
+ * `resumes.parsed`. The pipeline writes it with the service role. If somebody
+ * later builds the in app answer surface (issue #134 item 4), the shape to add
+ * is a server action that validates, not a name on this list.
  */
 const PROFILE_USER_COLUMNS = [
   "citizenship_status",
@@ -85,8 +106,12 @@ const PROFILE_USER_COLUMNS = [
   "id",
   "needs_sponsorship_non_us",
   "postal_code",
+  "previously_employed_at_target_employers",
+  "relatives_at_target_employers",
   "requires_sponsorship",
+  "salary_expectation",
   "street_address",
+  "subject_to_restrictive_covenant",
   "target_locations",
   "updated_at",
   "visa_status",

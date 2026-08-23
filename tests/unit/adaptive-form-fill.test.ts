@@ -44,6 +44,10 @@ import {
 import type { CandidateApplicationAnswers } from "@/lib/candidate-intake";
 import type { CandidateFact, FieldDecision, ResumeProfile } from "@/lib/resume-parser";
 import { CONSENT_FIELD_RE, type EnumeratedField } from "@/lib/form-fields";
+// JOB-134. The answer memory, exercised here rather than only in its own test
+// file because what this ticket promises is a second run that does not ask, and
+// that promise is only kept where the memory meets the fill layer's own rules.
+import { rememberAnswers, withStoredAnswers } from "@/lib/candidate-answers";
 
 /**
  * The real user's profile row, as production held it on the day of the run.
@@ -2468,5 +2472,265 @@ describe("what the unknown-field fallback refuses, and why", () => {
     expect(
       fallbackRefusalReason(item({ fieldLabel: "How did you hear about us?", kind: "text" }))
     ).toBeNull();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+describe("JOB-134: the four questions intake now asks", () => {
+  it("states the restrictive covenant answer as the sentence a form asks for", () => {
+    // The question that stopped the Avery Dennison run. Both values are stated,
+    // because "No, I am not under one" and "Yes, I am" are equally the
+    // candidate's own answer and an employer asking has a right to either.
+    expect(facts({ subjectToRestrictiveCovenant: false }).get("restrictiveCovenant")?.value).toBe(
+      "No"
+    );
+    expect(facts({ subjectToRestrictiveCovenant: true }).get("restrictiveCovenant")?.value).toBe(
+      "Yes"
+    );
+    expect(facts().get("restrictiveCovenant")).toBeUndefined();
+  });
+
+  it("carries the salary expectation in the candidate's own words", () => {
+    // HARD STOP 9 names salary expectations outright as something no model may
+    // compose, so what reaches a form is the sentence the person wrote.
+    expect(facts({ salaryExpectation: "negotiable" }).get("salaryExpectation")?.value).toBe(
+      "negotiable"
+    );
+    expect(facts().get("salaryExpectation")).toBeUndefined();
+  });
+
+  it("answers the relatives question from a no and refuses to answer it from a yes", () => {
+    // The one asymmetry in the catalogue, and the whole reason these two
+    // columns are safe. Intake asks about EVERY employer the person might apply
+    // to; the form asks about one named company. "None of them" entails "not
+    // this one", so it answers the form. "Some of them" entails nothing about
+    // this one, so there is no fact and the question goes to the candidate.
+    expect(
+      facts({ relativesAtTargetEmployers: false }).get("noRelativesAtThisEmployer")?.value
+    ).toBe("No");
+    expect(
+      facts({ relativesAtTargetEmployers: true }).get("noRelativesAtThisEmployer")
+    ).toBeUndefined();
+    expect(facts().get("noRelativesAtThisEmployer")).toBeUndefined();
+  });
+
+  it("answers the prior employment question the same way and with the same asymmetry", () => {
+    expect(
+      facts({ previouslyEmployedAtTargetEmployers: false }).get("noPriorEmploymentAtThisEmployer")
+        ?.value
+    ).toBe("No");
+    expect(
+      facts({ previouslyEmployedAtTargetEmployers: true }).get("noPriorEmploymentAtThisEmployer")
+    ).toBeUndefined();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+describe("JOB-134: the restrictive covenant scope admits one fact and no other", () => {
+  it("answers a non-compete question from the candidate's own stored answer", () => {
+    // `ATTESTATION_FACT_SCOPES` used to name no topic matching these labels,
+    // for the right reason at the time: nothing in this system knew, so
+    // anything answering would have been a guess. Intake asks now, so the
+    // premise changed and the rule did not. Same move JOB-101 made for
+    // security clearance.
+    const resolution = resolveDecision(
+      field({
+        label: "Are you subject to a non-compete or non-solicitation agreement?",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "non-compete",
+        decision: "answer",
+        value: "No",
+        sourceFact: "restrictiveCovenant",
+      }),
+      facts({ subjectToRestrictiveCovenant: false })
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("No");
+  });
+
+  it("still refuses a sponsorship answer for a non-compete question", () => {
+    // The pairing the allow-list exists for, tested on the new topic. A
+    // sponsorship answer says nothing whatsoever about whether a previous
+    // employer's contract binds this person, and both happening to be "No" is
+    // luck rather than correctness.
+    const resolution = resolveDecision(
+      field({
+        label: "Are you subject to a non-compete agreement?",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "non-compete",
+        decision: "answer",
+        value: "No",
+        sourceFact: "requiresSponsorship",
+      }),
+      facts({ subjectToRestrictiveCovenant: false })
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("still refuses the covenant answer for a criminal history question", () => {
+    // Criminal history admits nothing at all, and always will unless a ticket
+    // decides otherwise out loud. Adding a topic next to it must not widen it.
+    const resolution = resolveDecision(
+      field({
+        label: "Have you ever been convicted of a felony?",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "felony",
+        decision: "answer",
+        value: "No",
+        sourceFact: "restrictiveCovenant",
+      }),
+      facts({ subjectToRestrictiveCovenant: false })
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("still refuses the covenant answer for a work authorization question", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Are you legally authorized to work in the United States?",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "work auth",
+        decision: "answer",
+        value: "Yes",
+        sourceFact: "restrictiveCovenant",
+      }),
+      facts({ subjectToRestrictiveCovenant: true })
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+describe("JOB-134: the second run does not ask what the first run was told", () => {
+  /**
+   * The whole ticket, end to end, with the browser taken out.
+   *
+   * Run one reaches a required question no stored fact covers and escalates it,
+   * reporting a `needsInput` item whose `key` is the form's own label. The
+   * candidate answers. Run two is a fresh process against a fresh page with
+   * nothing supplied at all, and the question is answered from what they said.
+   */
+  const question = "are you subject to a non-compete agreement?";
+  const nonCompete = () =>
+    field({
+      label: "Are you subject to a non-compete agreement?",
+      kind: "select",
+      options: ["Yes", "No"],
+      optionsKnown: true,
+    });
+
+  it("has nothing to answer the question with on the first run", () => {
+    expect(resolveAdditionalAnswer(nonCompete(), {}).kind).toBe("none");
+    // And no stored fact covers it either, so the run escalates rather than
+    // guessing. That is the state this ticket starts from.
+    expect(facts().get("restrictiveCovenant")).toBeUndefined();
+  });
+
+  it("answers it on the second run from what the candidate said on the first", () => {
+    const stored = rememberAnswers([], { [question]: "No" }, { now: new Date() });
+    // A second run supplies nothing: this is a different application, on a
+    // different board, started by a pipeline that was told nothing new.
+    const supplied = withStoredAnswers(stored, {});
+
+    const resolution = resolveAdditionalAnswer(nonCompete(), supplied);
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") expect(resolution.value).toBe("No");
+  });
+
+  it("puts the answer in the fact catalogue quoting the question it answered", () => {
+    // The other half of the reuse, and the half that reaches a differently
+    // worded field. The fact's label carries the original question verbatim, so
+    // the decision layer can see what was actually answered rather than being
+    // handed a bare "No" with no subject attached — and `attestationFactAllowed`
+    // has always accepted an `answer:` fact, which is what makes this the
+    // existing mechanism rather than a new one.
+    const stored = rememberAnswers([], { [question]: "No" }, { now: new Date() });
+    const catalogue = buildFactCatalog(PROFILE, ANSWERS, withStoredAnswers(stored, {}));
+    const fact = catalogue.find((entry) => entry.key === `answer:${question}`);
+
+    expect(fact?.value).toBe("No");
+    expect(fact?.label).toContain("non-compete agreement");
+  });
+
+  it("never carries a demographic answer into the second run", () => {
+    // HARD STOP 10, at the seam this ticket created. Nothing that reaches a
+    // second run may have come from a demographic question.
+    const stored = rememberAnswers(
+      [],
+      { "what is your gender?": "prefer not to say", [question]: "No" },
+      { now: new Date() }
+    );
+
+    expect(Object.keys(withStoredAnswers(stored, {}))).toEqual([question]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+describe("JOB-134: a remembered answer cannot be swallowed by a short label", () => {
+  /**
+   * The risk persistence adds, and the tightening that answers it.
+   *
+   * The fuzzy match has always been substring containment either way round, and
+   * it only checked that the SUPPLIED key was long enough to mean something.
+   * That was fine while the map held two answers a caller had just been handed
+   * about the page in front of them. It is not fine now that it holds every
+   * question this person has ever answered, because a long question contains a
+   * great many short strings.
+   */
+  const remembered = { "how many years of experience do you have with python?": "4" };
+
+  it("does not type a python answer into a field labelled Experience", () => {
+    expect(resolveAdditionalAnswer(field({ label: "Experience" }), remembered).kind).toBe("none");
+    expect(resolveAdditionalAnswer(field({ label: "Python" }), remembered).kind).toBe("none");
+    // And the one that would have been most wrong: a short label that appears
+    // inside a stored question about something else entirely.
+    expect(resolveAdditionalAnswer(field({ label: "Years" }), remembered).kind).toBe("none");
+  });
+
+  it("still matches a three word heading, which is where this rule stops", () => {
+    // Asserted so the boundary is visible rather than assumed. "Years of
+    // experience" is three words, so it still takes the answer to a question
+    // about Python years, and that is not obviously right. It is left alone
+    // here because it is exactly what this rule did before this ticket, and
+    // because narrowing it further starts costing real matches: JOB-132's own
+    // key is a truncation of a 240 character label, and every rule that would
+    // reject a heading also came close to rejecting that.
+    expect(
+      resolveAdditionalAnswer(field({ label: "Years of experience" }), remembered).kind
+    ).toBe("apply");
+  });
+
+  it("still answers the question that was actually asked", () => {
+    // The exact-match pass is untouched, and the fuzzy pass still works between
+    // two questions that are both long enough to mean something.
+    const exact = resolveAdditionalAnswer(
+      field({ label: "How many years of experience do you have with Python?" }),
+      remembered
+    );
+    expect(exact.kind).toBe("apply");
+
+    const contained = resolveAdditionalAnswer(
+      field({
+        label: "For our records: how many years of experience do you have with Python? (required)",
+      }),
+      remembered
+    );
+    expect(contained.kind).toBe("apply");
   });
 });

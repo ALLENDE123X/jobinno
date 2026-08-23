@@ -152,6 +152,51 @@ export function intakeSchema(userId: string) {
       clearanceEligibility,
       clearanceLevelHeld,
 
+      /**
+       * ── JOB-134: the questions the pipeline kept having to ask ────────────
+       *
+       * Every one of these was a real screening question on a real board that
+       * no stored answer covered, so the run stopped and the person answered it
+       * on a terminal. They are here because a question answered at intake once
+       * is a question the second user never sees at all.
+       *
+       * Whether a previous employer's contract still binds them: a non-compete,
+       * a non-solicitation clause, or another restrictive covenant. Required
+       * and a plain boolean, because the form's version is a plain yes or no
+       * and a blank is a stopped application. A "yes" is not a dead end, it is
+       * a true answer to the question every employer asks; any follow up asking
+       * which agreement and on what terms is free text only the person can
+       * write, so that one still reaches them.
+       */
+      subjectToRestrictiveCovenant: z.boolean(),
+      /**
+       * Read this one carefully, because it is deliberately not the question
+       * the form asks. A form asks about one named employer; this asks about
+       * every employer the person might apply to.
+       *
+       * That is what makes a "no" reusable: "none of them" entails "not this
+       * one" for every company, so it truthfully answers the form's version of
+       * the question. A "yes" entails nothing about any particular company, so
+       * `buildFactCatalog` writes no fact for it at all and the question is
+       * still put to the person, per company. The label the form shows says so
+       * in as many words, because a question that quietly means something wider
+       * than it appears to is a question somebody answers wrongly.
+       */
+      relativesAtTargetEmployers: z.boolean(),
+      /** The same shape and the same asymmetry, for prior employment. */
+      previouslyEmployedAtTargetEmployers: z.boolean(),
+      /**
+       * What they expect to be paid, in their own words.
+       *
+       * Free text rather than a number, and required rather than optional.
+       * HARD STOP 9 names salary expectations outright as something no model
+       * may compose, so the only answer this system can ever put on a form is
+       * one the person wrote. "$120,000", "market rate for a new grad" and
+       * "negotiable" are all real answers, and a number field would accept
+       * neither of the last two.
+       */
+      salaryExpectation: requiredText("Salary expectation", 200),
+
       currentCity: requiredText("Current city"),
       currentCountry: requiredText("Current country"),
       streetAddress: requiredText("Street address", 200),
