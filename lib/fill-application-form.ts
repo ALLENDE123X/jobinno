@@ -3747,6 +3747,39 @@ export type AdditionalAnswerResolution =
  *    the fuzzy match above means the entry need not even have been meant for
  *    this field.
  *
+ * ── JOB-132: why that second carve-out also reads the control's shape ───────
+ * `CONSENT_FIELD_RE` matches words, and some of those words appear in
+ * questions that ask ABOUT an agreement rather than asking the candidate to
+ * enter into one. A real Avery Dennison screening question,
+ *
+ *   "Are you currently subject to a non compete, non-solicit or other similar
+ *    clause in your employment contract with your current or a previous
+ *    employer, and if so, could you provide this agreement as part of the
+ *    recruitment process?"
+ *
+ * matched on the single word "agreement" — the noun naming a document the
+ * question asks about — and the candidate's own answer, given in response to
+ * this exact field being escalated to them by a previous run, was refused as
+ * though answering it agreed to something. It agrees to nothing. It reports a
+ * fact about their employment history that nobody else can report, which is
+ * the entire reason `additionalAnswers` exists.
+ *
+ * So the refusal now also requires the control to be one that is answered BY
+ * asserting: `ASSERTING_KINDS`, a checkbox or a radio, the same shape test
+ * issue #100 settled on for the unknown-field fallback, and for the same
+ * reason given there — a ticked box is an assertion whatever its label says,
+ * while a wording rule only ever catches the phrasings somebody anticipated.
+ *
+ * This deliberately does not move the cases the carve-out exists for. An
+ * "I agree to the Terms" checkbox is still refused. Lever's "Yes, I consent" /
+ * "No, I do not consent" radio pair is still refused. What is no longer
+ * refused is a `select` or `combobox` offering mutually exclusive statements
+ * of fact, where choosing one reports rather than promises. Note also that
+ * `attestationFactAllowed` already treats an `answer:`-keyed fact as valid
+ * backing for a legal attestation: the architecture had already decided a
+ * candidate's own answer may settle one of these, and this carve-out was
+ * reaching past that decision on the strength of a noun.
+ *
  * Refusing does not leave the field unanswered. It falls through to the
  * ordinary ladder, and `resolveDecision`'s own consent branch already ticks a
  * REQUIRED, non-attestation agreement box deterministically — so a real
@@ -3770,7 +3803,10 @@ export function resolveAdditionalAnswer(
     };
   }
 
-  if (CONSENT_FIELD_RE.test(field.label)) {
+  // JOB-132. The wording test alone matched questions that ask ABOUT an
+  // agreement rather than asking for one, so the shape of the control has to
+  // agree before a supplied answer is refused. See the note on this function.
+  if (CONSENT_FIELD_RE.test(field.label) && ASSERTING_KINDS.has(field.kind)) {
     return {
       kind: "refused",
       category: "consent, agreement or certification field",
