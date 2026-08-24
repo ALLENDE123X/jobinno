@@ -1,6 +1,6 @@
 # Jobinno: Agent Operating Guide
 
-This file mirrors `AGENTS.md` in this same repo, so the same operating rules apply regardless of which coding agent opened this project (Claude Code reads `CLAUDE.md`; OpenCode reads `AGENTS.md` in preference to `CLAUDE.md`). Keep both in sync when either changes.
+This file mirrors `CLAUDE.md` in this same repo, so the same operating rules apply regardless of which coding agent opened this project (OpenCode reads `AGENTS.md` in preference to `CLAUDE.md`; Claude Code reads `CLAUDE.md`). Keep both in sync when either changes.
 
 MEMORY_PROJECT: startup
 

@@ -303,7 +303,7 @@ export async function analyzeFailureVideo(
   failure: FailureRecord,
   options: { apiKey: string; model?: string }
 ): Promise<string> {
-  const model = options.model ?? "gemini-2.5-pro";
+  const model = options.model ?? "gemini-3.1-pro-preview";
   const bytes = await readFile(videoPath);
 
   const start = await fetch(`${GEMINI_API}/upload/v1beta/files?key=${options.apiKey}`, {

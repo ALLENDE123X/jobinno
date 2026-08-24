@@ -25,7 +25,8 @@
     "sync-boards": "tsx lib/board-sync-cli.ts",
     "skip-rollup": "tsx lib/skip-rollup-cli.ts",
     "analyze-failures": "tsx lib/failure-recordings-cli.ts",
-    "measure:reap-lag": "tsx scripts/browserbase-reap-lag.ts"
+    "measure:reap-lag": "tsx scripts/browserbase-reap-lag.ts",
+    "test:ashby": "tsx scripts/test-ashby-api.ts"
   },
   "dependencies": {
     "@browserbasehq/stagehand": "^4.0.1",
