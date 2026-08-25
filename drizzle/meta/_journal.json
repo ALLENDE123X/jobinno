@@ -85,6 +85,13 @@
       "when": 1787371170214,
       "tag": "0011_creators_signup",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1787965200000,
+      "tag": "0012_profiles_stored_answers",
+      "breakpoints": true
     }
   ]
 }

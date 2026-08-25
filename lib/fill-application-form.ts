@@ -212,6 +212,7 @@ import {
   type FormFieldKind,
 } from "@/lib/form-fields";
 import { loadCandidate, type CandidateApplicationAnswers } from "@/lib/candidate-intake";
+import { ALWAYS_BLOCK_TOPIC_SLUGS, classifyIntent } from "@/lib/canonical-topics";
 // JOB-004. Both copies of `updateApplication` and `recordFailure` that the port
 // carried are gone; this module and `submit-application.ts` share one now. See
 // that file's header for why a failure is two writes here and was one there.
@@ -1212,6 +1213,17 @@ export type NeedsInputItem = {
   kind: FormFieldKind;
   /** The choices the form offers, when it offers a fixed set. */
   options?: string[];
+  /**
+   * JOB-v1-B. The canonical intent slug this question classifies into, or
+   * `null` when `classifyIntent` did not recognise it. v1-C's async
+   * escalation flow (issue #143) writes the user's answer back to
+   * `stored_answers` keyed by this slug, so the next employer's rewording
+   * of the same intent no longer re-asks. Also drives the narrowed HARD STOP
+   * #9 gate in `blockedForAnswers`: only the intents whose `alwaysBlock` is
+   * true land in the `needs_attestation` bucket now, not every
+   * LEGAL_ATTESTATION_RE hit.
+   */
+  topic: string | null;
 };
 
 export type FillApplicationFormResult = {
@@ -2700,6 +2712,19 @@ function matchAdditionalAnswer(
   const wanted = normalizeText(field.key);
   const label = normalizeText(field.label);
 
+  // JOB-v1-B. Try the canonical intent slug BEFORE the sentence-level match.
+  // v1-C writes escalated answers back keyed by intent slug (`us_citizen_or_pr`
+  // and so on), and the whole point of the taxonomy is that the twenty-first
+  // employer's rewording of "are you authorized to work" does not miss the
+  // stored answer just because the sentence changed. A slug lookup is exact
+  // and cheap, and the fuzzy passes below remain the fallback for legacy
+  // question-text-keyed entries.
+  const intent = classifyIntent(field.label);
+  if (intent !== null) {
+    const bySlug = additionalAnswers[intent.slug];
+    if (typeof bySlug === "string" && bySlug.trim() !== "") return bySlug.trim();
+  }
+
   for (const [key, value] of Object.entries(additionalAnswers)) {
     const candidate = normalizeText(key);
     if (candidate === "" || value.trim() === "") continue;
@@ -3524,6 +3549,15 @@ async function fillRemainingFields(
   };
 
   const ask = (field: EnumeratedField, question: string, why: string): void => {
+    // JOB-v1-B. Tag every escalation with its canonical intent slug (or null
+    // when the classifier does not recognise it). v1-C's async escalation
+    // reads this to key `stored_answers` writes by intent, and
+    // `blockedForAnswers` uses it to narrow the `needs_attestation` gate
+    // down to the intents whose `alwaysBlock` is true. The classifier reads
+    // the field's label — the same string the candidate would see next to
+    // the control — rather than the message we compose for the escalation
+    // sentence, so slight rewording of that sentence never affects routing.
+    const intent = classifyIntent(field.label);
     needsInput.push({
       key: field.key,
       fieldLabel: field.label,
@@ -3532,9 +3566,14 @@ async function fillRemainingFields(
       required: field.required,
       kind: field.kind,
       ...(field.optionsKnown && field.options.length > 0 ? { options: field.options } : {}),
+      topic: intent?.slug ?? null,
     });
     record(field, "needs-input", null, `left blank and escalated — ${why}`);
-    console.warn(`${LOG} needs the candidate: ${field.label} — ${why}`);
+    console.warn(
+      `${LOG} needs the candidate: ${field.label}` +
+        (intent === null ? "" : ` [intent: ${intent.slug}]`) +
+        ` — ${why}`
+    );
   };
 
   // ── Step 3: the user's own answers, applied without a model ──────────────
@@ -3763,9 +3802,31 @@ export function blockedForAnswers(needsInput: readonly NeedsInputItem[], url: st
   // history question would tell somebody blocked by a required "Gender" select
   // something plainly untrue about their own application. Caught in review on
   // this PR.
-  const legal = required.filter((item) => LEGAL_ATTESTATION_RE.test(item.fieldLabel));
+  //
+  // ── JOB-v1-B: narrower legal-attestation gate ─────────────────────────────
+  // The old rule fired on every LEGAL_ATTESTATION_RE hit, which pulled in
+  // GDPR-adjacent labels ("privacy notice", "personal data processing")
+  // whose safe default is a plain "Yes" — accepting the employer's own
+  // notice is what makes the application submittable, and refusing to
+  // default it just meant every European employer escalated on boilerplate.
+  // The narrower rule below counts a field as `needs_attestation` when it
+  // has an `alwaysBlock` canonical intent (work auth, sponsorship,
+  // citizenship, felony, clearance, sanctioned-country, government service),
+  // OR the field's label matches LEGAL_ATTESTATION_RE and the classifier
+  // did NOT recognise it — the fallback still catches novel wordings the
+  // taxonomy has not seen yet, but boilerplate the taxonomy explicitly
+  // marked defaultable no longer trips the block. See `canonical-topics.ts`
+  // for the full rationale on which intents belong on each side of the line.
+  const legal = required.filter((item) => {
+    if (item.topic !== null && ALWAYS_BLOCK_TOPIC_SLUGS.has(item.topic)) return true;
+    if (item.topic !== null) return false;
+    return LEGAL_ATTESTATION_RE.test(item.fieldLabel);
+  });
   const demographic = required.filter(
-    (item) => !LEGAL_ATTESTATION_RE.test(item.fieldLabel) && EEO_FIELD_RE.test(item.fieldLabel)
+    (item) =>
+      !legal.includes(item) &&
+      !LEGAL_ATTESTATION_RE.test(item.fieldLabel) &&
+      EEO_FIELD_RE.test(item.fieldLabel)
   );
   const tag = legal.length + demographic.length > 0 ? "needs_attestation" : "needs_candidate_input";
   const clauses: string[] = [];

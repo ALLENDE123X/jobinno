@@ -1,0 +1,20 @@
+-- JOB-v1-B. A per-profile answer memory keyed by canonical intent slug.
+--
+-- One JSONB column, null on every existing row, read and written through
+-- `lib/candidate-answers.ts`. The shape is an array of
+--   { topic: string | null, question: string, answer: string, answeredAt: string }
+-- entries; the module caps the array at `STORED_ANSWER_LIMIT` (100) and
+-- drops HARD-STOP-10 demographic questions on both read and write.
+--
+-- Not granted to `authenticated`. The blob feeds the fill layer's prompt
+-- deciding what to type onto a real employer's form, so it sits on our side
+-- of the fence `drizzle/0003_profiles_column_privileges.sql` drew: the
+-- service role writes it (from candidate input already validated on the way
+-- in), and v1-C's escalation-answer endpoint (issue #143) is the ordinary
+-- user-driven writer, going through validation rather than through a direct
+-- column grant.
+-- IF NOT EXISTS because production already carries this column, applied out
+-- of band during the v1 branch's earlier iteration on this same design.
+-- The v1-B PR is opened against `main`, whose schema does not have it yet, so
+-- the migration is real for a fresh install and idempotent everywhere else.
+ALTER TABLE "profiles" ADD COLUMN IF NOT EXISTS "stored_answers" jsonb;
