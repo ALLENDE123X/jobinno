@@ -44,7 +44,10 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import type { ApplicationStatus } from "@/lib/application-status";
+import {
+  CAP_CONSUMING_STATUSES,
+  type ApplicationStatus,
+} from "@/lib/application-status";
 import { SKIP_REASONS, type SkipReason } from "@/lib/db/schema";
 
 const LOG = "[job-004]";
@@ -404,25 +407,37 @@ const UNCLAIMABLE: ReadonlySet<string> = new Set(["submitted", "submission_uncon
  *    every generated answer stands on that attestation, so a run for a profile
  *    that has never made it is a run with nothing behind what it will submit.
  *
- *  · **They have applications left.** `profiles.applications_used` is compared
- *    against `profiles.applications_cap`, both straight off the profile row.
+ *  · **They have applications left.** The count of the person's `applications`
+ *    rows in a status that counts against the cap (see `CAP_CONSUMING_STATUSES`
+ *    in `lib/application-status.ts`) is compared against `profiles.applications_cap`.
  *    The cap defaults to zero and the schema is explicit that zero means
  *    "cannot apply yet" rather than "no limit" — the failure of the other
  *    reading is billable work done for free on someone else's job board.
  *
- *    This used to be a live `count(*)` of the person's `applications` rows,
- *    because nothing wrote the counter. `lib/application-quota.ts` writes it
- *    now, and the count had two bugs the counter does not have: it was a
- *    lifetime total, so JOB-010 resetting it to zero on a genuine plan change
- *    bought somebody 150 applications and handed them 150 minus whatever they
- *    had already done; and it had no status filter, so a `discovered` row and
- *    every failed or skipped attempt spent allowance nobody applied with.
+ *    ── Why this is a live count and not the stored counter (JOB-v1-A) ─────
+ *    `profiles.applications_used` is a counter `lib/application-quota.ts`
+ *    increments and decrements, and it is supposed to mirror the live count of
+ *    slot consuming rows. It does not always: verified on 2026 08 24 that at
+ *    least one production profile shipped rows into `applications` from before
+ *    the counter was wired, and its `applications_used` reads 2 against 10+
+ *    real rows. A guard that gates on that counter is a no op in exactly the
+ *    case where the cap is a real question. Reading the count off the source
+ *    of truth is one extra query per claim, which at v1 volumes (at most 150
+ *    rows per person) is a millisecond, and it is proof against every future
+ *    variety of the same drift.
  *
- *    This check is the cheap one, and it is deliberately not the enforcement.
- *    It exists so that a person with nothing left is refused before a browser
- *    is launched. What actually enforces the cap is the conditional UPDATE in
- *    `reserveApplicationSlot`, which the pipeline runs between this and the
- *    submit — see that module for the race this check cannot close on its own.
+ *    A row in `discovered` or `error` is deliberately not counted — neither
+ *    reached the employer, and refusing somebody over a queue slot or a
+ *    pipeline hiccup would be its own bug. The filter is closed set and lives
+ *    with the status vocabulary so that any status this file learns to write
+ *    later cannot silently start or stop counting here without a decision.
+ *
+ *    This check is the cheap one, and it is deliberately not the only line of
+ *    defense. It exists so that a person with nothing left is refused before a
+ *    browser is launched. What actually enforces the cap under concurrent
+ *    pressure is the conditional UPDATE in `reserveApplicationSlot`, which the
+ *    pipeline runs between this and the submit — see that module for the race
+ *    this check cannot close on its own.
  *
  *  · **The listing has not already been submitted to.** Re-claiming a row at
  *    `submitted` or `submission_unconfirmed` would hand a live row id to a
@@ -466,7 +481,7 @@ export async function claimApplicationRow(
 
   const { data: profileRows, error: profileError } = await supabase
     .from("profiles")
-    .select("id,attested_at,applications_used,applications_cap")
+    .select("id,attested_at,applications_cap")
     .eq("id", userId)
     .limit(1);
   if (profileError) throw new Error(`profiles lookup failed: ${profileError.message}`);
@@ -488,8 +503,33 @@ export async function claimApplicationRow(
   }
 
   const cap = typeof profile.applications_cap === "number" ? profile.applications_cap : 0;
-  const used = typeof profile.applications_used === "number" ? profile.applications_used : 0;
+
+  // Live count of the person's `applications` rows in a status that counts
+  // against the cap, off the source of truth rather than the counter that
+  // sometimes lags it. `head: true` because the number is all we want and
+  // dragging the rows themselves back would spend allowance on network for
+  // nothing at v1 volumes where a person's history is at most 150.
+  const {
+    count: usedCount,
+    error: usedError,
+  } = await supabase
+    .from("applications")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .in("status", [...CAP_CONSUMING_STATUSES]);
+  if (usedError) {
+    throw new Error(`applications cap count failed: ${usedError.message}`);
+  }
+  const used = typeof usedCount === "number" ? usedCount : 0;
   if (used >= cap) {
+    // Structured line so a production log grep on `applications_cap_reached`
+    // returns exactly the users who hit the ceiling. The pipeline logs its own
+    // stop reason on the run itself; this is the one place a claim refusal
+    // appears in the logs at all.
+    console.warn(
+      `[job-004] applications_cap_reached ` +
+        `user=${userId} used=${used} cap=${cap}`
+    );
     throw new Error(
       `Profile ${userId} has used ${used} of ${cap} applications. A cap of zero is the default ` +
         `and means this account has not been provisioned to apply yet, not that it may apply ` +

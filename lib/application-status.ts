@@ -155,3 +155,48 @@ export const APPLICATION_STATUS = {
 
 export type ApplicationStatus =
   (typeof APPLICATION_STATUS)[keyof typeof APPLICATION_STATUS];
+
+/**
+ * The statuses that count against a person's `applications_cap`, as read by
+ * `claimApplicationRow`'s live-count guard (JOB-v1-A).
+ *
+ * ── The rule ────────────────────────────────────────────────────────────────
+ * A row counts if a real attempt was made against the employer, whether or not
+ * the attempt succeeded. That covers the four terminal outcomes a real click on
+ * the application flow can produce:
+ *
+ *   · `submitted` and `submission_unconfirmed` — the submit control was pressed,
+ *     and by HARD STOP #2 both are terminal and neither can be re-run.
+ *   · `form_fill_blocked` — the form was reached, and something the pipeline
+ *     could not answer on the person's behalf stopped it (captcha, an
+ *     unanswerable required field, a resume upload that would not attach).
+ *     The candidate spent our LLM time and the employer's server time.
+ *   · `submission_blocked` — the form was filled, and no control on it could be
+ *     identified as *the* application submit. Same accounting as above.
+ *   · `account_gate_blocked` — a sign in wall existed and could not be answered
+ *     safely. The pipeline touched the board with a real intent to apply.
+ *
+ * Deliberately absent:
+ *
+ *   · `discovered` — queued and never attempted. A person with 200 discovered
+ *     rows has consumed nothing but a queue slot, and refusing them at claim
+ *     over rows nothing was ever tried against would be its own bug.
+ *   · `error` — the pipeline stopped for an internal reason of its own. Nothing
+ *     was really tried at the employer, and the fix is a retry, not a charge.
+ *   · Everything in `IN_FLIGHT_STATUSES` — a run that is mid stream may still
+ *     become one of the terminal outcomes above, and it is that transition that
+ *     writes the count, not the transient state it is passing through.
+ *
+ * `captcha_blocked` is not in this list because it is not a status: a captcha
+ * lands in the database as `form_fill_blocked` with the reason `captcha` in the
+ * paired `skip_log` row. Adding `form_fill_blocked` here counts every captcha
+ * stop; adding a separate `captcha_blocked` value would need a status vocabulary
+ * change nothing else is asking for.
+ */
+export const CAP_CONSUMING_STATUSES: readonly ApplicationStatus[] = [
+  APPLICATION_STATUS.SUBMITTED,
+  APPLICATION_STATUS.SUBMISSION_UNCONFIRMED,
+  APPLICATION_STATUS.FORM_FILL_BLOCKED,
+  APPLICATION_STATUS.SUBMISSION_BLOCKED,
+  APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED,
+];
