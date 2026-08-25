@@ -45,6 +45,7 @@ type Call = {
   table: string;
   verb: string;
   columns?: string;
+  head?: boolean;
   filters: [string, string, unknown][];
   payload?: unknown;
 };
@@ -52,6 +53,12 @@ type Call = {
 const calls: Call[] = [];
 /** `table` → the rows a select on it should answer with. */
 const rows: Record<string, unknown[]> = {};
+/**
+ * `table` → what a `select("…", { count: "exact", head: true })` on it should
+ * report. Kept separate from `rows` so a test can seed the (user, job) lookup
+ * (which needs actual rows) and the cap count (which does not) independently.
+ */
+const counts: Record<string, number> = {};
 
 function fakeClient() {
   return {
@@ -59,10 +66,27 @@ function fakeClient() {
       const call: Call = { table, verb: "select", filters: [] };
       calls.push(call);
 
-      const result = () => ({ data: rows[table] ?? [], error: null, count: (rows[table] ?? []).length });
+      const result = () => {
+        // A head:true count query returns the count only — no rows — because
+        // that is what PostgREST does. Falling back to `rows[table].length`
+        // keeps the fake usable for suites that don't set `counts` at all.
+        if (call.head) {
+          return {
+            data: null,
+            error: null,
+            count: counts[table] ?? (rows[table] ?? []).length,
+          };
+        }
+        return {
+          data: rows[table] ?? [],
+          error: null,
+          count: counts[table] ?? (rows[table] ?? []).length,
+        };
+      };
       const chain: Record<string, unknown> = {
-        select(columns?: string) {
+        select(columns?: string, options?: { head?: boolean; count?: string }) {
           call.columns = columns;
+          if (options?.head) call.head = true;
           return chain;
         },
         insert(payload: unknown) {
@@ -125,6 +149,7 @@ const client = () => fakeClient() as unknown as Parameters<typeof recordSkip>[0]
 beforeEach(() => {
   calls.length = 0;
   for (const key of Object.keys(rows)) delete rows[key];
+  for (const key of Object.keys(counts)) delete counts[key];
 });
 
 /** The one call against a table, when exactly one is expected. */
@@ -445,7 +470,6 @@ describe("claimApplicationRow", () => {
       {
         id: USER_ID,
         attested_at: "2026-08-01T00:00:00Z",
-        applications_used: 0,
         applications_cap: 0,
       },
     ];
@@ -455,58 +479,84 @@ describe("claimApplicationRow", () => {
   });
 
   /**
-   * The counter, not a count. `profiles.applications_used` is now written by
-   * `lib/application-quota.ts`, and the guard reads it off the same row it
-   * already loads for the attestation.
+   * The count, off the source of truth (JOB-v1-A).
+   *
+   * `claimApplicationRow` used to gate on `profiles.applications_used`, which
+   * `lib/application-quota.ts` maintains. That works only while the counter
+   * matches the real count of slot consuming `applications` rows, and it did
+   * not on 2026 08 24: at least one production profile carried rows from
+   * before the counter was wired, and its `applications_used` read 2 against
+   * 10+ real rows. A gate on a counter that lags reality is a no op.
+   *
+   * The check now counts the rows in `CAP_CONSUMING_STATUSES` off `applications`
+   * directly. The stored counter is not read at all, and it is not on the
+   * `profiles` select any more.
    */
-  it("compares the stored counter against the cap rather than counting rows", async () => {
-    // No `applications` row for this pair at all, and the person is still out:
-    // a lifetime count would have said zero and let this through.
+  it("gates on a live count of slot consuming applications rows, not the stored counter", async () => {
+    // No existing row for this (user, job). Ten slot consuming rows for this
+    // person against other listings, cap of ten. The stored counter is
+    // deliberately not on the profiles read at all any more; supplying it
+    // here would prove nothing about which value the guard trusted.
     rows.applications = [];
+    counts.applications = 10;
     rows.profiles = [
       {
         id: USER_ID,
         attested_at: "2026-08-01T00:00:00Z",
-        applications_used: 150,
-        applications_cap: 150,
+        applications_cap: 10,
       },
     ];
 
     await expect(
       claimApplicationRow(client(), { userId: USER_ID, jobId: JOB_ID })
-    ).rejects.toThrow(/has used 150 of 150 applications/);
+    ).rejects.toThrow(/has used 10 of 10 applications/);
 
-    expect(callTo("profiles").columns).toBe("id,attested_at,applications_used,applications_cap");
-    // One `applications` call, the lookup for this (user, job) pair. The old
-    // guard's second call — a `count(*)` of every row this person has ever had,
-    // `discovered` and failed ones included — is gone, and with it the defect
-    // where a board that refused us spent somebody's allowance.
-    expect(calls.filter((call) => call.table === "applications")).toHaveLength(1);
+    // `applications_used` is no longer on the profiles read: the guard reads
+    // whichever value it counts, not one somebody else was supposed to write.
+    expect(callTo("profiles").columns).toBe("id,attested_at,applications_cap");
+
+    // Two `applications` calls: the (user, job) lookup and the count. The count
+    // uses `head: true` and filters on `user_id` plus a status IN clause built
+    // from `CAP_CONSUMING_STATUSES`.
+    const applicationsCalls = calls.filter((call) => call.table === "applications");
+    expect(applicationsCalls).toHaveLength(2);
+    const countCall = applicationsCalls[1]!;
+    expect(countCall.head).toBe(true);
+    expect(countCall.filters).toContainEqual(["eq", "user_id", USER_ID]);
+    const inFilter = countCall.filters.find(([verb]) => verb === "in");
+    expect(inFilter?.[1]).toBe("status");
+    // The set of statuses the count filters on has to include every terminal
+    // outcome of a real attempt, and nothing that could be re-run or was never
+    // attempted. This mirrors the ticket's acceptance list for JOB-v1-A.
+    expect(inFilter?.[2]).toEqual(
+      expect.arrayContaining([
+        "submitted",
+        "submission_unconfirmed",
+        "form_fill_blocked",
+        "submission_blocked",
+        "account_gate_blocked",
+      ])
+    );
+    // And nothing that should not count.
+    expect(inFilter?.[2]).not.toEqual(expect.arrayContaining(["discovered"]));
+    expect(inFilter?.[2]).not.toEqual(expect.arrayContaining(["error"]));
   });
 
-  /**
-   * The cross-ticket bug, from the other side. JOB-010 resets the counter to
-   * zero when somebody genuinely changes plan, so a long standing customer's
-   * history must not be able to refuse them the allowance they just paid for.
-   */
-  it("lets a renewed allowance through however long the person's history is", async () => {
+  it("lets the claim through when the live count is one short of the cap", async () => {
+    // Nine of ten used, this attempt is the tenth. The count is what says so.
     rows.applications = [];
+    counts.applications = 9;
     rows.profiles = [
       {
         id: USER_ID,
         attested_at: "2026-08-01T00:00:00Z",
-        applications_used: 0,
-        applications_cap: 150,
+        applications_cap: 10,
       },
     ];
 
     const claimed = await claimApplicationRow(client(), { userId: USER_ID, jobId: JOB_ID });
-
-    expect(claimed).toEqual({
-      applicationId: APPLICATION_ID,
-      status: "discovered",
-      created: true,
-    });
+    expect(claimed.created).toBe(true);
+    expect(claimed.status).toBe("discovered");
     expect(calls.find((call) => call.verb === "insert")?.payload).toEqual({
       user_id: USER_ID,
       job_id: JOB_ID,
