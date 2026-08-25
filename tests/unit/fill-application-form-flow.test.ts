@@ -1529,7 +1529,9 @@ describe("what the unknown-field fallback leaves behind", () => {
     const result = await run();
 
     expect(h.state.fallbackActs).toHaveLength(1);
-    expect(result.status).toBe("form_fill_blocked");
+    // v1-C (#143): an unanswerable required question routes to the escalation
+    // queue instead of the terminal blocked state.
+    expect(result.status).toBe("pending_user_input");
     expect(result.needsInput.map((item) => item.fieldLabel)).toContain(
       "Which team interests you most?"
     );
@@ -1549,7 +1551,9 @@ describe("what the unknown-field fallback leaves behind", () => {
     const result = await run();
 
     expect(h.state.fallbackActs).toEqual([]);
-    expect(result.status).toBe("form_fill_blocked");
+    // v1-C (#143): an unanswerable required question routes to the escalation
+    // queue instead of the terminal blocked state.
+    expect(result.status).toBe("pending_user_input");
     expect(result.needsInput.map((item) => item.fieldLabel)).toContain(
       "Which team interests you most?"
     );
@@ -1561,7 +1565,9 @@ describe("what the unknown-field fallback leaves behind", () => {
     const result = await run();
 
     expect(h.state.fallbackActs).toEqual([]);
-    expect(result.status).toBe("form_fill_blocked");
+    // v1-C (#143): an unanswerable required question routes to the escalation
+    // queue instead of the terminal blocked state.
+    expect(result.status).toBe("pending_user_input");
   });
 
   it("stops the run when a box gets ticked while it is filling something else", async () => {

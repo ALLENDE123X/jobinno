@@ -235,6 +235,7 @@ import {
   type FormFieldKind,
 } from "@/lib/form-fields";
 import { loadCandidate, type CandidateApplicationAnswers } from "@/lib/candidate-intake";
+import { classifyIntent } from "@/lib/canonical-topics";
 // JOB-134. The candidate's own answers to questions intake never asked, kept
 // against their profile instead of living for one invocation. This module owns
 // no policy from that file and that file owns none from this one: it decides
@@ -249,7 +250,13 @@ import {
 // JOB-004. Both copies of `updateApplication` and `recordFailure` that the port
 // carried are gone; this module and `submit-application.ts` share one now. See
 // that file's header for why a failure is two writes here and was one there.
-import { recordFailure, updateApplication } from "@/lib/application-records";
+import {
+  recordFailure,
+  updateApplication,
+  writeEscalation,
+  type EscalationQuestion,
+} from "@/lib/application-records";
+import { sendEscalationNotification } from "@/lib/notifier";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 const LOG = "[act-007]";
@@ -6844,6 +6851,66 @@ async function persistStoredAnswers(
   }
 }
 
+function isEscalationBlock(blockedReason: string): boolean {
+  return (
+    blockedReason.startsWith("needs_candidate_input:") ||
+    blockedReason.startsWith("needs_attestation:")
+  );
+}
+
+/**
+ * v1-C (#143). Move a row into `pending_user_input`, tag each required
+ * question with v1-B's classifier, and fire the notifier once.
+ *
+ * Returns the fill result with the new status stitched in so the caller sees
+ * the same shape any other block returns: everything filled up to the point
+ * of the escalation, and a status that names what happened. The pipeline's
+ * cron will pick this row up again the moment the dashboard resume path
+ * flips it back to `discovered`.
+ */
+async function handleEscalationBlock(
+  supabase: SupabaseClient,
+  jobApplicationId: string,
+  report: Omit<FillApplicationFormResult, "status">
+): Promise<RetainedFillSession> {
+  const required = report.needsInput.filter((item) => item.required);
+  const questions: EscalationQuestion[] = (required.length > 0
+    ? required
+    : report.needsInput
+  ).map((item) => ({
+    fieldKey: item.key,
+    fieldLabel: item.fieldLabel,
+    question: item.question,
+    options: item.options ?? null,
+    required: item.required,
+    topicSlug: classifyIntent(item.question)?.slug ?? null,
+  }));
+
+  const now = new Date();
+  await writeEscalation(supabase, jobApplicationId, questions, { now });
+  console.log(
+    `${LOG} applications ${jobApplicationId} → ${APPLICATION_STATUS.PENDING_USER_INPUT} ` +
+      `(${questions.length} question(s) surfaced; waiting on the user)`
+  );
+
+  // Best effort. A notifier that could not fire (missing credentials, upstream
+  // rejection) already logged its own warning, and the row is still in the
+  // right state for the dashboard to surface it on the person's next visit.
+  try {
+    await sendEscalationNotification({ supabase, applicationId: jobApplicationId, now });
+  } catch (err) {
+    console.warn(
+      `${LOG} notifier threw for ${jobApplicationId}, continuing: ` +
+        `${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  return {
+    result: { ...report, status: APPLICATION_STATUS.PENDING_USER_INPUT },
+    session: null,
+  };
+}
+
 async function runFill(
   input: FillApplicationFormInput,
   retainSession: boolean
@@ -6980,6 +7047,18 @@ async function runFill(
     );
 
     if (report.blockedReason !== null) {
+      // ── v1-C (#143): route needs_candidate_input / needs_attestation into
+      // the async escalation flow instead of the terminal blocked state ──
+      //
+      // `blockedForAnswers` prefixes its message with one of those two tags
+      // and returns the `needsInput` items on `report`. Anything else — a
+      // captcha, a DOM change, an unreachable form — is a stop-for-a-human
+      // that a routine reask cannot close, so it still lands in
+      // `form_fill_blocked` for the operator to look at.
+      if (isEscalationBlock(report.blockedReason)) {
+        return await handleEscalationBlock(supabase, jobApplicationId, report);
+      }
+
       await recordFailure(supabase, {
         applicationId: jobApplicationId,
         jobId: state.jobId,
