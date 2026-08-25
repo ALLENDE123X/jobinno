@@ -5793,6 +5793,64 @@ async function fillRemainingFields(
     );
   }
 
+  // ── JOB-137: Reveal-scan loop ────────────────────────────────────────────
+  // Picking an "Other" dropdown option, ticking a required checkbox, or a
+  // Boolean "Yes" can mount a follow-up required field that did not exist
+  // when this pass first enumerated the form at the top. Belvedere's grad
+  // date is the case we hit for real: the dropdown offers "Other" for
+  // out-of-list dates, the initial fill picked "Other", a required "please
+  // specify" text input mounted, and nothing filled it because the
+  // enumeration had already frozen. Submit then went out on a form with a
+  // silently-empty required field, which the board then rejected without a
+  // confirmation, and the row went to `submission_unconfirmed`.
+  //
+  // Rescan here; any newly-required empty control not seen at the first pass
+  // gets pushed through `ask()` into `needsInput`, which is exactly what the
+  // LLM fallback immediately below already consumes. `all` (from the very
+  // first enumeration at the top of this function) provides the
+  // already-handled set — anything with a selector in there was seen once
+  // and either got filled or is already sitting in `needsInput`, so a
+  // re-add would double-count it. Bounded by MAX_REVEAL_PASSES so a
+  // reveal-that-reveals-more pattern cannot loop forever, and each pass
+  // logs so a future run can tell if the ceiling was ever the reason a
+  // form went out unsubmitted.
+  {
+    const handledSelectors = new Set<string>(all.map((field) => field.selector));
+    const MAX_REVEAL_PASSES = 4;
+    for (let pass = 1; pass <= MAX_REVEAL_PASSES; pass++) {
+      const rescanned = await enumerateFormFields(session.page);
+      const revealed = rescanned.filter(
+        (field) =>
+          field.required &&
+          field.currentValue === "" &&
+          field.kind !== "file" &&
+          field.kind !== "other" &&
+          field.label !== "" &&
+          !handledSelectors.has(field.selector)
+      );
+      if (revealed.length === 0) break;
+      console.log(
+        `${LOG} reveal-scan pass ${pass}: ${revealed.length} newly-mounted required control(s): ` +
+          revealed.map((field) => field.label).join(", ")
+      );
+      for (const field of revealed) {
+        handledSelectors.add(field.selector);
+        ask(
+          field,
+          `The form asks: "${field.label}". What would you like to say?`,
+          `mounted after an earlier control was set, so the initial enumeration ` +
+            `did not see it — the LLM fallback below will try to fill it from the profile`
+        );
+      }
+      if (pass === MAX_REVEAL_PASSES) {
+        console.warn(
+          `${LOG} reveal-scan hit MAX_REVEAL_PASSES=${MAX_REVEAL_PASSES}; some later ` +
+            `reveals may remain unfilled — check for chained reveals on this board`
+        );
+      }
+    }
+  }
+
   // ── Issue #91 Part 2: LLM fallback for unknown required fields ───────────
   // If any required field that is not a legal attestation or EEO question is
   // still in needsInput at this point, the rule-based system had nothing for
@@ -5835,6 +5893,71 @@ async function fillRemainingFields(
   //     is what should happen to a form now carrying an assertion nobody made.
   const attempts = needsInput.filter((item) => fallbackRefusalReason(item) === null);
   const afterLlmFallback: NeedsInputItem[] = [];
+
+  // JOB-137: profile summary handed to the LLM fallback below.
+  //
+  // Pre-JOB-137 the fallback's prompt read "with the most appropriate value
+  // for a job applicant" and nothing more. That is a licence for the model
+  // to invent — pick a graduation date, guess a salary, write a "why do you
+  // want to work here" from thin context — and HARD STOP 9 is why the
+  // fallback existed at all in that shape. The refusal list on
+  // `fallbackRefusalReason` was the safety, not the prompt.
+  //
+  // A live Belvedere run then showed the same failure mode from the other
+  // side: a required text input that mounted after an "Other" grad-date
+  // pick, sitting inside `needsInput` for a shape that had no rule and no
+  // stored fact, and the prompt above had nothing to say about how the
+  // candidate would actually answer. That is the fill quality gap the
+  // coordinator asked for: let the model reason from what the candidate
+  // actually is, not from generic priors.
+  //
+  // What this summary is: a compact, factual, provably-here-in-the-data
+  // string. Name, contact, location, degree, top three work rows by title
+  // and company. Nothing that could not be produced by concatenating
+  // scalars off `profile`. It is limited to short factual atoms on
+  // purpose — every string below is either a stored field or a slice of
+  // one, and the prompt below tells the model it may synthesise short
+  // prose FROM these facts but must not invent atoms outside them.
+  const eduTop = profile.education[0];
+  const eduLine =
+    eduTop === undefined
+      ? null
+      : [
+          eduTop.degree ?? "",
+          eduTop.discipline ?? "",
+          eduTop.school ? `at ${eduTop.school}` : "",
+          eduTop.endDate ? `(${eduTop.endDate})` : "",
+        ]
+          .filter((s) => s.trim().length > 0)
+          .join(" ");
+  const workLines = profile.workHistory
+    .slice(0, 3)
+    .map((w) => {
+      const parts = [
+        w.title ?? "",
+        w.company ? `at ${w.company}` : "",
+        w.startDate ? `(${w.startDate}${w.endDate ? "–" + w.endDate : "–present"})` : "",
+      ].filter((s) => s.trim().length > 0);
+      return parts.join(" ");
+    })
+    .filter((s) => s.length > 0);
+  const skillsLine =
+    profile.skills.length > 0 ? profile.skills.slice(0, 15).join(", ") : null;
+  const profileSummary = [
+    `Name: ${(profile.firstName ?? "").trim()} ${(profile.lastName ?? "").trim()}`.trim(),
+    `Email: ${profile.email}`,
+    profile.phone ? `Phone: ${profile.phone}` : null,
+    profile.location ? `Location: ${profile.location}` : null,
+    profile.linkedinUrl ? `LinkedIn: ${profile.linkedinUrl}` : null,
+    profile.githubUrl ? `GitHub: ${profile.githubUrl}` : null,
+    profile.websiteUrl ? `Website: ${profile.websiteUrl}` : null,
+    eduLine ? `Education: ${eduLine}` : null,
+    workLines.length > 0 ? `Recent work:\n  - ${workLines.join("\n  - ")}` : null,
+    skillsLine ? `Skills: ${skillsLine}` : null,
+    state.company ? `Applying to: ${state.jobTitle ?? "role"} at ${state.company}` : null,
+  ]
+    .filter((s): s is string => s !== null && s.length > 0)
+    .join("\n");
 
   // Read once, before any attempt, rather than trusting the `currentValue` from
   // enumeration: the ordinary pass above ticks required agreement boxes by
@@ -5903,8 +6026,29 @@ async function fillRemainingFields(
     const safeLabel = item.fieldLabel.slice(0, 200);
     console.log(`${LOG} LLM fallback (unknown-field): filling "${safeLabel}" via act()`);
     try {
+      // JOB-137. Prompt grounds the model in the candidate's real profile
+      // rather than "the most appropriate value for a job applicant", which
+      // let the model pick any plausible-sounding string with no line to the
+      // person on whose behalf the form is being filled. See `profileSummary`
+      // above for what is included and why. The safety story is unchanged:
+      // `fallbackRefusalReason` still refuses attestations, EEO, radios and
+      // checkboxes on shape before the label is read; this prompt only
+      // reaches shapes where a text or prose answer is what the form asked
+      // for, and the rules below tell the model to leave the field blank
+      // rather than invent an atom that is not on the profile.
       await session.stagehand.act(
-        `Fill the field labelled '${safeLabel}' with the most appropriate value for a job applicant.`,
+        `Fill the field labelled '${safeLabel}' using ONLY the candidate profile below.\n\n` +
+          `${profileSummary}\n\n` +
+          `Rules:\n` +
+          `- You MAY synthesize short prose grounded in these facts (for example, "why do ` +
+          `you want to work at ${state.company ?? "this company"}" or "describe a project" ` +
+          `written from the work history, education, and skills shown above).\n` +
+          `- You MUST NOT invent employer names, degrees, dates, salary numbers, ` +
+          `addresses, or credentials that are not in the profile above.\n` +
+          `- If the profile does not have the specific factual value being asked for ` +
+          `(a US visa type the candidate does not hold, a specific graduation date not ` +
+          `listed, a salary expectation the candidate has not stated), leave the field ` +
+          `blank rather than guessing.`,
         { page: session.page }
       );
     } catch (err) {

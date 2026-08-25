@@ -73,3 +73,9 @@ output.txt
 # Supabase CLI scratch state. `supabase/config.toml` is the tracked artefact;
 # everything the CLI caches next to it is machine local.
 supabase/.temp/
+
+# Scratch / temporary diagnostic scripts
+.tmp-*
+
+# Ephemeral failure recordings from ad-hoc batch runs
+failure-recordings-*/
