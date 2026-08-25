@@ -27,7 +27,11 @@ import {
   WAITLIST_REFERRAL_COOKIE_MAX_AGE_SECONDS,
   WAITLIST_REFERRAL_QUERY_PARAM,
 } from "@/lib/waitlist";
-import { isExemptFromWaitlistGate, WAITLIST_PATH } from "@/lib/waitlist-gate";
+import {
+  isExemptFromWaitlistGate,
+  WAITLIST_GATE_ACTIVE,
+  WAITLIST_PATH,
+} from "@/lib/waitlist-gate";
 
 export async function middleware(request: NextRequest) {
   // ── JOB-031: the waitlist gate ────────────────────────────────────────────
@@ -45,11 +49,13 @@ export async function middleware(request: NextRequest) {
   // this change, whatever a future route adds, is redirected: the browser's
   // address bar changes to `/`, which is what makes "no other URL path"
   // actually true rather than just true of the content.
-  if (!isExemptFromWaitlistGate(request.nextUrl.pathname)) {
-    const url = request.nextUrl.clone();
-    url.pathname = WAITLIST_PATH;
-    url.search = "";
-    return NextResponse.redirect(url);
+  if (WAITLIST_GATE_ACTIVE) {
+    if (!isExemptFromWaitlistGate(request.nextUrl.pathname)) {
+      const url = request.nextUrl.clone();
+      url.pathname = WAITLIST_PATH;
+      url.search = "";
+      return NextResponse.redirect(url);
+    }
   }
 
   // ── JOB-041: capture a creator referral code ────────────────────────────
