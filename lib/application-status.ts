@@ -140,6 +140,21 @@ export const APPLICATION_STATUS = {
    */
   SUBMISSION_BLOCKED: "submission_blocked",
   /**
+   * The fill step hit a required question the profile, the stored answers and
+   * the canonical defaults could not honestly answer, and rather than block the
+   * whole pipeline waiting for a person we parked the row and asked them. The
+   * questions live on `applications.escalation_questions`, the ask went out
+   * over the notifier v1-C wires, and the dashboard queue view (v1-D) is where
+   * the person answers.
+   *
+   * A row in this state must not be picked up by the discovery worker: it is
+   * waiting for an answer, not for another retry. Once the user posts their
+   * answers the resume path clears `escalation_questions`, writes the answers
+   * back to `profiles.stored_answers` keyed by intent, and flips the status
+   * back to `discovered` so the next tick fills the form afresh.
+   */
+  PENDING_USER_INPUT: "pending_user_input",
+  /**
    * The submit control **was clicked** and the result could not be confirmed —
    * the session died mid-click, the page could not be read afterwards, or the
    * board still shows the form. Whether a real application now exists at the
@@ -151,24 +166,6 @@ export const APPLICATION_STATUS = {
    * carries the detail.
    */
   SUBMISSION_UNCONFIRMED: "submission_unconfirmed",
-
-  // ── added by v1-C (#143): async escalation flow ──────────────────────────
-  //
-  // The form was partially filled, one or more required questions could not
-  // be answered from profile columns, stored answers or canonical defaults,
-  // and the pipeline has surfaced them for the person to answer on the
-  // dashboard. Distinct from `form_fill_blocked` on purpose: that one is
-  // terminal-until-a-human-looks (a captcha, a DOM change, an unreachable
-  // form), while this one is a routine handoff the pipeline itself resumes
-  // once the person answers.
-  //
-  // A row here is invisible to the fill loop (`READY_STATUSES` in
-  // `lib/fill-application-form.ts` does not admit it) so the cron does not
-  // pick it up until the dashboard resume path flips it back to
-  // `discovered`. `escalation_questions`, `escalation_created_at`,
-  // `escalation_notified_at` and `escalation_resolved_at` on the
-  // `applications` row carry the state; see `drizzle/0013_applications_escalation.sql`.
-  PENDING_USER_INPUT: "pending_user_input",
 } as const;
 
 export type ApplicationStatus =
