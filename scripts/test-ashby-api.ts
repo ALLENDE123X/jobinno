@@ -263,7 +263,7 @@ async function uploadToS3(
   const form = new FormData();
   for (const [k, v] of Object.entries(fields)) form.append(k, v);
   form.append("Content-Type", contentType);
-  form.append("file", new Blob([fileBuffer], { type: contentType }), fileName);
+  form.append("file", new Blob([Uint8Array.from(fileBuffer)], { type: contentType }), fileName);
   const resp = await fetch(url, { method: "POST", body: form });
   if (!resp.ok && resp.status !== 204) {
     throw new Error(`[ashby] S3 upload failed: ${resp.status} ${await resp.text().catch(() => "")}`);
