@@ -24,6 +24,14 @@
  * a schema this ticket owns. If v1-C's PR reshapes the payload, the reshape
  * lands here and in the escalation form; nothing else in this ticket depends
  * on the exact keys.
+ *
+ * ── v1-BLOCKER-2 (#152): the shape is camelCase everywhere ─────────────────
+ * `writeEscalation` (`lib/application-records.ts`) persists each entry in the
+ * camelCase shape it declares on `EscalationQuestion`: `{fieldKey, fieldLabel,
+ * question, options, required, topicSlug}`. This module reads those keys
+ * verbatim, and the escalation form and its API handler use the same names in
+ * the resume payload. There is one contract for the whole cycle, and this file
+ * is the reader end of it.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -46,25 +54,28 @@ export type AppliedQueueRow = {
 };
 
 /**
- * One question the person still has to answer, in the shape v1-C writes to
- * `applications.escalation_questions`. Fields beyond `question_text` are all
- * optional because the pipeline may not always have a `topic_slug` (unknown
- * intent), and the options list is only meaningful when the form was a fixed
- * enum rather than a free text field.
+ * One question the person still has to answer, in the shape v1-C's
+ * `writeEscalation` writes to `applications.escalation_questions`. Keys match
+ * `lib/application-records.ts::EscalationQuestion` verbatim, per #152, so no
+ * side of the escalation cycle has to translate between conventions.
+ *
+ * `topicSlug` is null when v1-B's classifier did not recognise the intent;
+ * `options` is null for free text questions and populated for enum ones. The
+ * remaining fields are always present when v1-C wrote the row.
  */
 export type EscalationQuestion = {
-  /** The prompt the form showed, verbatim. Always present. */
-  question_text: string;
-  /**
-   * A stable identifier for the intent behind the question, when v1-B's
-   * classifier recognised one. Passed back to the resume endpoint so the
-   * answer is stored keyed by intent rather than by the truncated prose.
-   */
-  topic_slug?: string | null;
+  /** The prompt the form showed, verbatim. */
+  question: string;
+  /** v1-B's canonical intent slug, or null when the question was unknown. */
+  topicSlug: string | null;
   /** The board's field name, kept for debugging and for the resume writeback. */
-  field_key?: string | null;
+  fieldKey: string;
+  /** The label as the form printed it. Falls back to `fieldKey` when missing. */
+  fieldLabel: string;
   /** Fixed enum options (radio buttons) when the source form had them. */
-  question_options?: string[] | null;
+  options: string[] | null;
+  /** Whether the source form marked the question required. */
+  required: boolean;
 };
 
 /** One row on the "pending your input" side of the queue. */
@@ -171,16 +182,23 @@ function normaliseQuestions(raw: unknown): EscalationQuestion[] {
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
     const q = item as Record<string, unknown>;
-    const text = typeof q.question_text === "string" ? q.question_text : null;
-    if (!text) continue;
-    const options = Array.isArray(q.question_options)
-      ? q.question_options.filter((v): v is string => typeof v === "string")
+    const question = typeof q.question === "string" ? q.question : null;
+    const fieldKey = typeof q.fieldKey === "string" ? q.fieldKey : null;
+    // Both are load bearing on the resume path — the form sends the question
+    // back verbatim so the writeback keys on it when there is no slug, and
+    // `fieldKey` is what the writer used to identify the field on the source
+    // form. An entry missing either one is unusable.
+    if (!question || !fieldKey) continue;
+    const options = Array.isArray(q.options)
+      ? q.options.filter((v): v is string => typeof v === "string")
       : null;
     out.push({
-      question_text: text,
-      topic_slug: typeof q.topic_slug === "string" ? q.topic_slug : null,
-      field_key: typeof q.field_key === "string" ? q.field_key : null,
-      question_options: options && options.length > 0 ? options : null,
+      question,
+      fieldKey,
+      fieldLabel: typeof q.fieldLabel === "string" ? q.fieldLabel : fieldKey,
+      topicSlug: typeof q.topicSlug === "string" ? q.topicSlug : null,
+      options: options && options.length > 0 ? options : null,
+      required: q.required === true,
     });
   }
   return out;

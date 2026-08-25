@@ -2,7 +2,7 @@
  * v1-C (#143) — the dashboard's resume path for a `pending_user_input` row.
  *
  * `PUT /api/applications/{id}/escalation-answers` with a JSON body of
- * `{ answers: { [fieldKey]: string } }`:
+ * `{ answers: [{ topicSlug: string | null, question: string, answer: string }, ...] }`:
  *
  *  1. Verifies the signed in user owns the row.
  *  2. Writes every answer back to `profiles.stored_answers` keyed by v1-B's
@@ -22,6 +22,13 @@
  * UPDATE policy (see the header on the `applications` block in
  * `lib/db/schema.ts`). Authorization is done in this handler, against the
  * signed in user's own session client, before either write.
+ *
+ * ── v1-BLOCKER-2 (#152): array body, camelCase keys ───────────────────────
+ * The body shape is an ordered array whose keys match v1-C's `writeEscalation`
+ * output and the reader in `lib/dashboard/queue-data.ts`. Each entry is
+ * self-contained: `topicSlug` (may be null when the classifier did not
+ * recognise the intent) and `question` (verbatim as the form printed it) let
+ * `rememberAnswers` file the answer whether or not a slug was known.
  */
 
 import { NextResponse, type NextRequest } from "next/server";
@@ -31,6 +38,7 @@ import {
   parseStoredAnswers,
   rememberAnswers,
   sameStoredAnswers,
+  type IncomingAnswer,
   type StoredAnswer,
 } from "@/lib/candidate-answers";
 import { createServerClient, createServiceRoleClient } from "@/lib/supabase/server";
@@ -56,7 +64,16 @@ export async function PUT(
   const answers = parseAnswers(body);
   if (answers === null) {
     return NextResponse.json(
-      { error: "body must be { answers: { [fieldKey]: string } }" },
+      {
+        error:
+          "body must be { answers: [{ topicSlug: string | null, question: string, answer: string }, ...] }",
+      },
+      { status: 400 }
+    );
+  }
+  if (answers.length === 0) {
+    return NextResponse.json(
+      { error: "answers must contain at least one entry" },
       { status: 400 }
     );
   }
@@ -111,32 +128,50 @@ export async function PUT(
 
   // ── Persist the answers to profiles.stored_answers ────────────────────────
   //
-  // Keyed by the question text — which is the same `needsInput[].key` the
-  // pipeline reports and `additionalAnswers` is keyed on, so a stored answer
-  // re-enters the fill loop as an ordinary supplied one and every guard runs
-  // unchanged. `topicSlug` from v1-B is folded in by `canonicalAnswerTopic`,
-  // which `rememberAnswers` recomputes on write so a stale slug from a
-  // narrower topic table cannot survive.
-  await mergeStoredAnswers(service, session.user.id, questions, answers, now);
+  // Each incoming entry brings its own `question` text (same key the fill loop
+  // reports in `needsInput[].key` and looks up on the next run) and, when the
+  // pipeline classified it at escalation time, its own `topicSlug`. Passing
+  // both to `rememberAnswers` lets it file the answer by slug when there is
+  // one and by normalised question when there is not, without a second trip
+  // through the classifier.
+  const merged = await mergeStoredAnswers(service, session.user.id, answers, now);
 
   await clearEscalation(service, applicationId, { now });
   console.log(
-    `${LOG} applications ${applicationId} → discovered (${questions.length} answer(s) merged)`
+    `${LOG} applications ${applicationId} → discovered (${merged} answer(s) merged)`
   );
 
-  return NextResponse.json({ ok: true, answersMerged: Object.keys(answers).length });
+  return NextResponse.json({ ok: true, answersMerged: merged });
 }
 
-function parseAnswers(body: unknown): Record<string, string> | null {
+/**
+ * The submit body shape, validated. Returns `null` when the body is not an
+ * object with an `answers` array, or when any entry is malformed. Empty-string
+ * answers are rejected here so the caller need not check them.
+ *
+ * A malformed entry (missing `question`, missing `answer`, wrong types) is a
+ * bug in the form, not user input to silently drop — the whole request 400s so
+ * it shows up loudly. Extra keys on an entry are ignored: only `topicSlug`,
+ * `question`, and `answer` are read.
+ */
+type ParsedAnswer = { topicSlug: string | null; question: string; answer: string };
+
+function parseAnswers(body: unknown): ParsedAnswer[] | null {
   if (body === null || typeof body !== "object") return null;
   const raw = (body as { answers?: unknown }).answers;
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof value !== "string") continue;
-    const trimmed = value.trim();
-    if (trimmed === "") continue;
-    out[key] = trimmed;
+  if (!Array.isArray(raw)) return null;
+  const out: ParsedAnswer[] = [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== "object") return null;
+    const e = entry as Record<string, unknown>;
+    const question = typeof e.question === "string" ? e.question.trim() : "";
+    const answer = typeof e.answer === "string" ? e.answer.trim() : "";
+    if (question === "" || answer === "") return null;
+    const topicSlug =
+      typeof e.topicSlug === "string" && e.topicSlug.trim() !== ""
+        ? e.topicSlug.trim()
+        : null;
+    out.push({ topicSlug, question, answer });
   }
   return out;
 }
@@ -164,13 +199,18 @@ function parseEscalationQuestions(value: unknown): EscalationQuestion[] {
   return out;
 }
 
+/**
+ * Fold the parsed answers into `profiles.stored_answers`, returning the count
+ * of entries actually offered to `rememberAnswers` (before de-duplication).
+ * The write is skipped when the merged list is byte-for-byte identical to what
+ * was already stored, so a re-submit of the same answers is a no-op.
+ */
 async function mergeStoredAnswers(
   supabase: ReturnType<typeof createServiceRoleClient>,
   userId: string,
-  questions: readonly EscalationQuestion[],
-  answers: Record<string, string>,
+  answers: readonly ParsedAnswer[],
   now: Date
-): Promise<void> {
+): Promise<number> {
   const { data: profileRow, error } = await supabase
     .from("profiles")
     .select("stored_answers")
@@ -182,22 +222,19 @@ async function mergeStoredAnswers(
 
   const existing: StoredAnswer[] = parseStoredAnswers(profileRow?.stored_answers);
 
-  // Build the supplied list keyed off the row's own escalation questions, so a
-  // body with an extra key is silently ignored. v1-B's `rememberAnswers`
-  // accepts an array of `{question, answer, topic?}`; passing the escalation's
-  // own `topicSlug` here lets it skip the classifier round-trip since the
-  // pipeline already classified at escalation time.
-  const questionByKey = new Map(questions.map((q) => [q.fieldKey, q] as const));
-  const supplied: { question: string; answer: string; topic?: string | null }[] = [];
-  for (const [key, value] of Object.entries(answers)) {
-    const q = questionByKey.get(key);
-    if (q === undefined) continue;
-    supplied.push({ question: q.question, answer: value, topic: q.topicSlug });
-  }
-  if (supplied.length === 0) return;
+  // Each incoming entry carries its own `question` and `topicSlug`, straight
+  // from the row's escalation questions via the form. `rememberAnswers`
+  // accepts `topic?` optionally, so passing null through skips the classifier
+  // round-trip only when v1-C already labelled the intent.
+  const supplied: IncomingAnswer[] = answers.map((a) => ({
+    question: a.question,
+    answer: a.answer,
+    topic: a.topicSlug,
+  }));
+  if (supplied.length === 0) return 0;
 
   const merged = rememberAnswers(existing, supplied, { now });
-  if (sameStoredAnswers(existing, merged)) return;
+  if (sameStoredAnswers(existing, merged)) return supplied.length;
 
   const { error: writeError } = await supabase
     .from("profiles")
@@ -206,4 +243,5 @@ async function mergeStoredAnswers(
   if (writeError) {
     throw new Error(`profiles.stored_answers write failed: ${writeError.message}`);
   }
+  return supplied.length;
 }
