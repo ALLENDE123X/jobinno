@@ -130,6 +130,16 @@ export const STATUS_PRESENTATION: Record<ApplicationStatus, StatusPresentation> 
     tone: "attention",
     needsHuman: true,
   },
+  // v1-C (#143). Same wording family as `form_fill_blocked` — a person has to
+  // act — but the tone is `attention` rather than terminal: the pipeline will
+  // pick this row up again the moment they answer on the dashboard.
+  [APPLICATION_STATUS.PENDING_USER_INPUT]: {
+    label: "waiting on your answer",
+    description:
+      "There were a couple of questions on the form we could not answer for you. Answer them in your dashboard and we will finish the application.",
+    tone: "attention",
+    needsHuman: true,
+  },
 };
 
 /**

@@ -69,7 +69,11 @@ describe("status wording", () => {
 
     // The four blocked ones plus `submission_unconfirmed`, which is not blocked
     // and still needs a human: a submit control was pressed and nobody knows
-    // what happened, so it must never be retried automatically.
+    // what happened, so it must never be retried automatically. v1-C (#143)
+    // added `pending_user_input` to this list: the row is waiting on the
+    // person to answer questions on the dashboard, which is a "cannot move
+    // without a person" state even though the pipeline will resume the row
+    // automatically once they do.
     expect(needsHuman).toEqual(
       [
         APPLICATION_STATUS.ACCOUNT_GATE_BLOCKED,
@@ -77,6 +81,7 @@ describe("status wording", () => {
         APPLICATION_STATUS.FORM_FILL_BLOCKED,
         APPLICATION_STATUS.SUBMISSION_BLOCKED,
         APPLICATION_STATUS.SUBMISSION_UNCONFIRMED,
+        APPLICATION_STATUS.PENDING_USER_INPUT,
       ].sort()
     );
   });

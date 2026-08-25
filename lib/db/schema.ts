@@ -186,6 +186,18 @@ export const CREATOR_PAYOUT_METHODS = ["zelle", "venmo", "cashapp"] as const;
 export type CreatorPayoutMethod = (typeof CREATOR_PAYOUT_METHODS)[number];
 
 /**
+ * v1-C (#143). The channels the notifier will dispatch to. `both` is here
+ * because a user who has hooked up both channels wants both, not one — the
+ * notifier is not going to guess which the person will see first.
+ *
+ * Enforced by `profiles_notification_preference_check` in
+ * `drizzle/0014_profiles_notification_preference.sql`. A value the check
+ * refuses is a value the notifier could not dispatch to anyway.
+ */
+export const NOTIFICATION_PREFERENCES = ["email", "sms", "both"] as const;
+export type NotificationPreference = (typeof NOTIFICATION_PREFERENCES)[number];
+
+/**
  * The ATS platforms V1 targets, per CLAUDE.md. Not a database constraint, see
  * the header. Validate against this in application code.
  */
@@ -306,6 +318,18 @@ export const profiles = pgTable(
      * created at signup and not yet taken through intake.
      */
     attestedAt: timestamp("attested_at", { withTimezone: true }),
+
+    /**
+     * v1-C (#143). Which channel a pending_user_input notification goes to.
+     * One of `NOTIFICATION_PREFERENCES`; `email` by default because Resend is
+     * the only wired sender right now (Twilio credentials are absent from
+     * `.env.local`), so a user who has never touched this still receives one.
+     *
+     * The person owns this preference, so it is granted to `authenticated` by
+     * name in `drizzle/0014_profiles_notification_preference.sql`, per the
+     * rule `drizzle/0003_profiles_column_privileges.sql` states.
+     */
+    notificationPreference: text("notification_preference").notNull().default("email"),
 
     /**
      * When a job search was last asked for on this person's behalf. The whole of
@@ -525,6 +549,27 @@ export const applications = pgTable(
     confirmationText: text("confirmation_text"),
     /** Where the board sent the browser after submit, when it sent it anywhere. */
     redirectUrl: text("redirect_url"),
+
+    /**
+     * ── v1-C (#143): async escalation ────────────────────────────────────
+     *
+     * Four columns that carry a `pending_user_input` row's state. Written by
+     * the pipeline through `lib/application-records.ts` (`writeEscalation`)
+     * and read by the notifier and the dashboard resume path. All four are
+     * null for a row that is not currently escalated; `escalation_resolved_at`
+     * being non null while the others are null means "this row escalated
+     * once and has since been answered".
+     *
+     * There is no user-side UPDATE policy on this table (see the header on
+     * the `applications` block), so nothing here needs a column grant: the
+     * dashboard resume path is a server action running against the service
+     * role client on behalf of the signed in user.
+     */
+    escalationQuestions: jsonb("escalation_questions"),
+    escalationCreatedAt: timestamp("escalation_created_at", { withTimezone: true }),
+    escalationResolvedAt: timestamp("escalation_resolved_at", { withTimezone: true }),
+    escalationNotifiedAt: timestamp("escalation_notified_at", { withTimezone: true }),
+
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

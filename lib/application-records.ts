@@ -86,6 +86,40 @@ export type ApplicationPatch = {
   submittedAt?: string | null;
   /** Where the board sent the browser after submit, when it sent it anywhere. */
   redirectUrl?: string | null;
+
+  /**
+   * v1-C (#143). The escalation columns as one shape, so both the pipeline
+   * writer and the resume path go through the same code. See
+   * `writeEscalation` and `clearEscalation` below for the two callers.
+   *
+   * Nullable on purpose: `null` clears the column, `undefined` leaves it
+   * alone. That distinction matters on the resume path, which clears
+   * `escalation_questions` and stamps `escalation_resolved_at` in one write.
+   */
+  escalationQuestions?: EscalationQuestion[] | null;
+  escalationCreatedAt?: string | null;
+  escalationNotifiedAt?: string | null;
+  escalationResolvedAt?: string | null;
+};
+
+/**
+ * v1-C (#143). One question the run could not answer, ready to be surfaced on
+ * the dashboard for the person to answer.
+ *
+ * `topicSlug` is the v1-B canonical intent for this question, when the
+ * classifier recognised one; `null` (`unknown_intent`) when it did not. The
+ * resume path uses this to key the answer back into `stored_answers` when it
+ * exists, so a future re-ask across boards is answered from stored intent
+ * lookup rather than from raw question text. See #143 for the coordination
+ * contract with v1-B (#142).
+ */
+export type EscalationQuestion = {
+  fieldKey: string;
+  fieldLabel: string;
+  question: string;
+  options: string[] | null;
+  required: boolean;
+  topicSlug: string | null;
 };
 
 /** `ApplicationPatch` → the row shape, dropping anything the caller left out. */
@@ -95,6 +129,14 @@ function patchColumns(patch: ApplicationPatch): Record<string, unknown> {
   if (patch.confirmationText !== undefined) row.confirmation_text = patch.confirmationText;
   if (patch.submittedAt !== undefined) row.submitted_at = patch.submittedAt;
   if (patch.redirectUrl !== undefined) row.redirect_url = patch.redirectUrl;
+  if (patch.escalationQuestions !== undefined)
+    row.escalation_questions = patch.escalationQuestions;
+  if (patch.escalationCreatedAt !== undefined)
+    row.escalation_created_at = patch.escalationCreatedAt;
+  if (patch.escalationNotifiedAt !== undefined)
+    row.escalation_notified_at = patch.escalationNotifiedAt;
+  if (patch.escalationResolvedAt !== undefined)
+    row.escalation_resolved_at = patch.escalationResolvedAt;
   return row;
 }
 
@@ -117,6 +159,68 @@ export async function updateApplication(
         `(${JSON.stringify(Object.keys(columns))}): ${error.message}`
     );
   }
+}
+
+/**
+ * v1-C (#143). Move a row into `pending_user_input`, stamping the escalation
+ * questions and the created-at timestamp in one write.
+ *
+ * `escalation_resolved_at` is cleared here even when it was already null,
+ * because a row that re-escalates after being answered has to start a fresh
+ * escalation lifecycle: the notifier's 6h rate limit reads
+ * `escalation_notified_at`, which is also cleared here so the next
+ * notification actually fires. See `clearEscalation` for the resume half.
+ */
+export async function writeEscalation(
+  supabase: SupabaseClient,
+  applicationId: string,
+  questions: readonly EscalationQuestion[],
+  options: { now: Date }
+): Promise<void> {
+  await updateApplication(supabase, applicationId, {
+    status: "pending_user_input",
+    escalationQuestions: [...questions],
+    escalationCreatedAt: options.now.toISOString(),
+    escalationNotifiedAt: null,
+    escalationResolvedAt: null,
+  });
+}
+
+/**
+ * v1-C (#143). Stamp the notifier's send time, so the rate limit in
+ * `lib/notifier.ts` reads it back on the next call.
+ */
+export async function markEscalationNotified(
+  supabase: SupabaseClient,
+  applicationId: string,
+  options: { now: Date }
+): Promise<void> {
+  await updateApplication(supabase, applicationId, {
+    escalationNotifiedAt: options.now.toISOString(),
+  });
+}
+
+/**
+ * v1-C (#143). Move a row back out of `pending_user_input` so the pipeline
+ * picks it up on the next tick. Called by the dashboard resume path
+ * (`PUT /api/applications/{id}/escalation-answers`) after the answers have
+ * been written to `profiles.stored_answers`.
+ *
+ * `escalation_questions` is cleared to `null` (rather than `[]`) so a reader
+ * can distinguish "nothing to answer" from "answered a moment ago". The
+ * `escalation_resolved_at` stamp is what carries the second half of that
+ * distinction.
+ */
+export async function clearEscalation(
+  supabase: SupabaseClient,
+  applicationId: string,
+  options: { now: Date }
+): Promise<void> {
+  await updateApplication(supabase, applicationId, {
+    status: "discovered",
+    escalationQuestions: null,
+    escalationResolvedAt: options.now.toISOString(),
+  });
 }
 
 /**
