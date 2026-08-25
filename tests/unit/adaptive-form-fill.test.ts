@@ -2644,7 +2644,11 @@ describe("JOB-134: the second run does not ask what the first run was told", () 
   });
 
   it("answers it on the second run from what the candidate said on the first", () => {
-    const stored = rememberAnswers([], { [question]: "No" }, { now: new Date() });
+    const stored = rememberAnswers(
+      [],
+      [{ question, answer: "No" }],
+      { now: new Date() }
+    );
     // A second run supplies nothing: this is a different application, on a
     // different board, started by a pipeline that was told nothing new.
     const supplied = withStoredAnswers(stored, {});
@@ -2661,7 +2665,11 @@ describe("JOB-134: the second run does not ask what the first run was told", () 
     // handed a bare "No" with no subject attached — and `attestationFactAllowed`
     // has always accepted an `answer:` fact, which is what makes this the
     // existing mechanism rather than a new one.
-    const stored = rememberAnswers([], { [question]: "No" }, { now: new Date() });
+    const stored = rememberAnswers(
+      [],
+      [{ question, answer: "No" }],
+      { now: new Date() }
+    );
     const catalogue = buildFactCatalog(PROFILE, ANSWERS, withStoredAnswers(stored, {}));
     const fact = catalogue.find((entry) => entry.key === `answer:${question}`);
 
@@ -2674,7 +2682,10 @@ describe("JOB-134: the second run does not ask what the first run was told", () 
     // second run may have come from a demographic question.
     const stored = rememberAnswers(
       [],
-      { "what is your gender?": "prefer not to say", [question]: "No" },
+      [
+        { question: "what is your gender?", answer: "prefer not to say" },
+        { question, answer: "No" },
+      ],
       { now: new Date() }
     );
 

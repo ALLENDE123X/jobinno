@@ -522,33 +522,6 @@ export const profiles = pgTable(
     salaryExpectation: text("salary_expectation"),
 
     /**
-     * Every question this person has answered that intake never asked, kept so
-     * that the next application does not ask it again. JOB-134 item 1.
-     *
-     * An array of `{question, answer, topic, answeredAt}` objects, written and
-     * read through `lib/candidate-answers.ts` and capped at
-     * `STORED_ANSWER_LIMIT`. `question` is the form's own label, which is the
-     * same string `needsInput[].key` reports and `additionalAnswers` is keyed
-     * on, so a stored answer re-enters the fill exactly as a freshly supplied
-     * one does and every guard in front of it runs unchanged.
-     *
-     * ── Why this one is NOT granted to `authenticated` ─────────────────────
-     * Unlike the four columns above it, this is not a field on a form somebody
-     * fills in. It is free text that goes into the prompt deciding what gets
-     * typed onto a real employer's application, and
-     * `0016_resumes_column_privileges.sql` settled the same question for
-     * `resumes.parsed` the same way and for the same reason. The pipeline
-     * writes it with the service role, from an answer the person gave. The in
-     * app surface for answering a pending question, which is issue #134 item 4
-     * and is not built here, wants a server action that validates rather than a
-     * direct column grant.
-     *
-     * Null on every existing row, which `parseStoredAnswers` reads as an empty
-     * list. Nothing needs backfilling.
-     */
-    storedAnswers: jsonb("stored_answers"),
-
-    /**
      * When the person confirmed their intake is accurate and authorized us to
      * apply on their behalf. Added by JOB-007.
      *

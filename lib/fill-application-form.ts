@@ -6906,7 +6906,11 @@ async function runFill(
   // and nothing downstream should: `resolveAdditionalAnswer`, the attestation
   // ladder, `optionSupportsFact` and the read-back all run over it unchanged.
   const supplied = input.additionalAnswers ?? {};
-  const remembered = rememberAnswers(state.storedAnswers, supplied, { now: new Date() });
+  const remembered = rememberAnswers(
+    state.storedAnswers,
+    Object.entries(supplied).map(([question, answer]) => ({ question, answer })),
+    { now: new Date() }
+  );
   if (!sameStoredAnswers(remembered, state.storedAnswers)) {
     await persistStoredAnswers(supabase, state.candidateId, remembered);
     state.storedAnswers = remembered;
