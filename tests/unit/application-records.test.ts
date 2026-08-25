@@ -135,10 +135,12 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ??= "test-service-role-key";
 
 const {
   claimApplicationRow,
+  clearEscalation,
   recordFailure,
   recordSkip,
   skipReasonFor,
   updateApplication,
+  writeEscalation,
 } = await import("@/lib/application-records");
 const { listCandidateApplications, loadCandidate, toCandidateRecord } = await import(
   "@/lib/candidate-intake"
@@ -625,6 +627,62 @@ describe("listCandidateApplications", () => {
  * the ids created here. There is no truncate, no reset and no unfiltered delete
  * anywhere in this file.
  */
+// ───────────────────────────────────
+// v1-C (#143): escalation lifecycle
+// ───────────────────────────────────
+
+describe("writeEscalation", () => {
+  it("moves the row into pending_user_input with the questions attached", async () => {
+    const now = new Date("2026-08-25T10:00:00Z");
+    await writeEscalation(
+      client(),
+      APPLICATION_ID,
+      [
+        {
+          fieldKey: "are you legally authorized to work in the united states?",
+          fieldLabel: "Are you legally authorized to work in the United States?",
+          question: "Are you legally authorized to work in the United States?",
+          options: ["Yes", "No"],
+          required: true,
+          topicSlug: "work_auth_current_us",
+        },
+      ],
+      { now }
+    );
+
+    const call = callTo("applications");
+    expect(call.verb).toBe("update");
+    expect(call.payload).toMatchObject({
+      status: "pending_user_input",
+      escalation_created_at: now.toISOString(),
+      // Cleared so the notifier can fire again for this fresh escalation.
+      escalation_notified_at: null,
+      escalation_resolved_at: null,
+    });
+    const escalation = (call.payload as { escalation_questions: unknown[] })
+      .escalation_questions;
+    expect(escalation).toHaveLength(1);
+    expect((escalation as Array<{ topicSlug: string | null }>)[0]!.topicSlug).toBe(
+      "work_auth_current_us"
+    );
+  });
+});
+
+describe("clearEscalation", () => {
+  it("flips the row back to discovered and stamps escalation_resolved_at", async () => {
+    const now = new Date("2026-08-25T11:00:00Z");
+    await clearEscalation(client(), APPLICATION_ID, { now });
+
+    const call = callTo("applications");
+    expect(call.verb).toBe("update");
+    expect(call.payload).toEqual({
+      status: "discovered",
+      escalation_questions: null,
+      escalation_resolved_at: now.toISOString(),
+    });
+  });
+});
+
 liveDbSuite("the columns the code writes exist in the real schema", () => {
   const sql = postgres(liveDbUrl, { prepare: false, max: 1, onnotice: () => {} });
 

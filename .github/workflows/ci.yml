@@ -98,6 +98,17 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0003_profiles_column_privileges.sql
 
+      - name: Apply the v1-C notification preference migration
+        # v1-C (#143). Grants `notification_preference` on `profiles` to
+        # `authenticated` so the person can pick their channel. The column
+        # itself is created by drizzle-kit push above; this file only carries
+        # the CHECK constraint and the column grant, neither of which the
+        # Drizzle schema DSL can express.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0014_profiles_notification_preference.sql
+
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -176,6 +187,17 @@ jobs:
         run: >-
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0003_profiles_column_privileges.sql
+
+      - name: Apply the v1-C notification preference migration
+        # v1-C (#143). Grants `notification_preference` on `profiles` to
+        # `authenticated` so the person can pick their channel. The column
+        # itself is created by drizzle-kit push above; this file only carries
+        # the CHECK constraint and the column grant, neither of which the
+        # Drizzle schema DSL can express.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0014_profiles_notification_preference.sql
+
 
       - name: Build
         run: npm run build
