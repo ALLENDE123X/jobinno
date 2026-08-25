@@ -72,6 +72,11 @@ const PROFILE_USER_COLUMNS = [
   "f1_status",
   "grad_date",
   "id",
+  // v1-C (#143). Granted by `drizzle/0014_profiles_notification_preference.sql`
+  // so the person can pick the channel a `pending_user_input` notification
+  // goes to. The classification rule is the same as every other column here:
+  // this is a preference the person owns, not a system-controlled column.
+  "notification_preference",
   "requires_sponsorship",
   "target_locations",
   "updated_at",
