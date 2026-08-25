@@ -323,6 +323,33 @@ export const profiles = pgTable(
      */
     lastSearchRequestedAt: timestamp("last_search_requested_at", { withTimezone: true }),
 
+    /**
+     * JOB-v1-B — every question this person has answered that intake never
+     * asked, kept keyed by canonical intent so the next employer's rewording
+     * of the same question does not ask it again.
+     *
+     * An array of `{topic, question, answer, answeredAt}` objects, written
+     * and read through `lib/candidate-answers.ts` and capped at
+     * `STORED_ANSWER_LIMIT`. `topic` is the slug from `CANONICAL_TOPICS`
+     * when the classifier recognises the intent, `null` otherwise (either a
+     * legacy pre-classifier row or a question the taxonomy has not yet
+     * learned about). See the header on `lib/candidate-answers.ts` for the
+     * full ladder that consumes it.
+     *
+     * ── Why this is NOT granted to `authenticated` ────────────────────────
+     * The `stored_answers` blob feeds the LLM prompt deciding what gets
+     * typed onto real employers' forms, so its integrity matters in exactly
+     * the way `resumes.parsed` does. Both are written by the service role
+     * from candidate input that has already been validated on the way in.
+     * v1-C's escalation-answer endpoint (issue #143) is the ordinary writer
+     * from the user's side, and it validates before writing rather than
+     * granting the column to `authenticated` directly.
+     *
+     * Null on every existing row, which `parseStoredAnswers` reads as an
+     * empty list. Nothing needs backfilling.
+     */
+    storedAnswers: jsonb("stored_answers"),
+
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

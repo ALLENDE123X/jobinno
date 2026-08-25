@@ -650,13 +650,14 @@ describe("what a best effort answer may not do", () => {
 
 // ═══════════════════════════════════════════════════════════════════════════
 describe("the message a blocked run leaves behind", () => {
-  const item = (fieldLabel: string) => ({
+  const item = (fieldLabel: string, topic: string | null = null) => ({
     key: fieldLabel.toLowerCase(),
     fieldLabel,
     question: `What about "${fieldLabel}"?`,
     why: "nothing supplies this",
     required: true,
     kind: "select" as const,
+    topic,
   });
 
   it("tags a legal attestation so skipReasonFor can file it as one", () => {
