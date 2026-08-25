@@ -38,6 +38,7 @@ import { revalidatePath } from "next/cache";
 
 import { ANALYTICS_EVENT } from "@/lib/analytics/events";
 import { captureServerEvent } from "@/lib/analytics/posthog-server";
+import { requestDocumentParse } from "@/lib/candidate-document-trigger";
 import { recordAttestation } from "@/lib/onboarding/attestation";
 import { intakeFieldErrors, intakeSchema } from "@/lib/onboarding/intake-schema";
 import { RESUMES_BUCKET, createServerClient } from "@/lib/supabase/server";
@@ -80,6 +81,36 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
       target_locations: intake.targetLocations,
       grad_date: intake.gradDate,
       earliest_start: intake.earliestStart,
+      // JOB-101. Every one of these is read back by `CANDIDATE_COLUMNS` in
+      // `lib/candidate-intake.ts` and has a fact in `buildFactCatalog`, which is
+      // the whole point of the ticket: the four columns JOB-022 found were
+      // written here and read nowhere had cost 18 stopped applications in a
+      // single day, and adding a ninth column to this list without doing the
+      // other two steps would rebuild that exact failure.
+      clearance_eligibility: intake.clearanceEligibility,
+      clearance_level_held: intake.clearanceLevelHeld,
+      needs_sponsorship_non_us: intake.needsSponsorshipNonUs,
+      visa_status: intake.visaStatus,
+      high_school_name: intake.highSchoolName,
+      high_school_grad_year: intake.highSchoolGradYear,
+      street_address: intake.streetAddress,
+      postal_code: intake.postalCode,
+      // JOB-134. Four more, and the same rule the JOB-101 comment above states:
+      // every one of these is read back by `CANDIDATE_COLUMNS` in
+      // `lib/candidate-intake.ts` and has a fact in `buildFactCatalog`. They are
+      // here because the pipeline had to stop and ask a real person each of
+      // them on a real board, and a question answered once here is a question
+      // the next user never reaches.
+      //
+      // `stored_answers` is deliberately not written here. It is the pipeline's
+      // record of questions this form did not ask, written with the service
+      // role, and `authenticated` holds no grant on it. See
+      // `drizzle/0018_profiles_answer_memory_privileges.sql`.
+      subject_to_restrictive_covenant: intake.subjectToRestrictiveCovenant,
+      relatives_at_target_employers: intake.relativesAtTargetEmployers,
+      previously_employed_at_target_employers:
+        intake.previouslyEmployedAtTargetEmployers,
+      salary_expectation: intake.salaryExpectation,
       updated_at: new Date().toISOString(),
     })
     .eq("id", user.id);
@@ -91,15 +122,23 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // Written after the profile, deliberately. The other order leaves a resume
   // pointing at a profile that never got its answers, which nothing downstream
   // can tell apart from a half filled form.
-  const { error: resumeError } = await supabase.from("resumes").insert({
-    user_id: user.id,
-    // Bucket qualified, matching the convention `lib/candidate-intake.ts` uses
-    // for every stored resume path: a path to sign a URL from, never a URL.
-    storage_path: `${RESUMES_BUCKET}/${intake.resumePath}`,
-    linkedin_pdf_path: intake.linkedinPdfPath
-      ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`
-      : null,
-  });
+  // JOB-112 added the `select`. The new row's id is what `intake/completed`
+  // carries, so the parse runs against the row this submit created rather than
+  // against whichever row a second lookup would have found — which for someone
+  // re-uploading is a race with their own previous resume.
+  const { data: resumeRow, error: resumeError } = await supabase
+    .from("resumes")
+    .insert({
+      user_id: user.id,
+      // Bucket qualified, matching the convention `lib/candidate-intake.ts` uses
+      // for every stored resume path: a path to sign a URL from, never a URL.
+      storage_path: `${RESUMES_BUCKET}/${intake.resumePath}`,
+      linkedin_pdf_path: intake.linkedinPdfPath
+        ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`
+        : null,
+    })
+    .select("id")
+    .single();
 
   if (resumeError) {
     return { ok: false, message: `Could not save your resume: ${resumeError.message}` };
@@ -141,8 +180,14 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   //
   // `intake` is in scope and holds this person's citizenship status, F1 status,
   // work authorization, sponsorship need, city, country, graduation date and
-  // the path to their resume. None of it is sent. Two facts about the shape of
-  // the answers go out, neither of which describes the person: whether a
+  // the path to their resume, and since JOB-101 their security clearance
+  // eligibility, the clearance level they have held, their visa status, their
+  // high school and their home address as well. None of it is sent, and the new
+  // ones least of all: a clearance status, a street address and, since JOB-134,
+  // a salary expectation and whether a non-compete binds them are exactly the
+  // kind of thing that must not leave for an analytics pipeline. Two facts
+  // about the shape of the answers go out, neither of which describes the
+  // person: whether a
   // LinkedIn export was attached, and how many locations they named.
   // `lib/analytics/events.ts` records why the work authorization fields in
   // particular are excluded rather than merely omitted.
@@ -156,6 +201,15 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
         : 0,
     },
   });
+
+  // JOB-112. The resume and the LinkedIn export get parsed once, now, rather
+  // than on every application forever. Deliberately last and deliberately not
+  // awaited for its result: this person is waiting on a form submit, and two
+  // PDFs through an LLM is far too slow to hold that open. Nothing they see
+  // next depends on it, and the fill pipeline parses inline anyway when the
+  // column is empty, so a failure here costs one slower first application and
+  // nothing else. That is why it cannot fail the submit.
+  await requestDocumentParse(user.id, String(resumeRow?.id ?? ""));
 
   revalidatePath("/onboarding");
   return { ok: true };

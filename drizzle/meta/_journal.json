@@ -106,6 +106,69 @@
       "when": 1787965400000,
       "tag": "0014_profiles_notification_preference",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1787354161929,
+      "tag": "0015_profiles_github_url",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1787354184960,
+      "tag": "0016_profiles_github_url_privileges",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1787378646711,
+      "tag": "0017_applications_browserbase_session_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1787385600000,
+      "tag": "0018_profiles_browserbase_context_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1787428001108,
+      "tag": "0019_profiles_intake_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1787428051468,
+      "tag": "0020_profiles_intake_fields_privileges",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1787443200000,
+      "tag": "0021_resumes_column_privileges",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1787529600000,
+      "tag": "0022_profiles_answer_memory",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1787529660000,
+      "tag": "0023_profiles_answer_memory_privileges",
+      "breakpoints": true
     }
   ]
 }

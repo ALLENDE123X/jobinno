@@ -47,12 +47,23 @@ const RLS_TABLES = TABLES;
  * completion gate on `/onboarding`. `stripe_customer_id` was added by JOB-010
  * and classified here rather than granted, because which Stripe customer a
  * person pays as is our record and not theirs.
+ *
+ * `stored_answers` (JOB-134) is here for a different reason from the rest, and
+ * it is the one worth reading. It genuinely holds the person's own answers, so
+ * by the ownership test above it looks like it belongs on the other list. It is
+ * on this one because it is not a field on a form somebody fills in: it is free
+ * text that becomes a fact in the prompt deciding what gets typed onto a real
+ * employer's application, which is exactly the surface
+ * `0016_resumes_column_privileges.sql` closed on `resumes.parsed`. The pipeline
+ * writes it with the service role, from an answer the person gave in response
+ * to a question a real form really asked.
  */
 const PROFILE_SYSTEM_COLUMNS = [
   "applications_cap",
   "applications_used",
   "attested_at",
   "plan",
+  "stored_answers",
   "stripe_customer_id",
 ] as const;
 
@@ -61,25 +72,54 @@ const PROFILE_SYSTEM_COLUMNS = [
  * has to stay able to edit. `id` is here because the `with check` on
  * `profiles_update_own` already pins it to `auth.uid()`, so a grant on it
  * cannot move a row to another owner.
+ *
+ * The eight JOB-101 added are all on this side, and every one of them is an
+ * answer the person gives about themselves at intake. A security clearance
+ * status and a home address are sensitive, which is an argument for who may
+ * READ them and never an argument for taking away the owner's ability to
+ * correct their own record.
+ *
+ * Four of JOB-134's five are on this side for the same reason, and the fifth is
+ * the interesting one. `stored_answers` is deliberately absent, and this test
+ * is what proves the grant was actually withheld rather than merely intended:
+ * it is not a field on the intake form, it is free text that becomes a fact in
+ * the prompt deciding what gets typed onto a real employer's application, which
+ * is the surface `0016_resumes_column_privileges.sql` closed on
+ * `resumes.parsed`. The pipeline writes it with the service role. If somebody
+ * later builds the in app answer surface (issue #134 item 4), the shape to add
+ * is a server action that validates, not a name on this list.
  */
 const PROFILE_USER_COLUMNS = [
   "citizenship_status",
+  "clearance_eligibility",
+  "clearance_level_held",
   "created_at",
   "current_city",
   "current_country",
   "earliest_start",
   "email",
   "f1_status",
+  "github_url",
   "grad_date",
+  "high_school_grad_year",
+  "high_school_name",
   "id",
+  "needs_sponsorship_non_us",
   // v1-C (#143). Granted by `drizzle/0014_profiles_notification_preference.sql`
   // so the person can pick the channel a `pending_user_input` notification
   // goes to. The classification rule is the same as every other column here:
   // this is a preference the person owns, not a system-controlled column.
   "notification_preference",
+  "postal_code",
+  "previously_employed_at_target_employers",
+  "relatives_at_target_employers",
   "requires_sponsorship",
+  "salary_expectation",
+  "street_address",
+  "subject_to_restrictive_covenant",
   "target_locations",
   "updated_at",
+  "visa_status",
   "willing_to_relocate",
   "work_authorized_us",
 ] as const;

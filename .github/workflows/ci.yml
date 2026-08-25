@@ -1,10 +1,17 @@
 name: CI
 
+# `v1` (JOB-032 era) is a second long-lived integration branch alongside
+# `main` while the live site is gated behind a waitlist — every pre-launch
+# fix lands there first, tested via Vercel preview, before eventually
+# merging back into `main`. Without `v1` in these branch lists this workflow
+# silently never runs on any PR targeting it: not caught for several PRs
+# (JOB-024, JOB-027 through JOB-030) before this was noticed. Drop `v1` here
+# once it has merged back into `main` and the branch is retired.
 on:
   push:
-    branches: [main]
+    branches: [main, v1]
   pull_request:
-    branches: [main]
+    branches: [main, v1]
 
 jobs:
   test:
@@ -108,6 +115,44 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0014_profiles_notification_preference.sql
 
+      - name: Apply the profiles.github_url privilege migration
+        # JOB-044. Same reasoning as the step above, and the same rule: this one
+        # grants `github_url`, which `0010_profiles_github_url.sql`'s ALTER TABLE
+        # (picked up by the `drizzle-kit push` step) already added by the time
+        # this runs.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0016_profiles_github_url_privileges.sql
+
+      - name: Apply the JOB-101 intake field privilege migration
+        # JOB-101. Same reasoning again, and the same rule: this one grants the
+        # eight columns `0014_profiles_intake_fields.sql` added, which the
+        # `drizzle-kit push` step has already created by the time this runs.
+        # There is still deliberately no glob over `drizzle/`; a new privilege
+        # migration gets its own line here, on purpose.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0020_profiles_intake_fields_privileges.sql
+
+      - name: Apply the resumes privilege migration
+        # JOB-112. Same reasoning again, and its own line rather than a glob for
+        # the reason three steps up. This one takes the table wide INSERT and
+        # UPDATE grants on `resumes` away from `authenticated` so that `parsed`,
+        # which now holds the candidate's employment and education history, has
+        # exactly one writer.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0021_resumes_column_privileges.sql
+
+      - name: Apply the JOB-134 answer memory privilege migration
+        # JOB-134. Same reasoning again, and its own line rather than a glob for
+        # the reason four steps up. This one grants the four intake columns
+        # `0017_profiles_answer_memory.sql` added and deliberately leaves
+        # `stored_answers` ungranted; see that file for why the fifth column is
+        # not on the list.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0023_profiles_answer_memory_privileges.sql
 
       - name: Type check
         run: npx tsc --noEmit
@@ -117,6 +162,13 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+      - name: tsx CLI resolution smoke check (JOB-029)
+        # Type check, lint and the unit tests above never actually run a
+        # `lib/*-cli.ts` entrypoint through `tsx` — that gap is exactly how
+        # ERR_PACKAGE_PATH_NOT_EXPORTED (issue #47) went unnoticed in CI. See
+        # `scripts/check-tsx-cli-resolution.mjs` for the full explanation.
+        run: npm run check:cli-resolution
 
   e2e:
     runs-on: ubuntu-latest
@@ -198,6 +250,44 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0014_profiles_notification_preference.sql
 
+      - name: Apply the profiles.github_url privilege migration
+        # JOB-044. Same reasoning as the step above, and the same rule: this one
+        # grants `github_url`, which `0010_profiles_github_url.sql`'s ALTER TABLE
+        # (picked up by the `drizzle-kit push` step) already added by the time
+        # this runs.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0016_profiles_github_url_privileges.sql
+
+      - name: Apply the JOB-101 intake field privilege migration
+        # JOB-101. Same reasoning again, and the same rule: this one grants the
+        # eight columns `0014_profiles_intake_fields.sql` added, which the
+        # `drizzle-kit push` step has already created by the time this runs.
+        # There is still deliberately no glob over `drizzle/`; a new privilege
+        # migration gets its own line here, on purpose.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0020_profiles_intake_fields_privileges.sql
+
+      - name: Apply the resumes privilege migration
+        # JOB-112. Same reasoning again, and its own line rather than a glob for
+        # the reason three steps up. This one takes the table wide INSERT and
+        # UPDATE grants on `resumes` away from `authenticated` so that `parsed`,
+        # which now holds the candidate's employment and education history, has
+        # exactly one writer.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0021_resumes_column_privileges.sql
+
+      - name: Apply the JOB-134 answer memory privilege migration
+        # JOB-134. Same reasoning again, and its own line rather than a glob for
+        # the reason four steps up. This one grants the four intake columns
+        # `0017_profiles_answer_memory.sql` added and deliberately leaves
+        # `stored_answers` ungranted; see that file for why the fifth column is
+        # not on the list.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0023_profiles_answer_memory_privileges.sql
 
       - name: Build
         run: npm run build

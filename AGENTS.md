@@ -1,6 +1,6 @@
 # Jobinno: Agent Operating Guide
 
-This file mirrors `AGENTS.md` in this same repo, so the same operating rules apply regardless of which coding agent opened this project (Claude Code reads `CLAUDE.md`; OpenCode reads `AGENTS.md` in preference to `CLAUDE.md`). Keep both in sync when either changes.
+This file mirrors `CLAUDE.md` in this same repo, so the same operating rules apply regardless of which coding agent opened this project (OpenCode reads `AGENTS.md` in preference to `CLAUDE.md`; Claude Code reads `CLAUDE.md`). Keep both in sync when either changes.
 
 MEMORY_PROJECT: startup
 
@@ -75,7 +75,7 @@ JOB-001 was a copy and make it compile ticket. The whole port type checks, lints
 5. ~~Authenticated users can update their own `plan` and `applications_cap` columns directly, because Postgres row level security restricts rows and not columns.~~ **Closed by JOB-007**, which found the same bug a second time on `attested_at` and fixed both in `drizzle/0003_profiles_column_privileges.sql`. `authenticated` no longer holds a table wide UPDATE on `profiles`; it holds a named grant on the columns a person answers about themselves, and `plan`, `applications_used`, `applications_cap` and `attested_at` are writable only by the service role. Closes [issue #2](https://github.com/ALLENDE123X/jobinno/issues/2).
 6. **One lint warning survives:** an unused `_signals` binding in `lib/fill-application-form.ts`. Left alone rather than silently edited, since touching ported code outside a ticket's scope is how a port stops being reviewable.
 7. **Two columns actinno had have no Jobinno equivalent.** `candidates.target_title` and `candidates.pay_min` were search preferences; `candidates.linkedin_url` was the profile URL an application form asks for by name. JOB-004 dropped all three from `CandidateRecord` rather than hard wiring them to null, so that the day a column is added is a compile error at every site that should start reading it. Until then a title and a pay floor have to be supplied on the `job-search/requested` event, and a LinkedIn URL comes from the resume text or from nowhere. Closing this is a `profiles` migration plus three fields on the intake form.
-8. ~~**`profiles.applications_used` is written by nothing.**~~ **Closed by JOB-v1-A** (issue #141). `lib/application-quota.ts` writes the counter via `reserveApplicationSlot`/`releaseApplicationSlot`, but the counter was still drifting for profiles seeded with rows from before that wiring — verified 2026 08 24 on the founder's own profile, which read `applications_used=2` against 10+ real rows. `claimApplicationRow` now gates on a live count of the person's `applications` rows in a `CAP_CONSUMING_STATUSES` (see `lib/application-status.ts`) instead of the stored counter, so the cap holds regardless of how far the counter has drifted. The counter is kept as a cached mirror maintained by the atomic reserve/release path; dashboards read it and are not affected.
+8. **`profiles.applications_used` is written by nothing.** `claimApplicationRow` enforces `applications_cap` against a live count of the person's `applications` rows instead, because a guard reading a counter nobody increments is not a guard. Whichever ticket owns billing owns making the column true or removing it.
 
 ## `lib/future-gmail/` is unwired V2 reference code
 

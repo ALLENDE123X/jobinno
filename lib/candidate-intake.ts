@@ -47,6 +47,7 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { parseStoredAnswers, type StoredAnswer } from "@/lib/candidate-answers";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 export const RESUMES_BUCKET = "resumes";
@@ -86,6 +87,22 @@ export type CandidateIntakeInput = {
    * `CandidateRecord` for what that costs and who owns closing it.
    */
   locations?: string[];
+  /**
+   * JOB-044. Written to `profiles.github_url`. Trimmed to `null` when blank,
+   * exactly like `locations` above: saying nothing must never blank a column
+   * that already holds an answer, so this key is left out of the update
+   * entirely rather than written as an empty string.
+   *
+   * A GitHub URL was one of `linkedinUrl`'s two siblings that JOB-004 dropped
+   * for having no column — see `CandidateRecord.linkedinUrl` for that gap,
+   * which this is not: unlike LinkedIn, GitHub gets a real column and a real
+   * writer here, because the "Github Link" field it answers is asked for by
+   * name on a large share of engineering applications and nothing before this
+   * ticket ever collected a stated answer for it. `lib/fill-application-form.ts`
+   * still falls back to a GitHub URL spotted in `websiteUrl` or `linkedinUrl`
+   * for candidates who have not filled this in yet.
+   */
+  githubUrl?: string;
   /**
    * ACT-015. The facts an ATS application form asks for on almost every listing.
    *
@@ -159,14 +176,82 @@ export type CandidateApplicationAnswers = {
    * four of them.
    */
   targetLocations?: string[];
+  /**
+   * ── JOB-101: the answers that were blocking real applications ─────────────
+   *
+   * Eight more, added the same way and for the same reason the four above were:
+   * a required field on a real employer's form had no stored answer behind it,
+   * so the run stopped. The lesson JOB-022 wrote down is the one that governs
+   * them, and it is worth repeating because it is what makes this block longer
+   * than the column list. A column written at intake that never reaches the
+   * fill layer is worse than no column at all, because the person answered the
+   * question and nothing asked the database for the answer. Every key below is
+   * read by `toApplicationAnswers`, is named in `CANDIDATE_COLUMNS`, and has a
+   * fact in `buildFactCatalog`. Adding a ninth means doing all three.
+   *
+   * The two clearance answers and the visa status are legal attestations, and
+   * they arrive under the rule `LEGAL_ATTESTATION_RE` states rather than around
+   * it: storing an answer is not a licence to guess one, it is what lets the
+   * question be answered from the candidate's own words instead of stopping the
+   * run. `attestationFactAllowed` still decides which stored fact may back
+   * which question, and a clearance question may be backed only by a clearance
+   * fact.
+   */
+  /** `profiles.clearance_eligibility`, one of the `clearance_eligibility` enum values. */
+  clearanceEligibility?: string;
+  /** `profiles.clearance_level_held`, one of the `clearance_level` enum values. */
+  clearanceLevelHeld?: string;
+  /**
+   * `profiles.needs_sponsorship_non_us`. Issue #108.
+   *
+   * Deliberately a separate answer from `requiresSponsorship` rather than a
+   * reading of it. That one is a US only fact, derived from a US citizenship
+   * status, and says nothing about the United Kingdom or Ireland; this is the
+   * jurisdiction it never covered.
+   */
+  needsSponsorshipNonUs?: boolean;
+  /** `profiles.visa_status`, in the candidate's own words. */
+  visaStatus?: string;
+  /** `profiles.high_school_name`. Required by all 128 Palantir listings. */
+  highSchoolName?: string;
+  /** `profiles.high_school_grad_year`, a four digit year. */
+  highSchoolGradYear?: number;
+  /** `profiles.street_address`. The half of a postal address `current_city` never held. */
+  streetAddress?: string;
+  /** `profiles.postal_code`, the other half. */
+  postalCode?: string;
+  /**
+   * ── JOB-134: four more, added on the same evidence as JOB-101's eight ─────
+   *
+   * The rule JOB-022 wrote down still governs, and adding a thirteenth means
+   * doing all three steps: a key here, a read in `toApplicationAnswers`, a name
+   * in `CANDIDATE_COLUMNS`, and a fact in `buildFactCatalog`. A column intake
+   * writes and the fill layer never sees is worse than no column, because the
+   * person answered the question and nothing asked the database for the answer.
+   *
+   * Two of them are tri-state in a way the others are not, and it is worth
+   * saying here rather than only in the schema: `relativesAtTargetEmployers`
+   * and `previouslyEmployedAtTargetEmployers` are statements about every
+   * employer the person might apply to, so only `false` is reusable as an
+   * answer to a form's question about one named company. `true` produces no
+   * fact and the question is still put to the candidate. See `buildFactCatalog`.
+   */
+  /** `profiles.subject_to_restrictive_covenant`. Non-compete, non-solicit, and the rest. */
+  subjectToRestrictiveCovenant?: boolean;
+  /** `profiles.relatives_at_target_employers`. False is reusable, true is not. */
+  relativesAtTargetEmployers?: boolean;
+  /** `profiles.previously_employed_at_target_employers`. Same asymmetry. */
+  previouslyEmployedAtTargetEmployers?: boolean;
+  /** `profiles.salary_expectation`, in the candidate's own words. */
+  salaryExpectation?: string;
 };
 
 /** `CandidateApplicationAnswers` → the row shape, dropping anything unstated. */
 function applicationAnswerColumns(
   answers: CandidateApplicationAnswers | undefined
-): Record<string, string | boolean | null> {
+): Record<string, string | number | boolean | null> {
   if (answers === undefined) return {};
-  const row: Record<string, string | boolean | null> = {};
+  const row: Record<string, string | number | boolean | null> = {};
   // `undefined` is left out entirely rather than written as NULL, so that a
   // caller who says nothing about sponsorship cannot overwrite a column that
   // already holds an answer. On an INSERT the two are the same; the distinction
@@ -195,6 +280,42 @@ function applicationAnswerColumns(
   if (grad !== null) row.grad_date = grad;
   const start = normalizeOptionalText(answers.earliestStart);
   if (start !== null) row.earliest_start = start;
+  // JOB-101. Same rule again for the eight late arrivals: unstated is left out
+  // entirely rather than written as NULL, so that a caller who says nothing
+  // about a clearance or an address cannot blank an answer already stored.
+  const clearance = normalizeOptionalText(answers.clearanceEligibility);
+  if (clearance !== null) row.clearance_eligibility = clearance;
+  const clearanceLevel = normalizeOptionalText(answers.clearanceLevelHeld);
+  if (clearanceLevel !== null) row.clearance_level_held = clearanceLevel;
+  if (typeof answers.needsSponsorshipNonUs === "boolean") {
+    row.needs_sponsorship_non_us = answers.needsSponsorshipNonUs;
+  }
+  const visa = normalizeOptionalText(answers.visaStatus);
+  if (visa !== null) row.visa_status = visa;
+  const highSchool = normalizeOptionalText(answers.highSchoolName);
+  if (highSchool !== null) row.high_school_name = highSchool;
+  if (Number.isInteger(answers.highSchoolGradYear)) {
+    row.high_school_grad_year = answers.highSchoolGradYear as number;
+  }
+  const street = normalizeOptionalText(answers.streetAddress);
+  if (street !== null) row.street_address = street;
+  const postal = normalizeOptionalText(answers.postalCode);
+  if (postal !== null) row.postal_code = postal;
+  // JOB-134. The same rule a fourth time: unstated is left out entirely rather
+  // than written as NULL, so a caller who says nothing about a non-compete
+  // cannot blank an answer already stored.
+  if (typeof answers.subjectToRestrictiveCovenant === "boolean") {
+    row.subject_to_restrictive_covenant = answers.subjectToRestrictiveCovenant;
+  }
+  if (typeof answers.relativesAtTargetEmployers === "boolean") {
+    row.relatives_at_target_employers = answers.relativesAtTargetEmployers;
+  }
+  if (typeof answers.previouslyEmployedAtTargetEmployers === "boolean") {
+    row.previously_employed_at_target_employers =
+      answers.previouslyEmployedAtTargetEmployers;
+  }
+  const salary = normalizeOptionalText(answers.salaryExpectation);
+  if (salary !== null) row.salary_expectation = salary;
   return row;
 }
 
@@ -407,6 +528,7 @@ export async function intakeCandidate(
   const locations = input.locations
     ?.map((l) => l.trim())
     .filter((l) => l.length > 0);
+  const githubUrl = normalizeOptionalText(input.githubUrl);
 
   let resumeId: string;
   try {
@@ -457,6 +579,7 @@ export async function intakeCandidate(
     const profilePatch: Record<string, unknown> = {
       ...applicationAnswerColumns(input.applicationAnswers),
       ...(locations && locations.length > 0 ? { target_locations: locations } : {}),
+      ...(githubUrl !== null ? { github_url: githubUrl } : {}),
     };
     if (Object.keys(profilePatch).length > 0) {
       const { error: profileError } = await supabase
@@ -552,8 +675,36 @@ export type CandidateRecord = {
    * ticket's to add.
    */
   linkedinUrl: string | null;
+  /**
+   * `profiles.github_url`, stated at intake. Added by JOB-044, and unlike
+   * `linkedinUrl` above this one is not a gap: `intakeCandidate` writes it for
+   * real when a caller supplies `CandidateIntakeInput.githubUrl`, so null here
+   * means the candidate genuinely has not given one, not that the column does
+   * not exist. `lib/fill-application-form.ts` still falls back to a GitHub URL
+   * spotted in `websiteUrl` or `linkedinUrl` when this is null.
+   */
+  githubUrl: string | null;
+  /**
+   * JOB-112. `resumes.id` of the row `resumeUrl` came off.
+   *
+   * Carried because `resumes.parsed` is stored per resume row, so reading or
+   * writing it needs the row and not only its path. Also the identity that
+   * makes a re-upload invalidate a parse for free: a new upload is a new row,
+   * and a new row's `parsed` is NULL.
+   */
+  resumeId: string;
   /** Bucket-qualified path, NOT a fetchable URL. */
   resumeUrl: string;
+  /**
+   * JOB-112. `resumes.linkedin_pdf_path`, the candidate's LinkedIn profile
+   * export, or null when they uploaded none.
+   *
+   * Written since JOB-007 and read by nothing until this ticket. Like
+   * `resumeUrl` it is a bucket-qualified path and not a fetchable URL, and it
+   * must never be put on a form: a form asking for LinkedIn wants
+   * `linkedin.com/in/...`, which is `linkedinUrl` above.
+   */
+  linkedinPdfPath: string | null;
   /**
    * `profiles.target_locations`. The only one of actinno's three search
    * preferences that has a column here.
@@ -578,6 +729,17 @@ export type CandidateRecord = {
    * rather than a guess on a real application.
    */
   applicationAnswers: CandidateApplicationAnswers;
+  /**
+   * JOB-134. Every question this person has answered that intake never asked,
+   * newest first, from `profiles.stored_answers`.
+   *
+   * Separate from `applicationAnswers` above rather than folded into it,
+   * because the two are different kinds of thing. That one is a fixed set of
+   * questions with known shapes, asked once at intake; this is an open ended
+   * log keyed by whatever a board happened to call the field. Empty means this
+   * person has never had a run stop on a question, or has never answered one.
+   */
+  storedAnswers: StoredAnswer[];
 };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -596,10 +758,25 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * because JOB-007 spelled its columns the way actinno already had; `id` is now
  * `auth.users.id`, `application_email` is now plain `email`, and `locations` is
  * now `target_locations`. The resume is not in this list at all any more — it
- * is a row in another table, read by `loadActiveResume`.
+ * is a row in another table, read by `loadActiveResume`. `github_url` is
+ * JOB-044's, and is read straight onto `CandidateRecord.githubUrl` rather than
+ * through `toApplicationAnswers`, since it is a stated fact about the
+ * candidate rather than an answer collected for a specific form question.
+ *
+ * The next eight after that are JOB-101's, and they are the whole reason that
+ * ticket touched three files rather than one: a column intake writes and this
+ * literal does not name is a question the person answered and the form filler
+ * never sees. Keep them in step with `toApplicationAnswers` below and with
+ * `buildFactCatalog` in `lib/fill-application-form.ts`.
+ *
+ * The trailing five are JOB-134's. Four are intake answers and follow that same
+ * rule exactly; `stored_answers` is the odd one out and is read straight onto
+ * `CandidateRecord.storedAnswers` rather than through `toApplicationAnswers`,
+ * because it is not one answer of a known shape but the log of every question
+ * this person has answered that intake never asked.
  */
 const CANDIDATE_COLUMNS =
-  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start";
+  "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country,current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start,github_url,clearance_eligibility,clearance_level_held,needs_sponsorship_non_us,visa_status,high_school_name,high_school_grad_year,street_address,postal_code,subject_to_restrictive_covenant,relatives_at_target_employers,previously_employed_at_target_employers,salary_expectation,stored_answers";
 
 /**
  * Row → the answers that were actually recorded.
@@ -637,19 +814,80 @@ export function toApplicationAnswers(row: Record<string, unknown>): CandidateApp
     ? row.target_locations.map(String).filter((entry) => entry.trim() !== "")
     : [];
   if (locations.length > 0) answers.targetLocations = locations;
+  // JOB-101. The same rule a third time, and the reason it is written out
+  // rather than looped: a NULL column is left out, so "never asked" and "the
+  // answer is no" stay different statements. That distinction is what makes an
+  // unanswered clearance question become a question put to the candidate
+  // instead of a "No" nobody said.
+  const clearance =
+    typeof row.clearance_eligibility === "string" ? row.clearance_eligibility.trim() : "";
+  if (clearance !== "") answers.clearanceEligibility = clearance;
+  const clearanceLevel =
+    typeof row.clearance_level_held === "string" ? row.clearance_level_held.trim() : "";
+  if (clearanceLevel !== "") answers.clearanceLevelHeld = clearanceLevel;
+  if (typeof row.needs_sponsorship_non_us === "boolean") {
+    answers.needsSponsorshipNonUs = row.needs_sponsorship_non_us;
+  }
+  const visa = typeof row.visa_status === "string" ? row.visa_status.trim() : "";
+  if (visa !== "") answers.visaStatus = visa;
+  const highSchool =
+    typeof row.high_school_name === "string" ? row.high_school_name.trim() : "";
+  if (highSchool !== "") answers.highSchoolName = highSchool;
+  // PostgREST hands an `integer` column back as a JSON number, but a stored
+  // year that arrives as a string still parses to the same year, and refusing
+  // it would drop an answer over a transport detail.
+  const gradYear = Number(row.high_school_grad_year);
+  if (row.high_school_grad_year !== null && Number.isInteger(gradYear)) {
+    answers.highSchoolGradYear = gradYear;
+  }
+  const street = typeof row.street_address === "string" ? row.street_address.trim() : "";
+  if (street !== "") answers.streetAddress = street;
+  const postal = typeof row.postal_code === "string" ? row.postal_code.trim() : "";
+  if (postal !== "") answers.postalCode = postal;
+  // JOB-134. The same rule a fourth time. It reads as repetitive and it is
+  // written out anyway, because the one thing that must not happen to these
+  // four is a NULL becoming a "No": nobody has told us whether this person is
+  // under a non-compete, and "we were never told" is the state that makes the
+  // question reach them rather than a real employer's form.
+  if (typeof row.subject_to_restrictive_covenant === "boolean") {
+    answers.subjectToRestrictiveCovenant = row.subject_to_restrictive_covenant;
+  }
+  if (typeof row.relatives_at_target_employers === "boolean") {
+    answers.relativesAtTargetEmployers = row.relatives_at_target_employers;
+  }
+  if (typeof row.previously_employed_at_target_employers === "boolean") {
+    answers.previouslyEmployedAtTargetEmployers =
+      row.previously_employed_at_target_employers;
+  }
+  const salary = typeof row.salary_expectation === "string" ? row.salary_expectation.trim() : "";
+  if (salary !== "") answers.salaryExpectation = salary;
   return answers;
 }
 
 /**
+ * JOB-112. The `resumes` row the pipeline will apply with, as `loadActiveResume`
+ * resolved it.
+ *
+ * A record rather than the bare path it used to be, because two more of that
+ * row's columns are now read: its id, which is what `resumes.parsed` is keyed
+ * on, and its LinkedIn export path, which nothing had ever read.
+ */
+export type ActiveResume = {
+  id: string;
+  storagePath: string;
+  linkedinPdfPath: string | null;
+};
+
+/**
  * Row → record. Shared by `loadCandidate` and `findCandidateByEmail`.
  *
- * `resumeUrl` is passed in rather than read off the row, because it lives on a
+ * The resume is passed in rather than read off the row, because it lives on a
  * different table now. Exported so the mapping can be tested against a row
  * shape without a database in the way.
  */
 export function toCandidateRecord(
   row: Record<string, unknown>,
-  resumeUrl: string
+  resume: ActiveResume
 ): CandidateRecord {
   const userId = String(row.id ?? "").trim();
   const applicationEmail = String(row.email ?? "").trim();
@@ -660,14 +898,26 @@ export function toCandidateRecord(
     throw new Error(`profiles ${userId} has no email.`);
   }
 
+  const githubUrl = typeof row.github_url === "string" ? row.github_url.trim() : "";
+
   return {
     userId,
     applicationEmail,
     // See the type. There is no column to read this from yet.
     linkedinUrl: null,
-    resumeUrl,
+    // JOB-044. Unlike linkedinUrl above, this one has a column and is read
+    // from it directly.
+    githubUrl: githubUrl !== "" ? githubUrl : null,
+    resumeId: resume.id,
+    resumeUrl: resume.storagePath,
+    linkedinPdfPath: resume.linkedinPdfPath,
     locations: Array.isArray(row.target_locations) ? row.target_locations.map(String) : null,
     applicationAnswers: toApplicationAnswers(row),
+    // JOB-134. Validated rather than cast: this column is JSON, so the only
+    // thing its type guarantees is that it parsed. `parseStoredAnswers` drops
+    // anything malformed, and a NULL column reads as an empty list, which is
+    // why no backfill was needed for rows that predate it.
+    storedAnswers: parseStoredAnswers(row.stored_answers),
   };
 }
 
@@ -684,24 +934,33 @@ export function toCandidateRecord(
  * employer's form with no resume to attach has already wasted a browser and an
  * application slot, and the failure is far more legible here.
  */
-async function loadActiveResume(supabase: SupabaseClient, userId: string): Promise<string> {
+async function loadActiveResume(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<ActiveResume> {
   const { data, error } = await supabase
     .from("resumes")
-    .select("storage_path,created_at")
+    .select("id,storage_path,linkedin_pdf_path,created_at")
     .eq("user_id", userId)
     .eq("is_active", true)
     .order("created_at", { ascending: false })
     .limit(1);
   if (error) throw new Error(`resumes lookup failed: ${error.message}`);
 
-  const storagePath = String(data?.[0]?.storage_path ?? "").trim();
+  const row = data?.[0];
+  const storagePath = String(row?.storage_path ?? "").trim();
   if (storagePath === "") {
     throw new Error(
       `No active resumes row for profile ${userId}. Finish onboarding at /onboarding, ` +
         `or attach one from the command line with \`npm run intake\`.`
     );
   }
-  return storagePath;
+  const linkedinPdfPath = String(row?.linkedin_pdf_path ?? "").trim();
+  return {
+    id: String(row?.id ?? "").trim(),
+    storagePath,
+    linkedinPdfPath: linkedinPdfPath === "" ? null : linkedinPdfPath,
+  };
 }
 
 /**

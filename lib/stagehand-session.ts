@@ -35,13 +35,12 @@
  * attached every function below behaves exactly as it did before.
  */
 
-import {
-  Stagehand,
-  browserbase,
-  localBrowser,
-  type Page,
-  type StagehandBrowser,
-} from "@browserbasehq/stagehand";
+// Type-only: erased before runtime, so this half of the package is never
+// actually resolved by `require()` and is unaffected by the JOB-029 issue
+// below. The runtime values (`Stagehand`, `browserbase`, `localBrowser`) come
+// from `loadStagehandRuntime()` instead of a top-level import — see the
+// comment on that function for why.
+import type { Page, Stagehand, StagehandBrowser } from "@browserbasehq/stagehand";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,6 +50,45 @@ import {
   planRecord,
   type ActionPlan,
 } from "@/lib/form-action-cache";
+
+/**
+ * JOB-029 (issue #47): `@browserbasehq/stagehand`'s package.json declares
+ * only an `"import"` export condition — it ships pure ESM (`dist/index.mjs`)
+ * and has no `"require"` condition at all. This file has no
+ * `"type": "module"` ancestor in package.json, so when it's run through
+ * `tsx <file>` (as every `lib/*-cli.ts` entrypoint is) tsx transpiles it to
+ * CommonJS and a top-level `import ... from "@browserbasehq/stagehand"` here
+ * becomes a plain `require()` at runtime — which fails outright with
+ * `ERR_PACKAGE_PATH_NOT_EXPORTED`, because Node's `require()` matches a
+ * package's exports map against the "require"/"node"/"default" conditions
+ * only and never falls back to "import". That happens for a bare
+ * `import { Stagehand } from "@browserbasehq/stagehand"` all on its own —
+ * it is not a tsx version regression (reproduces identically on tsx 4.7.0
+ * through the pinned 4.23.12) and has nothing to do with any other import
+ * sharing the file.
+ *
+ * A dynamic `import()`, by contrast, always goes through Node's real ESM
+ * resolver, which does honor the "import" condition, regardless of whether
+ * the calling file itself is CJS or ESM — so that's what loads the runtime
+ * values here instead. Deliberately called once and memoized, rather than
+ * inline at each call site: `openBrowserSession` can run many times
+ * concurrently (see `tests/unit/browser-session-concurrency.test.ts`), and
+ * routing every one of those calls through its own fresh `import()` call
+ * turned out to matter under Vitest specifically — concurrent first-time
+ * `import()` calls for the same specifier could race ahead of `vi.mock`'s
+ * module-registry substitution and load the real package instead of the
+ * mock. A single shared promise means only the first caller ever triggers a
+ * resolution at all; every later call, concurrent or not, awaits that same
+ * settled promise instead of starting a new one.
+ */
+type StagehandRuntime = typeof import("@browserbasehq/stagehand");
+let stagehandRuntimePromise: Promise<StagehandRuntime> | undefined;
+function loadStagehandRuntime(): Promise<StagehandRuntime> {
+  if (!stagehandRuntimePromise) {
+    stagehandRuntimePromise = import("@browserbasehq/stagehand");
+  }
+  return stagehandRuntimePromise;
+}
 
 /**
  * Model driving `act`/`extract`/`observe`. Stagehand validates this string
@@ -109,6 +147,24 @@ export type BrowserSession = {
 export type OpenBrowserSessionOptions = {
   headless: boolean;
   logTag: string;
+  /**
+   * Issue #88. When provided and `BROWSERBASE_CONTEXTS_ENABLED=1`, this
+   * Browserbase Context ID is attached to the session so cookies and
+   * localStorage persist across runs for the same user.
+   *
+   * Obtain it via `createBrowserbaseContext()` and store it in
+   * `profiles.browserbase_context_id`. Ignored for local browser sessions.
+   */
+  contextId?: string;
+  /**
+   * When `true`, the Browserbase session is launched without proxies.
+   *
+   * Ashby's spam filter specifically detects proxy IPs and rejects submissions
+   * from them (their rejection page lists "Turn off your VPN or proxy" as the
+   * first suggestion). Setting this disables proxies for Ashby sessions so the
+   * outbound IP is the Browserbase host rather than a proxy node.
+   */
+  disableProxies?: boolean;
 };
 
 // ───────────────────────────────────
@@ -126,6 +182,15 @@ export type EnvSource = Readonly<Record<string, string | undefined>>;
 export const BROWSERBASE_API_KEY_ENV_VAR = "BROWSERBASE_API_KEY";
 export const BROWSERBASE_PROJECT_ID_ENV_VAR = "BROWSERBASE_PROJECT_ID";
 export const BROWSERBASE_CONCURRENCY_ENV_VAR = "BROWSERBASE_CONCURRENCY";
+/**
+ * Set to `"1"` to enable Browserbase Contexts (issue #88). When enabled,
+ * `openBrowserSession` passes a persistent Context to the Browserbase session,
+ * carrying cookies and localStorage across runs for the same user.
+ *
+ * Off by default so existing deployments are unaffected until the Context IDs
+ * have been provisioned and stored in `profiles.browserbase_context_id`.
+ */
+export const BROWSERBASE_CONTEXTS_ENABLED_ENV_VAR = "BROWSERBASE_CONTEXTS_ENABLED";
 
 /**
  * Sessions this Browserbase project may run at once, when
@@ -177,6 +242,58 @@ export const BROWSERBASE_DEFAULT_CONCURRENCY = 3;
  * bounded for one that is not.
  */
 export const BROWSERBASE_SESSION_TIMEOUT_S = 20 * 60;
+
+/**
+ * Proxy and browser-presentation settings passed to Browserbase on every
+ * remote launch, for JOB-046 (issue #80): a real run sent 10 applications
+ * through Ashby-hosted boards across 6 unrelated companies and all 10 came
+ * back rejected with Ashby's own platform-wide "flagged as possible spam"
+ * message. The investigation the issue records traced the only
+ * `browserbase.launch()` call site (right below) and found two plain
+ * absences ranked as the highest-confidence, lowest-effort fix, ahead of
+ * typing cadence and mouse movement, which are separate, higher-effort work
+ * the issue explicitly defers until after this is re-tested: no proxy
+ * configured at all, and no `browserSettings` at all, so every session ran
+ * on whatever Browserbase's bare default happens to be — identically, every
+ * time. A third-party benchmark cited in the issue (moderate confidence, not
+ * first-party proof) found that exact unconfigured default leaking a
+ * `Playwright: true` framework flag and an identical hardware/GPU
+ * fingerprint across sessions.
+ *
+ * `BROWSERBASE_VIEWPORT` exists as its own named constant, following
+ * `BROWSERBASE_SESSION_TIMEOUT_S` immediately above, rather than an inline
+ * object at the call site, so a future caller — or a test — has one place to
+ * read what this pipeline claims to be and one place to change it.
+ *
+ * `browserSettings.os` was here too, set to `"windows"`, until a live test
+ * against the real Browserbase session-create API on this project's actual
+ * plan came back `400 Bad Request: "windows OS is only available for
+ * verified users, which is only available on the Enterprise plan. By
+ * default, we only support Linux."` — confirmed directly, not inferred.
+ * Every session on this project failed to create at all while that setting
+ * was live, which is strictly worse than the fingerprint gap it was meant to
+ * close. Removed rather than left in behind a flag: the whole point of
+ * naming it here was one place to change it, and Linux (Browserbase's
+ * default, unconfigured) is what this project can actually run. Revisit if
+ * the project ever moves to Enterprise. `advancedStealth` and `verified` are
+ * deliberately absent for the same reason `os` almost stayed in by mistake:
+ * issue #80's investigation confirmed `advancedStealth` is Scale-plan-gated,
+ * and `verified` gates `os` the same way `os` alone turned out to require it.
+ *
+ * `browserSettings.blockAds: true` was added for issue #85, for a different
+ * pair of stops than `os` was chasing: SmartRecruiters (`oneclick-ui` shape)
+ * filled an entire form and then reported no usable submit control at all,
+ * and Workable clicked what it identified as the submit control and got no
+ * confirmation either way — both genuinely unexplained. An ad iframe or
+ * overlay sitting on top of the real submit control, or intercepting the
+ * click, is a plausible explanation for either. Confidence: moderate — a
+ * real mechanism, not a documented Browserbase claim tied to this specific
+ * symptom. It is also a setting that can break something else: ad blocking
+ * can take out legitimate functionality served from an ad-network-adjacent
+ * domain, so this wants a re-run against both SmartRecruiters and Workable to
+ * confirm nothing this pipeline actually needs got blocked along with it.
+ */
+export const BROWSERBASE_VIEWPORT = { width: 1920, height: 1080 } as const;
 
 /**
  * Sessions the local Chromium path may run at once.
@@ -626,6 +743,76 @@ async function blockUnroutableDomains(
   }
 }
 
+// ───────────────────────────────────
+// Captcha-solving evidence (issue #85)
+// ───────────────────────────────────
+
+/** The two console markers Browserbase's own managed solver writes. */
+const CAPTCHA_SOLVING_STARTED_MARKER = "browserbase-solving-started";
+const CAPTCHA_SOLVING_FINISHED_MARKER = "browserbase-solving-finished";
+
+/**
+ * Best-effort text out of a `Runtime.consoleAPICalled` CDP event's `args`.
+ *
+ * This SDK's `page.on("console", …)` (below) hands a listener the raw CDP
+ * event, not a Playwright `ConsoleMessage` — there is no `.text()` to call.
+ * Each console argument is a Chrome DevTools `RemoteObject`; for the plain
+ * string `console.log(...)` calls a marker like this is written with, `value`
+ * carries the text directly. Deliberately permissive rather than a full CDP
+ * `RemoteObject` parser: this only ever has to recognise two fixed strings.
+ */
+function consoleEventArgsText(params: Record<string, unknown> | undefined): string {
+  const args = params?.args;
+  if (!Array.isArray(args)) return "";
+  return args
+    .map((arg) => {
+      if (arg === null || typeof arg !== "object") return "";
+      const record = arg as Record<string, unknown>;
+      if (typeof record.value === "string") return record.value;
+      if (typeof record.description === "string") return record.description;
+      return "";
+    })
+    .join(" ");
+}
+
+/**
+ * Issue #85: confirms — rather than assumes — that Browserbase's managed
+ * captcha solver actually engaged on a given run.
+ *
+ * `browserSettings.solveCaptchas` defaults to `true` already (confirmed in
+ * the installed `@browserbasehq/sdk` types) and nothing here changes that.
+ * What was missing was evidence: Browserbase's solver writes
+ * `browserbase-solving-started` / `browserbase-solving-finished` to the
+ * page's own console when it engages, so a console listener turns "maybe a
+ * captcha ate the submit button" into a yes/no for future debugging, right
+ * in the same log stream as the rest of a run's `logTag` narration (e.g.
+ * `[act-007]`/`[act-008]`).
+ *
+ * Best effort, in the same shape as `blockUnroutableDomains` just above: a
+ * `page` that does not implement `on()` at all — every mocked page in this
+ * repo's test suite, and any future non-Browserbase provider — must not be
+ * the reason a run fails over a piece of after-the-fact evidence.
+ */
+async function watchForCaptchaSolvingEvidence(page: Page, logTag: string): Promise<void> {
+  try {
+    await page.on("console", (event) => {
+      const text = consoleEventArgsText(event.params);
+      if (text.includes(CAPTCHA_SOLVING_STARTED_MARKER)) {
+        console.log(`${logTag} captcha solving detected: started`);
+      } else if (text.includes(CAPTCHA_SOLVING_FINISHED_MARKER)) {
+        console.log(`${logTag} captcha solving detected: finished`);
+      }
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `${logTag} could not attach a console listener for captcha-solving evidence (ignored): ` +
+        `${reason}. This does not change whether Browserbase's own captcha solver runs — only ` +
+        `whether this process can see when it did.`
+    );
+  }
+}
+
 export async function openBrowserSession(
   options: OpenBrowserSessionOptions
 ): Promise<BrowserSession> {
@@ -637,6 +824,10 @@ export async function openBrowserSession(
         `pipeline; do not point it at another project's key.`
     );
   }
+
+  // See `loadStagehandRuntime` above (JOB-029) for why this isn't a
+  // top-level import.
+  const { Stagehand, browserbase, localBrowser } = await loadStagehandRuntime();
 
   // Resolved before a slot is taken, so a half configured environment fails
   // immediately and without ever occupying the queue.
@@ -656,6 +847,12 @@ export async function openBrowserSession(
   const slot = await acquireSessionSlot(options.logTag);
   let browser: StagehandBrowser;
   try {
+    // Issue #88: attach a persistent Context when the feature flag is on and
+    // the caller supplied a context ID. Falls back to ephemeral if not.
+    const contextsEnabled =
+      process.env[BROWSERBASE_CONTEXTS_ENABLED_ENV_VAR] === "1";
+    const contextId = contextsEnabled ? options.contextId : undefined;
+
     browser =
       choice.provider === "browserbase"
         ? await browserbase.launch({
@@ -665,6 +862,18 @@ export async function openBrowserSession(
             // mapped to anything: a Browserbase session has no display either
             // way, and its live view is how a run gets watched.
             api_timeout: BROWSERBASE_SESSION_TIMEOUT_S,
+            // JOB-046 (issue #80): see `BROWSERBASE_VIEWPORT`'s comment above
+            // for why these are here and what is deliberately not (including
+            // `os`, which was here too and broke every session on this plan).
+            // `blockAds` (issue #85) is documented in that same comment.
+            // Ashby's spam filter detects proxy IPs and rejects submissions;
+            // `disableProxies` lets the caller opt out for boards known to flag them.
+            proxies: options.disableProxies !== true,
+            browserSettings: {
+              viewport: BROWSERBASE_VIEWPORT,
+              blockAds: true,
+              ...(contextId !== undefined ? { context: { id: contextId, persist: true } } : {}),
+            },
           })
         : await localBrowser.launch({ headless: options.headless });
   } catch (err) {
@@ -700,6 +909,9 @@ export async function openBrowserSession(
     const context = stagehand.browser.context;
     await blockUnroutableDomains(context, options.logTag);
     const page = (await context.activePage()) ?? (await context.newPage());
+    // Issue #85: evidence that Browserbase's captcha solver did or did not
+    // fire on this run, in the same log stream as the rest of it.
+    await watchForCaptchaSolvingEvidence(page, options.logTag);
     const session: BrowserSession = { stagehand, browser, page, logTag: options.logTag };
     // The last statement before the return, so a session only ever becomes the
     // holder of a slot once it is a session the caller actually has and can
@@ -794,6 +1006,136 @@ export async function closeBrowserSession(session: BrowserSession): Promise<void
       slotForSession.delete(session);
       releaseSessionSlot(slot);
     }
+  }
+}
+
+// ───────────────────────────────────
+// Browserbase Contexts (issue #88)
+// ───────────────────────────────────
+
+/**
+ * In-memory table of per-user context-creation Promises.
+ *
+ * When two runs for the same user start simultaneously, only the first call to
+ * `createBrowserbaseContext` for that user actually hits the Browserbase REST
+ * API. Any subsequent call that arrives while the first is in flight awaits the
+ * same Promise and gets the same result. This prevents duplicate context rows
+ * in a single process; duplicate contexts across processes are not possible
+ * because the second process reads from the database and finds the one the
+ * first process already stored.
+ */
+const contextCreationInFlight: Map<string, Promise<string>> = new Map();
+
+/**
+ * Creates a new Browserbase Context for the given user, returning its ID.
+ *
+ * The returned ID should be stored in `profiles.browserbase_context_id` so
+ * subsequent runs can reuse the same context. Call this at most once per user;
+ * subsequent runs should pass the stored ID directly to `openBrowserSession`.
+ *
+ * Concurrency-safe within a single process: simultaneous calls for the same
+ * userId share one in-flight Promise and receive the same context ID.
+ */
+export async function createBrowserbaseContext(
+  userId: string,
+  apiKey: string,
+  projectId: string
+): Promise<string> {
+  const existing = contextCreationInFlight.get(userId);
+  if (existing !== undefined) return existing;
+
+  const creation = (async (): Promise<string> => {
+    try {
+      const response = await fetch("https://api.browserbase.com/v1/contexts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-BB-API-Key": apiKey,
+        },
+        body: JSON.stringify({ projectId }),
+      });
+      if (!response.ok) {
+        const body = await response.text().catch(() => "(unreadable)");
+        throw new Error(
+          `Browserbase context creation failed with HTTP ${response.status}: ${body}`
+        );
+      }
+      const data = (await response.json()) as { id: string };
+      if (typeof data.id !== "string" || data.id.length === 0) {
+        throw new Error(`Browserbase context creation returned an unexpected body: ${JSON.stringify(data)}`);
+      }
+      return data.id;
+    } finally {
+      contextCreationInFlight.delete(userId);
+    }
+  })();
+
+  contextCreationInFlight.set(userId, creation);
+  return creation;
+}
+
+/**
+ * JOB-050 — the missing half of issue #88's Contexts work.
+ *
+ * `createBrowserbaseContext` above has existed and been correct since #88, and
+ * `openBrowserSession` has known how to attach a context since then too. Between
+ * the two there was nothing: no caller ever created a context, and no caller
+ * ever passed `contextId`, so the feature was unreachable code behind a flag
+ * nobody could usefully set. The `browserbase_context_id` column its own
+ * migration adds was likewise never read or written.
+ *
+ * That mattered because a context is the one countermeasure aimed squarely at
+ * what a cold session looks like: same fingerprint, same cookie jar, run after
+ * run, which is a returning device rather than a new machine every time.
+ *
+ * Returns `undefined` rather than throwing on every failure path, and that is
+ * deliberate. A context is a hardening measure, not a correctness requirement;
+ * an application that would have gone out without one should still go out when
+ * the contexts API is unreachable, the flag is off, or the column write loses a
+ * race. The only cost of returning `undefined` is a session that looks as cold
+ * as every session looked before this function existed.
+ */
+export async function resolveBrowserbaseContextId(input: {
+  userId: string;
+  /** Reads `profiles.browserbase_context_id` and writes it back when minted. */
+  readStoredId: () => Promise<string | null>;
+  persistId: (contextId: string) => Promise<void>;
+  logTag: string;
+  env?: EnvSource;
+}): Promise<string | undefined> {
+  const env = input.env ?? process.env;
+  if (readEnv(env, BROWSERBASE_CONTEXTS_ENABLED_ENV_VAR) !== "1") return undefined;
+
+  const choice = chooseBrowserProvider(env);
+  if (choice.provider !== "browserbase") return undefined;
+
+  try {
+    const stored = await input.readStoredId();
+    if (stored !== null && stored !== "") {
+      console.log(`${input.logTag} reusing Browserbase context ${stored.slice(0, 8)}…`);
+      return stored;
+    }
+
+    const created = await createBrowserbaseContext(input.userId, choice.apiKey, choice.projectId);
+    // Persisted before it is returned, so the next run reuses this one instead
+    // of minting another. A failure to persist is not a failure to browse: the
+    // context still works for this run, it just will not be found again.
+    try {
+      await input.persistId(created);
+    } catch (err) {
+      console.log(
+        `${input.logTag} Browserbase context ${created.slice(0, 8)}… was created but not stored ` +
+          `(${err instanceof Error ? err.message : String(err)}), so the next run will mint a new one`
+      );
+    }
+    console.log(`${input.logTag} created Browserbase context ${created.slice(0, 8)}…`);
+    return created;
+  } catch (err) {
+    console.log(
+      `${input.logTag} continuing without a Browserbase context: ` +
+        `${err instanceof Error ? err.message : String(err)}`
+    );
+    return undefined;
   }
 }
 

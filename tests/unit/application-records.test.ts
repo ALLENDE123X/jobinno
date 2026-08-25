@@ -188,13 +188,23 @@ describe("loadCandidate", () => {
     expect(calls.map((call) => call.table)).not.toContain("job_applications");
 
     // The exact column list, because a typo in it is the whole bug class. The
-    // trailing four are JOB-022's, and a column missing from here is not a typo
-    // sized problem: intake wrote all four of them and this list not naming them
-    // is why the form filler had no graduation date, no start date and no
-    // citizenship status to answer a form with.
+    // trailing four before `github_url` are JOB-022's, and a column missing
+    // from here is not a typo sized problem: intake wrote all four of them and
+    // this list not naming them is why the form filler had no graduation date,
+    // no start date and no citizenship status to answer a form with. JOB-044
+    // added `github_url` on the same reasoning, and JOB-101 the eight after it
+    // on exactly the same reasoning again: a clearance eligibility written at
+    // intake and absent from this line is a question the candidate answered
+    // that no form ever gets told about. JOB-134's trailing five are four more
+    // of exactly that plus `stored_answers`, which is the log of every question
+    // this person has answered that intake never asked.
     expect(callTo("profiles").columns).toBe(
       "id,email,target_locations,work_authorized_us,requires_sponsorship,current_country," +
-        "current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start"
+        "current_city,willing_to_relocate,citizenship_status,f1_status,grad_date,earliest_start," +
+        "github_url,clearance_eligibility,clearance_level_held,needs_sponsorship_non_us," +
+        "visa_status,high_school_name,high_school_grad_year,street_address,postal_code," +
+        "subject_to_restrictive_covenant,relatives_at_target_employers," +
+        "previously_employed_at_target_employers,salary_expectation,stored_answers"
     );
     expect(callTo("profiles").filters).toContainEqual(["eq", "id", USER_ID]);
 
@@ -227,7 +237,11 @@ describe("loadCandidate", () => {
   it("maps a null answer to an absent one, never to a no", () => {
     const record = toCandidateRecord(
       { ...profileRow, requires_sponsorship: null, willing_to_relocate: null },
-      "resumes/user/abc.pdf"
+      {
+        id: "1c0ffee0-0000-4000-8000-000000000001",
+        storagePath: "resumes/user/abc.pdf",
+        linkedinPdfPath: null,
+      }
     );
     expect(record.applicationAnswers.workAuthorizedUs).toBe(true);
     expect("requiresSponsorship" in record.applicationAnswers).toBe(false);
@@ -246,6 +260,7 @@ describe("updateApplication", () => {
       confirmationText: "REF-1234",
       submittedAt: "2026-08-19T00:00:00.000Z",
       redirectUrl: "https://boards.example.com/thanks",
+      browserbaseSessionId: "bb-session-abc123",
     });
 
     const call = callTo("applications");
@@ -255,6 +270,7 @@ describe("updateApplication", () => {
       confirmation_text: "REF-1234",
       submitted_at: "2026-08-19T00:00:00.000Z",
       redirect_url: "https://boards.example.com/thanks",
+      browserbase_session_id: "bb-session-abc123",
     });
     // Two columns actinno wrote that do not exist here. Writing either would be
     // rejected by PostgREST at runtime and by nothing at compile time.
@@ -266,6 +282,23 @@ describe("updateApplication", () => {
   it("does not issue an UPDATE at all when the patch is empty", async () => {
     await updateApplication(client(), APPLICATION_ID, {});
     expect(calls).toHaveLength(0);
+  });
+
+  // JOB-045. `browserbase_session_id` follows the same "undefined means leave
+  // it out, explicit null means write null" rule every other column here does
+  // — see `patchColumns`. A run with no Browserbase session (the local
+  // Chromium fallback) has to be able to say so on the row rather than the
+  // column just being silently skipped.
+  it("writes an explicit null for browserbaseSessionId rather than omitting the column", async () => {
+    await updateApplication(client(), APPLICATION_ID, {
+      status: "form_filled",
+      browserbaseSessionId: null,
+    });
+
+    expect(callTo("applications").payload).toEqual({
+      status: "form_filled",
+      browserbase_session_id: null,
+    });
   });
 });
 
@@ -365,7 +398,7 @@ describe("recordSkip", () => {
       field_label: "Are you legally authorized to work in the United States?",
       field_kind: "radio",
       required: true,
-      raw_context: { message: "needs_candidate_input: 3 required field(s)" },
+      raw_context: { message: "needs_candidate_input: 3 required field(s)", browserbaseSessionId: null },
     });
   });
 
@@ -409,6 +442,30 @@ describe("recordFailure", () => {
     expect(skip.reason).toBe("captcha");
     // The status is a real one, not an intermediate "waiting for something".
     expect(callTo("applications").payload).not.toEqual({ status: "awaiting_verification" });
+  });
+
+  // JOB-045. `raw_context.browserbaseSessionId` (via `recordSkip`, above) was
+  // the only place this ever landed before — a stop's recording, not the row
+  // itself. When the caller has one to give, it now has to reach both, because
+  // `applications.browserbase_session_id` is meant to answer "which recording
+  // is THIS attempt" for a query against `applications` alone, with no join to
+  // `skip_log` required.
+  it("carries the Browserbase session id onto both the row and the skip log, when the caller has one", async () => {
+    await recordFailure(client(), {
+      applicationId: APPLICATION_ID,
+      jobId: JOB_ID,
+      ats: "greenhouse",
+      status: "form_fill_blocked",
+      message: "captcha_present: an hCaptcha widget is on the application form",
+      browserbaseSessionId: "bb-session-xyz789",
+    });
+
+    expect(callTo("applications").payload).toEqual({
+      status: "form_fill_blocked",
+      browserbase_session_id: "bb-session-xyz789",
+    });
+    const skip = callTo("skip_log").payload as { raw_context: { browserbaseSessionId: string | null } };
+    expect(skip.raw_context.browserbaseSessionId).toBe("bb-session-xyz789");
   });
 
   it("never throws over the original error when the database refuses both writes", async () => {
@@ -729,14 +786,20 @@ liveDbSuite("the columns the code writes exist in the real schema", () => {
          set status = 'submitted',
              confirmation_text = 'REF-1234',
              submitted_at = now(),
-             redirect_url = 'https://boards.example.com/thanks'
+             redirect_url = 'https://boards.example.com/thanks',
+             browserbase_session_id = 'bb-session-live-test'
        where id = ${APPLICATION_ID}`;
 
     const [application] = await sql<
-      { status: string; confirmation_text: string | null }[]
-    >`select status, confirmation_text from public.applications where id = ${APPLICATION_ID}`;
+      { status: string; confirmation_text: string | null; browserbase_session_id: string | null }[]
+    >`select status, confirmation_text, browserbase_session_id from public.applications
+       where id = ${APPLICATION_ID}`;
     expect(application?.status).toBe("submitted");
     expect(application?.confirmation_text).toBe("REF-1234");
+    // JOB-045. Nullable, and this is the migration this proves landed: the
+    // column did not exist before it, and this query would fail against a
+    // database that never got the migration applied.
+    expect(application?.browserbase_session_id).toBe("bb-session-live-test");
   });
 
   it("accepts the skip_log row the failure path writes, column for column", async () => {

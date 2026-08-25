@@ -1,6 +1,6 @@
 // @vitest-environment node
 /**
- * The checkout route (JOB-010), and the two things it must refuse.
+ * The checkout route (JOB-010), and the things it must refuse.
  *
  * ── Why this file exists ────────────────────────────────────────────────────
  * `tests/unit/billing-plans.test.ts` proves `alreadyCoveredBy` computes the
@@ -9,6 +9,11 @@
  * person's card. So this drives the real handler and asserts that no Checkout
  * Session is opened at all in that case, rather than testing the predicate
  * twice.
+ *
+ * JOB-033 adds the Origin check. `pressBuy` sends a trusted `Origin` by
+ * default so every test above stays about what it always tested; the "Origin
+ * check" describe block below is where cross-origin and missing-header
+ * requests are exercised directly.
  *
  * Nothing here reaches Stripe. `createCheckoutSession` is mocked, and the
  * assertion that matters most is `not.toHaveBeenCalled()`.
@@ -53,7 +58,13 @@ function supabaseStub(profile: Record<string, unknown> | null) {
   };
 }
 
-async function pressBuy(plan: string) {
+/**
+ * Presses "Get Starter" with a trusted, same-origin `Origin` header by
+ * default, since that is what every browser actually sends on this form post
+ * and it is not what the tests above are about. Pass `headers` to override it
+ * for the Origin-check tests themselves.
+ */
+async function pressBuy(plan: string, headers?: HeadersInit) {
   const { POST } = await import("@/app/api/billing/checkout/route");
   const { NextRequest } = await import("next/server");
 
@@ -64,6 +75,7 @@ async function pressBuy(plan: string) {
     new NextRequest("https://jobinno.app/api/billing/checkout", {
       method: "POST",
       body: form,
+      headers: headers ?? { origin: "https://jobinno.app" },
     })
   );
 }
@@ -170,5 +182,68 @@ describe("the checkout route", () => {
     // their browser history. The reason belongs in the server log.
     expect(billingErrorOf(response)).toBe("checkout_failed");
     expect(location).not.toContain("price_1ABCdefGHIjklMNO");
+  });
+
+  /**
+   * JOB-033. `pressBuy`'s default `Origin` header is exactly what the
+   * "opens a checkout for somebody on the free tier" test above already
+   * proves works, so it is not repeated here — this block is only the cases
+   * where the Origin is wrong, or missing.
+   */
+  describe("the Origin check", () => {
+    it("refuses a cross-origin POST, the hidden-form attack the ticket describes", async () => {
+      createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+
+      const response = await pressBuy("starter", {
+        origin: "https://evil.example",
+      });
+
+      expect(createCheckoutSession).not.toHaveBeenCalled();
+      expect(response.status).toBe(403);
+    });
+
+    it("refuses a request with neither an Origin nor a Referer, rather than failing open", async () => {
+      createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+
+      const response = await pressBuy("starter", {});
+
+      expect(createCheckoutSession).not.toHaveBeenCalled();
+      expect(response.status).toBe(403);
+    });
+
+    it("refuses a request with no Origin and a Referer pointing elsewhere", async () => {
+      createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+
+      const response = await pressBuy("starter", {
+        referer: "https://evil.example/attack.html",
+      });
+
+      expect(createCheckoutSession).not.toHaveBeenCalled();
+      expect(response.status).toBe(403);
+    });
+
+    it("falls back to a same-origin Referer when Origin is missing", async () => {
+      // Some browser/referrer-policy combinations omit Origin on a same-origin
+      // form post. That should not be treated as an attack.
+      createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+
+      const response = await pressBuy("starter", {
+        referer: "https://jobinno.app/",
+      });
+
+      expect(createCheckoutSession).toHaveBeenCalledTimes(1);
+      expect(response.status).toBe(303);
+    });
+
+    it("accepts the www production origin, JOB-023's second real hostname", async () => {
+      createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+
+      const response = await pressBuy("starter", {
+        origin: "https://www.jobinno.app",
+      });
+
+      expect(createCheckoutSession).toHaveBeenCalledTimes(1);
+      expect(response.status).toBe(303);
+    });
   });
 });
