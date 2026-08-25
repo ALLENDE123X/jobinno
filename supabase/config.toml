@@ -24,6 +24,12 @@ additional_redirect_urls = [
   # deployment, not a typo: it is a CNAME to Vercel and answers `/login` with a
   # 200. People arrive on it, so the magic link has to be allowed to land on it.
   "https://www.jobinno.app/auth/callback",
+  # JOB-164. Vercel preview deployments of this project under the nullcoders
+  # team scope. Supabase's own wildcard syntax, one star per path segment and
+  # two for any depth. Scoped to this project's previews only, deliberately not
+  # *.vercel.app. The app side accepts the same set through the hostname
+  # pattern in lib/auth/redirect-urls.ts; keep both halves in sync.
+  "https://jobinno-*-nullcoders-projects.vercel.app/**",
 ]
 
 # Everything from here down restates what the project already has set. It is

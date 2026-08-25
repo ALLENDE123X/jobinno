@@ -51,14 +51,47 @@ export const WWW_PRODUCTION_ORIGIN = "https://www.jobinno.app";
 export const LOCAL_DEV_ORIGIN = "http://localhost:3000";
 
 /**
+ * Vercel preview deployments of this project on the nullcoders team (JOB-164).
+ *
+ * This is the Supabase style glob, spelled exactly as it appears in
+ * `additional_redirect_urls` in `supabase/config.toml`: the unit test that
+ * compares the two halves compares them as sets of strings, so the pattern has
+ * to be byte for byte identical on both sides or the suite fails. It is a
+ * pattern rather than an origin, which is why `authCallbackUrlFor` decides
+ * concrete acceptance with the hostname pattern below instead of membership
+ * here.
+ *
+ * Deliberately not `*.vercel.app`. That would admit every deployment anyone
+ * has ever published anywhere on Vercel. This admits only previews whose
+ * project name starts with `jobinno` under the nullcoders team scope.
+ */
+export const VERCEL_PREVIEW_ALLOWLIST_PATTERN =
+  "https://jobinno-*-nullcoders-projects.vercel.app/**";
+
+/**
+ * The hostname half of the same decision, as a strict match against one
+ * segment between the fixed prefix and the fixed team suffix. Anything else,
+ * including other teams' projects that happen to start with `jobinno`, still
+ * throws below.
+ */
+export const VERCEL_PREVIEW_HOSTNAME_PATTERN =
+  /^jobinno-[a-z0-9]+-nullcoders-projects\.vercel\.app$/;
+
+/**
  * Every callback URL the app is allowed to ask Supabase to send someone to.
  * Sorted, because the test that compares this against `supabase/config.toml`
  * compares sets and a stable order makes a failure readable.
+ *
+ * The final entry is the preview wildcard above, present so the set comparison
+ * against `additional_redirect_urls` keeps holding and the error message below
+ * names it. Concrete preview origins are accepted by `authCallbackUrlFor`
+ * through `VERCEL_PREVIEW_HOSTNAME_PATTERN`.
  */
 export const AUTH_REDIRECT_ALLOWLIST = [
   `${LOCAL_DEV_ORIGIN}${AUTH_CALLBACK_PATH}`,
   `${PRODUCTION_ORIGIN}${AUTH_CALLBACK_PATH}`,
   `${WWW_PRODUCTION_ORIGIN}${AUTH_CALLBACK_PATH}`,
+  VERCEL_PREVIEW_ALLOWLIST_PATTERN,
 ] as const;
 
 /**
@@ -82,15 +115,30 @@ export const AUTH_REDIRECT_ALLOWLIST = [
 export function authCallbackUrlFor(origin: string): string {
   const candidate = `${origin.replace(/\/+$/, "")}${AUTH_CALLBACK_PATH}`;
 
-  if (!(AUTH_REDIRECT_ALLOWLIST as readonly string[]).includes(candidate)) {
+  let isVercelPreviewHostname = false;
+  try {
+    const { hostname } = new URL(candidate);
+    isVercelPreviewHostname =
+      VERCEL_PREVIEW_HOSTNAME_PATTERN.test(hostname);
+  } catch {
+    // An origin that is not an absolute URL cannot be a preview deployment.
+    // It falls through to the exact membership check, which rejects it below.
+  }
+
+  if (
+    !isVercelPreviewHostname &&
+    !(AUTH_REDIRECT_ALLOWLIST as readonly string[]).includes(candidate)
+  ) {
     throw new Error(
       `Refusing to send a magic link to ${candidate}: it is not in Jobinno's ` +
         `redirect allowlist. Supabase would not reject it either, it would ` +
         `silently redirect to the project Site URL instead and the emailed ` +
         `link would go nowhere useful. Allowed: ` +
-        `${AUTH_REDIRECT_ALLOWLIST.join(", ")}. To add one, put it in ` +
-        `AUTH_REDIRECT_ALLOWLIST and in additional_redirect_urls in ` +
-        `supabase/config.toml, then run npm run supabase:auth-config.`
+        `${AUTH_REDIRECT_ALLOWLIST.join(", ")}. Preview deployments whose ` +
+        `hostname matches jobinno-*-nullcoders-projects.vercel.app are also ` +
+        `accepted. To add one, put it in AUTH_REDIRECT_ALLOWLIST and in ` +
+        `additional_redirect_urls in supabase/config.toml, then run npm run ` +
+        `supabase:auth-config.`
     );
   }
 
