@@ -136,11 +136,20 @@ beforeEach(() => {
   state.updates = [];
 });
 
+// v1-BLOCKER-2 (#152). Body shape is the camelCase array v1-D's
+// `EscalationForm` submits; each entry carries its own `question` verbatim
+// and the pipeline's `topicSlug` when one was assigned.
+const QUESTION_TEXT = "Are you legally authorized to work in the United States?";
+
 describe("PUT /api/applications/[id]/escalation-answers", () => {
   it("401s a caller with no session", async () => {
     state.currentUserId = null;
     const response = await PUT(
-      makeRequest({ answers: { x: "y" } }),
+      makeRequest({
+        answers: [
+          { topicSlug: "work_auth_current_us", question: QUESTION_TEXT, answer: "Yes" },
+        ],
+      }),
       { params: Promise.resolve({ id: APPLICATION_ID }) }
     );
     expect(response.status).toBe(401);
@@ -151,9 +160,9 @@ describe("PUT /api/applications/[id]/escalation-answers", () => {
     state.currentUserId = OTHER_USER_ID;
     const response = await PUT(
       makeRequest({
-        answers: {
-          "are you legally authorized to work in the united states?": "Yes",
-        },
+        answers: [
+          { topicSlug: "work_auth_current_us", question: QUESTION_TEXT, answer: "Yes" },
+        ],
       }),
       { params: Promise.resolve({ id: APPLICATION_ID }) }
     );
@@ -165,9 +174,9 @@ describe("PUT /api/applications/[id]/escalation-answers", () => {
     state.application!.status = "discovered";
     const response = await PUT(
       makeRequest({
-        answers: {
-          "are you legally authorized to work in the united states?": "Yes",
-        },
+        answers: [
+          { topicSlug: "work_auth_current_us", question: QUESTION_TEXT, answer: "Yes" },
+        ],
       }),
       { params: Promise.resolve({ id: APPLICATION_ID }) }
     );
@@ -175,16 +184,60 @@ describe("PUT /api/applications/[id]/escalation-answers", () => {
     expect(state.updates).toHaveLength(0);
   });
 
+  it("400s an empty answers array", async () => {
+    const response = await PUT(
+      makeRequest({ answers: [] }),
+      { params: Promise.resolve({ id: APPLICATION_ID }) }
+    );
+    expect(response.status).toBe(400);
+    expect(state.updates).toHaveLength(0);
+  });
+
+  it("400s an entry missing the question text", async () => {
+    const response = await PUT(
+      makeRequest({
+        answers: [{ topicSlug: null, answer: "Yes" }],
+      }),
+      { params: Promise.resolve({ id: APPLICATION_ID }) }
+    );
+    expect(response.status).toBe(400);
+    expect(state.updates).toHaveLength(0);
+  });
+
+  it("400s an entry missing the answer text", async () => {
+    const response = await PUT(
+      makeRequest({
+        answers: [{ topicSlug: null, question: QUESTION_TEXT }],
+      }),
+      { params: Promise.resolve({ id: APPLICATION_ID }) }
+    );
+    expect(response.status).toBe(400);
+    expect(state.updates).toHaveLength(0);
+  });
+
+  it("400s an answers key that is an object (the pre-#152 shape)", async () => {
+    const response = await PUT(
+      makeRequest({ answers: { "some field": "Yes" } }),
+      { params: Promise.resolve({ id: APPLICATION_ID }) }
+    );
+    expect(response.status).toBe(400);
+    expect(state.updates).toHaveLength(0);
+  });
+
   it("merges the answers into profiles.stored_answers and flips status to discovered", async () => {
     const response = await PUT(
       makeRequest({
-        answers: {
-          "are you legally authorized to work in the united states?": "Yes",
-        },
+        answers: [
+          { topicSlug: "work_auth_current_us", question: QUESTION_TEXT, answer: "Yes" },
+        ],
       }),
       { params: Promise.resolve({ id: APPLICATION_ID }) }
     );
     expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; answersMerged: number };
+    expect(body.ok).toBe(true);
+    expect(body.answersMerged).toBe(1);
+
     const profileUpdate = state.updates.find((u) => u.table === "profiles");
     const applicationUpdate = state.updates.find((u) => u.table === "applications");
 
@@ -196,12 +249,11 @@ describe("PUT /api/applications/[id]/escalation-answers", () => {
     }>);
     expect(answers).toHaveLength(1);
     // v1-B's `rememberAnswers` lowercases and length-caps the question before
-    // storing, so the stored form is the normalized shape rather than the
+    // storing, so the stored form is the normalised shape rather than the
     // employer's original casing. See `lib/candidate-answers.ts`.
-    expect(answers[0]!.question).toBe(
-      "are you legally authorized to work in the united states?"
-    );
+    expect(answers[0]!.question).toBe(QUESTION_TEXT.toLowerCase());
     expect(answers[0]!.answer).toBe("Yes");
+    expect(answers[0]!.topic).toBe("work_auth_current_us");
 
     expect(applicationUpdate).toBeDefined();
     expect(applicationUpdate!.payload.status).toBe("discovered");
@@ -209,20 +261,31 @@ describe("PUT /api/applications/[id]/escalation-answers", () => {
     expect(typeof applicationUpdate!.payload.escalation_resolved_at).toBe("string");
   });
 
-  it("silently drops answer keys the row never escalated on", async () => {
+  it("accepts an unknown-intent entry (topicSlug null) and still merges the answer", async () => {
+    // The pipeline may escalate a question without a slug when the classifier
+    // did not recognise the intent. The route must still merge the answer;
+    // `rememberAnswers` re-runs the classifier and picks up a slug if the
+    // taxonomy has since grown to cover it, otherwise the entry is filed by
+    // normalised question text. Either behaviour is correct — the round-trip
+    // property is that the answer is remembered, not what it was keyed on.
     const response = await PUT(
       makeRequest({
-        answers: {
-          "some field the run never surfaced": "Whatever",
-        },
+        answers: [
+          { topicSlug: null, question: "How did you hear about us?", answer: "LinkedIn" },
+        ],
       }),
       { params: Promise.resolve({ id: APPLICATION_ID }) }
     );
     expect(response.status).toBe(200);
-    // No profile update, because nothing merged; row still flipped.
     const profileUpdate = state.updates.find((u) => u.table === "profiles");
-    expect(profileUpdate).toBeUndefined();
-    const applicationUpdate = state.updates.find((u) => u.table === "applications");
-    expect(applicationUpdate!.payload.status).toBe("discovered");
+    expect(profileUpdate).toBeDefined();
+    const answers = profileUpdate!.payload.stored_answers as Array<{
+      question: string;
+      answer: string;
+      topic: string | null;
+    }>;
+    expect(answers).toHaveLength(1);
+    expect(answers[0]!.answer).toBe("LinkedIn");
+    expect(answers[0]!.question).toBe("how did you hear about us?");
   });
 });

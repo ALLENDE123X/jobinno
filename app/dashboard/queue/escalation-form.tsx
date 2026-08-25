@@ -6,12 +6,18 @@
  * purpose: it is a controlled form with a submit button and nothing else, and
  * the row's optimistic disappearance is the parent's business, not this one's.
  *
- * ── Why a hidden trip through `question_text` when there is no slug ─────────
- * v1-B's classifier does not always assign a `topic_slug`: an unknown intent
+ * ── Why the payload carries both `topicSlug` and `question` ────────────────
+ * v1-B's classifier does not always assign a `topicSlug`: an unknown intent
  * gets escalated so the person can still make the submission move. When that
- * happens the resume endpoint keys the writeback on `question_text` instead,
- * which means this form has to send both when it has both and one when it has
- * one, and never nothing. That is what the payload builder below enforces.
+ * happens the resume endpoint keys the writeback on `question` instead, which
+ * means this form has to send both when it has both and just the question when
+ * it does not, and never nothing. The payload builder below enforces that.
+ *
+ * ── v1-BLOCKER-2 (#152): one camelCase shape across the cycle ──────────────
+ * The submit body is `{answers: [{topicSlug, question, answer}, ...]}` and the
+ * key names match the columns v1-C's `writeEscalation` persists and the reader
+ * in `lib/dashboard/queue-data.ts` surfaces. No side of the round trip has to
+ * translate between conventions.
  */
 
 import { useState } from "react";
@@ -23,8 +29,8 @@ import type { EscalationQuestion } from "@/lib/dashboard/queue-data";
 
 export type EscalationSubmitPayload = {
   answers: Array<{
-    topic_slug?: string | null;
-    question_text?: string | null;
+    topicSlug: string | null;
+    question: string;
     answer: string;
   }>;
 };
@@ -58,8 +64,8 @@ export function EscalationForm({ applicationId, questions, onResolved }: Props) 
       }
       const q = questions[i];
       payload.answers.push({
-        topic_slug: q.topic_slug ?? null,
-        question_text: q.question_text,
+        topicSlug: q.topicSlug ?? null,
+        question: q.question,
         answer,
       });
     }
@@ -88,11 +94,11 @@ export function EscalationForm({ applicationId, questions, onResolved }: Props) 
     <form onSubmit={handleSubmit} className="space-y-4">
       {questions.map((q, i) => {
         const inputId = `q-${applicationId}-${i}`;
-        const options = q.question_options ?? null;
+        const options = q.options ?? null;
         return (
           <div key={inputId} className="space-y-2">
             <Label htmlFor={inputId} className="block text-sm font-medium">
-              {q.question_text}
+              {q.question}
             </Label>
 
             {options && options.length > 0 ? (

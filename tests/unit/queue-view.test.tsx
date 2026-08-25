@@ -44,16 +44,21 @@ function withRows(): ApplicationQueue {
         escalationCreatedAt: "2026-08-24T09:00:00.000Z",
         escalationQuestions: [
           {
-            question_text: "Are you authorized to work in the US?",
-            question_options: ["Yes", "No"],
-            topic_slug: "work_auth_current_us",
-            field_key: "work_auth",
+            // v1-BLOCKER-2 (#152): camelCase everywhere.
+            fieldKey: "work_auth",
+            fieldLabel: "Are you authorized to work in the US?",
+            question: "Are you authorized to work in the US?",
+            options: ["Yes", "No"],
+            required: true,
+            topicSlug: "work_auth_current_us",
           },
           {
-            question_text: "How did you hear about us?",
-            topic_slug: null,
-            field_key: "referral",
-            question_options: null,
+            fieldKey: "referral",
+            fieldLabel: "How did you hear about us?",
+            question: "How did you hear about us?",
+            options: null,
+            required: false,
+            topicSlug: null,
           },
         ],
       },
@@ -137,13 +142,13 @@ describe("the queue view", () => {
     const body = JSON.parse((init?.body as string) ?? "{}");
     expect(body.answers).toHaveLength(2);
     expect(body.answers[0]).toMatchObject({
-      topic_slug: "work_auth_current_us",
-      question_text: "Are you authorized to work in the US?",
+      topicSlug: "work_auth_current_us",
+      question: "Are you authorized to work in the US?",
       answer: "Yes",
     });
     expect(body.answers[1]).toMatchObject({
-      topic_slug: null,
-      question_text: "How did you hear about us?",
+      topicSlug: null,
+      question: "How did you hear about us?",
       answer: "LinkedIn",
     });
 

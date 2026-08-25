@@ -134,9 +134,13 @@ describe("the queue read", () => {
         escalation_created_at: "2026-08-10T09:00:00.000Z",
         escalation_questions: [
           {
-            question_text: "Are you authorized to work in the US?",
-            question_options: ["Yes", "No"],
-            topic_slug: "work_auth_current_us",
+            // v1-BLOCKER-2 (#152) shape: what writeEscalation actually persists.
+            fieldKey: "work_auth",
+            fieldLabel: "Are you authorized to work in the US?",
+            question: "Are you authorized to work in the US?",
+            options: ["Yes", "No"],
+            required: true,
+            topicSlug: "work_auth_current_us",
           },
         ],
       }),
@@ -152,9 +156,11 @@ describe("the queue read", () => {
     );
     expect(queue.pending.map((r) => r.id)).toEqual(["mine-pending-1"]);
     expect(queue.pending[0].escalationQuestions[0]).toMatchObject({
-      question_text: "Are you authorized to work in the US?",
-      topic_slug: "work_auth_current_us",
-      question_options: ["Yes", "No"],
+      question: "Are you authorized to work in the US?",
+      topicSlug: "work_auth_current_us",
+      options: ["Yes", "No"],
+      required: true,
+      fieldKey: "work_auth",
     });
   });
 
@@ -212,14 +218,24 @@ describe("the queue read", () => {
         status: PENDING_STATUS,
         escalation_created_at: "2026-08-10T09:00:00.000Z",
         escalation_questions: [
-          { question_text: "How did you hear about us?" },
-          { field_key: "no-text-here" },
+          // Missing fieldKey — dropped.
+          { question: "How did you hear about us?" },
+          // Missing question text — dropped.
+          { fieldKey: "no-text-here" },
           null,
           "not an object",
+          // Well formed.
           {
-            question_text: "Do you require sponsorship?",
-            question_options: ["Yes", "No", 42],
-            topic_slug: "requires_visa_sponsorship",
+            fieldKey: "referral",
+            question: "How did you hear about us?",
+          },
+          // Well formed with options.
+          {
+            fieldKey: "sponsorship",
+            question: "Do you require sponsorship?",
+            options: ["Yes", "No", 42],
+            topicSlug: "requires_visa_sponsorship",
+            required: true,
           },
         ],
       }),
@@ -227,11 +243,92 @@ describe("the queue read", () => {
 
     const queue = await readApplicationQueue(fakeClient(), ME);
     const questions = queue.pending[0].escalationQuestions;
-    expect(questions.map((q) => q.question_text)).toEqual([
+    expect(questions.map((q) => q.question)).toEqual([
       "How did you hear about us?",
       "Do you require sponsorship?",
     ]);
     // The `42` gets dropped because it is not a string.
-    expect(questions[1].question_options).toEqual(["Yes", "No"]);
+    expect(questions[1].options).toEqual(["Yes", "No"]);
+    expect(questions[1].required).toBe(true);
+    // fieldLabel falls back to fieldKey when the writer left it out.
+    expect(questions[0].fieldLabel).toBe("referral");
+  });
+
+  // v1-BLOCKER-2 (#152) regression: the reader surfaces every row
+  // `writeEscalation` writes. Rather than hand-write a JSONB fixture we call
+  // the writer through the same shim the live-DB integration test uses.
+  it("surfaces the questions in the shape writeEscalation actually produces", async () => {
+    const { writeEscalation } = await import("@/lib/application-records");
+
+    // Build the JSONB payload the way writeEscalation does — the fake client
+    // captures the update, then we drop the payload straight into the fixture
+    // so the reader consumes what the writer produced, byte for byte.
+    let captured: unknown = null;
+    const captureClient = {
+      from(_table: string) {
+        void _table;
+        return {
+          update(payload: Record<string, unknown>) {
+            captured = payload.escalation_questions;
+            return {
+              async eq() {
+                return { error: null };
+              },
+            };
+          },
+        };
+      },
+    } as unknown as Parameters<typeof writeEscalation>[0];
+
+    await writeEscalation(
+      captureClient,
+      "any-id",
+      [
+        {
+          fieldKey: "work_auth",
+          fieldLabel: "Are you authorized to work in the United States?",
+          question: "Are you authorized to work in the United States?",
+          options: ["Yes", "No"],
+          required: true,
+          topicSlug: "work_auth_current_us",
+        },
+        {
+          fieldKey: "referral_source",
+          fieldLabel: "How did you hear about us?",
+          question: "How did you hear about us?",
+          options: null,
+          required: false,
+          topicSlug: null,
+        },
+      ],
+      { now: new Date("2026-08-25T00:00:00Z") }
+    );
+
+    tables.applications = [
+      row({
+        id: "mine-writer-shape",
+        status: PENDING_STATUS,
+        escalation_created_at: "2026-08-25T00:00:00.000Z",
+        escalation_questions: captured,
+      }),
+    ];
+
+    const queue = await readApplicationQueue(fakeClient(), ME);
+    const pending = queue.pending[0];
+    expect(pending.escalationQuestions).toHaveLength(2);
+    expect(pending.escalationQuestions[0]).toMatchObject({
+      fieldKey: "work_auth",
+      question: "Are you authorized to work in the United States?",
+      topicSlug: "work_auth_current_us",
+      options: ["Yes", "No"],
+      required: true,
+    });
+    expect(pending.escalationQuestions[1]).toMatchObject({
+      fieldKey: "referral_source",
+      question: "How did you hear about us?",
+      topicSlug: null,
+      options: null,
+      required: false,
+    });
   });
 });
