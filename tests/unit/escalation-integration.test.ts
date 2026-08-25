@@ -147,30 +147,34 @@ function postgresBackedClient(sql: ReturnType<typeof postgres>) {
         update(payload: Record<string, unknown>) {
           return {
             async eq(column: string, value: unknown) {
-              // Serialise every value into a Postgres-friendly literal here
-              // rather than relying on `sql.json`'s typing, which is stricter
-              // than the shape `EscalationQuestion[]` actually is.
-              const values: unknown[] = [];
-              const setFragments: string[] = [];
-              for (const [col, val] of Object.entries(payload)) {
-                if (val === null) {
-                  setFragments.push(`${col} = null`);
-                } else if (val instanceof Date) {
-                  values.push(val.toISOString());
-                  setFragments.push(`${col} = $${values.length}`);
-                } else if (typeof val === "object") {
-                  values.push(JSON.stringify(val));
-                  setFragments.push(`${col} = $${values.length}::jsonb`);
-                } else {
-                  values.push(val);
-                  setFragments.push(`${col} = $${values.length}`);
+              // Column identifiers are keys we own (they come from
+              // `patchColumns` in `lib/application-records.ts`), so the
+              // `sql.unsafe` fragment names them safely; every value is bound
+              // through the template. `sql.json` handles the `jsonb` cast the
+              // way the driver expects, which `sql.unsafe(...)` binding a raw
+              // JSON string does not — see #143.
+              const cols = Object.keys(payload);
+              if (cols.length === 0) return { error: null };
+              const setFragments = cols.map((col) => {
+                const val = payload[col];
+                if (val === null || val === undefined) {
+                  return sql`${sql.unsafe(col)} = ${null}`;
                 }
-              }
-              values.push(value);
-              const query =
-                `update public.${table} set ${setFragments.join(", ")} ` +
-                `where ${column} = $${values.length}`;
-              await sql.unsafe(query, values as Array<string | number | boolean | null>);
+                if (val instanceof Date) {
+                  return sql`${sql.unsafe(col)} = ${val.toISOString()}`;
+                }
+                if (typeof val === "object") {
+                  return sql`${sql.unsafe(col)} = ${sql.json(val as never)}`;
+                }
+                return sql`${sql.unsafe(col)} = ${val as string | number | boolean}`;
+              });
+              // Interleave fragments with comma separators through the
+              // driver's own sql`` composition, so no user data ever leaves
+              // the parameterised path.
+              const setClause = setFragments.reduce((acc, frag, i) =>
+                i === 0 ? frag : sql`${acc}, ${frag}`
+              );
+              await sql`update ${sql.unsafe(`public.${table}`)} set ${setClause} where ${sql.unsafe(column)} = ${value as string}`;
               return { error: null };
             },
           };
