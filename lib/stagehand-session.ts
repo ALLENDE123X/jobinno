@@ -50,6 +50,7 @@ import {
   planRecord,
   type ActionPlan,
 } from "@/lib/form-action-cache";
+import { createFireworksClientLLM } from "@/lib/fireworks-client-llm";
 
 /**
  * JOB-029 (issue #47): `@browserbasehq/stagehand`'s package.json declares
@@ -94,8 +95,18 @@ function loadStagehandRuntime(): Promise<StagehandRuntime> {
  * Model driving `act`/`extract`/`observe`. Stagehand validates this string
  * against a closed per-provider allowlist at `Stagehand.create()`, so the
  * provider prefix is mandatory and a typo fails before any request is billed.
+ *
+ * JOB-175: this is the default and stays the default. Setting
+ * `STAGEHAND_LLM_PROVIDER=fireworks` swaps `openBrowserSession` onto the
+ * `lib/fireworks-client-llm.ts` adapter instead (Fireworks-hosted DeepSeek V4
+ * Flash), which does not go through this constant or through
+ * `ModelConfigSchema` at all — see that file's header for why a `ClientLLM`
+ * callback was the only path available under the pinned Stagehand version.
  */
 export const STAGEHAND_MODEL = "openai/gpt-5.6-luna" as const;
+
+/** Set to exactly `"fireworks"` to drive Stagehand with Fireworks' DeepSeek V4 Flash instead of {@link STAGEHAND_MODEL}. Any other value, including unset, keeps the OpenAI path. */
+export const STAGEHAND_LLM_PROVIDER_ENV_VAR = "STAGEHAND_LLM_PROVIDER";
 
 /**
  * How long Stagehand waits for the DOM to stop changing before it **acts** on
@@ -816,12 +827,18 @@ async function watchForCaptchaSolvingEvidence(page: Page, logTag: string): Promi
 export async function openBrowserSession(
   options: OpenBrowserSessionOptions
 ): Promise<BrowserSession> {
-  const apiKey = process.env.STAGEHAND_LLM_API_KEY;
+  const usesFireworks = process.env[STAGEHAND_LLM_PROVIDER_ENV_VAR] === "fireworks";
+  const apiKey = usesFireworks
+    ? process.env.FIREWORKS_API_KEY || process.env.STAGEHAND_LLM_API_KEY
+    : process.env.STAGEHAND_LLM_API_KEY;
   if (!apiKey) {
     throw new Error(
-      "STAGEHAND_LLM_API_KEY env var is required (the LLM key Stagehand drives " +
-        `${STAGEHAND_MODEL} with — see .env.example). This is a dedicated key for this ` +
-        `pipeline; do not point it at another project's key.`
+      usesFireworks
+        ? `FIREWORKS_API_KEY env var is required (falls back to STAGEHAND_LLM_API_KEY) when ` +
+          `${STAGEHAND_LLM_PROVIDER_ENV_VAR}=fireworks — see .env.example.`
+        : "STAGEHAND_LLM_API_KEY env var is required (the LLM key Stagehand drives " +
+          `${STAGEHAND_MODEL} with — see .env.example). This is a dedicated key for this ` +
+          `pipeline; do not point it at another project's key.`
     );
   }
 
@@ -897,7 +914,7 @@ export async function openBrowserSession(
   try {
     const stagehand = await Stagehand.create({
       browser,
-      model: { modelName: STAGEHAND_MODEL, apiKey },
+      model: usesFireworks ? createFireworksClientLLM(apiKey) : { modelName: STAGEHAND_MODEL, apiKey },
       domSettleTimeoutMs: DOM_SETTLE_TIMEOUT_MS,
       // Re-find a control whose cached selector no longer resolves rather than
       // failing the run. Only ever re-finds the control the instruction already
