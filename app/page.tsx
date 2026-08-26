@@ -518,7 +518,7 @@ export default async function Home({
           </p>
         </Section>
 
-        <WaitlistBanner referredBy={referredBy} />
+        {WAITLIST_GATE_ACTIVE ? <WaitlistBanner referredBy={referredBy} /> : null}
       </main>
 
       <footer className="border-t px-4 py-10 sm:px-6">
