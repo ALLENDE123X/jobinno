@@ -166,11 +166,14 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   try {
     await recordAttestation(user.id);
   } catch (error) {
+    // The raw error carries Drizzle's parameterized SQL dump and this person's
+    // user id. None of that belongs in a browser (#166), so it goes to the
+    // server log and the form gets one plain sentence, the same split
+    // `app/dashboard/actions.ts` makes for search failures.
+    console.error("[onboarding] recordAttestation failed:", error);
     return {
       ok: false,
-      message: `Could not record your confirmation: ${
-        error instanceof Error ? error.message : "an unknown error"
-      }`,
+      message: "Could not save your details. Please try again in a moment.",
     };
   }
 
