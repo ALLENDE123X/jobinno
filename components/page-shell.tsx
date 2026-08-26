@@ -23,6 +23,7 @@
 import Link from "next/link";
 
 import { Logo } from "@/components/logo";
+import { SignOutButton } from "@/components/sign-out-button";
 import { ThemeToggle } from "@/components/theme";
 import { DotPattern } from "@/components/ui/dot-pattern";
 
@@ -38,7 +39,15 @@ export function PageShell({ children }: { children: React.ReactNode }) {
             <Logo />
             Jobinno
           </Link>
-          <ThemeToggle />
+          {/*
+            SignOutButton self-hides when there is no session, so this same
+            group renders correctly on `/login` (button absent) and on
+            `/dashboard` (button present) without a prop threaded through.
+          */}
+          <div className="flex items-center gap-2">
+            <SignOutButton />
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 
