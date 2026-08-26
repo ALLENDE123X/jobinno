@@ -35,7 +35,7 @@ import {
   fanOutLimit,
   listUsersDueForSearch,
   loadMatchProfile,
-  matchJobsForUser,
+  matchJobsForUserInMode,
   remainingAllowance,
   searchBlockedReason,
   type MatchProfile,
@@ -51,6 +51,7 @@ const profileOf = (overrides: Partial<MatchProfile> = {}): MatchProfile => ({
   targetLocations: null,
   willingToRelocate: null,
   currentCity: null,
+  gradDate: null,
   applicationsUsed: 0,
   applicationsCap: 0,
   attestedAt: new Date(),
@@ -253,12 +254,17 @@ liveDbSuite("matching against the synced jobs table", () => {
   const match = async (
     overrides: {
       profile?: Partial<MatchProfile>;
-      preferences?: Parameters<typeof matchJobsForUser>[0]["preferences"];
+      preferences?: Parameters<typeof matchJobsForUserInMode>[1]["preferences"];
       limit?: number;
       userId?: string;
     } = {}
   ) =>
-    matchJobsForUser(
+    matchJobsForUserInMode(
+      // Every case in this file pins STRICT mode on purpose. It is the
+      // regression net for the semantics JOB-171's loose default replaced:
+      // when `MATCHER_MODE` is flipped back, this whole suite must pass with
+      // no edits. Loose behaviour lives in job-matching-loose.test.ts.
+      "strict",
       {
         userId: overrides.userId ?? USER_ID,
         profile: profileOf(overrides.profile),
@@ -437,7 +443,8 @@ liveDbSuite("matching against the synced jobs table", () => {
 
     // No allowlist at all means every active board, not none. Containment
     // rather than equality: other suites' listings are in this table too.
-    const unscoped = await matchJobsForUser(
+    const unscoped = await matchJobsForUserInMode(
+      "strict",
       { userId: USER_ID, profile: profileOf(), limit: 500 },
       database
     );

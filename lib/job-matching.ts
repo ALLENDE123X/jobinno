@@ -29,6 +29,12 @@
  * Only signals the schema really carries, which is a shorter list than the old
  * live search accepted:
  *
+ * Everything below describes STRICT mode, which is also what `MATCHER_MODE =
+ * "strict"` restores. Since JOB-171 the shipped default is "loose": intern vs
+ * fulltime plus an SWE-adjacent title allowlist only, no location, no
+ * narrowing of any other kind. See `MATCHER_MODE` and the two predicates it
+ * enables.
+ *
  *  · **The board allowlist.** `preferences.companies`, matched against
  *    `boards.board_token` and `boards.company`, case insensitively. Omit it and
  *    every active board is in scope, which is the useful default now that the
@@ -80,6 +86,66 @@ import { classifyTitle } from "@/lib/ats-job-feeds";
 import { db } from "@/lib/db/client";
 import { applications, boards, jobs, profiles, resumes } from "@/lib/db/schema";
 
+/**
+ * Temporary matcher looseness for v1 launch (JOB-171).
+ *
+ * "loose" applies intern-vs-fulltime + SWE-adjacent title-family only.
+ * Drops location, willing-to-relocate, exclude-keywords, industries, and
+ * every other narrowing filter. Trades match precision for perceived
+ * volume, so a user with narrow real preferences still gets a full 10-app
+ * batch per Find jobs now. Revisit when SR+Breezy inventory > 1000 active
+ * postings, or when the user complains about specific mismatches.
+ *
+ * "strict" restores the original matcher semantics. Flip this constant to
+ * unwind the loosening; no other code path changes are required.
+ */
+export type MatcherMode = "loose" | "strict";
+
+export const MATCHER_MODE: MatcherMode = "loose";
+
+/**
+ * Title families loose mode will apply to, checked as case insensitive
+ * substring containment against `jobs.title`.
+ *
+ * Deliberately hardcoded and deliberately NOT tied to anything the person
+ * typed at intake: users' free text titles are often over-narrow, and JOB-171
+ * is the illusion-of-volume ticket, not the honor-user-preferences ticket.
+ * Temporary by construction; widening or retiring this list belongs to
+ * whichever ticket flips `MATCHER_MODE` back.
+ */
+export const SWE_ADJACENT_TITLES: readonly string[] = [
+  "software engineer",
+  "swe",
+  "developer",
+  "programmer",
+  "full stack",
+  "full-stack",
+  "fullstack",
+  "back end",
+  "back-end",
+  "backend",
+  "front end",
+  "front-end",
+  "frontend",
+  "platform engineer",
+  "systems engineer",
+  "data engineer",
+  "ml engineer",
+  "machine learning",
+  "ai engineer",
+  "applied ai",
+  "research engineer",
+  "sre",
+  "site reliability",
+  "devops",
+  "cloud engineer",
+  "mobile engineer",
+  "ios engineer",
+  "android engineer",
+  "web engineer",
+  "computer science",
+];
+
 /** The Drizzle client the statements run on. Injectable so a test can supply its own pool. */
 export type MatchDatabase = ReturnType<typeof db>;
 
@@ -126,6 +192,16 @@ export type MatchProfile = {
   targetLocations: string[] | null;
   willingToRelocate: boolean | null;
   currentCity: string | null;
+  /**
+   * The one signal `profiles` carries that separates a current student from
+   * somebody who has already graduated, and therefore the whole of what loose
+   * mode reads for intern-vs-fulltime intent. JOB-171 asked for "whatever the
+   * current field is that indicates intern-vs-fulltime intent" and this is
+   * it: no dedicated stage column exists, so a graduation date still in the
+   * future is what "student" means here. Null reads as graduated, which keeps
+   * the wider set and serves the volume this mode exists for.
+   */
+  gradDate: string | null;
   applicationsUsed: number;
   applicationsCap: number;
   /**
@@ -171,6 +247,7 @@ export async function loadMatchProfile(
       targetLocations: profiles.targetLocations,
       willingToRelocate: profiles.willingToRelocate,
       currentCity: profiles.currentCity,
+      gradDate: profiles.gradDate,
       applicationsUsed: profiles.applicationsUsed,
       applicationsCap: profiles.applicationsCap,
       attestedAt: profiles.attestedAt,
@@ -322,6 +399,27 @@ function locationPredicate(wanted: readonly string[]): SQL | undefined {
   return or(...clauses);
 }
 
+/**
+ * Whether loose mode should treat this person as still in school.
+ *
+ * The reading is `grad_date > today`, nothing cleverer. A date in the future
+ * means they have not graduated yet; a date in the past, or no date at all,
+ * means the wider non-intern set, which is the direction that serves volume.
+ * Compared in UTC against UTC midnight of `now`, which is exact enough for a
+ * filter whose wrong side costs one day of internship listings at either end
+ * of a graduation.
+ */
+export function seekingInternship(
+  profile: Pick<MatchProfile, "gradDate">,
+  now: Date = new Date()
+): boolean {
+  if (profile.gradDate === null) return false;
+  const gradDay = new Date(`${profile.gradDate}T00:00:00Z`).getTime();
+  if (Number.isNaN(gradDay)) return false;
+  const todayStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return gradDay > todayStart;
+}
+
 /** `lower(column)`, for a case insensitive equality against a normalized list. */
 function lower(column: SQLWrapper): SQL {
   return sql`lower(${column})`;
@@ -333,6 +431,36 @@ function boardPredicate(companies: readonly string[]): SQL | undefined {
     inArray(lower(boards.boardToken), [...companies]),
     inArray(lower(boards.company), [...companies])
   );
+}
+
+/**
+ * Loose mode's title filter: one `ilike` containment per entry of
+ * `SWE_ADJACENT_TITLES`, any of which is enough.
+ *
+ * In the WHERE clause rather than an in-memory pass because, unlike
+ * `classifyTitle`, this list has exactly one definition and it lives in this
+ * file; there is no second caller to drift away from. The needles go through
+ * `likeContains` like every other user supplied value so a future edit that
+ * adds one with a `%` in it stays inert.
+ */
+function sweAdjacentTitlePredicate(): SQL {
+  return or(
+    ...SWE_ADJACENT_TITLES.map((needle) => ilike(jobs.title, likeContains(needle)))
+  ) as SQL;
+}
+
+/**
+ * Loose mode's intern-vs-fulltime split, straight from JOB-171:
+ *
+ *  · Still in school: internships only. `jobs.is_intern` is what ingest
+ *    records for a title with "intern" in it.
+ *  · Otherwise: everything except internships, spelled as
+ *    `is_new_grad OR NOT is_intern` so both new grad flagged listings and
+ *    plain postings carry through.
+ */
+function internshipStagePredicate(seekingIntern: boolean): SQL {
+  if (seekingIntern) return eq(jobs.isIntern, true);
+  return or(eq(jobs.isNewGrad, true), eq(jobs.isIntern, false)) as SQL;
 }
 
 // ───────────────────────────────────
@@ -444,15 +572,41 @@ export async function matchJobsForUser(
   input: MatchInput,
   database: MatchDatabase = db()
 ): Promise<JobMatch[]> {
+  return matchJobsForUserInMode(MATCHER_MODE, input, database);
+}
+
+/**
+ * The same match with the mode supplied by the caller rather than read off
+ * `MATCHER_MODE`.
+ *
+ * Exists so the strict path keeps an executable regression net after JOB-171
+ * flips the shipped default to loose: `tests/unit/job-matching.test.ts` runs
+ * entirely through `"strict"` and asserts semantics this module must not lose
+ * when the constant is flipped back, while the loose suite sits beside it.
+ * Production callers never touch this directly.
+ */
+export async function matchJobsForUserInMode(
+  mode: MatcherMode,
+  input: MatchInput,
+  database: MatchDatabase = db()
+): Promise<JobMatch[]> {
   const { userId, profile, preferences, limit } = input;
   if (limit <= 0) return [];
 
   const title = preferences?.title?.trim() ?? "";
+  const loose = mode === "loose";
 
   const conditions: (SQL | undefined)[] = [
     eq(boards.active, true),
     boardPredicate(normalizeList(preferences?.companies)),
-    locationPredicate(acceptableLocations(profile, preferences?.locations)),
+    // Loose mode drops the location narrowing entirely: no stored targets, no
+    // per-search override, no relocation fallback. That drop is the point of
+    // JOB-171 and is why the predicate below is skipped whole rather than fed
+    // an empty list.
+    loose ? undefined : locationPredicate(acceptableLocations(profile, preferences?.locations)),
+    // The two filters loose mode keeps. See each predicate for the shape.
+    loose ? sweAdjacentTitlePredicate() : undefined,
+    loose ? internshipStagePredicate(seekingInternship(profile)) : undefined,
     title === "" ? undefined : ilike(jobs.title, likeContains(title)),
     notExists(
       database
@@ -495,8 +649,11 @@ export async function matchJobsForUser(
       seen.add(candidate.jobId);
 
       // The gate. `classifyTitle`, not a copy of it — see the note above on
-      // why this is not a `~*` in the WHERE clause.
-      if (!classifyTitle(candidate.title).relevant) continue;
+      // why this is not a `~*` in the WHERE clause. Strict mode only: loose
+      // mode replaced this pass with its own SQL side title allowlist, and
+      // running both would quietly re-narrow loose mode to titles that also
+      // spell out an internship or a new grad role, defeating the loosening.
+      if (!loose && !classifyTitle(candidate.title).relevant) continue;
 
       matches.push(candidate);
       if (matches.length === limit) break;
