@@ -163,16 +163,33 @@ export function DashboardView({
   quota: DashboardQuota;
   applications: DashboardApplication[];
 }) {
+  // "pending_user_input" is APPLICATION_STATUS.PENDING_USER_INPUT — the
+  // string is repeated here rather than imported so the header does not gain
+  // a whole-module import for one comparison. The label surfaced next to the
+  // Queue link is the number of applications waiting on a candidate answer,
+  // so a person can see at a glance whether the queue has anything for them.
+  const pendingCount = applications.filter(
+    (a) => a.status === "pending_user_input",
+  ).length;
   return (
     <PageShell>
       <main className="relative mx-auto w-full max-w-3xl flex-1 space-y-8 px-4 py-12 sm:px-6 sm:py-16">
-        <header className="space-y-2">
-          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
-            Your applications
-          </h1>
-          <p className="text-muted-foreground text-base">
-            Everything Jobinno has done for {email}, newest first.
-          </p>
+        <header className="flex flex-wrap items-start justify-between gap-4">
+          <div className="space-y-2">
+            <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
+              Your applications
+            </h1>
+            <p className="text-muted-foreground text-base">
+              Everything Jobinno has done for {email}, newest first.
+            </p>
+          </div>
+          <Link
+            href="/dashboard/queue"
+            className="text-primary hover:text-primary/80 inline-flex shrink-0 items-center gap-1.5 self-center text-sm font-medium underline underline-offset-4 hover:no-underline"
+          >
+            Queue{pendingCount > 0 ? ` (${pendingCount})` : ""}
+            <span aria-hidden="true">→</span>
+          </Link>
         </header>
 
         <div className="space-y-6 rounded-2xl border bg-card/40 p-6 sm:p-8">
