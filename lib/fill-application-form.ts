@@ -6157,12 +6157,20 @@ async function fillRemainingFields(
   // Before this ticket each such REQUIRED field became an escalation and the
   // row stopped at `pending_user_input`. Per the Option A product decision of
   // 2026-08-26 it is now answered by asking the text model, grounded in the
-  // candidate's own intake data and resume digest, through
-  // `resolveAnswer`'s fabrication rung. The full ladder runs here rather than
-  // only its new rungs: rungs 1 through 4 are cheap re-checks against state
-  // this function already holds, and routing every item through one function
-  // is what keeps the ordering in `lib/candidate-answers.ts` the single
-  // source of truth for it.
+  // candidate's own intake data and resume digest.
+  //
+  // Deliberately rungs 4 and 5 only. `resolveAnswer`'s first three rungs are
+  // NOT consulted here, for a reason the verification run against Western
+  // Digital on launch night supplied: their intent classifier reads "your
+  // right to work for WD" in a non-compete question as the work-authorization
+  // intent, and a column backed answer for the wrong intent is a confident,
+  // wrong legal attestation. Everything rungs 1 through 3 could contribute
+  // already reached this loop by a wording-aware route: intake columns and
+  // stored answers sit in the fact catalogue and in `additionalAnswers`,
+  // consent fields get their own deterministic policy, and declines are
+  // chosen from the control's own options. What is left here is exactly the
+  // residue that needs a model, and the model sees the intake values as
+  // data to mirror rather than as a column keyed by a possibly wrong intent.
   //
   // Two boundaries hold even under Option A:
   //
@@ -6203,12 +6211,6 @@ async function fillRemainingFields(
       intakeRecord[`stored_answer: ${question.slice(0, 120)}`] = answer.slice(0, 200);
     }
   }
-  const profileColumns = {
-    workAuthorizedUs: state.applicationAnswers.workAuthorizedUs ?? null,
-    requiresSponsorship: state.applicationAnswers.requiresSponsorship ?? null,
-    citizenshipStatus: state.applicationAnswers.citizenshipStatus ?? null,
-    willingToRelocate: state.applicationAnswers.willingToRelocate ?? null,
-  };
 
   for (const item of afterLlmFallback) {
     if (!item.required || EEO_FIELD_RE.test(item.fieldLabel)) {
@@ -6220,7 +6222,7 @@ async function fillRemainingFields(
       afterFabrication.push(item);
       continue;
     }
-    const resolved = await resolveAnswer(item.fieldLabel, profileColumns, state.storedAnswers, {
+    const resolved = await resolveAnswer(item.fieldLabel, {}, [], {
       options: item.options ?? [],
       context: { intake: intakeRecord, resume: profileSummary },
     });
