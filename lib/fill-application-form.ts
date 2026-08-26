@@ -245,6 +245,9 @@ import {
   rememberAnswers,
   sameStoredAnswers,
   withStoredAnswers,
+  answerProvenanceEntry,
+  resolveAnswer,
+  type AnswerProvenanceEntry,
   type StoredAnswer,
 } from "@/lib/candidate-answers";
 // JOB-004. Both copies of `updateApplication` and `recordFailure` that the port
@@ -260,6 +263,28 @@ import { sendEscalationNotification } from "@/lib/notifier";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 
 const LOG = "[act-007]";
+
+/**
+ * ── JOB-170: the escalation gate ────────────────────────────────────────────
+ *
+ * False since the Option A product decision of 2026-08-26: the pipeline
+ * fabricates an answer for a field the rest of the ladder cannot fill (see
+ * `lib/candidate-answers.ts`, JOB-170's fabrication rung) instead of stopping
+ * the row at `pending_user_input`. The whole escalation machinery below,
+ * `writeEscalation`, `handleEscalationBlock`, `isEscalationBlock`, the queue
+ * reader and the escalation-answers route, stays wired exactly as v1-C built
+ * it, because two residual cases still need it:
+ *
+ *  · A required EEO question offering no decline option. Demographic answers
+ *    are never fabricated and never defaulted (HARD STOP #10), so that stop
+ *    is the only honest outcome.
+ *  · Repeating section entries, where the alternative to asking is inventing
+ *    an employer or a school, which HARD STOP #9 forbids.
+ *
+ * Flipping this back to true restores v1-C behaviour with zero other edits,
+ * which is the whole point of a constant rather than a deletion.
+ */
+export const ESCALATION_ENABLED = false;
 
 // ───────────────────────────────────
 // The instructions — every one a constant
@@ -1806,6 +1831,13 @@ export type FillApplicationFormResult = {
    * sees a live session for one of these.
    */
   needsInput: NeedsInputItem[];
+  /**
+   * JOB-170. Every field this run answered through the LLM fabrication rung
+   * or its sane default fallback, in application order. Written to
+   * `applications.answer_provenance` on the success path so a post hoc audit
+   * can tell which categories got fabricated across many submissions.
+   */
+  answerProvenance: AnswerProvenanceEntry[];
   coverLetter: {
     required: boolean;
     generated: boolean;
@@ -5062,6 +5094,13 @@ export function resolveDecision(
 type RemainingFieldsResult = {
   outcomes: FieldOutcome[];
   needsInput: NeedsInputItem[];
+  /**
+   * JOB-170. One entry per field this pass answered through the fabrication
+   * rung or its sane default fallback, for `applications.answer_provenance`.
+   * Empty on every pass that fabricated nothing, including every
+   * repeating-sections pass, which deliberately never fabricates.
+   */
+  answerProvenance: AnswerProvenanceEntry[];
 };
 
 /**
@@ -5189,7 +5228,7 @@ async function fillRepeatingSections(
   await awaitStableForm(session);
 
   const sections = await enumerateRepeatingSections(session.page);
-  if (sections.length === 0) return { outcomes, needsInput };
+  if (sections.length === 0) return { outcomes, needsInput, answerProvenance: [] };
 
   console.log(
     `${LOG} ${sections.length} required repeating section(s): ` +
@@ -5430,7 +5469,7 @@ async function fillRepeatingSections(
     }
   }
 
-  return { outcomes, needsInput };
+  return { outcomes, needsInput, answerProvenance: [] };
 }
 
 /**
@@ -5501,7 +5540,11 @@ async function fillRemainingFields(
       field.label !== ""
   );
   if (empty.length === 0) {
-    return { outcomes, needsInput: [...needsInput, ...repeatingNeedsInput] };
+    return {
+      outcomes,
+      needsInput: [...needsInput, ...repeatingNeedsInput],
+      answerProvenance: [...repeating.answerProvenance],
+    };
   }
   console.log(
     `${LOG} ${empty.length} control(s) still empty: ` +
@@ -5649,7 +5692,11 @@ async function fillRemainingFields(
   }
 
   if (undecided.length === 0) {
-    return { outcomes, needsInput: [...needsInput, ...repeatingNeedsInput] };
+    return {
+      outcomes,
+      needsInput: [...needsInput, ...repeatingNeedsInput],
+      answerProvenance: [...repeating.answerProvenance],
+    };
   }
 
   // ── Step 4: open the dropdowns that stand between this and a submittable
@@ -6104,7 +6151,128 @@ async function fillRemainingFields(
     console.log(`${LOG} ${field.label}: filled by fallback + verified — reads ${JSON.stringify(readBack)}`);
   }
 
-  return { outcomes, needsInput: [...afterLlmFallback, ...repeatingNeedsInput] };
+  // ── JOB-170: the LLM fabrication rung ────────────────────────────────────
+  // Everything still in `afterLlmFallback` at this point survived the rule
+  // based ladder, the stored answers, and the unknown-field fallback above.
+  // Before this ticket each such REQUIRED field became an escalation and the
+  // row stopped at `pending_user_input`. Per the Option A product decision of
+  // 2026-08-26 it is now answered by asking the text model, grounded in the
+  // candidate's own intake data and resume digest, through
+  // `resolveAnswer`'s fabrication rung. The full ladder runs here rather than
+  // only its new rungs: rungs 1 through 4 are cheap re-checks against state
+  // this function already holds, and routing every item through one function
+  // is what keeps the ordering in `lib/candidate-answers.ts` the single
+  // source of truth for it.
+  //
+  // Two boundaries hold even under Option A:
+  //
+  //  · EEO questions are never sent to the model. `resolveAnswer` refuses
+  //    them internally as well; the check here keeps a demographic label
+  //    from ever building a prompt. A required EEO question with no decline
+  //    option therefore stays in `needsInput` and escalates, which is the
+  //    residual case the companion ticket tracks.
+  //  · Repeating section entries never reach this loop: they are merged back
+  //    below from `repeatingNeedsInput`, which `fillRepeatingSections`
+  //    populated before any fabrication existed. Inventing an employer or a
+  //    school would be worse than asking.
+  //
+  // The value goes onto the control through `applyFieldValue`, the same
+  // guarded apply with read-back verification every ordinary fill uses, so a
+  // fabricated dropdown answer can only ever land on an option the DOM
+  // offered. A failed apply leaves the item escalated exactly as before.
+  const answerProvenance: AnswerProvenanceEntry[] = [];
+  const afterFabrication: NeedsInputItem[] = [];
+  const intakeRecord: Record<string, string> = {};
+  {
+    const answers = state.applicationAnswers;
+    if (answers.workAuthorizedUs !== undefined) intakeRecord.work_authorized_us = answers.workAuthorizedUs ? "Yes" : "No";
+    if (answers.requiresSponsorship !== undefined) intakeRecord.requires_sponsorship = answers.requiresSponsorship ? "Yes" : "No";
+    if (answers.willingToRelocate !== undefined) intakeRecord.willing_to_relocate = answers.willingToRelocate ? "Yes" : "No";
+    if (answers.currentCountry) intakeRecord.current_country = answers.currentCountry;
+    if (answers.currentCity) intakeRecord.current_city = answers.currentCity;
+    if (answers.citizenshipStatus) intakeRecord.citizenship_status = answers.citizenshipStatus;
+    if (answers.f1Status) intakeRecord.f1_status = answers.f1Status;
+    if (answers.gradDate) intakeRecord.grad_date = answers.gradDate;
+    if (answers.earliestStart) intakeRecord.earliest_start = answers.earliestStart;
+    if (state.company) intakeRecord.applying_to = `${state.jobTitle ?? "role"} at ${state.company}`;
+    // The candidate's own words about questions intake never asked, already
+    // folded into `additionalAnswers` by the caller. These are facts the
+    // person stated, which is what makes them admissible grounding here.
+    for (const [question, answer] of Object.entries(additionalAnswers)) {
+      if (question.trim() === "" || answer.trim() === "") continue;
+      intakeRecord[`stored_answer: ${question.slice(0, 120)}`] = answer.slice(0, 200);
+    }
+  }
+  const profileColumns = {
+    workAuthorizedUs: state.applicationAnswers.workAuthorizedUs ?? null,
+    requiresSponsorship: state.applicationAnswers.requiresSponsorship ?? null,
+    citizenshipStatus: state.applicationAnswers.citizenshipStatus ?? null,
+    willingToRelocate: state.applicationAnswers.willingToRelocate ?? null,
+  };
+
+  for (const item of afterLlmFallback) {
+    if (!item.required || EEO_FIELD_RE.test(item.fieldLabel)) {
+      afterFabrication.push(item);
+      continue;
+    }
+    const field = escalatedFrom.get(item);
+    if (field === undefined) {
+      afterFabrication.push(item);
+      continue;
+    }
+    const resolved = await resolveAnswer(item.fieldLabel, profileColumns, state.storedAnswers, {
+      options: item.options ?? [],
+      context: { intake: intakeRecord, resume: profileSummary },
+    });
+    if (resolved === null || resolved.answer.trim() === "") {
+      console.warn(
+        `${LOG} fabrication rung declined "${item.fieldLabel.slice(0, 80)}" — staying escalated`
+      );
+      afterFabrication.push(item);
+      continue;
+    }
+    await sleep(randomInteractionDelayMs());
+    const outcome = await applyFieldValue(session.page, field, resolved.answer, {
+      allowContains: OPTION_KINDS.has(field.kind),
+    });
+    if (!outcome.ok) {
+      console.warn(
+        `${LOG} fabrication rung could not apply "${resolved.answer}" to ` +
+          `"${item.fieldLabel.slice(0, 80)}" (${outcome.detail}) — staying escalated`
+      );
+      afterFabrication.push(item);
+      continue;
+    }
+    supersede(
+      field,
+      "filled",
+      resolved.answer,
+      resolved.source === "llm_fabrication"
+        ? `answered by the LLM fabrication rung from the candidate's own intake data and resume ` +
+          `(confidence ${resolved.confidence?.toFixed(2) ?? "n/a"}): ${outcome.detail}`
+        : `answered by the sane default fallback after the fabrication call did not produce one: ` +
+          `${outcome.detail}`,
+      outcome.readBack
+    );
+    console.log(
+      `${LOG} ${field.label}: filled by the ${resolved.source} rung + verified — reads ` +
+        `${JSON.stringify(outcome.readBack)}`
+    );
+    answerProvenance.push(
+      answerProvenanceEntry({
+        fieldKey: item.key,
+        fieldLabel: item.fieldLabel,
+        questionText: item.fieldLabel,
+        resolution: resolved,
+      })
+    );
+  }
+
+  return {
+    outcomes,
+    needsInput: [...afterFabrication, ...repeatingNeedsInput],
+    answerProvenance: [...repeating.answerProvenance, ...answerProvenance],
+  };
 }
 
 /**
@@ -6851,11 +7019,54 @@ async function persistStoredAnswers(
   }
 }
 
-function isEscalationBlock(blockedReason: string): boolean {
+/**
+ * Exported for `tests/unit/fill-application-form.test.ts`, which pins the
+ * contract this predicate must keep while ESCALATION_ENABLED is false: the
+ * classification is untouched, so flipping the gate back to true restores
+ * v1-C behaviour with no other edit.
+ */
+export function isEscalationBlock(blockedReason: string): boolean {
   return (
     blockedReason.startsWith("needs_candidate_input:") ||
     blockedReason.startsWith("needs_attestation:")
   );
+}
+
+/**
+ * JOB-170 Change 3. Files the fabrication rung's answers onto
+ * `applications.answer_provenance` once the row has landed on `form_filled`.
+ *
+ * Written here rather than through `updateApplication` so the patch type in
+ * `lib/application-records.ts` stays untouched: this module already owns
+ * direct column writes for run-scoped state (see `persistStoredAnswers`
+ * above for the precedent and the reasoning).
+ *
+ * Never throws, same rule as every other bookkeeping write on this path: a
+ * run that filled and verified a real form must not be failed by its own
+ * audit trail. The entries also stay on the returned report either way.
+ */
+async function persistAnswerProvenance(
+  supabase: SupabaseClient,
+  jobApplicationId: string,
+  entries: readonly AnswerProvenanceEntry[]
+): Promise<void> {
+  if (entries.length === 0) return;
+  try {
+    const { error } = await supabase
+      .from("applications")
+      .update({ answer_provenance: entries })
+      .eq("id", jobApplicationId);
+    if (error !== null) throw new Error(error.message);
+    console.log(
+      `${LOG} applications ${jobApplicationId}: recorded ${entries.length} fabricated ` +
+        `answer(s) in answer_provenance`
+    );
+  } catch (err) {
+    console.warn(
+      `${LOG} could not write applications.answer_provenance for ${jobApplicationId}, ` +
+        `continuing without it: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 /**
@@ -7055,7 +7266,14 @@ async function runFill(
       // captcha, a DOM change, an unreachable form — is a stop-for-a-human
       // that a routine reask cannot close, so it still lands in
       // `form_fill_blocked` for the operator to look at.
-      if (isEscalationBlock(report.blockedReason)) {
+      //
+      // JOB-170: gated behind ESCALATION_ENABLED. With the gate off, a
+      // needs-tagged block falls through to `form_fill_blocked` exactly like
+      // any other stop, which should be vanishingly rare because the
+      // fabrication rung answers what used to escalate. The residual cases
+      // that still reach here are EEO questions with no decline option and
+      // repeating section entries.
+      if (ESCALATION_ENABLED && isEscalationBlock(report.blockedReason)) {
         return await handleEscalationBlock(supabase, jobApplicationId, report);
       }
 
@@ -7087,6 +7305,7 @@ async function runFill(
       if (session !== null) await closeBrowserSession(session);
       throw err;
     }
+    await persistAnswerProvenance(supabase, jobApplicationId, report.answerProvenance);
     console.log(
       `${LOG} applications ${jobApplicationId} → ${APPLICATION_STATUS.FORM_FILLED} ` +
         `(the form is filled and NOT submitted — submission is ACT-008)`
@@ -7204,6 +7423,10 @@ async function runBrowserFlow(
   // to report the questions it was blocked on, and the commonest blocked stop
   // this module now has *is* "it needs answers".
   const needsInput: NeedsInputItem[] = [];
+  // JOB-170. What the fabrication rung answered across every pass and every
+  // wizard step of this run, carried out the same way so a blocked stop still
+  // reports what was fabricated before it stopped.
+  const answerProvenance: AnswerProvenanceEntry[] = [];
 
   try {
     verification = await completeVerification(supabase, session, state, input.verification);
@@ -7303,6 +7526,7 @@ async function runBrowserFlow(
     );
     fields.push(...remaining.outcomes);
     needsInput.push(...remaining.needsInput);
+    answerProvenance.push(...remaining.answerProvenance);
     assertNoMismatches(fields, signals.url);
 
     // A required field still empty is not a partial success — the board will
@@ -7354,7 +7578,8 @@ async function runBrowserFlow(
       profile,
       final,
       fields,
-      needsInput
+      needsInput,
+      answerProvenance
     );
 
     // Issue #116 — a whole-form verification pass belongs on this line, between
@@ -7386,6 +7611,7 @@ async function runBrowserFlow(
         verification: verificationReport(verification),
         fields,
         needsInput,
+        answerProvenance,
         coverLetter: coverLetterReport(cover, coverLetter, fields),
         parsedProfile: profile,
         profileWarnings: profile.warnings,
@@ -7419,6 +7645,7 @@ async function runBrowserFlow(
         verification: verificationReport(verification),
         fields,
         needsInput,
+        answerProvenance,
         coverLetter: coverLetterReport(cover, coverLetter, fields),
         parsedProfile: profile,
         profileWarnings: profile.warnings,
@@ -7698,7 +7925,8 @@ async function advanceThroughWizard(
   profile: ResumeProfile,
   current: FormSignals,
   fields: FieldOutcome[],
-  needsInput: NeedsInputItem[]
+  needsInput: NeedsInputItem[],
+  answerProvenance: AnswerProvenanceEntry[]
 ): Promise<FormSignals> {
   let signals = current;
 
@@ -7786,6 +8014,7 @@ async function advanceThroughWizard(
     );
     fields.push(...step.outcomes);
     needsInput.push(...step.needsInput);
+    answerProvenance.push(...step.answerProvenance);
     assertNoMismatches(fields, signals.url);
     if (needsInput.some((item) => item.required)) {
       throw blockedForAnswers(needsInput, signals.url);

@@ -26,8 +26,8 @@ import {
 
 describe("the resolveAnswer ladder", () => {
   describe("profile_column", () => {
-    it("returns the column value when profiles.work_authorized_us is set", () => {
-      const resolved = resolveAnswer(
+    it("returns the column value when profiles.work_authorized_us is set", async () => {
+      const resolved = await resolveAnswer(
         "Are you legally authorized to work in the country in which you are applying for a role?",
         { workAuthorizedUs: true },
         []
@@ -38,8 +38,8 @@ describe("the resolveAnswer ladder", () => {
       expect(resolved!.topic).toBe("work_auth_current_us");
     });
 
-    it("returns the column value when profiles.requires_sponsorship is set", () => {
-      const resolved = resolveAnswer(
+    it("returns the column value when profiles.requires_sponsorship is set", async () => {
+      const resolved = await resolveAnswer(
         "Do you now, or will you in the future, require immigration sponsorship for work authorization?",
         { requiresSponsorship: false },
         []
@@ -50,8 +50,8 @@ describe("the resolveAnswer ladder", () => {
       expect(resolved!.topic).toBe("requires_visa_sponsorship");
     });
 
-    it("derives us_citizen_or_pr from a citizenship_status of us_citizen", () => {
-      const resolved = resolveAnswer(
+    it("derives us_citizen_or_pr from a citizenship_status of us_citizen", async () => {
+      const resolved = await resolveAnswer(
         "Are you a U.S. citizen or a lawful permanent resident?",
         { citizenshipStatus: "us_citizen" },
         []
@@ -62,11 +62,11 @@ describe("the resolveAnswer ladder", () => {
       expect(resolved!.topic).toBe("us_citizen_or_pr");
     });
 
-    it("prefers a column-backed answer over an intent-keyed stored one", () => {
+    it("prefers a column-backed answer over an intent-keyed stored one", async () => {
       // Stored answer says No; the column says Yes. Column wins — it is the
       // authoritative answer, the stored row may be stale from an earlier
       // profile state that has since been corrected.
-      const resolved = resolveAnswer(
+      const resolved = await resolveAnswer(
         "Are you legally authorized to work in the United States?",
         { workAuthorizedUs: true },
         [
@@ -84,8 +84,8 @@ describe("the resolveAnswer ladder", () => {
   });
 
   describe("stored_by_intent", () => {
-    it("returns the stored answer keyed by intent slug when no column has it", () => {
-      const resolved = resolveAnswer(
+    it("returns the stored answer keyed by intent slug when no column has it", async () => {
+      const resolved = await resolveAnswer(
         "Have you ever been convicted of a felony?",
         {},
         [
@@ -103,12 +103,12 @@ describe("the resolveAnswer ladder", () => {
       expect(resolved!.topic).toBe("criminal_conviction_history");
     });
 
-    it("survives a wording change on the current form", () => {
+    it("survives a wording change on the current form", async () => {
       // The stored row's question text says "criminal record", the current
       // form asks about "felony conviction". Both classify into
       // `criminal_conviction_history`, so the intent slug matches even
       // though a fuzzy substring on the question text would miss.
-      const resolved = resolveAnswer(
+      const resolved = await resolveAnswer(
         "Do you have any criminal convictions on your record?",
         {},
         [
@@ -126,8 +126,8 @@ describe("the resolveAnswer ladder", () => {
   });
 
   describe("canonical_default", () => {
-    it("returns the canonical default for a defaultable intent when nothing else covers it", () => {
-      const resolved = resolveAnswer(
+    it("returns the canonical default for a defaultable intent when nothing else covers it", async () => {
+      const resolved = await resolveAnswer(
         "I consent to the processing of your personal data as described in this notice.",
         {},
         []
@@ -138,14 +138,14 @@ describe("the resolveAnswer ladder", () => {
       expect(resolved!.topic).toBe("gdpr_data_processing_consent");
     });
 
-    it("returns LinkedIn as the default source for heard_about_us_source", () => {
-      const resolved = resolveAnswer("How did you hear about us?", {}, []);
+    it("returns LinkedIn as the default source for heard_about_us_source", async () => {
+      const resolved = await resolveAnswer("How did you hear about us?", {}, []);
       expect(resolved!.answer).toBe("LinkedIn");
       expect(resolved!.source).toBe("canonical_default");
     });
 
-    it("prefers a stored answer over the canonical default", () => {
-      const resolved = resolveAnswer(
+    it("prefers a stored answer over the canonical default", async () => {
+      const resolved = await resolveAnswer(
         "How did you hear about us?",
         {},
         [
@@ -163,23 +163,23 @@ describe("the resolveAnswer ladder", () => {
   });
 
   describe("null — escalate to the candidate", () => {
-    it("escalates a classified intent with no column, no stored, and no default", () => {
+    it("escalates a classified intent with no column, no stored, and no default", async () => {
       // Salary expectation is classified but never defaulted. Nothing on
       // the profile answers it; escalate.
       expect(
-        resolveAnswer("What are your salary expectations?", {}, [])
+        await resolveAnswer("What are your salary expectations?", {}, [])
       ).toBeNull();
     });
 
-    it("escalates a video-interview-recording question — a real preference, not defaultable", () => {
+    it("escalates a video-interview-recording question — a real preference, not defaultable", async () => {
       expect(
-        resolveAnswer("Do you consent to your video interviews being recorded?", {}, [])
+        await resolveAnswer("Do you consent to your video interviews being recorded?", {}, [])
       ).toBeNull();
     });
 
-    it("escalates an alwaysBlock intent even when the wording is unambiguous", () => {
+    it("escalates an alwaysBlock intent even when the wording is unambiguous", async () => {
       expect(
-        resolveAnswer(
+        await resolveAnswer(
           "Are you a citizen of or ordinarily resident in Cuba, Syria, Iran, or North Korea?",
           {},
           []
@@ -189,11 +189,11 @@ describe("the resolveAnswer ladder", () => {
   });
 
   describe("stored_by_question — the legacy fuzzy path", () => {
-    it("falls through to a fuzzy question-text match when the classifier does not recognise the intent", () => {
+    it("falls through to a fuzzy question-text match when the classifier does not recognise the intent", async () => {
       // This is a real cover-letter-adjacent question the taxonomy does not
       // cover. The stored entry has no intent slug (legacy row), so the
       // fuzzy path takes over — a substring match on the raw question.
-      const resolved = resolveAnswer(
+      const resolved = await resolveAnswer(
         "Please describe a project you are proud of.",
         {},
         [
@@ -210,14 +210,14 @@ describe("the resolveAnswer ladder", () => {
       expect(resolved!.topic).toBeNull();
     });
 
-    it("does not fall through to fuzzy when the classifier DID recognise the intent", () => {
+    it("does not fall through to fuzzy when the classifier DID recognise the intent", async () => {
       // The classifier recognises this as work_auth_current_us. Even though
       // a legacy row with the same words is present, the ladder returns
       // null rather than sliding into the fuzzy path — that path exists
       // only to catch questions the taxonomy does not know about, and using
       // it here would re-introduce the substring-collision bug this file
       // fixes.
-      const resolved = resolveAnswer(
+      const resolved = await resolveAnswer(
         "Are you authorized to work in the United States?",
         {},
         [
@@ -240,7 +240,7 @@ describe("the resolveAnswer ladder", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("integration: three questions, three sources", () => {
-  it("routes work-auth to profile column, criminal-history to stored intent, and GDPR to canonical default", () => {
+  it("routes work-auth to profile column, criminal-history to stored intent, and GDPR to canonical default", async () => {
     const profile = { workAuthorizedUs: true };
     const stored: StoredAnswer[] = [
       {
@@ -251,7 +251,7 @@ describe("integration: three questions, three sources", () => {
       },
     ];
 
-    const workAuth = resolveAnswer(
+    const workAuth = await resolveAnswer(
       "Are you authorized to work in the United States?",
       profile,
       stored
@@ -260,7 +260,7 @@ describe("integration: three questions, three sources", () => {
     expect(workAuth?.topic).toBe("work_auth_current_us");
     expect(workAuth?.answer).toBe("Yes");
 
-    const felony = resolveAnswer(
+    const felony = await resolveAnswer(
       "Do you have any criminal convictions on your record?",
       profile,
       stored
@@ -269,7 +269,7 @@ describe("integration: three questions, three sources", () => {
     expect(felony?.topic).toBe("criminal_conviction_history");
     expect(felony?.answer).toBe("No");
 
-    const gdpr = resolveAnswer(
+    const gdpr = await resolveAnswer(
       "I consent to the processing of your personal data as described in this notice.",
       profile,
       stored
@@ -279,7 +279,7 @@ describe("integration: three questions, three sources", () => {
     expect(gdpr?.answer).toBe("Yes");
 
     // And the un-answerable question routes to escalation.
-    const salary = resolveAnswer("What are your salary expectations?", profile, stored);
+    const salary = await resolveAnswer("What are your salary expectations?", profile, stored);
     expect(salary).toBeNull();
   });
 });
@@ -289,14 +289,14 @@ describe("integration: three questions, three sources", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("parseStoredAnswers", () => {
-  it("returns an empty list for null, undefined or a non-array", () => {
+  it("returns an empty list for null, undefined or a non-array", async () => {
     expect(parseStoredAnswers(null)).toEqual([]);
     expect(parseStoredAnswers(undefined)).toEqual([]);
     expect(parseStoredAnswers({})).toEqual([]);
     expect(parseStoredAnswers("not an array")).toEqual([]);
   });
 
-  it("drops entries with a missing or empty question or answer", () => {
+  it("drops entries with a missing or empty question or answer", async () => {
     const parsed = parseStoredAnswers([
       { question: "", answer: "yes", answeredAt: "2026-08-25T10:00:00Z" },
       { question: "How did you hear about us?", answer: "" },
@@ -306,7 +306,7 @@ describe("parseStoredAnswers", () => {
     expect(parsed[0]!.answer).toBe("LinkedIn");
   });
 
-  it("recomputes the topic slug from the current taxonomy rather than trusting the stored value", () => {
+  it("recomputes the topic slug from the current taxonomy rather than trusting the stored value", async () => {
     const parsed = parseStoredAnswers([
       {
         // A row from an earlier taxonomy that mislabelled this as
@@ -321,7 +321,7 @@ describe("parseStoredAnswers", () => {
     expect(parsed[0]!.topic).toBe("work_auth_current_us");
   });
 
-  it("drops HARD-STOP-10 demographic entries on the way out even if they somehow reached the column", () => {
+  it("drops HARD-STOP-10 demographic entries on the way out even if they somehow reached the column", async () => {
     const parsed = parseStoredAnswers([
       {
         question: "What is your gender?",
@@ -338,7 +338,7 @@ describe("parseStoredAnswers", () => {
     expect(parsed[0]!.question).toBe("how did you hear about us?");
   });
 
-  it("deduplicates by intent slug, keeping the first occurrence", () => {
+  it("deduplicates by intent slug, keeping the first occurrence", async () => {
     const parsed = parseStoredAnswers([
       {
         question: "Have you ever been convicted of a felony?",
@@ -359,7 +359,7 @@ describe("parseStoredAnswers", () => {
 describe("rememberAnswers", () => {
   const now = new Date("2026-08-25T12:00:00.000Z");
 
-  it("assigns an intent slug at write time using the classifier", () => {
+  it("assigns an intent slug at write time using the classifier", async () => {
     const merged = rememberAnswers(
       [],
       [
@@ -376,7 +376,7 @@ describe("rememberAnswers", () => {
     expect(merged[0]!.answeredAt).toBe(now.toISOString());
   });
 
-  it("accepts an explicit topic slug from v1-C's escalation flow", () => {
+  it("accepts an explicit topic slug from v1-C's escalation flow", async () => {
     const merged = rememberAnswers(
       [],
       [
@@ -391,7 +391,7 @@ describe("rememberAnswers", () => {
     expect(merged[0]!.topic).toBe("salary_expectation");
   });
 
-  it("rejects an explicit topic that does not name a known intent", () => {
+  it("rejects an explicit topic that does not name a known intent", async () => {
     const merged = rememberAnswers(
       [],
       [
@@ -407,7 +407,7 @@ describe("rememberAnswers", () => {
     expect(merged[0]!.topic).toBeNull();
   });
 
-  it("newest wins when an incoming answer shares an intent slug with a stored one", () => {
+  it("newest wins when an incoming answer shares an intent slug with a stored one", async () => {
     const stored: StoredAnswer[] = [
       {
         topic: "heard_about_us_source",
@@ -425,7 +425,7 @@ describe("rememberAnswers", () => {
     expect(merged[0]!.answer).toBe("A friend referred me");
   });
 
-  it("drops HARD-STOP-10 demographic answers before they reach storage", () => {
+  it("drops HARD-STOP-10 demographic answers before they reach storage", async () => {
     const merged = rememberAnswers(
       [],
       [
@@ -439,7 +439,7 @@ describe("rememberAnswers", () => {
     expect(merged[0]!.question).toContain("how did you hear about us");
   });
 
-  it("caps the merged list at STORED_ANSWER_LIMIT, dropping the oldest first", () => {
+  it("caps the merged list at STORED_ANSWER_LIMIT, dropping the oldest first", async () => {
     const incoming = Array.from({ length: 5 }, (_, i) => ({
       question: `Fresh question ${i}?`,
       answer: `Fresh answer ${i}`,
@@ -469,7 +469,7 @@ describe("sameStoredAnswers", () => {
     answeredAt: now,
   };
 
-  it("compares length, question, answer and topic", () => {
+  it("compares length, question, answer and topic", async () => {
     expect(sameStoredAnswers([a], [a])).toBe(true);
     expect(sameStoredAnswers([a], [{ ...a, answer: "No" }])).toBe(false);
     expect(sameStoredAnswers([a], [{ ...a, topic: "other" }])).toBe(false);
@@ -478,7 +478,7 @@ describe("sameStoredAnswers", () => {
 });
 
 describe("classifiedIntentMustBlock", () => {
-  it("returns mustBlock=true for a real work-authorization question", () => {
+  it("returns mustBlock=true for a real work-authorization question", async () => {
     const { intent, mustBlock } = classifiedIntentMustBlock(
       "Are you authorized to work in the United States?"
     );
@@ -486,7 +486,7 @@ describe("classifiedIntentMustBlock", () => {
     expect(mustBlock).toBe(true);
   });
 
-  it("returns mustBlock=false for a boilerplate consent question with a safe default", () => {
+  it("returns mustBlock=false for a boilerplate consent question with a safe default", async () => {
     const { intent, mustBlock } = classifiedIntentMustBlock(
       "I consent to the processing of your personal data as described in this notice."
     );
@@ -494,7 +494,7 @@ describe("classifiedIntentMustBlock", () => {
     expect(mustBlock).toBe(false);
   });
 
-  it("returns intent=null and mustBlock=false for a question the taxonomy does not recognise", () => {
+  it("returns intent=null and mustBlock=false for a question the taxonomy does not recognise", async () => {
     const { intent, mustBlock } = classifiedIntentMustBlock(
       "Please describe your favourite side project."
     );

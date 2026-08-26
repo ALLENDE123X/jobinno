@@ -1529,9 +1529,11 @@ describe("what the unknown-field fallback leaves behind", () => {
     const result = await run();
 
     expect(h.state.fallbackActs).toHaveLength(1);
-    // v1-C (#143): an unanswerable required question routes to the escalation
-    // queue instead of the terminal blocked state.
-    expect(result.status).toBe("pending_user_input");
+    // JOB-170: with ESCALATION_ENABLED false the escalation route is gated
+    // off, so an unanswerable required question lands in the terminal blocked
+    // state instead of pending_user_input. The question itself is still
+    // reported verbatim for whoever reads the row.
+    expect(result.status).toBe("form_fill_blocked");
     expect(result.needsInput.map((item) => item.fieldLabel)).toContain(
       "Which team interests you most?"
     );
@@ -1551,9 +1553,9 @@ describe("what the unknown-field fallback leaves behind", () => {
     const result = await run();
 
     expect(h.state.fallbackActs).toEqual([]);
-    // v1-C (#143): an unanswerable required question routes to the escalation
-    // queue instead of the terminal blocked state.
-    expect(result.status).toBe("pending_user_input");
+    // JOB-170: the escalation route is gated off, so the stop is terminal.
+    // The refusal itself is unchanged and the question is still reported.
+    expect(result.status).toBe("form_fill_blocked");
     expect(result.needsInput.map((item) => item.fieldLabel)).toContain(
       "Which team interests you most?"
     );
@@ -1565,9 +1567,8 @@ describe("what the unknown-field fallback leaves behind", () => {
     const result = await run();
 
     expect(h.state.fallbackActs).toEqual([]);
-    // v1-C (#143): an unanswerable required question routes to the escalation
-    // queue instead of the terminal blocked state.
-    expect(result.status).toBe("pending_user_input");
+    // JOB-170: the escalation route is gated off, so the stop is terminal.
+    expect(result.status).toBe("form_fill_blocked");
   });
 
   it("stops the run when a box gets ticked while it is filling something else", async () => {

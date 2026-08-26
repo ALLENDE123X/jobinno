@@ -821,6 +821,28 @@ export const applications = pgTable(
      * specific run — see JOB-045.
      */
     browserbaseSessionId: text("browserbase_session_id"),
+
+    /**
+     * ── JOB-170: the fabrication audit trail ─────────────────────────────
+     *
+     * One entry per form field this run answered through the LLM fabrication
+     * rung (or its sane default fallback), shaped as
+     * `{field_key, field_label, question_text, answered_value, source,
+     * model_confidence?}`. Written by the fill pipeline on the success path;
+     * null for a run that fabricated nothing.
+     *
+     * Same grant story as the four escalation columns above: no user-side
+     * UPDATE policy exists on this table, the pipeline writes it with the
+     * service role, and nothing here needs a column grant. This is a record
+     * we keep about an application, not an answer the person gives about
+     * themselves.
+     *
+     * EEO answers never appear here by construction: demographic fields are
+     * never fabricated and never defaulted (HARD STOP #10), so they can only
+     * ever be declined from the control's own option set, which the existing
+     * outcome report already records.
+     */
+    answerProvenance: jsonb("answer_provenance"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
