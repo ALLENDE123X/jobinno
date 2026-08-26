@@ -26,7 +26,7 @@
  * `authenticated` for exactly that reason, so the stamp goes through
  * `recordAttestation`, which holds the only writer left.
  *
- * That same write is also where the Free plan's ten applications get granted,
+ * That same write is also where the Free plan's three applications get granted,
  * once, on a person's first completed intake. See
  * `lib/onboarding/attestation.ts` for why that grant has to be part of this
  * one statement rather than a second write here: this action can be reached a

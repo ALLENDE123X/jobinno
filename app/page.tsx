@@ -94,9 +94,9 @@ const PLANS = [
     name: "Free",
     price: "$0",
     cadence: "to try it",
-    allowance: "10 applications, total",
+    allowance: "3 applications, total",
     features: [
-      "10 applications, once",
+      "3 applications, once",
       "Every supported ATS platform",
       "Full log of what was submitted",
     ],
@@ -350,7 +350,7 @@ export default async function Home({
                 </div>
 
                 <p className="text-sm text-muted-foreground">
-                  10 applications free. No card needed.
+                  3 applications free. No card needed.
                 </p>
               </div>
 

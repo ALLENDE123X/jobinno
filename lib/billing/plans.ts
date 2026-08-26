@@ -116,7 +116,7 @@ export type PlanSlug = "free" | PaidPlanSlug;
  * proved what happens when a number like this lives in two places, which is
  * that they drift.
  */
-export const FREE_PLAN_APPLICATIONS_CAP = 10;
+export const FREE_PLAN_APPLICATIONS_CAP = 3;
 
 export interface PaidPlan {
   slug: PaidPlanSlug;
@@ -155,7 +155,7 @@ export const PAID_PLANS: Record<PaidPlanSlug, PaidPlan> = {
 /**
  * What `applications_cap` becomes when a paid plan goes away.
  *
- * Zero, and not `FREE_PLAN_APPLICATIONS_CAP`. The free tier's ten applications
+ * Zero, and not `FREE_PLAN_APPLICATIONS_CAP`. The free tier's three applications
  * are a one time trial granted the moment intake is first completed (see
  * `lib/onboarding/attestation.ts`), not something signup itself hands out, so
  * handing them back to somebody whose subscription just lapsed would mint a
