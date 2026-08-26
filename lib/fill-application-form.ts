@@ -7288,6 +7288,13 @@ async function runFill(
         browserbaseSessionId: report.browserbaseSessionId,
         log: LOG,
       });
+      // JOB-170: a blocked run can still have fabricated answers earlier on
+      // the form (the verification run against Western Digital fabricated
+      // three screening answers and then stopped on the residual EEO
+      // questions). The audit trail is written on this path too, so a row
+      // that never submits still records what the model chose. Best effort,
+      // same as below.
+      await persistAnswerProvenance(supabase, jobApplicationId, report.answerProvenance);
       // `session` is null on every blocked path — `runBrowserFlow` closed it.
       return {
         result: { ...report, status: APPLICATION_STATUS.FORM_FILL_BLOCKED },
