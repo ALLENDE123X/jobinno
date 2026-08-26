@@ -231,6 +231,7 @@ import {
   readFieldValue,
   CONSENT_FIELD_RE,
   EEO_FIELD_RE,
+  type ApplyOutcome,
   type EnumeratedField,
   type FormFieldKind,
 } from "@/lib/form-fields";
@@ -2639,6 +2640,138 @@ const plainCompare = (value: string): string => value.trim().replace(/\s+/g, " "
  * a different number reached the field.
  */
 const phoneCompare = (value: string): string => value.replace(/\D/g, "").slice(-10);
+
+// ── Issue #172: formatting-tolerant typing and read-back comparison ────────
+//
+// The general pass (ACT-015) applies every value through `applyFieldValue`,
+// whose own verification compares exactly once case and whitespace are
+// folded. That is not enough for the fields boards reformat underneath us.
+// On the founder run of 2026 08 26 (issue #172), five real submissions were
+// aborted by exactly this gap:
+//
+//  · Breezy's salary input strips the comma, so "120,000" was typed and
+//    "120000" read back — Atlas Technica, DS2 and Kastech all blocked on it.
+//  · SmartRecruiters' phone input reformats separators, so a phone typed one
+//    way read back as "404 444 6018" — CapTech blocked on it.
+//  · A model proposal of "$" alone went into a numeric salary input on DS2's
+//    AI listing and the control cleared to empty.
+//
+// Two pieces fix the family, both living here rather than in
+// `form-fields.ts` so the strict comparison every other caller relies on is
+// untouched:
+//
+//  · `canonicalizeTypedValue` runs BEFORE typing. It strips a leading
+//    currency marker and grouping commas from a digit-shaped answer, so the
+//    control receives "120000" rather than "120,000", and refuses an answer
+//    that is only a currency symbol so nothing meaningless gets typed. It
+//    deliberately touches nothing carrying letters, hyphens or parentheses,
+//    so prose, dates like "2022-2024" and formatted phone numbers keep
+//    their shape.
+//
+//  · `normalizeForComparison` reduces both sides of a FAILED read-back to
+//    their digit core, so "120000", "120,000" and "$120,000" compare equal,
+//    as do "4044446018" and "(404) 444-6018". A second chance only: it never
+//    replaces the strict comparison, it only overturns a failure when what
+//    read back differs from what was typed by currency symbols, grouping
+//    commas and separator characters alone. Applied to single-line text
+//    controls only — menus must keep refusing a near-miss option word.
+export function normalizeForComparison(raw: string, fieldKind?: string): string {
+  const folded = raw
+    .normalize("NFC")
+    // Invisible space variants boards emit: nbsp, figure space, narrow nbsp.
+    .replace(/[\u00a0\u2007\u202f]/g, " ")
+    .trim();
+  if (fieldKind === "phone") return folded.replace(/\D/g, "").slice(-10);
+  return folded
+    .replace(/[$,\s]/g, "")
+    .replace(/[()-]/g, "")
+    .toLowerCase();
+}
+
+/** What `canonicalizeTypedValue` decided about an answer offered for typing. */
+export type CanonicalizedValue = {
+  /** What should be typed into the control instead of the raw answer. */
+  value: string;
+  /**
+   * True when the raw answer carries no actual value at all once currency
+   * markers are stripped — "$" alone, for instance. Nothing is typed.
+   */
+  unusable: boolean;
+};
+
+export function canonicalizeTypedValue(rawValue: string): CanonicalizedValue {
+  const trimmed = rawValue.trim();
+  if (trimmed === "") return { value: "", unusable: false };
+  // Digit-shaped answers only: an optional leading currency marker, then
+  // digits with optional grouping commas and an optional decimal part.
+  // Anything else is prose, a date or a formatted phone number and is typed
+  // exactly as it arrived; the read-back comparator below absorbs whatever a
+  // board does to those.
+  const stripped = trimmed.replace(/^\$\s*/, "").replace(/,/g, "");
+  if (/^\d+(?:\.\d+)?$/.test(stripped)) {
+    return { value: stripped, unusable: false };
+  }
+  if (stripped === "") return { value: "", unusable: true };
+  return { value: trimmed, unusable: false };
+}
+
+/** What `applyWithReadBackTolerance` reports, including what it actually typed. */
+type TolerantApplyResult = ApplyOutcome & { typedValue: string };
+
+/**
+ * Applies one answer through `applyFieldValue`, with issue #172's two pieces
+ * wrapped around it for single-line text controls: digit-shaped answers are
+ * canonicalized before they are typed, and a failed strict read-back gets one
+ * second chance through `normalizeForComparison` before it is believed. Every
+ * general-pass apply goes through here so the named-field pass and this pass
+ * stay two expressions of one policy rather than drifting copies.
+ */
+export async function applyWithReadBackTolerance(
+  page: Page,
+  field: EnumeratedField,
+  rawValue: string,
+  options: ApplyOptions = {}
+): Promise<TolerantApplyResult> {
+  const refuseToType = (why: string): TolerantApplyResult => ({
+    ok: false,
+    readBack: "",
+    detail: why,
+    typedValue: "",
+  });
+  if (field.kind !== "text") {
+    const applied = await applyFieldValue(page, field, rawValue, options);
+    return { ...applied, typedValue: rawValue };
+  }
+  const canonical = canonicalizeTypedValue(rawValue);
+  if (canonical.unusable || canonical.value === "") {
+    return refuseToType(
+      `the proposed answer ${JSON.stringify(rawValue.slice(0, 80))} carries no actual value once ` +
+        `currency markers and grouping commas are stripped, so nothing was typed`
+    );
+  }
+  const applied = await applyFieldValue(page, field, canonical.value, options);
+  if (!applied.ok && applied.readBack !== "") {
+    const typedCore = normalizeForComparison(canonical.value);
+    const readCore = normalizeForComparison(applied.readBack);
+    if (typedCore !== "" && typedCore === readCore) {
+      return {
+        ok: true,
+        readBack: applied.readBack,
+        detail:
+          "typed and read back identical once currency symbols, grouping commas and separator " +
+          "characters were ignored (the board reformats this field)",
+        typedValue: canonical.value,
+      };
+    }
+  }
+  return { ...applied, typedValue: canonical.value };
+}
+
+/**
+ * The apply-time option bag `applyFieldValue` takes, named so the wrapper's
+ * signature can point at one definition instead of restating it.
+ */
+type ApplyOptions = NonNullable<Parameters<typeof applyFieldValue>[3]>;
 
 function buildFieldPlan(
   profile: ResumeProfile,
@@ -5369,7 +5502,7 @@ async function fillRepeatingSections(
 
         await sleep(randomInteractionDelayMs());
         const value = resolution.value;
-        const outcome = await applyFieldValue(session.page, field, value, {
+        const outcome = await applyWithReadBackTolerance(session.page, field, value, {
           allowContains: OPTION_KINDS.has(field.kind) && field.options.length === 0,
           // The same double gate the ordinary pass uses: a school-shaped
           // combobox whose answer came from a school-shaped fact. An employer
@@ -5391,7 +5524,7 @@ async function fillRepeatingSections(
         if (outcome.ok) {
           outcomes.push({
             field: field.key,
-            intended: value,
+            intended: outcome.typedValue,
             outcome: "filled",
             detail: `${section.heading} entry — ${resolution.note}; ${outcome.detail}`,
             readBack: outcome.readBack,
@@ -5405,7 +5538,7 @@ async function fillRepeatingSections(
           // in a real employer's work history is exactly what that guard is for.
           outcomes.push({
             field: field.key,
-            intended: value,
+            intended: outcome.typedValue,
             outcome: "mismatch",
             detail: `${section.heading} entry — ${outcome.detail}`,
             readBack: outcome.readBack,
@@ -5414,7 +5547,7 @@ async function fillRepeatingSections(
         }
         outcomes.push({
           field: field.key,
-          intended: value,
+          intended: outcome.typedValue === "" ? null : outcome.typedValue,
           outcome: field.required ? "needs-input" : "skipped",
           detail: `${section.heading} entry — ${outcome.detail}`,
         });
@@ -5642,12 +5775,12 @@ async function fillRemainingFields(
       const emailFact = factsByKey.get("email");
       if (emailFact !== undefined) {
         await sleep(randomInteractionDelayMs());
-        const outcome = await applyFieldValue(session.page, field, emailFact.value, {});
+        const outcome = await applyWithReadBackTolerance(session.page, field, emailFact.value, {});
         if (outcome.ok) {
-          record(field, "filled", emailFact.value, `confirm-email — filled with the email fact; ${outcome.detail}`, outcome.readBack);
+          record(field, "filled", outcome.typedValue, `confirm-email — filled with the email fact; ${outcome.detail}`, outcome.readBack);
           console.log(`${LOG} ${field.label}: filled as confirm-email`);
         } else if (outcome.readBack !== "") {
-          record(field, "mismatch", emailFact.value, outcome.detail, outcome.readBack);
+          record(field, "mismatch", outcome.typedValue, outcome.detail, outcome.readBack);
         } else {
           ask(field, `The confirm-email field "${field.label}" could not be filled. ${outcome.detail}. What email address should we use?`, `confirm-email fill failed — ${outcome.detail}`);
         }
@@ -5673,14 +5806,14 @@ async function fillRemainingFields(
     // what they said — see `chooseFromMenu` — so an ambiguous answer comes back
     // to them rather than being resolved for them.
     await sleep(randomInteractionDelayMs());
-    const outcome = await applyFieldValue(session.page, field, supplied, {
+    const outcome = await applyWithReadBackTolerance(session.page, field, supplied, {
       allowContains: OPTION_KINDS.has(field.kind),
     });
     if (outcome.ok) {
-      record(field, "filled", supplied, `answered by the candidate — ${outcome.detail}`, outcome.readBack);
+      record(field, "filled", outcome.typedValue, `answered by the candidate — ${outcome.detail}`, outcome.readBack);
       console.log(`${LOG} ${field.label}: filled from the candidate's own answer`);
     } else if (outcome.readBack !== "") {
-      record(field, "mismatch", supplied, outcome.detail, outcome.readBack);
+      record(field, "mismatch", outcome.typedValue, outcome.detail, outcome.readBack);
     } else {
       ask(
         field,
@@ -5800,7 +5933,7 @@ async function fillRemainingFields(
     }
 
     await sleep(randomInteractionDelayMs());
-    const outcome = await applyFieldValue(session.page, field, value, {
+    const outcome = await applyWithReadBackTolerance(session.page, field, value, {
       // No fixed option list means this is a search control that answers a
       // query rather than a menu with a fixed set — see `chooseFromMenu`.
       allowContains: OPTION_KINDS.has(field.kind) && field.options.length === 0,
@@ -5831,12 +5964,12 @@ async function fillRemainingFields(
     });
 
     if (outcome.ok) {
-      record(field, declined ? "declined" : "filled", value, `${note}; ${outcome.detail}`, outcome.readBack);
+      record(field, declined ? "declined" : "filled", outcome.typedValue, `${note}; ${outcome.detail}`, outcome.readBack);
       console.log(`${LOG} ${field.label}: ${declined ? "declined to answer" : "filled"} + verified`);
       continue;
     }
     if (outcome.readBack !== "") {
-      record(field, "mismatch", value, outcome.detail, outcome.readBack);
+      record(field, "mismatch", outcome.typedValue, outcome.detail, outcome.readBack);
       continue;
     }
     ask(
@@ -6234,7 +6367,7 @@ async function fillRemainingFields(
       continue;
     }
     await sleep(randomInteractionDelayMs());
-    const outcome = await applyFieldValue(session.page, field, resolved.answer, {
+    const outcome = await applyWithReadBackTolerance(session.page, field, resolved.answer, {
       allowContains: OPTION_KINDS.has(field.kind),
     });
     if (!outcome.ok) {
@@ -6248,7 +6381,7 @@ async function fillRemainingFields(
     supersede(
       field,
       "filled",
-      resolved.answer,
+      outcome.typedValue,
       resolved.source === "llm_fabrication"
         ? `answered by the LLM fabrication rung from the candidate's own intake data and resume ` +
           `(confidence ${resolved.confidence?.toFixed(2) ?? "n/a"}): ${outcome.detail}`
