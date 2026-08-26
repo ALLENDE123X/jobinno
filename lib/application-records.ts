@@ -100,6 +100,13 @@ export type ApplicationPatch = {
   escalationCreatedAt?: string | null;
   escalationNotifiedAt?: string | null;
   escalationResolvedAt?: string | null;
+
+  /**
+   * `applications.browserbase_session_id`: the Browserbase session this
+   * attempt ran in, when one existed. The durable, queryable link from a row
+   * here to the recording of that specific run — see JOB-045.
+   */
+  browserbaseSessionId?: string | null;
 };
 
 /**
@@ -137,6 +144,8 @@ function patchColumns(patch: ApplicationPatch): Record<string, unknown> {
     row.escalation_notified_at = patch.escalationNotifiedAt;
   if (patch.escalationResolvedAt !== undefined)
     row.escalation_resolved_at = patch.escalationResolvedAt;
+  if (patch.browserbaseSessionId !== undefined)
+    row.browserbase_session_id = patch.browserbaseSessionId;
   return row;
 }
 
@@ -350,6 +359,8 @@ export type SkipInput = {
   fieldLabel?: string | null;
   fieldKind?: string | null;
   required?: boolean | null;
+  /** The Browserbase session this stop happened in, when one existed. Lands in `raw_context`. */
+  browserbaseSessionId?: string | null;
 };
 
 /**
@@ -389,7 +400,7 @@ export async function recordSkip(supabase: SupabaseClient, input: SkipInput): Pr
     required: input.required ?? null,
     // Never a screenshot and never resume text, per the schema's own note on
     // this column. The message is the pipeline's own prose about its own stop.
-    raw_context: { message },
+    raw_context: { message, browserbaseSessionId: input.browserbaseSessionId ?? null },
   });
 
   if (error) {
@@ -433,7 +444,8 @@ export type FailureInput = Omit<SkipInput, "reason"> & {
 };
 
 /**
- * Records a terminal failure: the status on the row, the reason in the log.
+ * Records a terminal failure: the status (and, when known, the Browserbase
+ * session) on the row, the reason in the log.
  *
  * Best-effort, and never throws over the original error. That property is
  * carried over verbatim from actinno's `recordFailure` and is worth restating,
@@ -444,6 +456,12 @@ export type FailureInput = Omit<SkipInput, "reason"> & {
  *
  * The status is written first. If only one of the two writes lands, the more
  * useful survivor is the one that stops the row being picked up again.
+ *
+ * `browserbaseSessionId` was already flowing into `skip_log.raw_context`
+ * below (see `SkipInput`) before JOB-045 — it just never reached this row.
+ * Left off the patch entirely when the caller left it `undefined` (a stop
+ * that happened before any browser existed), rather than writing a `null`
+ * over whatever the row already held.
  */
 export async function recordFailure(
   supabase: SupabaseClient,
@@ -454,7 +472,11 @@ export async function recordFailure(
 
   if (input.applicationId !== null) {
     try {
-      await updateApplication(supabase, input.applicationId, { status: input.status });
+      const patch: ApplicationPatch = { status: input.status };
+      if (input.browserbaseSessionId !== undefined) {
+        patch.browserbaseSessionId = input.browserbaseSessionId;
+      }
+      await updateApplication(supabase, input.applicationId, patch);
       console.error(
         `${log} applications ${input.applicationId} → ${input.status} (${reason}): ${input.message}`
       );

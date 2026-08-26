@@ -24,6 +24,12 @@ additional_redirect_urls = [
   # deployment, not a typo: it is a CNAME to Vercel and answers `/login` with a
   # 200. People arrive on it, so the magic link has to be allowed to land on it.
   "https://www.jobinno.app/auth/callback",
+  # JOB-164. Vercel preview deployments of this project under the nullcoders
+  # team scope. Supabase's own wildcard syntax, one star per path segment and
+  # two for any depth. Scoped to this project's previews only, deliberately not
+  # *.vercel.app. The app side accepts the same set through the hostname
+  # pattern in lib/auth/redirect-urls.ts; keep both halves in sync.
+  "https://jobinno-*-nullcoders-projects.vercel.app/**",
 ]
 
 # Everything from here down restates what the project already has set. It is
@@ -50,11 +56,11 @@ enroll_enabled = true
 verify_enabled = true
 
 # ── Who actually sends the email (JOB-024) ──────────────────────────────────
-# There is no `[auth.email.smtp]` section below, and that means this project is
-# on Supabase's own built in mailer. That mailer is a development convenience,
-# not a sending service. Measured against this project's live auth logs on 21
-# August it allowed exactly two messages an hour and refused everything after
-# that with "email rate limit exceeded":
+# Supabase's own built in mailer was the only thing configured here until
+# 2026-08-21. That mailer is a development convenience, not a sending service.
+# Measured against this project's live auth logs on 21 August it allowed
+# exactly two messages an hour and refused everything after that with "email
+# rate limit exceeded":
 #
 #   03:40:34  mail.send        delivered
 #   03:43:32  mail.send        delivered
@@ -63,14 +69,14 @@ verify_enabled = true
 #   03:44:14  POST /otp  429   email rate limit exceeded
 #   03:44:36  POST /otp  429   email rate limit exceeded
 #
-# Two accounts an hour, across everybody, is the whole signup capacity of the
-# product while this stays as it is. Three real people were turned away in the
-# 64 seconds above.
+# Two accounts an hour, across everybody, was the whole signup capacity of the
+# product while this stood as it was. Three real people were turned away in
+# the 64 seconds above.
 #
-# Fixing it needs custom SMTP, and custom SMTP needs a verified sending domain,
-# which needs DNS records only the domain owner can add. So the fix is not in
-# this file yet and this comment is here instead of a half configured section
-# that would look like one.
+# Fixing it needed custom SMTP, and custom SMTP needed a verified sending
+# domain, which needed DNS records only the domain owner could add. Once
+# jobinno.app's DKIM and SPF records verified on Resend, `[auth.email.smtp]`
+# below was turned on to use it.
 #
 # ── Read this before adding the section ─────────────────────────────────────
 # `config push` sends the whole auth block and fills anything absent with the
@@ -94,13 +100,39 @@ verify_enabled = true
 # the CLI resolves from the environment, so the repository carries the shape and
 # never the secret.
 #
-# [auth.email.smtp]
-# host = "smtp.resend.com"
-# port = 587
-# user = "resend"
-# pass = "env(SUPABASE_AUTH_SMTP_PASS)"
-# admin_email = "noreply@jobinno.app"
-# sender_name = "Jobinno"
+# ── The section below looked complete and was not (JOB-024, 2026-08-21) ─────
+# host/port/user/pass/admin_email/sender_name were filled in and pushed with
+# `npm run supabase:auth-config`. The CLI reported "Remote Auth config is up to
+# date" and exited 0. A real magic link sent right after still arrived branded
+# as Supabase's own built-in mailer, not Resend.
+#
+# Root cause, confirmed by reading supabase-cli 2.115.0's own source
+# (`packages/config/src/auth/email.ts` and
+# `apps/cli/src/legacy/commands/config/push/config-sync/auth.sync.ts`):
+# `auth.email.smtp` has its own `enabled` boolean, independent of whether
+# host/port/user/pass/admin_email are filled in, and it defaults to `false`
+# when the key is simply absent — which it was, in every version of this
+# section up to this comment. The CLI's own required-field checks only run
+# `requiredWhenEnabled`, so a fully-populated section with no `enabled = true`
+# parses as valid; nothing warns you the block is inert. And `enabled` is
+# exactly what decides whether the CLI ever sends host/port/user/pass/
+# admin_email/sender_name to the Management API at all — with it unset, the
+# CLI's local-vs-remote diff resolves both sides to "disabled" (this project's
+# SMTP had never been turned on before), finds no difference, and never issues
+# the update. "Up to date" was true and useless at the same time: true of a
+# config that was never actually sent.
+#
+# So: `enabled = true` is not optional decoration, it is the field that makes
+# every other line in this table do anything. Set it explicitly.
+#
+[auth.email.smtp]
+enabled = true
+host = "smtp.resend.com"
+port = 587
+user = "resend"
+pass = "env(SUPABASE_AUTH_SMTP_PASS)"
+admin_email = "noreply@jobinno.app"
+sender_name = "Jobinno"
 
 [auth.email]
 enable_signup = true

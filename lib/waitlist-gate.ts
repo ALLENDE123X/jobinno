@@ -92,7 +92,7 @@ const EXEMPT_PATHS: ReadonlySet<string> = new Set([
  * the gate is active would send a signed in visitor back and forth between
  * the two routes forever. See "How to remove the gate later" above.
  */
-export const WAITLIST_GATE_ACTIVE = true;
+export const WAITLIST_GATE_ACTIVE = false;
 
 export function isExemptFromWaitlistGate(pathname: string): boolean {
   return EXEMPT_PATHS.has(pathname);

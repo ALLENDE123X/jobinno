@@ -51,6 +51,10 @@ lib/.form-fill-screenshots/
 lib/.submission-screenshots/
 lib/.stagehand-observe-cache.json
 
+# JOB-027. Screen recordings of real application runs, downloaded on demand
+# by `npm run analyze-failures`. Same rule as the screenshot directories above.
+failure-recordings/
+
 # Test output
 /test-results/
 /playwright-report/
@@ -69,3 +73,9 @@ output.txt
 # Supabase CLI scratch state. `supabase/config.toml` is the tracked artefact;
 # everything the CLI caches next to it is machine local.
 supabase/.temp/
+
+# Scratch / temporary diagnostic scripts
+.tmp-*
+
+# Ephemeral failure recordings from ad-hoc batch runs
+failure-recordings-*/

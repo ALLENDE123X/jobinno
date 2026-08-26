@@ -39,6 +39,8 @@ import {
 } from "@/components/ui/select";
 import {
   CITIZENSHIP_OPTIONS,
+  CLEARANCE_ELIGIBILITY_OPTIONS,
+  CLEARANCE_LEVEL_OPTIONS,
   F1_STATUS_OPTIONS,
   intakeFieldErrors,
   intakeSchema,
@@ -49,6 +51,8 @@ import { submitIntake } from "./actions";
 
 type CitizenshipValue = (typeof CITIZENSHIP_OPTIONS)[number]["value"];
 type F1Value = (typeof F1_STATUS_OPTIONS)[number]["value"];
+type ClearanceValue = (typeof CLEARANCE_ELIGIBILITY_OPTIONS)[number]["value"];
+type ClearanceLevelValue = (typeof CLEARANCE_LEVEL_OPTIONS)[number]["value"];
 
 const YES_NO = [
   { value: "yes", label: "Yes" },
@@ -122,6 +126,47 @@ function YesNoField({
   );
 }
 
+/**
+ * A select over a fixed option list, which is what most of this form is.
+ *
+ * Added by JOB-101 rather than by copying the citizenship block a third and a
+ * fourth time. The two older selects are left as they are: rewriting them would
+ * put a refactor in a ticket about missing fields, and a reviewer reading this
+ * diff should be able to see only what the ticket added.
+ */
+function ChoiceField<Value extends string>({
+  label,
+  options,
+  value,
+  onChange,
+  error,
+  hint,
+}: {
+  label: string;
+  options: readonly { value: Value; label: string }[];
+  value: Value | "";
+  onChange: (value: Value) => void;
+  error?: string;
+  hint?: string;
+}) {
+  return (
+    <Field label={label} error={error} hint={hint}>
+      <Select value={value} onValueChange={(next) => onChange(next as Value)}>
+        <SelectTrigger className="w-full">
+          <SelectValue placeholder="Choose one" />
+        </SelectTrigger>
+        <SelectContent>
+          {options.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </Field>
+  );
+}
+
 export function IntakeForm({ userId }: { userId: string }) {
   const [citizenshipStatus, setCitizenshipStatus] = useState<
     CitizenshipValue | ""
@@ -129,12 +174,34 @@ export function IntakeForm({ userId }: { userId: string }) {
   const [f1Status, setF1Status] = useState<F1Value | "">("");
   const [workAuthorizedUs, setWorkAuthorizedUs] = useState<YesNo>("");
   const [requiresSponsorship, setRequiresSponsorship] = useState<YesNo>("");
+  const [needsSponsorshipNonUs, setNeedsSponsorshipNonUs] = useState<YesNo>("");
+  const [visaStatus, setVisaStatus] = useState("");
+  const [clearanceEligibility, setClearanceEligibility] = useState<
+    ClearanceValue | ""
+  >("");
+  const [clearanceLevelHeld, setClearanceLevelHeld] = useState<
+    ClearanceLevelValue | ""
+  >("");
+  const [streetAddress, setStreetAddress] = useState("");
   const [currentCity, setCurrentCity] = useState("");
+  const [postalCode, setPostalCode] = useState("");
   const [currentCountry, setCurrentCountry] = useState("United States");
   const [willingToRelocate, setWillingToRelocate] = useState<YesNo>("");
   const [targetLocations, setTargetLocations] = useState("");
   const [gradDate, setGradDate] = useState("");
   const [earliestStart, setEarliestStart] = useState("");
+  const [highSchoolName, setHighSchoolName] = useState("");
+  const [highSchoolGradYear, setHighSchoolGradYear] = useState("");
+  // JOB-134. The four questions real screening steps kept stopping on.
+  const [subjectToRestrictiveCovenant, setSubjectToRestrictiveCovenant] =
+    useState<YesNo>("");
+  const [relativesAtTargetEmployers, setRelativesAtTargetEmployers] =
+    useState<YesNo>("");
+  const [
+    previouslyEmployedAtTargetEmployers,
+    setPreviouslyEmployedAtTargetEmployers,
+  ] = useState<YesNo>("");
+  const [salaryExpectation, setSalaryExpectation] = useState("");
   const [resumeFile, setResumeFile] = useState<File | null>(null);
   const [linkedinFile, setLinkedinFile] = useState<File | null>(null);
   const [attestation, setAttestation] = useState(false);
@@ -178,7 +245,13 @@ export function IntakeForm({ userId }: { userId: string }) {
         f1Status: isF1 ? (f1Status === "" ? null : f1Status) : null,
         workAuthorizedUs: toBoolean(workAuthorizedUs),
         requiresSponsorship: toBoolean(requiresSponsorship),
+        needsSponsorshipNonUs: toBoolean(needsSponsorshipNonUs),
+        visaStatus,
+        clearanceEligibility,
+        clearanceLevelHeld,
+        streetAddress,
         currentCity,
+        postalCode,
         currentCountry,
         willingToRelocate: toBoolean(willingToRelocate),
         targetLocations: targetLocations
@@ -187,6 +260,19 @@ export function IntakeForm({ userId }: { userId: string }) {
           .filter(Boolean),
         gradDate,
         earliestStart,
+        highSchoolName,
+        // Left as a string when it is not a whole number, so that "twenty
+        // twenty two" fails the schema and comes back as a message under the
+        // control rather than becoming NaN and failing somewhere less legible.
+        highSchoolGradYear: /^\d+$/.test(highSchoolGradYear.trim())
+          ? Number(highSchoolGradYear.trim())
+          : highSchoolGradYear,
+        subjectToRestrictiveCovenant: toBoolean(subjectToRestrictiveCovenant),
+        relativesAtTargetEmployers: toBoolean(relativesAtTargetEmployers),
+        previouslyEmployedAtTargetEmployers: toBoolean(
+          previouslyEmployedAtTargetEmployers
+        ),
+        salaryExpectation,
         resumePath,
         linkedinPdfPath,
         attestation,
@@ -328,11 +414,73 @@ export function IntakeForm({ userId }: { userId: string }) {
           value={requiresSponsorship}
           onChange={setRequiresSponsorship}
           error={errors.requiresSponsorship}
+          hint="This one is about working in the US."
+        />
+
+        <YesNoField
+          label="Outside the US, would you need sponsorship to work"
+          value={needsSponsorshipNonUs}
+          onChange={setNeedsSponsorshipNonUs}
+          error={errors.needsSponsorshipNonUs}
+          hint="Forms in the UK, Ireland and elsewhere ask their own version of the question above, and a US answer is not an answer to it."
+        />
+
+        <Field
+          label="Your current visa status"
+          htmlFor="visa"
+          error={errors.visaStatus}
+          hint="In your own words. If you are not on a visa, say so, for example: not applicable, US citizen."
+        >
+          <Input
+            id="visa"
+            value={visaStatus}
+            onChange={(event) => setVisaStatus(event.target.value)}
+            placeholder="Not applicable, US citizen"
+          />
+        </Field>
+      </section>
+
+      <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
+        <h2 className="text-lg font-medium">Security clearance</h2>
+        <p className="text-muted-foreground text-sm">
+          Defence and aerospace employers ask this on every listing, and most of
+          them will not let an application through without an answer.
+        </p>
+
+        <ChoiceField
+          label="Do you hold a clearance, or could you get one"
+          options={CLEARANCE_ELIGIBILITY_OPTIONS}
+          value={clearanceEligibility}
+          onChange={setClearanceEligibility}
+          error={errors.clearanceEligibility}
+        />
+
+        <ChoiceField
+          label="The highest clearance you have ever held"
+          options={CLEARANCE_LEVEL_OPTIONS}
+          value={clearanceLevelHeld}
+          onChange={setClearanceLevelHeld}
+          error={errors.clearanceLevelHeld}
         />
       </section>
 
       <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
         <h2 className="text-lg font-medium">Where you are and where you want to be</h2>
+
+        <Field
+          label="Street address"
+          htmlFor="street"
+          error={errors.streetAddress}
+          hint="Application forms ask for a postal address far more often than you would expect, and a blank one stops the whole application."
+        >
+          <Input
+            id="street"
+            value={streetAddress}
+            onChange={(event) => setStreetAddress(event.target.value)}
+            placeholder="123 Peachtree Street NE, Apt 4"
+            autoComplete="street-address"
+          />
+        </Field>
 
         <Field label="Current city" htmlFor="city" error={errors.currentCity}>
           <Input
@@ -340,6 +488,17 @@ export function IntakeForm({ userId }: { userId: string }) {
             value={currentCity}
             onChange={(event) => setCurrentCity(event.target.value)}
             placeholder="Atlanta"
+            autoComplete="address-level2"
+          />
+        </Field>
+
+        <Field label="Postal code" htmlFor="postal" error={errors.postalCode}>
+          <Input
+            id="postal"
+            value={postalCode}
+            onChange={(event) => setPostalCode(event.target.value)}
+            placeholder="30308"
+            autoComplete="postal-code"
           />
         </Field>
 
@@ -404,6 +563,87 @@ export function IntakeForm({ userId }: { userId: string }) {
             type="date"
             value={earliestStart}
             onChange={(event) => setEarliestStart(event.target.value)}
+          />
+        </Field>
+      </section>
+
+      <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
+        <h2 className="text-lg font-medium">High school</h2>
+        <p className="text-muted-foreground text-sm">
+          A surprising number of forms ask for this by name, and a resume almost
+          never carries it.
+        </p>
+
+        <Field
+          label="High school name"
+          htmlFor="highschool"
+          error={errors.highSchoolName}
+        >
+          <Input
+            id="highschool"
+            value={highSchoolName}
+            onChange={(event) => setHighSchoolName(event.target.value)}
+            placeholder="Lincoln High School"
+          />
+        </Field>
+
+        <Field
+          label="Year you graduated high school"
+          htmlFor="highschoolyear"
+          error={errors.highSchoolGradYear}
+        >
+          <Input
+            id="highschoolyear"
+            inputMode="numeric"
+            value={highSchoolGradYear}
+            onChange={(event) => setHighSchoolGradYear(event.target.value)}
+            placeholder="2022"
+          />
+        </Field>
+      </section>
+
+      <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
+        <h2 className="text-lg font-medium">Screening questions</h2>
+        <p className="text-muted-foreground text-sm">
+          Almost every employer asks these somewhere in the application. Answer
+          them once here and we will not stop to ask you again.
+        </p>
+
+        <YesNoField
+          label="Are you under a non compete or non solicitation agreement"
+          value={subjectToRestrictiveCovenant}
+          onChange={setSubjectToRestrictiveCovenant}
+          error={errors.subjectToRestrictiveCovenant}
+          hint="This is about an agreement with a previous employer. If you are under one, say yes. We will still come back to you if a form asks for the details."
+        />
+
+        <YesNoField
+          label="Do you have relatives working at any company you might apply to"
+          value={relativesAtTargetEmployers}
+          onChange={setRelativesAtTargetEmployers}
+          error={errors.relativesAtTargetEmployers}
+          hint="Forms ask this about themselves, one company at a time. A no here answers all of them. A yes means we ask you about the specific company when it comes up."
+        />
+
+        <YesNoField
+          label="Have you ever worked at any company you might apply to"
+          value={previouslyEmployedAtTargetEmployers}
+          onChange={setPreviouslyEmployedAtTargetEmployers}
+          error={errors.previouslyEmployedAtTargetEmployers}
+          hint="Same as above. A no answers every version of this question, and a yes means we ask you which company when a form wants to know."
+        />
+
+        <Field
+          label="What you expect to be paid"
+          htmlFor="salary"
+          error={errors.salaryExpectation}
+          hint="In your own words. A number, a range, or something like negotiable. We never make one up for you."
+        >
+          <Input
+            id="salary"
+            value={salaryExpectation}
+            onChange={(event) => setSalaryExpectation(event.target.value)}
+            placeholder="$120,000, or negotiable"
           />
         </Field>
       </section>

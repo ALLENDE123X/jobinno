@@ -402,3 +402,41 @@ export function classifiedIntentMustBlock(question: string): {
     mustBlock: intent !== null && ALWAYS_BLOCK_TOPIC_SLUGS.has(intent.slug),
   };
 }
+
+/**
+ * The question, folded the way `matchAdditionalAnswer` folds a field key.
+ * Case, surrounding whitespace, runs of whitespace, a required marker a form
+ * printed in front of the label, and trailing punctuation — nothing else.
+ */
+function normalizeQuestion(question: string): string {
+  return question
+    .toLowerCase()
+    .replace(/[*✱]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[\s:?.!,;]+$/, "");
+}
+
+/**
+ * Stored answers in the shape `additionalAnswers` has always had, merged under
+ * whatever this run was given (JOB-134).
+ *
+ * The supplied entries come first and win outright, in value and in iteration
+ * order, and both halves of that matter. A person answering a question again
+ * right now is correcting the record, and `matchAdditionalAnswer` walks this
+ * object in insertion order and takes the first key that contains or is
+ * contained by the field's own — so a stale stored answer listed first could
+ * win a fuzzy match against a fresh one listed second.
+ */
+export function withStoredAnswers(
+  stored: readonly StoredAnswer[],
+  supplied: Record<string, string>
+): Record<string, string> {
+  const merged: Record<string, string> = { ...supplied };
+  const already = new Set(Object.keys(supplied).map(normalizeQuestion));
+  for (const entry of stored) {
+    if (already.has(normalizeQuestion(entry.question))) continue;
+    merged[entry.question] = entry.answer;
+  }
+  return merged;
+}

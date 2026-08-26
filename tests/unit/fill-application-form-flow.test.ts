@@ -32,6 +32,24 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => {
   type Resolution = { selector: string; description: string; replayed: boolean } | null;
 
+  /** One control as `enumerateFormFields` reports it. Mirrors `EnumeratedField`. */
+  type FormControl = {
+    key: string;
+    selector: string;
+    activateSelectors: string[];
+    label: string;
+    kind: string;
+    required: boolean;
+    currentValue: string;
+    options: string[];
+    optionSelectors: string[];
+    optionValues: string[];
+    optionsKnown: boolean;
+    optionsTruncated: boolean;
+    maxLength: number | null;
+    helpText: string;
+  };
+
   /** What `STRUCTURAL_FLOOR_SCRIPT` answers with. Mirrors the module's own type. */
   type StructuralFloor = {
     passwordFields: number;
@@ -70,6 +88,18 @@ const h = vi.hoisted(() => {
   const state = {
     /** Flipped by the click, exactly as the real page would be. */
     manualEntryClicked: false,
+    /**
+     * Whether the *DOM* holds an application form, as distinct from whether the
+     * page reader says it does.
+     *
+     * JOB-052 made those two separable, because on a web component board they
+     * genuinely came apart: `enumerateFormFields` found ten controls on a page
+     * the reader reported as having no form. A test that means "there really is
+     * no form" has to say so here as well as in `signalsOverride`, or its DOM
+     * still holds First Name, Last Name and Email and the premise is not what
+     * the fixture is describing.
+     */
+    domHasForm: true,
     /** What `tryResolveAction` answers for an instruction. */
     resolve: manualEntryOnly,
     /** The last value `typeInto` was given, which is what the page reads back. */
@@ -106,6 +136,13 @@ const h = vi.hoisted(() => {
     writes: [] as { table: string; op: "update" | "insert"; values: unknown }[],
     /** How many times a browser was opened. */
     browsersOpened: 0,
+    /**
+     * JOB-045. What `session.browser.sessionId` answers with once a browser is
+     * open — a real run's Browserbase session id, or null on the local Chromium
+     * fallback. Read live via a getter on `session.browser` below, so a test can
+     * flip it after `reset()` and still see its own value.
+     */
+    browserbaseSessionId: "bb_test_session_1" as string | null,
 
     // ── JOB-021: a page that arrives in pieces ────────────────────────────
     /**
@@ -135,6 +172,33 @@ const h = vi.hoisted(() => {
      * on the second, which no fixed fixture can express.
      */
     signalsOverride: null as null | ((call: number) => Record<string, unknown>),
+    /**
+     * Issue #100. Controls the ACT-015 pass really has to deal with, appended to
+     * the three above.
+     *
+     * Empty by default and deliberately so: every other test in this file wants
+     * a form with nothing left to fill, which is what `control`'s non-empty
+     * `currentValue` buys. A test about the unknown-field fallback needs the
+     * opposite, a required control sitting empty with no stored fact and no
+     * model decision behind it, since that is the only way anything reaches the
+     * fallback at all.
+     */
+    extraControls: [] as FormControl[],
+    /**
+     * What `readFieldValue` reports for a selector. Keyed by selector; a
+     * selector that is absent reads empty, which is what an untouched control
+     * does.
+     */
+    fieldReadBacks: {} as Record<string, string>,
+    /**
+     * The same, but only once the unknown-field fallback has called `act()`.
+     * Merged over `fieldReadBacks` from that moment on, which is the only way a
+     * fixture can say "this box was not ticked, and then it was" — the exact
+     * before/after the stray-tick check is looking for.
+     */
+    fieldReadBacksAfterAct: {} as Record<string, string>,
+    /** Every instruction the unknown-field fallback handed `act()`, in order. */
+    fallbackActs: [] as string[],
   };
 
   const reset = (): void => {
@@ -159,6 +223,7 @@ const h = vi.hoisted(() => {
     state.resumeAttachments = 0;
     state.writes = [];
     state.browsersOpened = 0;
+    state.browserbaseSessionId = "bb_test_session_1";
     state.floors = null;
     state.domReads = 0;
     state.lastFloor = null;
@@ -167,6 +232,10 @@ const h = vi.hoisted(() => {
     state.extractCalls = 0;
     state.selectorWaits = [];
     state.signalsOverride = null;
+    state.extraControls = [];
+    state.fieldReadBacks = {};
+    state.fieldReadBacksAfterAct = {};
+    state.fallbackActs = [];
   };
 
   /**
@@ -203,7 +272,7 @@ const h = vi.hoisted(() => {
    * The controls a DOM read finds. `currentValue` is non empty throughout so the
    * ACT-015 pass has nothing left to do and the test stays about the ordering.
    */
-  const control = (label: string, kind: string, selector: string) => ({
+  const control = (label: string, kind: string, selector: string): FormControl => ({
     key: label.toLowerCase(),
     selector,
     activateSelectors: [],
@@ -220,11 +289,23 @@ const h = vi.hoisted(() => {
     helpText: "",
   });
 
+  /**
+   * Issue #100. The same control left genuinely unanswered, and required, which
+   * is what puts it in front of the ACT-015 pass and then the fallback.
+   */
+  const unanswered = (label: string, kind: string, selector: string): FormControl => ({
+    ...control(label, kind, selector),
+    required: true,
+    currentValue: "",
+    optionsKnown: false,
+  });
+
   /** A self hosted careers page: no ids anywhere, so every selector is an XPath. */
-  const formControls = () => [
+  const formControls = (): FormControl[] => (!state.domHasForm ? [] : [
     control("First Name", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[1]/input[1]"),
     control("Last Name", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[2]/input[1]"),
     control("Email", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[3]/input[1]"),
+    ...state.extraControls,
     ...(state.manualEntryClicked
       ? [
           control(
@@ -234,7 +315,7 @@ const h = vi.hoisted(() => {
           ),
         ]
       : []),
-  ];
+  ]);
 
   /** The fixed shape every test that is not about hydration reads. */
   const settledFloor = (): StructuralFloor => ({
@@ -278,8 +359,25 @@ const h = vi.hoisted(() => {
       state.events.push("waited for the page to have content");
       return true;
     },
-    evaluate: async (script: unknown) =>
-      String(script).includes("passwordFields") ? readFloor() : state.descriptor,
+    evaluate: async (script: unknown) => {
+      const source = String(script);
+      if (source.includes("passwordFields")) return readFloor();
+      // Issue #100. `readFieldValue`'s script is the only one that asks a
+      // control whether it is checked, which is what identifies it here. The
+      // selector it was built for is embedded in the script as a literal, so
+      // the answer is looked up by finding the scripted selector inside it —
+      // the same trick `tests/unit/form-fields.test.ts` uses to tell this
+      // module's evaluated scripts apart.
+      if (source.includes('type === "radio" || type === "checkbox"')) {
+        const table =
+          state.fallbackActs.length === 0
+            ? state.fieldReadBacks
+            : { ...state.fieldReadBacks, ...state.fieldReadBacksAfterAct };
+        const hit = Object.keys(table).find((selector) => source.includes(selector));
+        return hit === undefined ? "" : table[hit];
+      }
+      return state.descriptor;
+    },
     screenshot: async () => new Uint8Array([1, 2, 3]),
     locator: () => ({
       inputValue: async () => state.lastTyped,
@@ -293,7 +391,15 @@ const h = vi.hoisted(() => {
   const session = {
     logTag: "[test]",
     actionPlan: null as unknown,
-    browser: {},
+    // A getter, not a plain literal: the object below is built once, at module
+    // load, and a plain `{ sessionId: state.browserbaseSessionId }` would freeze
+    // whatever that was at that instant rather than tracking `reset()` or a test
+    // that sets it afterward.
+    browser: {
+      get sessionId() {
+        return state.browserbaseSessionId;
+      },
+    },
     page,
     stagehand: {
       extract: async () => {
@@ -307,7 +413,15 @@ const h = vi.hoisted(() => {
         const override = state.signalsOverride?.(state.extractCalls) ?? {};
         return { data: { ...readPage(), ...override } };
       },
-      act: async (action: { description?: string }) => {
+      act: async (action: { description?: string } | string) => {
+        // Issue #100. The unknown-field fallback calls `act()` with a plain
+        // string rather than a resolved action, and what this fixture is for is
+        // recording whether it was called at all and with what.
+        if (typeof action === "string") {
+          state.fallbackActs.push(action);
+          state.events.push("the unknown-field fallback acted");
+          return;
+        }
         const description = action.description ?? "";
         if (description.includes("switches the cover letter")) {
           state.manualEntryClicked = true;
@@ -325,6 +439,7 @@ const h = vi.hoisted(() => {
     reset,
     session,
     formControls,
+    unanswered,
     manualEntryOnly,
     APPLY_URL,
     BOARD_TOKEN,
@@ -396,7 +511,14 @@ vi.mock("@supabase/supabase-js", () => {
       },
     ],
     resumes: [
-      { storage_path: "resumes/candidate.pdf", created_at: "2026-01-01T00:00:00.000Z" },
+      {
+        // JOB-112. The row's id and its LinkedIn path are read now, because
+        // `resumes.parsed` is keyed on the first and derived from both.
+        id: "5ca1ab1e-0000-4000-8000-0000000000ff",
+        storage_path: "resumes/candidate.pdf",
+        linkedin_pdf_path: null,
+        created_at: "2026-01-01T00:00:00.000Z",
+      },
     ],
   });
 
@@ -422,30 +544,40 @@ vi.mock("@supabase/supabase-js", () => {
   return { createClient: () => ({ from: (table: string) => builder(table) }) };
 });
 
+const PARSED_PROFILE = {
+  firstName: "Ada",
+  lastName: "Lovelace",
+  email: "candidate@example.com",
+  phone: null,
+  location: null,
+  linkedinUrl: null,
+  websiteUrl: null,
+  githubUrl: null,
+  workHistory: [],
+  education: [],
+  skills: [],
+  resumeStatedEmail: null,
+  warnings: [],
+};
+
 vi.mock("@/lib/resume-parser", () => ({
   loadResume: async () => ({
     bytes: new Uint8Array([37, 80, 68, 70]),
     text: "resume text",
     pageCount: 1,
   }),
-  parseResume: async () => ({
-    firstName: "Ada",
-    lastName: "Lovelace",
-    email: "candidate@example.com",
-    phone: null,
-    location: null,
-    linkedinUrl: null,
-    websiteUrl: null,
-    workHistory: [],
-    education: [],
-    skills: [],
-    resumeStatedEmail: null,
-    warnings: [],
-  }),
   generateCoverLetter: async () => "A cover letter grounded in the intake data.",
   decideFieldAnswers: async () => [],
   generateEssayAnswer: async () => "",
   InjectionSuspectedError: class InjectionSuspectedError extends Error {},
+}));
+
+// JOB-112. The fill pipeline no longer calls `parseResume` directly: it asks
+// for the profile and does not care whether that came out of `resumes.parsed`
+// or out of a fresh parse. Which of the two happened is exercised in
+// `tests/unit/stored-candidate-parse.test.ts`, against the real module.
+vi.mock("@/lib/candidate-documents", () => ({
+  resolveCandidateProfile: async () => PARSED_PROFILE,
 }));
 
 vi.mock("@/lib/stagehand-session", () => ({
@@ -455,6 +587,13 @@ vi.mock("@/lib/stagehand-session", () => ({
     return h.session;
   },
   closeBrowserSession: async () => undefined,
+  /**
+   * JOB-050. Contexts are a Browserbase hardening measure and this suite opens
+   * no browser at all, so the honest stand in is the answer the real function
+   * gives whenever the feature is switched off: no context, carry on. Its own
+   * fallback behaviour is covered in `stagehand-session.test.ts`.
+   */
+  resolveBrowserbaseContextId: async () => undefined,
   /**
    * Returns at once. The waiting this file cares about is *how many times the
    * page is read before a verdict is drawn*, and that is asserted by counting
@@ -698,6 +837,13 @@ describe("an apply URL that does not belong to the board it came from", () => {
     // In particular the row never passed through `filling_form`, because nothing
     // was ever filled.
     expect(statuses).not.toContain("filling_form");
+    // JOB-045: nothing to carry either. This throws out of `loadApplicationState`,
+    // before a browser — and so before a Browserbase session — ever exists.
+    expect(h.state.browsersOpened).toBe(0);
+    const [blockedWrite] = h.state.writes.filter(
+      (write) => write.table === "applications" && write.op === "update"
+    );
+    expect(blockedWrite!.values).not.toHaveProperty("browserbase_session_id");
 
     // And the reason, in the one place this schema keeps reasons.
     const skips = h.state.writes.filter(
@@ -726,6 +872,45 @@ describe("an apply URL that does not belong to the board it came from", () => {
     expect(result.status).toBe("form_filled");
     expect(result.blockedReason).toBeNull();
     expect(h.state.browsersOpened).toBe(1);
+  });
+});
+
+/**
+ * JOB-045. `runBrowserFlow` opens the browser and learns its Browserbase
+ * session id (`session.browser.sessionId`) before it writes anything else to
+ * `applications` — but that id has to reach the row through `updateApplication`
+ * like any other column, and the point of this block is that it actually does,
+ * at exactly the write where it first becomes available and not before.
+ */
+describe("the Browserbase session id, once the browser has opened", () => {
+  const applicationsWrites = () =>
+    h.state.writes.filter((write) => write.table === "applications" && write.op === "update");
+
+  it("is absent from the write made before a browser exists, and present on every write after", async () => {
+    const result = await run();
+    expect(result.status).toBe("form_filled");
+
+    const writes = applicationsWrites();
+    // `filling_form` is written before `openBrowserSession` is ever called — see
+    // `runFill` — so it has nothing to carry.
+    expect((writes[0]!.values as { status?: string }).status).toBe("filling_form");
+    expect(writes[0]!.values).not.toHaveProperty("browserbase_session_id");
+
+    // `form_filled` is written after `runBrowserFlow` returns the id in its
+    // report, and now carries it.
+    expect((writes[1]!.values as { status?: string }).status).toBe("form_filled");
+    expect((writes[1]!.values as { browserbase_session_id?: string | null }).browserbase_session_id).toBe(
+      "bb_test_session_1"
+    );
+  });
+
+  it("is null on the row rather than missing, on the local Chromium fallback", async () => {
+    h.state.browserbaseSessionId = null;
+
+    await run();
+
+    const writes = applicationsWrites();
+    expect((writes[1]!.values as { browserbase_session_id?: string | null }).browserbase_session_id).toBeNull();
   });
 });
 
@@ -822,6 +1007,17 @@ describe("a listing that redirects the browser somewhere else", () => {
     expect(skipRows()[0]!.ats).toBe("greenhouse");
     expect(skipRows()[0]!.job_id).toBe(h.JOB_ID);
     expect(skipRows()[0]!.raw_context.message).toContain("attacker.example");
+
+    // JOB-045. Unlike the pre-browser refusal above, this stop happens inside
+    // `runBrowserFlow` — `assertStillOnTheBoard` throws after the session is
+    // already open — so `recordFailure` is handed a Browserbase session id, and
+    // it now has to land on the row and not only in `skip_log.raw_context`.
+    const applicationsWrites = h.state.writes.filter(
+      (write) => write.table === "applications" && write.op === "update"
+    );
+    expect(
+      (applicationsWrites[1]!.values as { browserbase_session_id?: string | null }).browserbase_session_id
+    ).toBe("bb_test_session_1");
   });
 
   it("stops before the resume is uploaded when the page moves mid form", async () => {
@@ -1037,6 +1233,46 @@ describe("a careers page that is still hydrating when the browser arrives", () =
     expect(h.state.extractCalls).toBeGreaterThan(1);
   });
 
+  it("fills a form the page reader missed but the DOM can prove is there", async () => {
+    // JOB-052, and the Avery Dennison SmartRecruiters page it came from. Every
+    // control on that form lives in a shadow root, so the light-DOM counts the
+    // failure message quotes read 0 inputs and 418 characters of text, and the
+    // reader — which had every chance to see it — reported no application form
+    // on a page that was plainly one. `enumerateFormFields` finds First Name,
+    // Last Name and Email there, and those are the DOM's own words, not a
+    // model's opinion of them.
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: false,
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_filled");
+    expect(result.blockedReason).toBeNull();
+  });
+
+  it("does not mistake a sign-in wall for the form it stands in front of", async () => {
+    // The account-creation shape: a name box, an email box and a password box.
+    // Two identity fields is the bar the DOM floor clears, so without the
+    // password veto this page would be talked into looking like an application
+    // form and `reachApplicationForm` would walk straight past the sign-in stop
+    // that exists to catch it.
+    h.state.signalsOverride = () => ({
+      applicationFormPresent: false,
+      applyControlPresent: false,
+      passwordFieldCount: 1,
+    });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    // Stopped *at the wall*, positively, rather than merely not reaching the
+    // other message: a negative assertion here would pass for any failure at all.
+    expect(result.blockedReason).toContain("A sign-in form is in front of the application");
+    expect(result.blockedReason).toContain("Nothing was typed.");
+  });
+
   it("still fails closed, and bounded, when there really is no form", async () => {
     // The control. A retry loop that never gives up would turn a listing this
     // product cannot apply to into a run that never ends, and a guard that can
@@ -1046,6 +1282,12 @@ describe("a careers page that is still hydrating when the browser arrives", () =
       applicationFormPresent: false,
       applyControlPresent: false,
     });
+    // JOB-052. Said in the DOM as well as in the reader, because those are two
+    // separate sources now and this test is about the case where *neither* has
+    // a form. With the DOM still holding First Name, Last Name and Email this
+    // fixture would be describing the Avery Dennison page instead — a form the
+    // reader missed — which is the opposite case and is pinned below.
+    h.state.domHasForm = false;
 
     const result = await run();
 
@@ -1226,5 +1468,131 @@ describe("an apply control labelled the way SmartRecruiters labels it", () => {
     expect(result.status).toBe("form_fill_blocked");
     expect(result.blockedReason).toContain("Refusing to click");
     expect(result.blockedReason).toContain("SUBMITS the application");
+  });
+});
+
+// ───────────────────────────────────
+// Issue #100 — the unknown-field fallback reports what it does, and refuses to
+// assert anything
+// ───────────────────────────────────
+//
+// The fallback near the bottom of `fillRemainingFields` is the last thing that
+// touches a form before the screenshot, and it is the only path in this module
+// that hands a page-derived label to `act()` and asks for "the most appropriate
+// value for a job applicant". It cannot be exercised from the pure tests in
+// `adaptive-form-fill.test.ts`, because what changed about it is not what it
+// decides but what it leaves behind: whether a value it put on a real
+// employer's form appears anywhere a human will read.
+//
+// Every case below therefore runs the whole flow with one control that nothing
+// else could answer. `decideFieldAnswers` is mocked to return no decisions at
+// all, which is exactly the state the fallback exists for.
+describe("what the unknown-field fallback leaves behind", () => {
+  const QUESTION = "xpath=/html[1]/body[1]/main[1]/form[1]/div[9]/input[1]";
+
+  // Said rather than assumed: `reset()` does not restore `domHasForm`, so a
+  // block running after the JOB-052 cases inherits whatever they last set. A
+  // fixture whose whole premise is "there is a control on the form" has to
+  // state that itself.
+  beforeEach(() => {
+    h.state.domHasForm = true;
+  });
+
+  it("reports a field it filled as filled, with what the control now reads", async () => {
+    h.state.extraControls = [h.unanswered("Which team interests you most?", "text", QUESTION)];
+    h.state.fieldReadBacksAfterAct = { [QUESTION]: "Platform Engineering" };
+
+    const result = await run();
+
+    // It really did go through the fallback rather than through any rule.
+    expect(h.state.fallbackActs).toHaveLength(1);
+    expect(h.state.fallbackActs[0]).toContain("Which team interests you most?");
+
+    // And the report says so, in the same shape an ordinary fill produces: one
+    // line for the field, `filled`, carrying what the browser reads back out of
+    // the control. Before this ticket that line said "needs-input" forever and
+    // the value was in no report at all.
+    const lines = result.fields.filter((entry) => entry.field === "which team interests you most?");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.outcome).toBe("filled");
+    expect(lines[0]?.readBack).toBe("Platform Engineering");
+    expect(lines[0]?.detail).toContain("chosen by a model, not by the candidate");
+  });
+
+  it("keeps a field it could not verify as the candidate's question", async () => {
+    // `act()` returning without throwing used to be the whole test for success,
+    // and it is not evidence of anything: the control here reads empty
+    // afterwards, so nothing was filled and the question is still open.
+    h.state.extraControls = [h.unanswered("Which team interests you most?", "text", QUESTION)];
+    h.state.fieldReadBacks = {};
+
+    const result = await run();
+
+    expect(h.state.fallbackActs).toHaveLength(1);
+    // v1-C (#143): an unanswerable required question routes to the escalation
+    // queue instead of the terminal blocked state.
+    expect(result.status).toBe("pending_user_input");
+    expect(result.needsInput.map((item) => item.fieldLabel)).toContain(
+      "Which team interests you most?"
+    );
+    const line = result.fields.find((entry) => entry.field === "which team interests you most?");
+    expect(line?.outcome).toBe("needs-input");
+    expect(line?.detail).toContain("still reads empty");
+  });
+
+  it("will not point act() at a checkbox, whatever its label says", async () => {
+    // The label here is as ordinary as a label gets and matches no consent,
+    // attestation or demographic pattern anywhere in this codebase. The refusal
+    // is on the shape of the control, so a wording nobody anticipated cannot
+    // get past it — which is the whole difference between this and the regex
+    // that failed to match Avery Dennison's privacy declaration.
+    h.state.extraControls = [h.unanswered("Which team interests you most?", "checkbox", QUESTION)];
+
+    const result = await run();
+
+    expect(h.state.fallbackActs).toEqual([]);
+    // v1-C (#143): an unanswerable required question routes to the escalation
+    // queue instead of the terminal blocked state.
+    expect(result.status).toBe("pending_user_input");
+    expect(result.needsInput.map((item) => item.fieldLabel)).toContain(
+      "Which team interests you most?"
+    );
+  });
+
+  it("will not point act() at a radio group either", async () => {
+    h.state.extraControls = [h.unanswered("Which team interests you most?", "radio", QUESTION)];
+
+    const result = await run();
+
+    expect(h.state.fallbackActs).toEqual([]);
+    // v1-C (#143): an unanswerable required question routes to the escalation
+    // queue instead of the terminal blocked state.
+    expect(result.status).toBe("pending_user_input");
+  });
+
+  it("stops the run when a box gets ticked while it is filling something else", async () => {
+    // `act()` drives the whole page rather than one control, so refusing to
+    // point it at a checkbox is not the same as it never ticking one. Here the
+    // box the fallback was not asked about becomes checked while it works, and
+    // the form is no longer safe to submit: `assertNoMismatches` stops the run
+    // with the tick named.
+    const BOX = "xpath=/html[1]/body[1]/main[1]/form[1]/div[10]/input[1]";
+    h.state.extraControls = [
+      h.unanswered("Which team interests you most?", "text", QUESTION),
+      { ...h.unanswered("Keep me posted about other roles", "checkbox", BOX), required: false },
+    ];
+    // Both read empty until the fallback runs. Then the text control holds an
+    // answer, and so does a box nobody asked it about — which is what the live
+    // Avery Dennison run produced.
+    h.state.fieldReadBacksAfterAct = { [QUESTION]: "Platform Engineering", [BOX]: "checked" };
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("read back as");
+    const tick = result.fields.find(
+      (entry) => entry.field === "keep me posted about other roles" && entry.outcome === "mismatch"
+    );
+    expect(tick?.detail).toContain("nothing chose to tick it");
   });
 });

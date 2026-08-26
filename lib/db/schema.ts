@@ -86,6 +86,45 @@ export const citizenshipStatusEnum = pgEnum("citizenship_status", [
 export const f1StatusEnum = pgEnum("f1_status", ["opt", "cpt", "none"]);
 
 /**
+ * Security clearance eligibility, in the three states defence and aerospace
+ * boards actually word the question in (JOB-101).
+ *
+ * Anduril asks it verbatim as "CLEARANCE ELIGIBILITY - This position may
+ * require eligibility to obtain and maintain a U.S. security clearance." over
+ * the options "Yes, I hold an active U.S. security clearance", "Yes, I am
+ * eligible for a U.S. security clearance" and "No". Those three are the enum,
+ * because a question drawn from a fixed option list is best stored in the shape
+ * that list has: anything coarser has to be widened back out later by a lookup
+ * that guesses which of two "yes" answers the person meant.
+ *
+ * An enum rather than a CHECK, on the same reasoning as `citizenship_status`
+ * above: the set is closed by how the question is asked, and it changes only
+ * with a product decision rather than with a board.
+ */
+export const clearanceEligibilityEnum = pgEnum("clearance_eligibility", [
+  "active_clearance",
+  "eligible",
+  "no",
+]);
+
+/**
+ * The highest US security clearance the person has ever held, in the four
+ * states Anduril's follow up question offers: "N/A - have never held U.S.
+ * security clearance", "Confidential", "Secret", "Top Secret".
+ *
+ * `never_held` is an answer, not an absence. Null means nobody ever asked;
+ * `never_held` means they were asked and said they never have. Collapsing those
+ * two is the exact mistake `toApplicationAnswers` in `lib/candidate-intake.ts`
+ * exists to prevent.
+ */
+export const clearanceLevelEnum = pgEnum("clearance_level", [
+  "never_held",
+  "confidential",
+  "secret",
+  "top_secret",
+]);
+
+/**
  * Why a listing was abandoned. The pipeline writes one of these and nothing
  * else, so the set is closed and enforced.
  *
@@ -303,6 +342,186 @@ export const profiles = pgTable(
     earliestStart: date("earliest_start"),
 
     /**
+     * Added by JOB-044. "Github Link" is a required field on a real share of
+     * engineering application forms, and until this column existed nothing
+     * answered it except a GitHub URL that happened to be sitting in
+     * `websiteUrl` or `linkedinUrl` — which is most candidates' resumes not at
+     * all. See `CandidateRecord.githubUrl` in `lib/candidate-intake.ts` for how
+     * this is read, and `lib/fill-application-form.ts`'s `buildFactCatalog` for
+     * how the two still-inferred URLs remain the fallback for a candidate who
+     * has not filled this in yet.
+     *
+     * Owned by the person, not by us, so it is granted to `authenticated` in
+     * `drizzle/0011_profiles_github_url_privileges.sql`, following the rule
+     * `drizzle/0003_profiles_column_privileges.sql` states:
+     * a new column is not writable by a user session until the migration that
+     * adds it grants it by name.
+     */
+    githubUrl: text("github_url"),
+
+    /**
+     * ── JOB-101: the answers that were blocking real applications ───────────
+     *
+     * Every column in this block was added because a required field on a real
+     * employer's form had no stored answer behind it and stopped the run. None
+     * of them is speculative and none of them can be inferred from anything
+     * already here.
+     *
+     * All eight belong to the person rather than to us, so all eight are
+     * granted to `authenticated` by name in
+     * `drizzle/0015_profiles_intake_fields_privileges.sql`, per the rule
+     * `drizzle/0003_profiles_column_privileges.sql` states. `stripe_customer_id`
+     * and `browserbase_context_id` above are the counterexamples: our records
+     * about a person, not their answers, and deliberately ungranted.
+     */
+
+    /**
+     * Whether the person holds a US security clearance, could get one, or
+     * neither. Blocked Anduril twice with `needs_attestation`, and Anduril and
+     * SpaceX alone are 403 listings that ask it.
+     *
+     * Stored so that the clearance question is answered from what the candidate
+     * stated, which is the first rung of the ladder in `LEGAL_ATTESTATION_RE`.
+     * Storing it does not loosen that ladder: `attestationFactAllowed` in
+     * `lib/fill-application-form.ts` still restricts a clearance question to the
+     * clearance facts and nothing adjacent to them.
+     */
+    clearanceEligibility: clearanceEligibilityEnum("clearance_eligibility"),
+    /** The follow up question: which level, if any, they have ever held. */
+    clearanceLevelHeld: clearanceLevelEnum("clearance_level_held"),
+
+    /**
+     * Whether working outside the United States would need sponsorship.
+     *
+     * Issue #108, and the reason it is a separate column rather than a reading
+     * of `requires_sponsorship`: that one is a US only fact, derived from a US
+     * citizenship status, and it says nothing whatsoever about the United
+     * Kingdom or Ireland. It was being used to answer a UK sponsorship question
+     * "No" for a candidate who would in fact need sponsorship there, which is a
+     * false statement on a real application about the one subject
+     * `LEGAL_ATTESTATION_RE`'s own comment names as costly to get wrong.
+     *
+     * One boolean rather than a list of countries, because that is the shape of
+     * the question boards ask and the shape of the answer a candidate can give
+     * truthfully: a list would have to be exhaustive to mean anything, and a
+     * half filled one read as exhaustive is worse than no column.
+     */
+    needsSponsorshipNonUs: boolean("needs_sponsorship_non_us"),
+
+    /**
+     * The person's own words for their current visa status. Pylon Labs asks
+     * "What is your current visa status?" as a plain text box on Ashby and it
+     * blocked, because a visa status is a legal attestation and prose is never
+     * composed for one.
+     *
+     * Free text rather than an enum, and deliberately not derived from
+     * `citizenship_status`: "I am a US citizen and hold no visa" and "F-1, OPT
+     * expiring March 2027" are both answers to this question, and only the
+     * person can give either.
+     */
+    visaStatus: text("visa_status"),
+
+    /**
+     * High school, asked for by name on all 128 of Palantir's Lever listings,
+     * and the graduation year on Belvedere's.
+     *
+     * Nothing in a resume or in `education` reliably carries either: a resume
+     * lists a university and stops, and reading a school off the page is what
+     * put "Stanford University" on a Georgia Tech candidate's form (issue #100).
+     */
+    highSchoolName: text("high_school_name"),
+    /**
+     * An integer year rather than a date, because that is what the question
+     * asks for. The CHECK is a sanity bound, not validation: the intake schema
+     * does the real checking, and this only stops a four digit typo becoming a
+     * stored fact that reaches a form.
+     */
+    highSchoolGradYear: integer("high_school_grad_year"),
+
+    /**
+     * Street address and postal code, both required by Belvedere Trading and by
+     * a share of Greenhouse and SmartRecruiters forms.
+     *
+     * `current_city` and `current_country` already exist and are not duplicated
+     * here. These are the two pieces of a postal address that had nowhere to
+     * live, and their absence is what a run turned into the literal string "Not
+     * provided" typed into two required boxes before that path was closed.
+     */
+    streetAddress: text("street_address"),
+    postalCode: text("postal_code"),
+
+    /**
+     * ── JOB-134: the questions every employer asks and nothing had stored ───
+     *
+     * Same rule as the JOB-101 block above, and added on the same evidence: a
+     * required field on a real employer's form had no stored answer behind it
+     * and stopped the run. On the Avery Dennison screening step 9 of 11
+     * required questions were answered from stored facts and the two that were
+     * not were sponsorship and a non-compete, both asked by close to every US
+     * employer. Sponsorship already had its columns; this block is the rest.
+     *
+     * All four belong to the person rather than to us, so all four are granted
+     * to `authenticated` by name in
+     * `drizzle/0018_profiles_answer_memory_privileges.sql`.
+     */
+
+    /**
+     * Whether a previous employer's contract still binds them: a non-compete, a
+     * non-solicitation clause, or any other restrictive covenant.
+     *
+     * A legal attestation, and stored under the rule `LEGAL_ATTESTATION_RE` in
+     * `lib/fill-application-form.ts` states rather than around it. That comment
+     * used to say no stored fact could ever back one of these questions, and it
+     * was right at the time for the right reason: the system held no such fact,
+     * so anything answering the question would have been a guess. JOB-134
+     * changes the premise and not the rule, exactly as JOB-101 did for security
+     * clearance. `ATTESTATION_FACT_SCOPES` now names this topic and admits this
+     * one column and nothing else, so a sponsorship answer still cannot back a
+     * non-compete question and this answer still cannot back anything else.
+     * Criminal history still admits nothing at all, and always will.
+     *
+     * Null means never asked, which stays a question put to the candidate.
+     */
+    subjectToRestrictiveCovenant: boolean("subject_to_restrictive_covenant"),
+
+    /**
+     * "Do you have any relatives employed by this company?", asked on a large
+     * share of Greenhouse and SmartRecruiters screening steps.
+     *
+     * Read the question this column actually asks, because it is deliberately
+     * not the one the form asks. The form asks about ONE named employer; this
+     * asks whether the person has relatives at ANY employer they might apply
+     * to. Only one of the two answers is reusable, and that asymmetry is
+     * enforced in `buildFactCatalog`: false produces a fact, because "none at
+     * any of them" truthfully answers the question for every company; true
+     * produces no fact at all, because which company matters and only the
+     * person can say. So a "yes" here still escalates, per company, which is
+     * correct rather than a shortfall.
+     */
+    relativesAtTargetEmployers: boolean("relatives_at_target_employers"),
+
+    /**
+     * "Have you ever been employed by this company?". The same shape as the
+     * column above and the same asymmetry, for the same reason: false is a
+     * statement about every employer at once and answers the form's question;
+     * true is a statement about one of them and escalates.
+     */
+    previouslyEmployedAtTargetEmployers: boolean(
+      "previously_employed_at_target_employers"
+    ),
+
+    /**
+     * What the person expects to be paid, in their own words.
+     *
+     * Free text and never a number anything derives, because HARD STOP 9 names
+     * salary expectations outright as something no model may compose.
+     * "$120,000", "market rate for a new grad in San Francisco" and
+     * "negotiable" are all real answers to this question and only the person
+     * can give any of them.
+     */
+    salaryExpectation: text("salary_expectation"),
+
+    /**
      * When the person confirmed their intake is accurate and authorized us to
      * apply on their behalf. Added by JOB-007.
      *
@@ -374,6 +593,21 @@ export const profiles = pgTable(
      */
     storedAnswers: jsonb("stored_answers"),
 
+    /**
+     * Browserbase Context ID for this user (issue #88, `BROWSERBASE_CONTEXTS_ENABLED`).
+     *
+     * A Browserbase Context carries cookies, localStorage and other browser
+     * state across sessions, so re-running on the same board does not look like
+     * a cold first visit. Created once per user via the Browserbase Contexts
+     * REST API and stored here so every subsequent session can reuse it.
+     *
+     * Null until the first run that has `BROWSERBASE_CONTEXTS_ENABLED=1` set
+     * and the feature has been activated for that user. Not user-writable: only
+     * the pipeline (service role) sets it, following the same convention as
+     * `stripe_customer_id` above.
+     */
+    browserbaseContextId: text("browserbase_context_id"),
+
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -383,6 +617,17 @@ export const profiles = pgTable(
   },
   (table) => [
     unique("profiles_stripe_customer_id_key").on(table.stripeCustomerId),
+    /**
+     * JOB-101. A sanity bound on the high school graduation year, not
+     * validation: `lib/onboarding/intake-schema.ts` does the real checking with
+     * a message a person can act on. This is here so that a mistyped year can
+     * never become a stored fact that reaches an employer's form, whichever
+     * writer put it there.
+     */
+    check(
+      "profiles_high_school_grad_year_range",
+      sql`${table.highSchoolGradYear} is null or ${table.highSchoolGradYear} between 1900 and 2100`
+    ),
     pgPolicy("profiles_select_own", {
       for: "select",
       to: authenticatedRole,
@@ -570,6 +815,12 @@ export const applications = pgTable(
     escalationResolvedAt: timestamp("escalation_resolved_at", { withTimezone: true }),
     escalationNotifiedAt: timestamp("escalation_notified_at", { withTimezone: true }),
 
+    /**
+     * The Browserbase session this attempt ran in, when one existed. The
+     * durable, queryable link from a row here to the recording of that
+     * specific run — see JOB-045.
+     */
+    browserbaseSessionId: text("browserbase_session_id"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

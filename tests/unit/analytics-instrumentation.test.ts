@@ -68,8 +68,25 @@ let profile: Record<string, unknown> | null = {
 let profileUpdateError: { message: string } | null = null;
 let resumeInsertError: { message: string } | null = null;
 
+/** JOB-112. The `resumes.id` the insert hands back, and the parse event's key. */
+const RESUME_ID = "8d3f5c21-0000-4000-8000-0000000000aa";
+
 vi.mock("@/lib/job-search-trigger", () => ({
   requestJobSearch: (userId: string) => requestJobSearch(userId),
+}));
+
+// JOB-112. Stubbed rather than left real for the same reason `requestJobSearch`
+// above is: this file is about which analytics event fires and when, and the
+// real trigger would import the Inngest client and try to send.
+const requestDocumentParse = vi.fn(
+  async (userId: string, resumeId: string): Promise<void> => {
+    void userId;
+    void resumeId;
+  }
+);
+vi.mock("@/lib/candidate-document-trigger", () => ({
+  requestDocumentParse: (userId: string, resumeId: string) =>
+    requestDocumentParse(userId, resumeId),
 }));
 
 // `claimSearchSlot` is one conditional UPDATE against the real `profiles`
@@ -106,7 +123,13 @@ vi.mock("@/lib/supabase/server", () => ({
         select: () => chain,
         update: () => chain,
         eq: () => chain,
-        insert: async () => ({ error: resumeInsertError }),
+        // JOB-112. `submitIntake` now reads the new row's id back, so the
+        // insert chain has to keep chaining rather than resolve on its own.
+        insert: () => chain,
+        single: async () => ({
+          data: resumeInsertError === null ? { id: RESUME_ID } : null,
+          error: resumeInsertError,
+        }),
         maybeSingle: async () => ({ data: profile, error: null }),
         then: (resolve: (value: { error: { message: string } | null }) => unknown) =>
           Promise.resolve(
@@ -134,6 +157,7 @@ beforeEach(() => {
   captureServerEvent.mockClear();
   captureServerEvents.mockClear();
   requestJobSearch.mockClear();
+  requestDocumentParse.mockClear();
   claimSearchSlot.mockClear();
   claimSearchSlot.mockResolvedValue({ allowed: true });
   profileUpdateError = null;
@@ -231,12 +255,30 @@ describe("intake_completed", () => {
       f1Status: "opt",
       workAuthorizedUs: true,
       requiresSponsorship: true,
+      // JOB-101's eight. Present here because `intakeSchema` is the real one, so
+      // a fixture missing a required answer would fail this file at the parse
+      // rather than at the assertion, and would say nothing about analytics.
+      needsSponsorshipNonUs: true,
+      visaStatus: "F-1, currently on OPT",
+      clearanceEligibility: "no",
+      clearanceLevelHeld: "never_held",
+      streetAddress: "12 Peachtree Street NE",
       currentCity: "Atlanta",
+      postalCode: "30303",
       currentCountry: "United States",
       willingToRelocate: true,
       targetLocations: ["San Francisco", "New York", "Seattle"],
       gradDate: "2027-05-01",
       earliestStart: "2027-06-01",
+      highSchoolName: "Northview High School",
+      highSchoolGradYear: 2022,
+      // JOB-134. None of these four is sent to analytics either, and the salary
+      // expectation and the non-compete answer least of all — see the note in
+      // `app/onboarding/actions.ts` about what deliberately does not leave.
+      subjectToRestrictiveCovenant: false,
+      relativesAtTargetEmployers: false,
+      previouslyEmployedAtTargetEmployers: false,
+      salaryExpectation: "$120,000, or negotiable",
       resumePath: `${SESSION_USER}/${RESUME_OBJECT}.pdf`,
       attestation: true,
       ...overrides,
@@ -264,6 +306,10 @@ describe("intake_completed", () => {
     // Two facts about the shape. Not the city, not the country, not the
     // graduation date, and above all not the citizenship or sponsorship
     // answers, which `submitIntake` writes to `profiles` on the line above.
+    // JOB-101 added a security clearance status, a visa status and a home
+    // address to that same write, and none of those goes out here either. The
+    // exact-equality assertion is what keeps that true: a new property added to
+    // the capture fails this test rather than shipping quietly.
     expect(capture.properties).toEqual({
       has_linkedin_pdf: true,
       target_location_count: 3,
@@ -290,5 +336,9 @@ describe("intake_completed", () => {
 
     expect(result.ok).toBe(false);
     expect(captureServerEvent).not.toHaveBeenCalled();
+    // JOB-112. No row, nothing to parse. Asking for a parse of a resume that
+    // was never stored would be a run somebody has to go and look at, for an
+    // intake that did not happen.
+    expect(requestDocumentParse).not.toHaveBeenCalled();
   });
 });

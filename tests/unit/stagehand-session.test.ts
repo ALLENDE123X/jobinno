@@ -22,6 +22,7 @@ import {
   browserConcurrencyLimit,
   chooseBrowserProvider,
   openBrowserSession,
+  resolveBrowserbaseContextId,
   type EnvSource,
 } from "@/lib/stagehand-session";
 
@@ -175,5 +176,87 @@ describe("openBrowserSession", () => {
     await expect(
       openBrowserSession({ headless: true, logTag: "[job-005-test]" })
     ).rejects.toThrow(/STAGEHAND_LLM_API_KEY/);
+  });
+});
+
+/**
+ * JOB-050. `resolveBrowserbaseContextId` sits in front of every real run, so its
+ * contract is not "produce a context" but "never be the reason a run stops".
+ * Every failure it can meet has to come back as `undefined`, which the caller
+ * reads as an ordinary ephemeral session.
+ *
+ * The flag and the provider are read from an injected env for the same reason
+ * `chooseBrowserProvider` takes one: no global mutation, no network, no browser.
+ */
+describe("resolveBrowserbaseContextId", () => {
+  const CONTEXTS_ON: EnvSource = {
+    ...BOTH_SET,
+    BROWSERBASE_CONTEXTS_ENABLED: "1",
+  };
+
+  const neverCalled = (label: string) => async (): Promise<never> => {
+    throw new Error(`${label} should not have been called`);
+  };
+
+  it("returns undefined when the flag is unset, without reading the database", async () => {
+    const result = await resolveBrowserbaseContextId({
+      userId: "u1",
+      logTag: "[job-050-test]",
+      readStoredId: neverCalled("readStoredId"),
+      persistId: neverCalled("persistId"),
+      env: BOTH_SET,
+    });
+    expect(result).toBeUndefined();
+  });
+
+  it("returns undefined when the flag is set but the provider is local", async () => {
+    const result = await resolveBrowserbaseContextId({
+      userId: "u1",
+      logTag: "[job-050-test]",
+      readStoredId: neverCalled("readStoredId"),
+      persistId: neverCalled("persistId"),
+      env: { BROWSERBASE_CONTEXTS_ENABLED: "1" },
+    });
+    expect(result).toBeUndefined();
+  });
+
+  it("reuses a stored id without minting a new one", async () => {
+    const persistId = vi.fn(async () => {});
+    const result = await resolveBrowserbaseContextId({
+      userId: "u1",
+      logTag: "[job-050-test]",
+      readStoredId: async () => "ctx-already-stored",
+      persistId,
+      env: CONTEXTS_ON,
+    });
+    expect(result).toBe("ctx-already-stored");
+    expect(persistId).not.toHaveBeenCalled();
+  });
+
+  it("treats an empty stored id as absent rather than as a context", async () => {
+    // A blank column is what a failed earlier persist leaves behind, and
+    // handing "" to Browserbase as a context id is not a recoverable request.
+    const result = await resolveBrowserbaseContextId({
+      userId: "u1",
+      logTag: "[job-050-test]",
+      readStoredId: async () => "",
+      persistId: async () => {},
+      env: CONTEXTS_ON,
+    });
+    // No network in this suite, so minting fails and the run continues cold.
+    expect(result).toBeUndefined();
+  });
+
+  it("returns undefined when reading the stored id throws", async () => {
+    const result = await resolveBrowserbaseContextId({
+      userId: "u1",
+      logTag: "[job-050-test]",
+      readStoredId: async () => {
+        throw new Error("database unreachable");
+      },
+      persistId: neverCalled("persistId"),
+      env: CONTEXTS_ON,
+    });
+    expect(result).toBeUndefined();
   });
 });

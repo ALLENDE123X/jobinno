@@ -1,0 +1,70 @@
+-- JOB-134. The answers a candidate gives once, kept, plus the four intake
+-- questions that every employer asks and nothing had stored.
+--
+-- ── The evidence ───────────────────────────────────────────────────────────
+-- On the Avery Dennison screening step 11 required questions were analysed
+-- control by control. Nine were answered from stored facts with read back. Two
+-- escalated to the candidate: visa sponsorship, which was a guard bug fixed by
+-- JOB-132, and whether the candidate is subject to a non-compete, which nothing
+-- in this system had ever been told. The candidate answered the second one, and
+-- the answer existed only as a command line argument. The next employer asks it
+-- again, and so does the one after that.
+--
+--   stored_answers
+--     The memory. An array of {question, answer, topic, answeredAt} objects,
+--     written and read through `lib/candidate-answers.ts` and capped at 100
+--     entries. `question` is the form's own label, which is the same string
+--     `needsInput[].key` reports and `additionalAnswers` is keyed on, so a
+--     stored answer re-enters the fill exactly as a freshly supplied one does
+--     and every guard in front of it runs unchanged.
+--
+--   subject_to_restrictive_covenant
+--     The non-compete question above, promoted to intake so a new user never
+--     reaches it. A legal attestation, and it arrives under the ladder in
+--     `lib/fill-application-form.ts` rather than around it: `ATTESTATION_FACT_
+--     SCOPES` gains a topic that admits this column alone, so a sponsorship
+--     answer still cannot back a non-compete question and this answer still
+--     cannot back anything else. Criminal history still admits nothing at all.
+--
+--   relatives_at_target_employers, previously_employed_at_target_employers
+--     Two questions asked on a large share of screening steps. Read what these
+--     columns actually ask, because it is deliberately not what the form asks.
+--     A form asks about ONE named employer; these ask about every employer the
+--     person might apply to. Only false is reusable, since "none of them"
+--     entails "not this one" while "some of them" entails nothing about this
+--     one, and `buildFactCatalog` writes a fact for false and writes nothing at
+--     all for true. A yes still escalates, per company, which is correct.
+--
+--   salary_expectation
+--     Free text, in the candidate's own words. HARD STOP 9 names salary
+--     expectations outright as something no model may compose, so the only
+--     answer available is the one the person gives.
+--
+-- Sponsorship, earliest start date and willingness to relocate are on the same
+-- observed list and are deliberately absent here: `requires_sponsorship`,
+-- `needs_sponsorship_non_us`, `earliest_start` and `willing_to_relocate`
+-- already exist and are already read.
+--
+-- ── Privileges ─────────────────────────────────────────────────────────────
+-- The four intake answers belong to the person and are granted to
+-- `authenticated` by name in `0018_profiles_answer_memory_privileges.sql`, per
+-- the rule `0003_profiles_column_privileges.sql` states: after that migration
+-- `authenticated` holds no table wide UPDATE on `profiles`, so a new column is
+-- not writable by a user session until a migration names it.
+--
+-- `stored_answers` is deliberately NOT on that list, and it is the one column
+-- here where that decision needed making. It is not a field somebody fills in;
+-- it is free text that goes into the prompt deciding what gets typed onto a
+-- real employer's application, which is the surface `0016_resumes_column_
+-- privileges.sql` closed on `resumes.parsed` for exactly this reason. The
+-- pipeline writes it with the service role, from an answer the person gave.
+--
+-- Null on every existing row. `parseStoredAnswers` reads a null as an empty
+-- list and `toApplicationAnswers` drops a null rather than mapping it to a
+-- placeholder, so an unanswered question stays a question put to the candidate.
+-- Nothing needs backfilling.
+ALTER TABLE "profiles" ADD COLUMN "subject_to_restrictive_covenant" boolean;--> statement-breakpoint
+ALTER TABLE "profiles" ADD COLUMN "relatives_at_target_employers" boolean;--> statement-breakpoint
+ALTER TABLE "profiles" ADD COLUMN "previously_employed_at_target_employers" boolean;--> statement-breakpoint
+ALTER TABLE "profiles" ADD COLUMN "salary_expectation" text;--> statement-breakpoint
+ALTER TABLE "profiles" ADD COLUMN "stored_answers" jsonb;

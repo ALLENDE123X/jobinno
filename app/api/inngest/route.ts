@@ -57,6 +57,7 @@ import { serve } from "inngest/next";
 import { syncJobBoards } from "@/inngest/board-sync";
 import { applyToJob, discoverListings, inngest } from "@/inngest/job-application-pipeline";
 import { scheduleJobSearches } from "@/inngest/job-search-schedule";
+import { parseCandidateDocuments } from "@/inngest/parse-candidate-documents";
 
 /**
  * Node, not Edge. Non negotiable rather than a preference: the pipeline reaches
@@ -96,6 +97,10 @@ export const { GET, POST, PUT } = serve({
     // nothing sent `job-search/requested` at all, so the two functions below
     // were registered, correct, and unreachable.
     scheduleJobSearches,
+    // JOB-112. Fired by onboarding, once per uploaded resume. Parses the
+    // resume and the LinkedIn export and stores the result on the row, so the
+    // fill pipeline reads it instead of re-deriving it every application.
+    parseCandidateDocuments,
     // ACT-009, by way of JOB-004. Match and fan out, then one run per listing.
     discoverListings,
     applyToJob,
