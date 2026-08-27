@@ -627,16 +627,13 @@ export const profiles = pgTable(
      * Ours, not the person's, so it stays out of every grant list: no
      * `authenticated` UPDATE, matching `stripe_customer_id` and
      * `browserbase_context_id` above, and — a step further than either of
-     * those two — no `authenticated` SELECT either, which
-     * `drizzle/0025_profiles_gmail_refresh_token.sql` explains is not fully
-     * achieved yet. `profiles` still carries Supabase's original table wide
-     * SELECT grant to `authenticated`, and `0003_profiles_column_privileges.sql`
-     * only ever narrowed the UPDATE half of that; getting this column
-     * genuinely unreadable needs the same table wide REVOKE SELECT / GRANT
-     * SELECT-by-column treatment applied there, done once for this column
-     * and its two service-role-only siblings rather than three times over.
-     * Left as an explicit open question on the PR rather than done
-     * piecemeal here.
+     * those two originally had — no `authenticated` SELECT either.
+     * `drizzle/0027_profiles_column_select_lockdown.sql` closes the JOB-192
+     * follow up that `0026_profiles_gmail_refresh_token_privileges.sql`
+     * called out: it revokes the table wide SELECT grant on `profiles` from
+     * `authenticated` and grants SELECT back on every column except this
+     * one, `stripe_customer_id` and `browserbase_context_id`. All three are
+     * now readable only by the service role.
      */
     gmailRefreshToken: text("gmail_refresh_token"),
 

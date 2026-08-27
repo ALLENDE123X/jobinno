@@ -42,7 +42,7 @@ import {
   PRODUCTION_ORIGIN,
   WWW_PRODUCTION_ORIGIN,
 } from "@/lib/auth/redirect-urls";
-import { createServerClient } from "@/lib/supabase/server";
+import { createServerClient, createServiceRoleClient } from "@/lib/supabase/server";
 
 /** Where a person is sent to sign in. */
 const LOGIN_PATH = "/login";
@@ -144,11 +144,21 @@ async function startCheckout(request: NextRequest, planSlug: string | null) {
   }
 
   // The plan they are on, and the Stripe customer from an earlier purchase when
-  // there is one, so a second plan does not mint a duplicate customer. Read
-  // through the user's own session rather than the service role:
-  // `profiles_select_own` already limits this to their row, and nothing here
-  // needs more power than that.
-  const { data: profile } = await supabase
+  // there is one, so a second plan does not mint a duplicate customer.
+  //
+  // Read through the service role rather than the session client, pinned to
+  // `user.id` here rather than by a policy. `stripe_customer_id` used to
+  // come back through the session client too, but
+  // `drizzle/0027_profiles_column_select_lockdown.sql` revoked the
+  // `authenticated` SELECT grant on that column: the Stripe customer id is
+  // ours, not the person's, so exactly one role reads it now, and that role
+  // is the service role. Reading both columns in one query keeps the read
+  // atomic across `plan` and `stripe_customer_id`, so a webhook that writes
+  // both between two separate reads can never leave this handler with a
+  // mismatched view. The service role bypasses row level security, so treat
+  // the id it filters on as already authorised, which it is: `getUser()`
+  // above returned it from the caller's own session.
+  const { data: profile } = await createServiceRoleClient()
     .from("profiles")
     .select("plan, stripe_customer_id")
     .eq("id", user.id)

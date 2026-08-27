@@ -165,6 +165,19 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0026_profiles_gmail_refresh_token_privileges.sql
 
+      - name: Apply the JOB-192 profiles SELECT lockdown migration
+        # JOB-192. Same reasoning again, and its own line rather than a glob
+        # for the reason six steps up. This one revokes the table wide SELECT
+        # grant on `profiles` from `authenticated` and `anon` and grants
+        # SELECT back on every column except `stripe_customer_id`,
+        # `browserbase_context_id` and `gmail_refresh_token`, so the three
+        # sensitive columns are readable only by the service role. All 34
+        # columns it names have been created either by an earlier migration
+        # or by the `drizzle-kit push` step above by the time this runs.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0027_profiles_column_select_lockdown.sql
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -310,6 +323,19 @@ jobs:
         run: >-
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0026_profiles_gmail_refresh_token_privileges.sql
+
+      - name: Apply the JOB-192 profiles SELECT lockdown migration
+        # JOB-192. Same reasoning again, and its own line rather than a glob
+        # for the reason six steps up. This one revokes the table wide SELECT
+        # grant on `profiles` from `authenticated` and `anon` and grants
+        # SELECT back on every column except `stripe_customer_id`,
+        # `browserbase_context_id` and `gmail_refresh_token`, so the three
+        # sensitive columns are readable only by the service role. All 34
+        # columns it names have been created either by an earlier migration
+        # or by the `drizzle-kit push` step above by the time this runs.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0027_profiles_column_select_lockdown.sql
 
       - name: Build
         run: npm run build
