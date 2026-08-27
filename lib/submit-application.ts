@@ -101,6 +101,7 @@ import {
   applyFieldValue,
   enumerateFormFields,
   inPageError,
+  inPageExpression,
   type EnumeratedField,
 } from "@/lib/form-fields";
 // ACT-017. ACT-006's mailbox machinery, reused rather than reimplemented: the
@@ -1975,6 +1976,76 @@ function gateName(input: SubmitApplicationInput): "auto" | "custom" {
 }
 
 /**
+ * The in page half of the pre submit grecaptcha patch. Kept at module scope,
+ * as a plain function declaration rather than a `const arrow`, so its
+ * `.toString()` reads back cleanly for `inPageExpression()` to inject. tsx may
+ * still compile inner arrows to `__name(...)` wrappers, which is exactly the
+ * reason it runs through `inPageExpression()`: that helper installs a matching
+ * `__name` identity in the outer scope of the injected expression so those
+ * wrapper calls resolve to a no op inside the page. JOB-202.
+ *
+ * Patches whichever of "grecaptcha already exists" or "grecaptcha loads later"
+ * is true right now, so every subsequent `execute()` call resolves with the
+ * harvester's token instead of asking Google's own script to mint one in this
+ * Browserbase session. Called from `runSubmitPhase` for Ashby only, once, right
+ * before the point of no return.
+ */
+function patchGrecaptchaInPage(token: string): null {
+  type PatchableGrecaptcha = {
+    execute?: (...args: unknown[]) => Promise<string>;
+    __jobinnoPatched?: boolean;
+  };
+  const ourExecute = () => Promise.resolve(token);
+  // Defends a single `execute` property against a later plain assignment
+  // (`gr.execute = <real fn>`) by making it an accessor whose setter is a no op
+  // instead of a normal writable slot. That is the pattern Google's own
+  // reCAPTCHA loader uses once it finishes loading: it does not reassign
+  // `window.grecaptcha` wholesale, it mutates the existing stub in place, which
+  // a plain field assignment above does not survive. Best effort: some boards
+  // may have already made `execute` non configurable themselves, in which case
+  // this falls back to the plain assignment.
+  const defendExecute = (gr: PatchableGrecaptcha, key: "execute"): void => {
+    try {
+      Object.defineProperty(gr, key, {
+        configurable: true,
+        get: () => ourExecute,
+        set: () => {
+          // Swallow the board's own assignment. Reading `execute` still
+          // resolves to `ourExecute` no matter what was set.
+        },
+      });
+    } catch {
+      gr[key] = ourExecute;
+    }
+  };
+  const patch = (candidate: unknown): void => {
+    if (candidate === null || typeof candidate !== "object") return;
+    const gr = candidate as PatchableGrecaptcha;
+    if (gr.__jobinnoPatched) return;
+    defendExecute(gr, "execute");
+    gr.__jobinnoPatched = true;
+  };
+  const win = window as unknown as { grecaptcha?: PatchableGrecaptcha };
+  let current = win.grecaptcha;
+  patch(current);
+  try {
+    Object.defineProperty(window, "grecaptcha", {
+      configurable: true,
+      get: () => current,
+      set: (value: PatchableGrecaptcha) => {
+        current = value;
+        patch(current);
+      },
+    });
+  } catch {
+    // Google's own script may already have made this non configurable.
+    // Best effort only, the direct patch above already covers the common case
+    // where grecaptcha has loaded by the time the form is filled.
+  }
+  return null;
+}
+
+/**
  * Everything from "the form is filled and the browser is open" to a terminal
  * result. **Never throws.** Every exit is a `SubmitApplicationResult`, which is
  * what makes it impossible for a failure on this side of the click to escape
@@ -2459,92 +2530,25 @@ async function runSubmitPhase(
         );
       }
       // Patches whichever of "grecaptcha already exists" or "grecaptcha loads
-      // later" is true at this instant — a property of how far the board
-      // bundle has loaded, not something this module controls. Every call to
-      // `execute()` afterwards resolves with the harvester's token instead of
-      // asking Google's own script to mint one in this session.
-      // The outer try/catch mirrors `inPageExpression()` in `form-fields.ts`:
-      // a throw inside a page evaluate reaches the SDK as the bare word
-      // "Uncaught" with no message and no stack, which is indistinguishable
-      // from a transport failure. Catch in the page and return the stack as
-      // data so `blocked()` below can name the real reason. JOB-202.
+      // later" is true at this instant, a property of how far the board
+      // bundle has loaded and not something this module controls. Every call
+      // to `execute()` afterwards resolves with the harvester's token instead
+      // of asking Google's own script to mint one in this session.
+      //
+      // Runs through `inPageExpression()` rather than as a raw
+      // `page.evaluate(fn)` call because tsx compiles every arrow function
+      // and shorthand method inside the callback into an `__name(fn, "name")`
+      // wrapper for runtime `.name` metadata (see the header on
+      // `inPageExpression` in `form-fields.ts`). That helper does not exist
+      // in the page's global scope, so a raw evaluate throws
+      // `ReferenceError: __name is not defined` on the first compiled line,
+      // and the bare word "Uncaught" is what reaches the SDK from that.
+      // `inPageExpression()` prepends a `const __name = (f) => f` identity in
+      // an outer scope that the serialized callback closes over, and wraps
+      // the whole thing in a try/catch that returns `{ __error }` so the
+      // real stack reaches `blocked()` below. JOB-202.
       const patchOutcome = await session.page.evaluate(
-        (token: string): { __error?: string } | null => {
-          // Local `__name` identity, same shape `inPageExpression()` in
-          // form-fields.ts installs, and for the same reason: tsx compiles
-          // shorthand method definitions and arrow functions into calls to
-          // `__name(fn, "name")` for `.name` metadata at runtime. That helper
-          // does not exist in the page's global scope, so the first line of
-          // the serialized function throws `ReferenceError: __name is not
-          // defined` before anything else can run. A local identity makes
-          // every such call a no op. Observed live 2026 08 27 against Ramp.
-          const __name = <T>(fn: T): T => fn;
-          void __name;
-          try {
-            type PatchableGrecaptcha = {
-              execute?: (...args: unknown[]) => Promise<string>;
-              __jobinnoPatched?: boolean;
-            };
-            const ourExecute = () => Promise.resolve(token);
-            // Defends a single `execute` property against a later plain
-            // assignment (`gr.execute = <real fn>`) by making it an accessor
-            // whose setter is a no-op instead of a normal writable slot. That
-            // is the pattern Google's own reCAPTCHA loader uses once it finishes
-            // loading: it does not reassign `window.grecaptcha` wholesale, it
-            // mutates the existing stub in place, which a plain field
-            // assignment above does not survive. Best effort: some boards may
-            // have already made `execute` non configurable themselves, in
-            // which case this falls back to the plain assignment and logs so a
-            // future observer scanning Browserbase session logs can see it.
-            const defendExecute = (gr: PatchableGrecaptcha, key: "execute"): void => {
-              try {
-                Object.defineProperty(gr, key, {
-                  configurable: true,
-                  get: () => ourExecute,
-                  set: () => {
-                    // Swallow the board's own assignment. Reading `execute`
-                    // still resolves to `ourExecute` no matter what was set.
-                  },
-                });
-              } catch (err) {
-                console.warn(
-                  `[act-008] could not defend grecaptcha.${key} from later property clobber: ${String(err)}`
-                );
-                gr[key] = ourExecute;
-              }
-            };
-            const patch = (candidate: unknown): void => {
-              if (candidate === null || typeof candidate !== "object") return;
-              const gr = candidate as PatchableGrecaptcha;
-              if (gr.__jobinnoPatched) return;
-              defendExecute(gr, "execute");
-              gr.__jobinnoPatched = true;
-            };
-            const win = window as unknown as { grecaptcha?: PatchableGrecaptcha };
-            let current = win.grecaptcha;
-            patch(current);
-            try {
-              Object.defineProperty(window, "grecaptcha", {
-                configurable: true,
-                get: () => current,
-                set: (value: PatchableGrecaptcha) => {
-                  current = value;
-                  patch(current);
-                },
-              });
-            } catch {
-              // Google's own script may already have made this non configurable.
-              // Best effort only — the direct patch above already covers the
-              // common case where grecaptcha has loaded by the time the form is
-              // filled.
-            }
-            return null;
-          } catch (e) {
-            const err = e as { stack?: string } | undefined;
-            return { __error: String((err && err.stack) || e) };
-          }
-        },
-        mintedToken
+        inPageExpression(patchGrecaptchaInPage, JSON.stringify(mintedToken))
       );
       const patchError = inPageError(patchOutcome);
       if (patchError) {
