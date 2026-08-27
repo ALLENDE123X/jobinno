@@ -11,11 +11,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ASHBY_DIRECT_HTTP_MODE_VALUE,
   ASHBY_SUBMIT_MODE_ENV,
+  candidateValueForField,
   classifyAshbySubmitResponse,
   runAshbyDirectSubmit,
   shouldRouteAshbyDirectHttp,
+  type AshbyCandidateView,
   type ResolvedAshbyContext,
 } from "@/lib/ashby-direct-submit";
+import type { CandidateApplicationAnswers } from "@/lib/candidate-intake";
 import { APPLICATION_STATUS } from "@/lib/application-status";
 
 let priorEnvValue: string | undefined;
@@ -212,6 +215,61 @@ function emptyDiscoveryResponse(): Response {
   });
 }
 
+/**
+ * A discovery response carrying one required text field with no keyword
+ * `candidateValueForField` will match. Used to prove that a required
+ * unmapped field routes to submission_blocked without a submit call.
+ */
+function discoveryWithUnmappedRequiredField(): Response {
+  return jsonResponse({
+    data: {
+      jobPosting: {
+        id: "job-1",
+        title: "Test Engineer",
+        applicationForm: {
+          id: "frid-1",
+          sourceFormDefinitionId: "formdef-1",
+          formControls: [{ identifier: "submit-1", title: "Submit" }],
+          sections: [
+            {
+              title: "Application",
+              fieldEntries: [
+                {
+                  id: "entry-1",
+                  isRequired: true,
+                  isHidden: false,
+                  field: {
+                    path: "custom_favourite_number",
+                    title: "What is your favourite prime number?",
+                    type: "String",
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  });
+}
+
+function emptyAnswers(): CandidateApplicationAnswers {
+  return {};
+}
+
+function baseView(): AshbyCandidateView {
+  return {
+    firstName: "Pranav",
+    lastName: "Lende",
+    fullName: "Pranav Lende",
+    email: "pranavlende123@gmail.com",
+    phone: "404-444-6018",
+    linkedinUrl: "https://www.linkedin.com/in/pranavlende",
+    location: "Atlanta, GA",
+    entrepreneurialBackground: null,
+  };
+}
+
 describe("runAshbyDirectSubmit", () => {
   it("routes a GraphQL error response on submit to submission_unconfirmed", async () => {
     const { client, calls } = makeFakeSupabase();
@@ -325,5 +383,200 @@ describe("runAshbyDirectSubmit", () => {
     expect(statusWrite).toBeDefined();
     // No submitted_at stamp on a row nothing was sent for.
     expect(statusWrite?.values.submitted_at).toBeUndefined();
+  });
+
+  // ── MAJOR #3: missingRequired coverage — the HARD STOP 9 gate ──────────
+
+  it(
+    "blocks with a named field and issues no submit call when a required field has no grounded answer",
+    async () => {
+      const { client, calls } = makeFakeSupabase();
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(discoveryWithUnmappedRequiredField());
+      const mint = vi.fn().mockResolvedValue("harvester-token-should-not-be-called");
+
+      const result = await runAshbyDirectSubmit(baseContext(), {
+        fetch: fetchImpl as unknown as typeof globalThis.fetch,
+        mintRecaptchaToken: mint,
+        supabase: client as never,
+        now: () => new Date("2026-08-27T12:00:00Z"),
+      });
+
+      expect(result.status).toBe(APPLICATION_STATUS.SUBMISSION_BLOCKED);
+      expect(result.submitted).toBe(false);
+      expect(result.submitAttempted).toBe(false);
+      // The blocked reason names the field that was missing, so the
+      // operator reading the skip log knows what to add to intake.
+      expect(result.blockedReason).toContain("What is your favourite prime number?");
+      expect(result.blockedReason).toContain("HARD STOP 9");
+      // Discovery ran; submit mutation did not; harvester was never
+      // invoked because the missing required check gates before mint.
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(mint).not.toHaveBeenCalled();
+      // The skip_log message carries the same field name, so the row
+      // written to the database is the durable record of what stopped
+      // this run.
+      const skipInsert = calls.find((c) => c.table === "skip_log" && c.op === "insert");
+      expect(skipInsert).toBeDefined();
+      const skipContext = skipInsert?.values.raw_context as {
+        message?: string;
+      } | undefined;
+      expect(skipContext?.message).toContain("What is your favourite prime number?");
+    }
+  );
+});
+
+// ── HARD STOP 9 — every hardcoded value now traces to intake ──────────────
+
+describe("candidateValueForField grounding", () => {
+  const workAuthField = {
+    path: "custom_work_auth",
+    title: "Are you legally authorized to work in the United States?",
+    type: "String" as const,
+  };
+  const workAuthBooleanField = {
+    ...workAuthField,
+    type: "Boolean" as const,
+  };
+  const sponsorshipField = {
+    path: "custom_sponsorship",
+    title: "Will you now or in the future require sponsorship for an employment visa?",
+    type: "String" as const,
+  };
+  const sponsorshipBooleanField = {
+    ...sponsorshipField,
+    type: "Boolean" as const,
+  };
+  const usOrCanadaField = {
+    path: "custom_geo",
+    title: "Are you based in the US or Canada?",
+    type: "String" as const,
+  };
+  const relocationBoolean = {
+    path: "custom_relo",
+    title: "Are you willing to relocate?",
+    type: "Boolean" as const,
+  };
+  const arbitraryBoolean = {
+    path: "custom_random_bool",
+    title: "Have you ever worked at a startup?",
+    type: "Boolean" as const,
+  };
+
+  it("returns null for work authorization when intake did not state it", () => {
+    expect(candidateValueForField(workAuthField, baseView(), emptyAnswers(), true)).toBeNull();
+    expect(
+      candidateValueForField(workAuthBooleanField, baseView(), emptyAnswers(), true)
+    ).toBeNull();
+  });
+
+  it("routes stated work authorization straight through, both string and boolean flavours", () => {
+    const yes: CandidateApplicationAnswers = { workAuthorizedUs: true };
+    expect(candidateValueForField(workAuthField, baseView(), yes, true)).toBe("Yes");
+    expect(candidateValueForField(workAuthBooleanField, baseView(), yes, true)).toBe(true);
+    const no: CandidateApplicationAnswers = { workAuthorizedUs: false };
+    expect(candidateValueForField(workAuthField, baseView(), no, true)).toBe("No");
+    expect(candidateValueForField(workAuthBooleanField, baseView(), no, true)).toBe(false);
+  });
+
+  it("returns null for sponsorship when intake did not state it", () => {
+    expect(
+      candidateValueForField(sponsorshipField, baseView(), emptyAnswers(), true)
+    ).toBeNull();
+    expect(
+      candidateValueForField(sponsorshipBooleanField, baseView(), emptyAnswers(), true)
+    ).toBeNull();
+  });
+
+  it("routes stated sponsorship straight through — this is the JOB-022 style bug the MAJOR called out", () => {
+    // A candidate who genuinely needs sponsorship must not have a false
+    // "No" sent under their real name. This is the regression that
+    // review MAJOR #1 caught in the first draft of this module.
+    const needsSponsor: CandidateApplicationAnswers = { requiresSponsorship: true };
+    expect(candidateValueForField(sponsorshipField, baseView(), needsSponsor, true)).toBe("Yes");
+    expect(
+      candidateValueForField(sponsorshipBooleanField, baseView(), needsSponsor, true)
+    ).toBe(true);
+    const noSponsor: CandidateApplicationAnswers = { requiresSponsorship: false };
+    expect(candidateValueForField(sponsorshipField, baseView(), noSponsor, true)).toBe("No");
+    expect(
+      candidateValueForField(sponsorshipBooleanField, baseView(), noSponsor, true)
+    ).toBe(false);
+  });
+
+  it("only answers US-or-Canada questions from a stated country", () => {
+    expect(
+      candidateValueForField(usOrCanadaField, baseView(), emptyAnswers(), true)
+    ).toBeNull();
+    expect(
+      candidateValueForField(
+        usOrCanadaField,
+        baseView(),
+        { currentCountry: "United States" },
+        true
+      )
+    ).toBe("Yes");
+    expect(
+      candidateValueForField(usOrCanadaField, baseView(), { currentCountry: "US" }, true)
+    ).toBe("Yes");
+    expect(
+      candidateValueForField(usOrCanadaField, baseView(), { currentCountry: "India" }, true)
+    ).toBe("No");
+  });
+
+  it("returns null on a Boolean question with no matching intake even when required", () => {
+    expect(
+      candidateValueForField(arbitraryBoolean, baseView(), emptyAnswers(), true)
+    ).toBeNull();
+    expect(candidateValueForField(arbitraryBoolean, baseView(), emptyAnswers(), false)).toBeNull();
+  });
+
+  it("routes stated willingness to relocate", () => {
+    expect(
+      candidateValueForField(relocationBoolean, baseView(), { willingToRelocate: true }, true)
+    ).toBe(true);
+    expect(
+      candidateValueForField(
+        relocationBoolean,
+        baseView(),
+        { willingToRelocate: false },
+        true
+      )
+    ).toBe(false);
+    expect(
+      candidateValueForField(relocationBoolean, baseView(), emptyAnswers(), true)
+    ).toBeNull();
+  });
+
+  it("still returns Decline to Self Identify for EEO questions (HARD STOP 10 policy)", () => {
+    const eeoField = {
+      path: "eeo_gender",
+      title: "What is your gender?",
+      type: "String" as const,
+    };
+    expect(
+      candidateValueForField(eeoField, baseView(), emptyAnswers(), true)
+    ).toBe("Decline to Self Identify");
+    const eeoBoolean = { ...eeoField, type: "Boolean" as const };
+    // A boolean EEO question has no truthy "decline" answer, so this is
+    // deliberately null rather than a hallucinated true/false.
+    expect(
+      candidateValueForField(eeoBoolean, baseView(), emptyAnswers(), true)
+    ).toBeNull();
+  });
+
+  it("returns null for a required open-ended text with no grounded background paragraph", () => {
+    // v1 does not carry an entrepreneurial background column in intake,
+    // so `entrepreneurialBackground` is null on the view; the fallback
+    // for a required generic text field is therefore null, which the
+    // caller routes into missingRequired. No fabricated paragraph is
+    // ever sent to an employer.
+    const openText = {
+      path: "custom_open",
+      title: "Tell us about a project you're proud of",
+      type: "LongText" as const,
+    };
+    expect(candidateValueForField(openText, baseView(), emptyAnswers(), true)).toBeNull();
   });
 });

@@ -1,42 +1,59 @@
 /**
  * JOB-214 — the browserless Ashby submit path.
  *
- * ── What this replaces, and why it exists ───────────────────────────────────
- * The DOM path in `lib/submit-application.ts` opens a Browserbase session,
- * runs Stagehand across the Ashby form, and clicks Submit through Ashby's
- * own React UI. That works and stays as the default. It also fights every
- * anti bot signal Ashby's own reCAPTCHA v3 scorer produces on a Browserbase
- * fingerprint, and JOB-187 was the ticket that documented that failure mode
- * end to end. `scripts/test-ashby-api.ts` reverse engineered the Ashby non
- * user GraphQL API and drove a real submit against it, headless, using a
- * Fly harvester minted reCAPTCHA token in place of the one Ashby's own
- * client would mint in session. That script proved the flow. This module
- * promotes that flow from a debug harness into a production submit path.
+ * ── What this actually is, told honestly ────────────────────────────────────
+ * This module extracts the Ashby non user GraphQL SHAPES that were reverse
+ * engineered in `scripts/test-ashby-api.ts` — the queries and mutations
+ * `ApiJobPosting`, `ApiCreateFileUploadHandle`, `ApiSetFormValue`,
+ * `ApiSetFormValueToFile` and `ApiSubmitSingleApplicationFormAction`, and
+ * the S3 pre signed POST that carries the resume. What it does with them
+ * is different from what that script does.
+ *
+ * The script's `main()` opens a real Browserbase session, drives Stagehand
+ * through Ashby's own React UI to fill and click Submit, and lets Ashby's
+ * own client bundle mint the reCAPTCHA token in that browser. The GraphQL
+ * helper functions it defines (`createUploadHandle`, `setFieldValue`,
+ * `setFileField`, `submitForm`) are dead code inside that main — they are
+ * defined and never called on the path that has proved to submit a real
+ * application.
+ *
+ * This module runs those helpers over raw HTTP with no browser at all,
+ * a Fly harvester minted reCAPTCHA token in place of one Ashby's own JS
+ * would mint, and no cookies or fingerprint from a warmed session.
+ * That path has NEVER been exercised against a live Ashby endpoint —
+ * not by this module, not by the script, not anywhere. Live validation
+ * against a real Ashby posting is a required next step and has not
+ * happened yet. The mode selector in `lib/submit-application.ts` is off
+ * by default in prod so a live run only happens when someone deliberately
+ * flips the env.
  *
  * ── What lives here ─────────────────────────────────────────────────────────
  * `runAshbyDirectSubmit(ctx, deps)` is the seam a unit test drives. Every
- * network dependency (`fetch`, the reCAPTCHA harvester, the Supabase client
- * that stamps the row status) is behind `deps`, so the tests never touch a
- * live Ashby endpoint and never touch a live harvester.
+ * network dependency (`fetch`, the reCAPTCHA harvester, the Supabase
+ * client that stamps the row status) is behind `deps`, so the tests never
+ * touch a live Ashby endpoint and never touch a live harvester.
  *
- * `submitAshbyApplicationDirectly({ jobApplicationId, ... })` is the caller
- * facing entry, and it does the reads a live run needs — the applications
- * row's user id, the candidate profile, the resume bytes — before calling
- * `runAshbyDirectSubmit` with the resolved context. The mode selector in
- * `lib/submit-application.ts` calls this one and only when the env flag is
- * on and the row's ats is ashby.
+ * `submitAshbyApplicationDirectly({ jobApplicationId, ... })` is the
+ * caller facing entry, and it does the reads a live run needs — the
+ * applications row's user id, the candidate profile, the resume bytes —
+ * before calling `runAshbyDirectSubmit` with the resolved context. The
+ * mode selector in `lib/submit-application.ts` calls this one and only
+ * when the env flag is on and the row's ats is ashby.
  *
  * ── What this deliberately does NOT do ─────────────────────────────────────
  *   1. It never opens a browser. That is the entire point of the direct
  *      path. If a future edit reintroduces Browserbase or Stagehand here
  *      the ticket is wrong.
  *   2. It never invents an answer that is not in the candidate's own
- *      intake. HARD STOP 9. `candidateValueForField` is a straight port of
- *      the same function in `scripts/test-ashby-api.ts`, which was already
- *      grounded in a fixed intake shape, and every branch here either
- *      returns a known field, returns `null` (skip), or returns a fallback
- *      paragraph that describes real work the candidate has done and
- *      stated in their profile.
+ *      intake. HARD STOP 9. `candidateValueForField` reads work
+ *      authorization off `applicationAnswers.workAuthorizedUs`,
+ *      sponsorship off `applicationAnswers.requiresSponsorship`, "based in
+ *      US or Canada" style questions off `applicationAnswers.currentCountry`,
+ *      and returns `null` — routing the field to `missingRequired` when it
+ *      is required — the moment intake does not carry an answer. A boolean
+ *      question with no known source is `null`, not `true`. A required
+ *      text field with no honest source is `null`, not a fabricated
+ *      paragraph.
  *   3. It never widens what `submitted` or `submission_unconfirmed` mean.
  *      Both are terminal, from the moment the submit mutation is issued.
  *      The classifier below is deliberately narrow: a `FormSubmitSuccess`
@@ -327,6 +344,13 @@ async function uploadResumeToS3(
 ): Promise<void> {
   const form = new FormData();
   for (const [k, v] of Object.entries(target.fields)) form.append(k, v);
+  // These two look like a duplicate at a glance and they are not. S3 pre
+  // signed POST needs `Content-Type` as a FIELD in the multipart body —
+  // that is the object's stored content type, matched against the
+  // policy the pre signed POST was signed with. The Blob's `type` on
+  // the `file` part sets the Content-Type HEADER of that specific
+  // multipart part, which S3 also inspects. Same rule as
+  // `scripts/test-ashby-api.ts:264-266`; do not remove either.
   form.append("Content-Type", contentType);
   const buffer = fileBytes.buffer.slice(
     fileBytes.byteOffset,
@@ -571,17 +595,31 @@ export type AshbyCandidateView = {
 };
 
 /**
- * Ported verbatim in intent from `scripts/test-ashby-api.ts`, adapted to
- * read from the resolved candidate view rather than the hardcoded CANDIDATE
- * constant that script uses. Every keyword branch, every EEO decline, the
- * boolean question routing and the location narrowness are unchanged from
- * that script. The comments there explain the individual precedence
- * choices in more detail than fits here; do not edit either copy without
- * updating the other.
+ * The one function that decides what value goes on the form for a given
+ * Ashby field, grounded in real intake. HARD STOP 9 lives here.
+ *
+ * Every branch either returns a value that traces to an actual stated
+ * intake field (`applicationAnswers`), a fact off the person's own resume
+ * or profile record (`view`), the standing V1 policy for EEO questions
+ * ("Decline to Self Identify" — HARD STOP 10), or `null`. `null` skips
+ * the field on the fill call, and if the field is required the caller
+ * routes the row to `submission_blocked` naming the field rather than
+ * inventing an answer. A boolean question whose truth is not in intake
+ * returns `null`, not `true`; a work authorization question whose answer
+ * is not in intake returns `null`, not "Yes"; a sponsorship question the
+ * same. This is the difference between the first draft of this module,
+ * which reproduced JOB-022's original bug, and the version that ships.
+ *
+ * Keyword matching for field title routing (name, email, phone, location,
+ * sponsorship, work auth, EEO) is inherited from
+ * `scripts/test-ashby-api.ts`; what changed is the value each branch
+ * returns. If a keyword above matches but intake has no answer, the
+ * result is `null`.
  */
 export function candidateValueForField(
   field: AshbyField,
   view: AshbyCandidateView,
+  applicationAnswers: CandidateApplicationAnswers,
   isRequired = false
 ): unknown | null {
   const t = (field.title ?? "").toLowerCase();
@@ -591,38 +629,89 @@ export function candidateValueForField(
   if (field.path === "_systemfield_phone") return view.phone;
   if (field.path === "_systemfield_resume") return null;
 
-  if (field.type === "Boolean") {
-    if (
-      t.includes("gender") ||
-      t.includes("race") ||
-      t.includes("ethnicity") ||
-      t.includes("veteran") ||
-      t.includes("disability") ||
-      t.includes("pronouns")
-    ) {
-      return null;
-    }
-    if (t.includes("sponsor") || t.includes("visa")) return false;
-    return true;
-  }
-
-  if (
+  const isEeoTitle =
     t.includes("gender") ||
     t.includes("race") ||
     t.includes("ethnicity") ||
     t.includes("veteran") ||
     t.includes("disability") ||
-    t.includes("pronouns")
-  ) {
-    return "Decline to Self Identify";
+    t.includes("pronouns");
+
+  // EEO — HARD STOP 10. V1 policy: always decline, never store, never
+  // infer. This is not an invention. It is the product decision the whole
+  // pipeline works to.
+  if (field.type === "Boolean") {
+    if (isEeoTitle) return null;
+    // Sponsorship / visa — only if intake carries a real answer.
+    // `applicationAnswers.requiresSponsorship` is the stated fact
+    // ("Will you now or in the future require sponsorship for an
+    // employment visa?"). Anything else stays null → missingRequired.
+    if (t.includes("sponsor") || t.includes("visa")) {
+      if (typeof applicationAnswers.requiresSponsorship === "boolean") {
+        return applicationAnswers.requiresSponsorship;
+      }
+      return null;
+    }
+    // Work authorization — same rule, off the stated answer.
+    if (
+      t.includes("authorized") ||
+      t.includes("work auth") ||
+      t.includes("eligible to work")
+    ) {
+      if (typeof applicationAnswers.workAuthorizedUs === "boolean") {
+        return applicationAnswers.workAuthorizedUs;
+      }
+      return null;
+    }
+    // Relocation — same rule.
+    if (t.includes("relocate") || t.includes("relocation")) {
+      if (typeof applicationAnswers.willingToRelocate === "boolean") {
+        return applicationAnswers.willingToRelocate;
+      }
+      return null;
+    }
+    // Every other boolean stays null. A yes/no question we cannot answer
+    // from real intake becomes missingRequired when required, not a
+    // guessed `true` on someone else's employer form.
+    return null;
   }
 
-  if (t.includes("sponsor") || t.includes("visa")) return "No";
-  if (t.includes("authorized") || t.includes("work auth") || t.includes("eligible to work")) {
-    return "Yes";
+  if (isEeoTitle) return "Decline to Self Identify";
+
+  // Sponsorship / visa (string flavour). Only from real intake.
+  if (t.includes("sponsor") || t.includes("visa")) {
+    if (typeof applicationAnswers.requiresSponsorship === "boolean") {
+      return applicationAnswers.requiresSponsorship ? "Yes" : "No";
+    }
+    return null;
   }
-  if (t.includes("us or canada") || t.includes("based in us") || t.includes("based in the us")) {
-    return "Yes";
+
+  // Work authorization (string flavour). Only from real intake.
+  if (
+    t.includes("authorized") ||
+    t.includes("work auth") ||
+    t.includes("eligible to work")
+  ) {
+    if (typeof applicationAnswers.workAuthorizedUs === "boolean") {
+      return applicationAnswers.workAuthorizedUs ? "Yes" : "No";
+    }
+    return null;
+  }
+
+  // "Are you based in the US or Canada?" style. Only from stated country.
+  // `US`/`USA`/`United States` count as US; Canada is not in intake and
+  // is treated conservatively — a "US or Canada" question with only a
+  // stated US country still answers Yes truthfully, a stated non US
+  // country answers No. Anything else falls through to null.
+  if (
+    t.includes("us or canada") ||
+    t.includes("based in us") ||
+    t.includes("based in the us")
+  ) {
+    const country = normalizeCountry(applicationAnswers.currentCountry);
+    if (country === "united states") return "Yes";
+    if (country && country !== "") return "No";
+    return null;
   }
 
   if (t.includes("first name")) return view.firstName;
@@ -641,8 +730,17 @@ export function candidateValueForField(
     t.includes("what city");
   if (isShortLocationField || isExplicitLocationPhrase) return view.location;
 
-  if (t.includes("country") || t.includes("where are you located")) return "United States";
+  // "What country do you live in?" — only from the stated country.
+  if (t.includes("country") || t.includes("where are you located")) {
+    return normalizedCountryDisplay(applicationAnswers.currentCountry);
+  }
 
+  // Open ended "tell us about your entrepreneurial background" — only if
+  // a grounded background paragraph exists. `view.entrepreneurialBackground`
+  // is deliberately null in v1 (no grounded intake column carries this
+  // yet), so this branch also returns null and the field routes to
+  // missingRequired when required. That is the correct v1 outcome per
+  // HARD STOP 9.
   if (
     t.includes("entrepreneur") ||
     t.includes("startup") ||
@@ -683,11 +781,38 @@ export function candidateValueForField(
     return null;
   }
 
-  if (isRequired && (field.type === "String" || field.type === "LongText" || field.type === "Text")) {
-    return view.entrepreneurialBackground;
-  }
-
+  // A required open ended text with no grounded source is left null so
+  // the caller routes it to missingRequired. There is no fabricated
+  // "background paragraph" fallback here any more. `isRequired` is
+  // read for the signature contract only — the DOM path's LLM driven
+  // fill layer decides what to do about a required unmapped text field;
+  // this direct HTTP path stops.
+  void isRequired;
   return null;
+}
+
+/** Lowercased, trimmed country string, or null when intake carried none. */
+function normalizeCountry(input: string | undefined): string | null {
+  if (!input) return null;
+  const trimmed = input.trim().toLowerCase();
+  if (trimmed === "") return null;
+  if (trimmed === "us" || trimmed === "usa" || trimmed === "u.s." || trimmed === "u.s.a.") {
+    return "united states";
+  }
+  return trimmed;
+}
+
+/** Human display of the stated country, or null when intake carried none. */
+function normalizedCountryDisplay(input: string | undefined): string | null {
+  const norm = normalizeCountry(input);
+  if (norm === null) return null;
+  if (norm === "united states") return "United States";
+  // Title case the first letter of each word. The intake column is a
+  // free text field so no assumption about capitalisation is safe.
+  return norm
+    .split(/\s+/)
+    .map((w) => (w.length === 0 ? w : w[0].toUpperCase() + w.slice(1)))
+    .join(" ");
 }
 
 // ── Context assembly ────────────────────────────────────────────────────
@@ -803,6 +928,15 @@ export async function runAshbyDirectSubmit(
   const browserbaseSessionId = deps.browserbaseSessionId ?? null;
   const { jobApplicationId } = ctx;
 
+  /**
+   * Same variable, same rule, same name as the DOM path's own
+   * `submit-application.ts`: set to true on the line BEFORE the submit
+   * mutation is issued, never after. Read by `blocked()` above as a
+   * floor: a branch that reaches the pre submit exit after this flag has
+   * flipped is routed to `unconfirmed()` instead.
+   */
+  let submitAttempted = false;
+
   console.log(
     `${LOG} Ashby direct HTTP submit — application ${jobApplicationId} at ${ctx.applyUrl} ` +
       `(org ${ctx.orgName}, job posting ${ctx.jobPostingId})`
@@ -843,7 +977,17 @@ export async function runAshbyDirectSubmit(
     rowUpdated: terminal.rowUpdated,
   });
 
+  /**
+   * The pre submit exit. Same defensive guard the DOM path's `blocked()`
+   * carries in `lib/submit-application.ts`: if `submitAttempted` is ever
+   * true, the branch was reached after the submit mutation went out, and
+   * the outcome is not safely retryable. Route to `unconfirmed()`
+   * instead. Every call site today is before the submit mutation, so this
+   * check is a floor against a future edit routing a post submit failure
+   * into the pre submit exit and mislabelling it as safe.
+   */
   const blocked = async (why: string): Promise<SubmitApplicationResult> => {
+    if (submitAttempted) return await unconfirmed(why);
     const message = `submission_blocked (ashby direct http): ${why}`;
     let rowUpdated = false;
     try {
@@ -1029,7 +1173,12 @@ export async function runAshbyDirectSubmit(
   // ── 3. Fill value fields ────────────────────────────────────────────
   const missingRequired: string[] = [];
   for (const entry of valueEntries) {
-    const value = candidateValueForField(entry.field, ctx.candidate, entry.isRequired);
+    const value = candidateValueForField(
+      entry.field,
+      ctx.candidate,
+      ctx.applicationAnswers,
+      entry.isRequired
+    );
     if (value === null || value === undefined) {
       if (entry.isRequired) missingRequired.push(entry.field.title);
       continue;
@@ -1052,10 +1201,15 @@ export async function runAshbyDirectSubmit(
     }
   }
   if (missingRequired.length > 0) {
+    // HARD STOP 9. A required field with no grounded intake answer is
+    // filed here rather than filled with a guess, and the field names
+    // travel into the skip_log message so the operator sees what to
+    // add to intake before this row is re run.
     return await blocked(
-      `required Ashby fields have no mapped value from the candidate profile: ` +
+      `required Ashby field(s) had no grounded intake answer and this module refuses to ` +
+        `invent one on a real employer submission (HARD STOP 9): ` +
         JSON.stringify(missingRequired) +
-        `. Nothing was submitted.`
+        `. Nothing was submitted. Fill the missing intake column(s) and re run.`
     );
   }
 
@@ -1082,6 +1236,7 @@ export async function runAshbyDirectSubmit(
   // "no application was created", this row lands as submission_unconfirmed
   // and never automatically retries.
   console.log(`${LOG} calling ApiSubmitSingleApplicationFormAction — point of no return`);
+  submitAttempted = true;
   let outcome: AshbySubmitOutcome;
   try {
     outcome = await submitForm(fetchImpl, ctx.origin, {
@@ -1135,17 +1290,43 @@ export async function submitAshbyApplicationDirectly(
   const supabase = deps.supabase ?? getSupabaseClient();
   const parsedUrl = parseAshbyUrl(input.applyUrl);
 
-  // Read the row's user id. Preflight in `submit-application.ts` reads
-  // most of the row shape already but not user id, so this direct path
-  // fetches it here rather than force the caller to widen preflight's
-  // return shape.
+  // Read the row's user id and its current status. Preflight in
+  // `submit-application.ts` already refuses `submitted` and
+  // `submission_unconfirmed` before this function is ever called from
+  // the mode selector, but this direct path also has to be safe when
+  // invoked from a CLI or a test that has not run that preflight. So
+  // the guard is repeated here — defence in depth, matching the same
+  // rule ACT-007's `READY_STATUSES` enforces from the other direction.
   const { data: rows, error } = await supabase
     .from("applications")
-    .select("user_id")
+    .select("user_id,status")
     .eq("id", input.jobApplicationId)
     .limit(1);
   if (error) throw new Error(`applications lookup failed: ${error.message}`);
-  const userId = rows?.[0]?.user_id;
+  const row = rows?.[0];
+  if (!row) {
+    throw new Error(
+      `applications ${input.jobApplicationId} not found; cannot run Ashby direct HTTP submit against a missing row.`
+    );
+  }
+  const status = String(row.status ?? "");
+  if (status === APPLICATION_STATUS.SUBMITTED) {
+    throw new Error(
+      `applications ${input.jobApplicationId} is already at "${APPLICATION_STATUS.SUBMITTED}". ` +
+        `The Ashby direct HTTP path refuses to submit a second application against a row that ` +
+        `has already been sent to the employer. There is no version of this that is worth ` +
+        `risking a duplicate under a real candidate's name.`
+    );
+  }
+  if (status === APPLICATION_STATUS.SUBMISSION_UNCONFIRMED) {
+    throw new Error(
+      `applications ${input.jobApplicationId} is at ` +
+        `"${APPLICATION_STATUS.SUBMISSION_UNCONFIRMED}". An earlier run issued a submit against ` +
+        `this row and could not confirm the outcome. A human has to check the employer's side ` +
+        `before anything submits here again. Nothing was sent.`
+    );
+  }
+  const userId = row.user_id;
   if (typeof userId !== "string" || userId.trim() === "") {
     throw new Error(
       `applications ${input.jobApplicationId} has no user_id; cannot load candidate for Ashby direct HTTP submit.`
