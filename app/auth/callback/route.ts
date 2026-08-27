@@ -143,7 +143,24 @@ export async function GET(request: NextRequest) {
     });
   }
 
-  const { error: profileError } = await createServiceRoleClient()
+  // JOB-200: the service role factory throws when `SUPABASE_URL` or
+  // `SUPABASE_SERVICE_ROLE_KEY` are unset. Unwrapped, that surfaces as a
+  // framework 500 with a stack trace instead of the redirect the rest of
+  // this handler uses. The `detail` naming the missing variable stays in
+  // the log; the reason string sent to `/login` is generic.
+  let serviceClient: ReturnType<typeof createServiceRoleClient>;
+  try {
+    serviceClient = createServiceRoleClient();
+  } catch (thrown) {
+    const detail =
+      thrown instanceof Error ? thrown.message : "service role client unavailable";
+    console.error(`[auth-callback] service role client unavailable: ${detail}`);
+    return redirectTo(request, "/login", {
+      error: "Signed in, but your profile could not be created. Try again.",
+    });
+  }
+
+  const { error: profileError } = await serviceClient
     .from("profiles")
     .upsert({ id: user.id, email: user.email }, { onConflict: "id" });
 

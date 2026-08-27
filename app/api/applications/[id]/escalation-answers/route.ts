@@ -123,7 +123,23 @@ export async function PUT(
     );
   }
 
-  const service = createServiceRoleClient();
+  // JOB-200: unwrapped, a missing `SUPABASE_URL` or
+  // `SUPABASE_SERVICE_ROLE_KEY` throws a framework 500 with a stack trace
+  // instead of the JSON error shape the rest of this handler uses. The
+  // detail names which variable is empty and stays in the log; the body is
+  // generic.
+  let service: ReturnType<typeof createServiceRoleClient>;
+  try {
+    service = createServiceRoleClient();
+  } catch (thrown) {
+    const detail =
+      thrown instanceof Error ? thrown.message : "service role client unavailable";
+    console.error(`${LOG} service role client unavailable: ${detail}`);
+    return NextResponse.json(
+      { error: "server misconfigured" },
+      { status: 500 }
+    );
+  }
   const now = new Date();
 
   // ── Persist the answers to profiles.stored_answers ────────────────────────

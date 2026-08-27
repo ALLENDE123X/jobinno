@@ -116,8 +116,27 @@ export async function POST(request: NextRequest) {
   // the plan is genuinely changing, a lapse is guarded on the profile still
   // being on `starter`, and everything else is a constant from the catalog. See
   // `applyPlanChange`, which is where that is enforced rather than hoped for.
+  //
+  // JOB-200: build the service role client under its own try/catch so a
+  // missing `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` produces the same
+  // shape as the Stripe client failure above rather than a framework 500
+  // with a stack trace. 500 keeps Stripe retrying, which is the right thing
+  // to do for a configuration miss on this endpoint.
+  let serviceClient: ReturnType<typeof createServiceRoleClient>;
+  try {
+    serviceClient = createServiceRoleClient();
+  } catch (thrown) {
+    const detail =
+      thrown instanceof Error ? thrown.message : "service role client unavailable";
+    console.error(`[stripe-webhook] service role client unavailable: ${detail}`);
+    return NextResponse.json(
+      { error: "Billing webhook is not configured." },
+      { status: 500 }
+    );
+  }
+
   const result = await applyPlanChange(
-    createServiceRoleClient() as unknown as ProfileBillingClient,
+    serviceClient as unknown as ProfileBillingClient,
     change
   );
 
