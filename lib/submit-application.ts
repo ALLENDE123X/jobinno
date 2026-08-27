@@ -97,7 +97,12 @@ import {
 // ACT-017. The deterministic half of ACT-015 — read the DOM, put one value into
 // one control — reused verbatim for the security-code field. No model, and no
 // natural-language instruction, on the path that types the code.
-import { applyFieldValue, enumerateFormFields, type EnumeratedField } from "@/lib/form-fields";
+import {
+  applyFieldValue,
+  enumerateFormFields,
+  inPageError,
+  type EnumeratedField,
+} from "@/lib/form-fields";
 // ACT-017. ACT-006's mailbox machinery, reused rather than reimplemented: the
 // sender allowlist derived from this row's own apply URL, and the scoped,
 // time-bounded search that ends in its code extractor.
@@ -2458,65 +2463,85 @@ async function runSubmitPhase(
       // bundle has loaded, not something this module controls. Every call to
       // `execute()` afterwards resolves with the harvester's token instead of
       // asking Google's own script to mint one in this session.
-      await session.page.evaluate((token: string) => {
-        type PatchableGrecaptcha = {
-          execute?: (...args: unknown[]) => Promise<string>;
-          __jobinnoPatched?: boolean;
-        };
-        const ourExecute = () => Promise.resolve(token);
-        // Defends a single `execute` property against a later plain
-        // assignment (`gr.execute = <real fn>`) by making it an accessor
-        // whose setter is a no-op instead of a normal writable slot. That
-        // is the pattern Google's own reCAPTCHA loader uses once it finishes
-        // loading: it does not reassign `window.grecaptcha` wholesale, it
-        // mutates the existing stub in place, which a plain field
-        // assignment above does not survive. Best effort: some boards may
-        // have already made `execute` non configurable themselves, in
-        // which case this falls back to the plain assignment and logs so a
-        // future observer scanning Browserbase session logs can see it.
-        const defendExecute = (gr: PatchableGrecaptcha, key: "execute"): void => {
+      // The outer try/catch mirrors `inPageExpression()` in `form-fields.ts`:
+      // a throw inside a page evaluate reaches the SDK as the bare word
+      // "Uncaught" with no message and no stack, which is indistinguishable
+      // from a transport failure. Catch in the page and return the stack as
+      // data so `blocked()` below can name the real reason. JOB-202.
+      const patchOutcome = await session.page.evaluate(
+        (token: string): { __error?: string } | null => {
           try {
-            Object.defineProperty(gr, key, {
-              configurable: true,
-              get: () => ourExecute,
-              set: () => {
-                // Swallow the board's own assignment. Reading `execute`
-                // still resolves to `ourExecute` no matter what was set.
-              },
-            });
-          } catch (err) {
-            console.warn(
-              `[act-008] could not defend grecaptcha.${key} from later property clobber: ${String(err)}`
-            );
-            gr[key] = ourExecute;
+            type PatchableGrecaptcha = {
+              execute?: (...args: unknown[]) => Promise<string>;
+              __jobinnoPatched?: boolean;
+            };
+            const ourExecute = () => Promise.resolve(token);
+            // Defends a single `execute` property against a later plain
+            // assignment (`gr.execute = <real fn>`) by making it an accessor
+            // whose setter is a no-op instead of a normal writable slot. That
+            // is the pattern Google's own reCAPTCHA loader uses once it finishes
+            // loading: it does not reassign `window.grecaptcha` wholesale, it
+            // mutates the existing stub in place, which a plain field
+            // assignment above does not survive. Best effort: some boards may
+            // have already made `execute` non configurable themselves, in
+            // which case this falls back to the plain assignment and logs so a
+            // future observer scanning Browserbase session logs can see it.
+            const defendExecute = (gr: PatchableGrecaptcha, key: "execute"): void => {
+              try {
+                Object.defineProperty(gr, key, {
+                  configurable: true,
+                  get: () => ourExecute,
+                  set: () => {
+                    // Swallow the board's own assignment. Reading `execute`
+                    // still resolves to `ourExecute` no matter what was set.
+                  },
+                });
+              } catch (err) {
+                console.warn(
+                  `[act-008] could not defend grecaptcha.${key} from later property clobber: ${String(err)}`
+                );
+                gr[key] = ourExecute;
+              }
+            };
+            const patch = (candidate: unknown): void => {
+              if (candidate === null || typeof candidate !== "object") return;
+              const gr = candidate as PatchableGrecaptcha;
+              if (gr.__jobinnoPatched) return;
+              defendExecute(gr, "execute");
+              gr.__jobinnoPatched = true;
+            };
+            const win = window as unknown as { grecaptcha?: PatchableGrecaptcha };
+            let current = win.grecaptcha;
+            patch(current);
+            try {
+              Object.defineProperty(window, "grecaptcha", {
+                configurable: true,
+                get: () => current,
+                set: (value: PatchableGrecaptcha) => {
+                  current = value;
+                  patch(current);
+                },
+              });
+            } catch {
+              // Google's own script may already have made this non configurable.
+              // Best effort only — the direct patch above already covers the
+              // common case where grecaptcha has loaded by the time the form is
+              // filled.
+            }
+            return null;
+          } catch (e) {
+            const err = e as { stack?: string } | undefined;
+            return { __error: String((err && err.stack) || e) };
           }
-        };
-        const patch = (candidate: unknown): void => {
-          if (candidate === null || typeof candidate !== "object") return;
-          const gr = candidate as PatchableGrecaptcha;
-          if (gr.__jobinnoPatched) return;
-          defendExecute(gr, "execute");
-          gr.__jobinnoPatched = true;
-        };
-        const win = window as unknown as { grecaptcha?: PatchableGrecaptcha };
-        let current = win.grecaptcha;
-        patch(current);
-        try {
-          Object.defineProperty(window, "grecaptcha", {
-            configurable: true,
-            get: () => current,
-            set: (value: PatchableGrecaptcha) => {
-              current = value;
-              patch(current);
-            },
-          });
-        } catch {
-          // Google's own script may already have made this non configurable.
-          // Best effort only — the direct patch above already covers the
-          // common case where grecaptcha has loaded by the time the form is
-          // filled.
-        }
-      }, mintedToken);
+        },
+        mintedToken
+      );
+      const patchError = inPageError(patchOutcome);
+      if (patchError) {
+        return await blocked(
+          `could not patch grecaptcha before submit: ${patchError}. Nothing was clicked.`
+        );
+      }
     }
 
     // ── the point of no return ───────────────────────────────────────────────
