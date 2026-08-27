@@ -176,6 +176,20 @@
       "when": 1787616000000,
       "tag": "0024_applications_answer_provenance",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1787797239875,
+      "tag": "0025_profiles_gmail_refresh_token",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1787797385031,
+      "tag": "0026_profiles_gmail_refresh_token_privileges",
+      "breakpoints": true
     }
   ]
 }
