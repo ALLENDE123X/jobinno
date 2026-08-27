@@ -83,6 +83,13 @@ const EXEMPT_PATHS: ReadonlySet<string> = new Set([
   "/api/inngest",
   "/api/webhooks/stripe",
   "/creator-signup",
+  // JOB-205: the public privacy policy and terms of service. Both pages
+  // exist to satisfy Google OAuth verification for the gmail.readonly
+  // scope, and that verification requires them to be reachable to a signed
+  // out visitor. If the gate is turned back on, redirecting Google's
+  // crawler at either URL to the waitlist would fail the branding review.
+  "/privacy",
+  "/terms",
 ]);
 
 /**
