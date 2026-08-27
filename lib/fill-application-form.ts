@@ -2168,26 +2168,39 @@ async function completeVerification(
   let code = input?.code?.trim() || null;
   let codeSource: "input" | "gmail" = "input";
   if (link === null && code === null) {
-    // JOB-211 wiring — when the caller passed no verification input, try the
-    // Gmail reader before failing. The manual input path above always wins: a
-    // caller that supplied a code or a link goes through the same branches
-    // that existed before this ticket, and a broken Gmail read here can
-    // never turn a supplied code into a failed run. When no input was passed
-    // and no refresh token exists on the profile, the reader returns
-    // `no_gmail_connection` and the same `FormFillBlockedError` this branch
-    // has always thrown is what a human sees.
-    const readResult = await tryReadVerificationCodeFromGmail(state);
-    if (readResult !== null) {
-      code = readResult;
-      codeSource = "gmail";
+    // JOB-211 / JOB-217 wiring — when the caller passed no verification input,
+    // try the Gmail reader before failing, but only when the JOB-217 gate is
+    // on. The manual input path above always wins: a caller that supplied a
+    // code or a link goes through the same branches that existed before this
+    // ticket, and a broken Gmail read can never turn a supplied code into a
+    // failed run.
+    //
+    // When the gate is OFF, this branch throws the exact pre JOB-211 error
+    // message a human is already used to acting on. When the gate is ON and
+    // the reader still returned nothing, the message is different because
+    // the failure mode is different: it says so.
+    if (isGmailAutoReadEnabled()) {
+      const readResult = await tryReadVerificationCodeFromGmail(state);
+      if (readResult !== null) {
+        code = readResult;
+        codeSource = "gmail";
+      } else {
+        throw new FormFillBlockedError(
+          `applications ${state.jobApplicationId} is at ` +
+            `"${APPLICATION_STATUS.AWAITING_VERIFICATION}", the Gmail auto-read gate ` +
+            `(JOBINNO_GMAIL_AUTO_READ) is on, but no verification code could be read ` +
+            `for user ${state.candidateId} and no verification input was passed. ` +
+            `Either pass verificationCode / verificationLink through, or make sure ` +
+            `the Gmail connection is set on the profile and the ATS "${state.ats}" ` +
+            `is in the sender allowlist. Nothing was opened.`
+        );
+      }
     } else {
       throw new FormFillBlockedError(
         `applications ${state.jobApplicationId} is at ` +
           `"${APPLICATION_STATUS.AWAITING_VERIFICATION}" but no verification code or link was ` +
-          `supplied and no Gmail verification code could be read for user ${state.candidateId}. ` +
-          `Either pass verificationCode / verificationLink through, or make sure the Gmail ` +
-          `connection is set on the profile and the ATS "${state.ats}" is in the sender ` +
-          `allowlist. Nothing was opened.`
+          `supplied. ACT-006 carries both on its \`${"email/verification-received"}\` event ` +
+          `(verificationCode / verificationLink) — pass them through. Nothing was opened.`
       );
     }
   }
@@ -2273,19 +2286,9 @@ async function completeVerification(
 async function tryReadVerificationCodeFromGmail(
   state: ApplicationState
 ): Promise<string | null> {
-  // JOB-217 — the deploy time gate. Off by default in production so the
-  // deploy that ships this reader does not silently begin reading any
-  // connected user's mailbox. Flipped to `"on"` in Vercel prod only after
-  // the demo test account run has been recorded and the Google OAuth
-  // verification submission is under way. When off, this returns as if
-  // the reader were not wired at all and the caller throws the same
-  // pre JOB-211 `FormFillBlockedError` a human already knows how to act on.
-  if (!isGmailAutoReadEnabled()) {
-    console.log(
-      `${LOG} JOB-217: JOBINNO_GMAIL_AUTO_READ is not "on", skipping the Gmail auto-read entirely`
-    );
-    return null;
-  }
+  // The JOB-217 gate is checked at the caller so the off path can throw the
+  // exact pre JOB-211 error message a human is already used to. Reaching this
+  // function at all means the gate is on.
 
   const senderAllowlist = lookupVerificationSenders(state.ats);
   if (senderAllowlist.length === 0) {
@@ -2304,11 +2307,27 @@ async function tryReadVerificationCodeFromGmail(
   const since = new Date(now - 15 * 60_000);
   const until = new Date(now + 5 * 60_000);
 
-  // Numeric 4 to 8 character codes, per JOB-211's observation on the three
-  // ATSes V1 targets first (Ashby, Greenhouse, Lever). The anchor phrase is
-  // deliberately conservative and requires the word "code" to precede the
-  // digits, so a stray ticket number in a marketing footer never comes back.
-  const codePattern = /\bcode\b[^0-9]{0,80}?(\d{4,8})\b/i;
+  // ── Code pattern, grounded in one real Greenhouse sample ────────────────────
+  // The observed Greenhouse security code (quoted in `lib/future-gmail/`'s
+  // ACT-017 comment and mirrored in `lib/ats-verification-senders.ts`) is
+  // `uMO4xvqA` — 8 characters, mixed case alphanumeric, with at least one
+  // digit. The original regex was digit only and would never have matched a
+  // code of that shape at all, breaking the demo before it could start.
+  //
+  // The current form: an anchor on the word "code" (case insensitive), then
+  // up to 80 characters of anything, then an alphanumeric run of 6 to 10
+  // characters that contains at least one digit (positive lookahead). The
+  // digit requirement is what keeps a plain English word ("field",
+  // "application", "security") out of the capture — real Greenhouse codes
+  // always contain a digit even when they lean letter heavy. The 6 to 10
+  // range covers the observed length of 8 with a small margin.
+  //
+  // Do NOT widen this to letter only tokens or shorter/longer runs without
+  // a real Greenhouse code sample of that shape. Ground each format in what
+  // has actually been seen; add an OR only when a second confirmed shape is
+  // observed.
+  const codePattern =
+    /\bcode\b[\s\S]{0,80}?\b((?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{6,10})\b/i;
 
   const result = await findVerificationCode({
     userId: state.candidateId,

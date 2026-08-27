@@ -190,40 +190,64 @@ export async function findVerificationCode(
     };
   }
 
-  const now = internals.now ?? ((): number => Date.now());
-  const deadline = now() + Math.max(0, input.timeoutMs);
-
-  // ── Build the reader (real or injected) ─────────────────────────────────────
-  let reader: GmailReader;
-  if (internals.reader) {
-    reader = internals.reader;
-  } else {
-    const loaded = await loadRefreshTokenSafely(input.userId, internals.loadRefreshToken);
-    if (loaded.status !== "found") return loaded.result;
-    try {
-      reader = createGoogleapisReader(loaded.refreshToken);
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : "unknown error";
-      return { status: "auth_failed", reason };
-    }
-  }
-
-  // ── The read itself, hard capped at `timeoutMs`. ────────────────────────────
-  // `Promise.race` cannot cancel an in flight Gmail call, so a slow googleapis
-  // request continues in the background after this returns. That is fine: the
-  // caller has already moved on, the process is short lived, and nothing this
-  // module holds is written anywhere.
-  const query = buildGmailQuery(cleanedAllowlist, sinceMs, untilMs);
-  if (query === null) {
+  // ── Guardrail: zero budget must not dispatch a single call. ────────────────
+  // The original review finding here was that a non positive `timeoutMs`
+  // still ran the Supabase load and reached the Gmail SDK before failing.
+  // Reject upfront so no I/O happens at all.
+  if (input.timeoutMs <= 0) {
     return {
-      status: "no_match",
-      readMessageCount: 0,
-      searchedUntil: input.until.toISOString(),
+      status: "read_failed",
+      reason: `Gmail read has a non positive timeoutMs (${input.timeoutMs}ms); no Gmail call was made`,
     };
   }
 
-  const readOperation = performRead(reader, query, cleanedAllowlist, sinceMs, untilMs, input.codePattern);
-  return await raceAgainstDeadline(readOperation, deadline - now(), input.until);
+  // ── The whole I/O chain runs inside one `timeoutMs` race. ──────────────────
+  // Every step below can block on the network: the Supabase load of the
+  // encrypted refresh token, the OAuth2 client's implicit access token mint,
+  // `messages.list`, `messages.get`. The original code only raced the last
+  // two. So a stalled Supabase call was unbounded. Now the whole chain is
+  // the `operation` argument of the race, and the timeout is the hard cap
+  // on the whole thing regardless of which step is slow.
+  //
+  // `Promise.race` still cannot cancel an in flight call, so a slow request
+  // keeps running in the background after this function returns. That is
+  // fine: the caller has already moved on, the process is short lived, and
+  // nothing this module holds is written anywhere.
+  const operation: Promise<VerificationCodeResult> = (async () => {
+    let reader: GmailReader;
+    if (internals.reader) {
+      reader = internals.reader;
+    } else {
+      const loaded = await loadRefreshTokenSafely(input.userId, internals.loadRefreshToken);
+      if (loaded.status !== "found") return loaded.result;
+      try {
+        reader = createGoogleapisReader(loaded.refreshToken);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : "unknown error";
+        return { status: "auth_failed", reason };
+      }
+    }
+
+    const query = buildGmailQuery(cleanedAllowlist, sinceMs, untilMs);
+    if (query === null) {
+      return {
+        status: "no_match",
+        readMessageCount: 0,
+        searchedUntil: input.until.toISOString(),
+      };
+    }
+
+    return await performRead(
+      reader,
+      query,
+      cleanedAllowlist,
+      sinceMs,
+      untilMs,
+      input.codePattern
+    );
+  })();
+
+  return await raceAgainstDeadline(operation, input.timeoutMs, input.until);
 }
 
 // ───────────────────────────────────
@@ -290,11 +314,71 @@ export function isSenderOnAllowlist(
   return { allowed: false, address };
 }
 
-/** `"Name <addr@host>"` or bare `addr@host` becomes `addr@host`, lowercased. */
+/**
+ * `From:` header parser. Returns the routing address, lowercased, or null.
+ *
+ * ── The bug this exists to close ─────────────────────────────────────────────
+ * The original parser took the FIRST `<...>` group in the header. A crafted
+ * display name defeats that: a legal RFC 5322 header of the form
+ *
+ *   "Greenhouse <no-reply@greenhouse.io>" <attacker@evil.example>
+ *
+ * has two `<...>` runs, and only the second one is the actual routing
+ * address per RFC 5322 (§3.4). The first is inside a quoted display name.
+ * A naive first-match parser trusts the display name over the address the
+ * mail was really sent from, and the sender allowlist trusts the wrong
+ * side of it.
+ *
+ * ── What this does instead ───────────────────────────────────────────────────
+ * Walk the header once, tracking whether the cursor is inside a `"..."`
+ * quoted string. `<` and `>` inside quotes do not open or close an angle
+ * addr; only unquoted `<...>` runs do. The routing address is the LAST
+ * unquoted `<...>` run. If there is no unquoted `<...>` run at all the
+ * whole trimmed header is treated as the address (bare `foo@bar` shape).
+ *
+ * The RFC has more shapes than this (comments in `(...)`, `\` escapes,
+ * groups) but the ones that matter for sender-allowlist safety are:
+ * (a) an attacker cannot smuggle a trusted address in the display name;
+ * (b) a legitimate bare address without any display name still parses.
+ * Both hold here.
+ */
 function parseAddress(header: string): string | null {
-  const angled = /<([^>]+)>/.exec(header);
-  const raw = (angled?.[1] ?? header).trim().replace(/^["']|["']$/g, "");
-  const lowered = raw.toLowerCase();
+  let inQuotes = false;
+  let escape = false;
+  let lastOpen = -1;
+  let lastClose = -1;
+  let currentOpen = -1;
+  for (let i = 0; i < header.length; i += 1) {
+    const ch = header[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (inQuotes) continue;
+    if (ch === "<") {
+      currentOpen = i;
+      continue;
+    }
+    if (ch === ">" && currentOpen >= 0) {
+      lastOpen = currentOpen;
+      lastClose = i;
+      currentOpen = -1;
+    }
+  }
+  const raw =
+    lastOpen >= 0 && lastClose > lastOpen
+      ? header.slice(lastOpen + 1, lastClose)
+      : header;
+  const cleaned = raw.trim().replace(/^["']|["']$/g, "");
+  const lowered = cleaned.toLowerCase();
   return lowered.includes("@") ? lowered : null;
 }
 
@@ -460,7 +544,17 @@ async function performRead(
     try {
       message = await reader.get(stub.id);
     } catch (err) {
-      return classifyGmailError(err);
+      // Auth failures affect every message uniformly (revoked token, expired
+      // credential), so stop early. Every other per message error is skipped
+      // and the loop continues to the next candidate: the point of this
+      // reader is to find one code among many, not to require every
+      // candidate to be readable.
+      const classified = classifyGmailError(err);
+      if (classified.status === "auth_failed") return classified;
+      console.log(
+        `${LOG} messages.get failed for ${stub.id}, continuing to the next candidate`
+      );
+      continue;
     }
     readCount += 1;
 

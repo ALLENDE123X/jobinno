@@ -66,6 +66,13 @@ export const VERIFICATION_SENDERS_BY_ATS: Readonly<
   // and both `no-reply@greenhouse.io` and the wider `@greenhouse.io`
   // suffix are trusted here so a small `mail.` or `notifications.`
   // subdomain shift on Greenhouse's side does not silently break the read.
+  //
+  // The pattern the wiring in `lib/fill-application-form.ts` runs against
+  // this sender's mail is anchored on the word "code" and expects a 6 to 10
+  // character alphanumeric run that contains at least one digit. That is
+  // what `uMO4xvqA` looks like. If a future Greenhouse code carries a
+  // different shape (all digits, no digits, shorter or longer), widen the
+  // pattern there only after seeing the new shape on a real message.
   greenhouse: Object.freeze([
     "no-reply@greenhouse.io",
     "@greenhouse.io",

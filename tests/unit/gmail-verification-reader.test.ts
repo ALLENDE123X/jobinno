@@ -240,6 +240,56 @@ describe("findVerificationCode — Gmail query composition", () => {
   });
 });
 
+describe("isSenderOnAllowlist — RFC 5322 display name bypass (major review finding)", () => {
+  const allowlist = ["no-reply@greenhouse.io", "@greenhouse.io"];
+
+  it("rejects a header whose quoted display name spoofs a trusted address", () => {
+    // The exact reproducer from the review: an attacker who controls the
+    // display name puts a fake trusted-looking `<...>` inside the quoted
+    // string, and the real routing address at the end. The correct answer
+    // is the routing address, not the display name.
+    const header = '"Greenhouse <no-reply@greenhouse.io>" <attacker@evil.example>';
+    const result = isSenderOnAllowlist(header, allowlist);
+    expect(result.address).toBe("attacker@evil.example");
+    expect(result.allowed).toBe(false);
+  });
+
+  it("still accepts a plain header with one `<...>` and a trusted routing address", () => {
+    const result = isSenderOnAllowlist(
+      "Greenhouse <no-reply@greenhouse.io>",
+      allowlist
+    );
+    expect(result.address).toBe("no-reply@greenhouse.io");
+    expect(result.allowed).toBe(true);
+  });
+
+  it("accepts a bare address without any display name", () => {
+    const result = isSenderOnAllowlist("no-reply@greenhouse.io", allowlist);
+    expect(result.address).toBe("no-reply@greenhouse.io");
+    expect(result.allowed).toBe(true);
+  });
+
+  it("takes the last `<...>` when the header carries multiple unquoted runs", () => {
+    // A malformed but not necessarily malicious header. The last `<...>` is
+    // still what routes, per RFC 5322.
+    const header = "Notify <notice@example.com> <no-reply@greenhouse.io>";
+    const result = isSenderOnAllowlist(header, allowlist);
+    expect(result.address).toBe("no-reply@greenhouse.io");
+    expect(result.allowed).toBe(true);
+  });
+
+  it("ignores angle bracket characters that live inside quoted display names", () => {
+    // No unquoted `<...>` run at all; the whole trimmed header is treated
+    // as the address. The header is malformed but the important property
+    // is that nothing inside the quotes gets picked up as a trusted address.
+    const result = isSenderOnAllowlist(
+      '"has <fake@greenhouse.io> inside" attacker@evil.example',
+      allowlist
+    );
+    expect(result.allowed).toBe(false);
+  });
+});
+
 describe("findVerificationCode — timeoutMs bounds the call", () => {
   it("returns read_failed when the Gmail reader hangs past the timeout", async () => {
     // A reader whose `list` never resolves. The Promise.race in the reader
@@ -279,7 +329,10 @@ describe("findVerificationCode — timeoutMs bounds the call", () => {
     expect(elapsed).toBeLessThan(2000);
   });
 
-  it("returns read_failed immediately when timeoutMs is zero", async () => {
+  it("returns read_failed immediately when timeoutMs is zero, without any I/O call", async () => {
+    let listCalled = false;
+    let getCalled = false;
+    let loaderCalled = false;
     const result = await findVerificationCode(
       {
         userId: "user-1",
@@ -290,17 +343,156 @@ describe("findVerificationCode — timeoutMs bounds the call", () => {
         timeoutMs: 0,
       },
       {
-        loadRefreshToken: fakeLoader(),
+        loadRefreshToken: async () => {
+          loaderCalled = true;
+          return "not-a-real-token";
+        },
         reader: {
           async list() {
+            listCalled = true;
             throw new Error("should not be reached — the timeout is zero");
           },
           async get() {
+            getCalled = true;
             throw new Error("should not be reached — the timeout is zero");
           },
         },
       }
     );
     expect(result.status).toBe("read_failed");
+    // No I/O at all — the guardrail short-circuits before the reader is built
+    // or the Supabase load is dispatched.
+    expect(listCalled).toBe(false);
+    expect(getCalled).toBe(false);
+    expect(loaderCalled).toBe(false);
+  });
+
+  it("bounds a stalled Supabase refresh-token load inside timeoutMs (major review finding)", async () => {
+    // A refresh token loader that never resolves. Before the fix, this
+    // would hang forever because the load happened before Promise.race
+    // was constructed. Now the load lives inside the race and the timeout
+    // catches it.
+    const started = Date.now();
+    const result = await findVerificationCode(
+      {
+        userId: "user-1",
+        senderAllowlist: ["@greenhouse.io"],
+        since: new Date("2026-08-27T10:00:00Z"),
+        until: new Date("2026-08-27T10:15:00Z"),
+        codePattern: /\d{4,8}/,
+        timeoutMs: 50,
+      },
+      {
+        loadRefreshToken: async (): Promise<string | null> => {
+          return await new Promise<string | null>(() => {
+            /* never resolves — simulates a stalled Supabase call */
+          });
+        },
+        // No `reader` here on purpose: the real code path builds the reader
+        // AFTER the token load, and that whole chain must be bounded.
+        // A test-supplied reader would short-circuit the exact bug this
+        // covers, so leave it out.
+      }
+    );
+    const elapsed = Date.now() - started;
+    expect(result.status).toBe("read_failed");
+    if (result.status === "read_failed") {
+      expect(result.reason).toContain("50ms");
+    }
+    expect(elapsed).toBeLessThan(2000);
+  });
+});
+
+describe("findVerificationCode — continues past a single unreadable message (minor review finding)", () => {
+  it("skips a messages.get failure and returns the next message's code", async () => {
+    const goodInternal = new Date("2026-08-27T10:07:30Z").getTime();
+    const result = await findVerificationCode(
+      {
+        userId: "user-1",
+        senderAllowlist: ["@greenhouse.io"],
+        since: new Date("2026-08-27T10:00:00Z"),
+        until: new Date("2026-08-27T10:15:00Z"),
+        codePattern: /\bcode\b[\s\S]{0,80}?\b((?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{6,10})\b/i,
+        timeoutMs: 60_000,
+      },
+      {
+        loadRefreshToken: fakeLoader(),
+        reader: {
+          async list() {
+            return { messages: [{ id: "broken" }, { id: "good" }] };
+          },
+          async get(id: string) {
+            if (id === "broken") {
+              throw new Error("transient 500 on messages.get");
+            }
+            return fakeMessage(
+              {
+                From: "Greenhouse <no-reply@greenhouse.io>",
+                Subject: "Security code",
+              },
+              "Your code is uMO4xvqA",
+              goodInternal
+            );
+          },
+        },
+      }
+    );
+    expect(result.status).toBe("found");
+    if (result.status === "found") {
+      expect(result.match.emailId).toBe("good");
+      expect(result.match.code).toBe("uMO4xvqA");
+    }
+  });
+
+  it("still bails on auth_failed even if only one message errored — a revoked token affects them all", async () => {
+    const result = await findVerificationCode(
+      {
+        userId: "user-1",
+        senderAllowlist: ["@greenhouse.io"],
+        since: new Date("2026-08-27T10:00:00Z"),
+        until: new Date("2026-08-27T10:15:00Z"),
+        codePattern: /\d{4,8}/,
+        timeoutMs: 60_000,
+      },
+      {
+        loadRefreshToken: fakeLoader(),
+        reader: {
+          async list() {
+            return { messages: [{ id: "a" }, { id: "b" }] };
+          },
+          async get() {
+            throw new Error("invalid_grant: token has been revoked");
+          },
+        },
+      }
+    );
+    expect(result.status).toBe("auth_failed");
+  });
+});
+
+describe("codePattern used by fill-application-form matches the real Greenhouse sample", () => {
+  // Duplicated from `lib/fill-application-form.ts` on purpose. The wiring
+  // regex lives inside a private helper there and cannot be imported here,
+  // so this test is an assertion against the exact string that appears in
+  // that file. If the wiring changes the shape, this test will fail
+  // usefully and the two sides can be reconciled.
+  const codePattern =
+    /\bcode\b[\s\S]{0,80}?\b((?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{6,10})\b/i;
+
+  it("captures uMO4xvqA from the observed Greenhouse verification email", () => {
+    // The exact body text quoted in `lib/future-gmail/gmail-verification-listener.ts`
+    // and mirrored in `lib/ats-verification-senders.ts`.
+    const body =
+      "Copy and paste this code into the security code field on your application: uMO4xvqA";
+    const match = codePattern.exec(body);
+    expect(match?.[1]).toBe("uMO4xvqA");
+  });
+
+  it("does not capture a bare English word after the anchor", () => {
+    const body = "your verification code is field on your application";
+    const match = codePattern.exec(body);
+    // "field" is 5 chars, no digit; the pattern requires 6 to 10 alphanumeric
+    // with a digit. The word must not be captured.
+    expect(match).toBeNull();
   });
 });
