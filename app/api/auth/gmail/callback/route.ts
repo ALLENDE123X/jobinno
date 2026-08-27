@@ -35,15 +35,22 @@ const LOGIN_PATH = "/login";
 const SUCCESS_PATH = "/settings/gmail/success";
 /**
  * Where a signed in user goes when something after the session check fails.
- * There is no general `/settings` page yet (the only route under
- * `app/settings/` is the success page above), so this points at the
- * dashboard, the one page a signed in, onboarded user can actually land on
- * and read an `error` query parameter from. `/login` is wrong for this case:
- * `app/login/page.tsx` redirects a signed in visitor straight to `/dashboard`
- * before it ever reads `error`, so a signed in user bounced there never sees
- * why the connection failed.
+ * This is the same route as `SUCCESS_PATH` on purpose. That page already
+ * exists to represent the outcome of the Gmail connect flow, and it reads
+ * its `error` search param: with no `error` it renders the success card,
+ * and with `error` set it renders an error card whose description is the
+ * reason string this handler put there. Sending both branches to the same
+ * outcome page keeps every finish of this flow, good or bad, on the page
+ * that was built to explain it, rather than on a page that silently drops
+ * the `error` info. `/login` is wrong for this case: `app/login/page.tsx`
+ * redirects a signed in visitor straight to `/dashboard` before it ever
+ * reads `error`, so a signed in user bounced there never sees why the
+ * connection failed. `/dashboard` was tried once for the same reason and
+ * has the same silent drop problem: its page component takes no
+ * `searchParams` and its view never reads them, so an `error` sent there
+ * was never rendered either.
  */
-const POST_AUTH_FAILURE_PATH = "/dashboard";
+const POST_AUTH_FAILURE_PATH = SUCCESS_PATH;
 const TOKEN_EXCHANGE_TIMEOUT_MS = 15_000;
 
 /**
