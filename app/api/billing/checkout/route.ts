@@ -42,7 +42,7 @@ import {
   PRODUCTION_ORIGIN,
   WWW_PRODUCTION_ORIGIN,
 } from "@/lib/auth/redirect-urls";
-import { createServerClient } from "@/lib/supabase/server";
+import { createServerClient, createServiceRoleClient } from "@/lib/supabase/server";
 
 /** Where a person is sent to sign in. */
 const LOGIN_PATH = "/login";
@@ -144,15 +144,36 @@ async function startCheckout(request: NextRequest, planSlug: string | null) {
   }
 
   // The plan they are on, and the Stripe customer from an earlier purchase when
-  // there is one, so a second plan does not mint a duplicate customer. Read
-  // through the user's own session rather than the service role:
-  // `profiles_select_own` already limits this to their row, and nothing here
-  // needs more power than that.
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("plan, stripe_customer_id")
-    .eq("id", user.id)
-    .maybeSingle();
+  // there is one, so a second plan does not mint a duplicate customer.
+  //
+  // Two queries rather than one, because they now run as different roles.
+  // `plan` still reads through the user's own session:
+  // `profiles_select_own` limits it to their row and the column has an
+  // ordinary SELECT grant to `authenticated`. `stripe_customer_id` no longer
+  // does, per `drizzle/0027_profiles_column_select_lockdown.sql`, and its
+  // one caller on the user side is this one, so it reads through the service
+  // role and is pinned to `user.id` here rather than by a policy. The
+  // service role bypasses row level security, so treat the id it filters on
+  // as already authorised — which it is: `getUser()` above returned it from
+  // the caller's session.
+  const [{ data: planRow }, { data: customerRow }] = await Promise.all([
+    supabase
+      .from("profiles")
+      .select("plan")
+      .eq("id", user.id)
+      .maybeSingle(),
+    createServiceRoleClient()
+      .from("profiles")
+      .select("stripe_customer_id")
+      .eq("id", user.id)
+      .maybeSingle(),
+  ]);
+  const profile = planRow
+    ? {
+        plan: planRow.plan,
+        stripe_customer_id: customerRow?.stripe_customer_id ?? null,
+      }
+    : null;
 
   // ── Do not sell somebody something they already have ──────────────────────
   // Pressing "Get Starter" a second time used to open a second Checkout
