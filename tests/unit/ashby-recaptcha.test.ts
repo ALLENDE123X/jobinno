@@ -4,7 +4,7 @@
  * `fetch` is stubbed on every case, the same way `tests/unit/ats-job-feeds.test.ts`
  * stubs it for the boards it reads.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { HarvesterError, mintAshbyRecaptchaToken } from "@/lib/ashby-recaptcha";
 
@@ -33,9 +33,24 @@ function networkFailure(code: string): Error {
   return err;
 }
 
+// Captures whatever HARVESTER_URL was set to before each test and restores
+// exactly that value afterward, rather than unconditionally deleting it. An
+// unconditional delete clobbers a value another suite (or a real
+// environment) had set and never gives it back, which is its own bug
+// independent of anything this test file is actually asserting.
+let priorHarvesterUrl: string | undefined;
+
+beforeEach(() => {
+  priorHarvesterUrl = process.env.HARVESTER_URL;
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
-  delete process.env.HARVESTER_URL;
+  if (priorHarvesterUrl === undefined) {
+    delete process.env.HARVESTER_URL;
+  } else {
+    process.env.HARVESTER_URL = priorHarvesterUrl;
+  }
 });
 
 describe("mintAshbyRecaptchaToken", () => {
@@ -65,6 +80,11 @@ describe("mintAshbyRecaptchaToken", () => {
   });
 
   it("falls back to the localhost harvester when HARVESTER_URL is unset", async () => {
+    // Explicit, rather than relying on the ambient value being unset: the
+    // shared `beforeEach`/`afterEach` pair now restores whatever
+    // HARVESTER_URL was set to before this test, so this case has to clear
+    // it itself to exercise the fallback.
+    delete process.env.HARVESTER_URL;
     const fetchMock = mockFetchOnce(async () => jsonResponse(VALID_RESPONSE));
     expect(process.env.HARVESTER_URL).toBeUndefined();
 
@@ -154,5 +174,28 @@ describe("mintAshbyRecaptchaToken", () => {
       HarvesterError
     );
     expect(calls).toBe(2);
+  });
+});
+
+describe("HARVESTER_URL test isolation", () => {
+  const SENTINEL_URL = "https://sentinel.harvester.test";
+
+  beforeAll(() => {
+    process.env.HARVESTER_URL = SENTINEL_URL;
+  });
+
+  afterAll(() => {
+    delete process.env.HARVESTER_URL;
+  });
+
+  it("still holds the value set outside this test file's own suite, after the localhost fallback test ran and cleared it", () => {
+    // Runs after "falls back to the localhost harvester when HARVESTER_URL
+    // is unset" above, which deletes HARVESTER_URL for its own assertion.
+    // Before this fix, the shared `afterEach` unconditionally deleted
+    // HARVESTER_URL, so that test's cleanup would have permanently erased
+    // this sentinel instead of restoring it. The shared `beforeEach` now
+    // snapshots the prior value per test and `afterEach` puts it back, so
+    // the sentinel this `beforeAll` set is still here.
+    expect(process.env.HARVESTER_URL).toBe(SENTINEL_URL);
   });
 });

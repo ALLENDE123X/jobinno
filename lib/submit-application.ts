@@ -2463,11 +2463,39 @@ async function runSubmitPhase(
           execute?: (...args: unknown[]) => Promise<string>;
           __jobinnoPatched?: boolean;
         };
+        const ourExecute = () => Promise.resolve(token);
+        // Defends a single `execute` property against a later plain
+        // assignment (`gr.execute = <real fn>`) by making it an accessor
+        // whose setter is a no-op instead of a normal writable slot. That
+        // is the pattern Google's own reCAPTCHA loader uses once it finishes
+        // loading: it does not reassign `window.grecaptcha` wholesale, it
+        // mutates the existing stub in place, which a plain field
+        // assignment above does not survive. Best effort: some boards may
+        // have already made `execute` non configurable themselves, in
+        // which case this falls back to the plain assignment and logs so a
+        // future observer scanning Browserbase session logs can see it.
+        const defendExecute = (gr: PatchableGrecaptcha, key: "execute"): void => {
+          try {
+            Object.defineProperty(gr, key, {
+              configurable: true,
+              get: () => ourExecute,
+              set: () => {
+                // Swallow the board's own assignment. Reading `execute`
+                // still resolves to `ourExecute` no matter what was set.
+              },
+            });
+          } catch (err) {
+            console.warn(
+              `[act-008] could not defend grecaptcha.${key} from later property clobber: ${String(err)}`
+            );
+            gr[key] = ourExecute;
+          }
+        };
         const patch = (candidate: unknown): void => {
           if (candidate === null || typeof candidate !== "object") return;
           const gr = candidate as PatchableGrecaptcha;
           if (gr.__jobinnoPatched) return;
-          gr.execute = () => Promise.resolve(token);
+          defendExecute(gr, "execute");
           gr.__jobinnoPatched = true;
         };
         const win = window as unknown as { grecaptcha?: PatchableGrecaptcha };
