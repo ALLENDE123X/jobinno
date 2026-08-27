@@ -82,7 +82,7 @@ liveDbSuite("the free trial grant", () => {
   // The grant that closes the bug
   // ───────────────────────────────────
 
-  it("grants the ten free applications on a fresh free profile's first attestation", async () => {
+  it("grants the three free applications on a fresh free profile's first attestation", async () => {
     const userId = await freshProfile({ plan: "free", attestedAt: null, applicationsCap: 0 });
 
     await expect(recordAttestation(userId, database)).resolves.toEqual({
@@ -104,7 +104,7 @@ liveDbSuite("the free trial grant", () => {
    * renders once `attested_at` is set, it does not redirect the route away, so
    * the server action behind the form stays reachable. A second call for an
    * already attested person must not stamp the timestamp again or hand out a
-   * second ten.
+   * second three.
    */
   it("does not grant or stamp again on a second call, once already attested", async () => {
     const userId = await freshProfile({ plan: "free", attestedAt: null, applicationsCap: 0 });

@@ -379,8 +379,8 @@ describe("applyPlanChange", () => {
     expect(updates[0].values).toMatchObject({
       plan: "starter",
       applications_cap: 150,
-      // Somebody who upgrades after burning all ten free applications was sold
-      // 150 and must be handed 150.
+      // Somebody who upgrades after burning all three free applications was
+      // sold 150 and must be handed 150.
       applications_used: 0,
       stripe_customer_id: CUSTOMER_ID,
     });

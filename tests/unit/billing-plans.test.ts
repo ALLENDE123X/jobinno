@@ -71,8 +71,8 @@ describe("what each plan costs and buys", () => {
     expect(PAID_PLANS.season_pass.applicationsCap).toBe(500);
   });
 
-  it("drops a lapsed plan to a cap of zero rather than back to the free ten", () => {
-    // The free ten are a one time trial. Handing them back every time a card
+  it("drops a lapsed plan to a cap of zero rather than back to the free three", () => {
+    // The free three are a one time trial. Handing them back every time a card
     // expires would mint a fresh trial on every failed renewal.
     expect(LAPSED_PLAN_CAP).toBe(0);
   });

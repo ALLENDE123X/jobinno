@@ -8,8 +8,9 @@
  * `applications_used = 0` on a genuine plan change so that "150 a month" means
  * 150 from the moment somebody pays. Those two facts do not compose:
  *
- *  · Somebody who used ten free applications and then upgraded got 140, not the
- *    150 they were sold, because the lifetime row count still carried the ten.
+ *  · Somebody who used the free applications and then upgraded got 147, not the
+ *    150 they were sold, because the lifetime row count still carried those
+ *    three.
  *  · A long standing customer whose lifetime count had passed a renewed cap was
  *    refused outright the moment they paid again.
  *  · Every `discovered` row and every failed or skipped attempt counted, so a
