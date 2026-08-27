@@ -124,6 +124,13 @@ import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 // mint inside this Browserbase session — see that module's header for why.
 import { mintAshbyRecaptchaToken } from "@/lib/ashby-recaptcha";
 import { humanizedSleep, HUMANIZE_TIMINGS } from "@/lib/humanized-delays";
+// JOB-214. The browserless Ashby submit path. Off by default; the mode
+// selector at the top of `submitApplication` is the only place it is called
+// from and the ats gate lives there too.
+import {
+  shouldRouteAshbyDirectHttp,
+  submitAshbyApplicationDirectly,
+} from "@/lib/ashby-direct-submit";
 
 const LOG = "[act-008]";
 
@@ -2055,6 +2062,28 @@ export async function submitApplication(
   console.log(
     `${LOG} ── this run will submit a REAL application to a REAL employer. There is no undo. ──`
   );
+
+  // ── JOB-214: Ashby direct HTTP mode selector ─────────────────────────────
+  // Skips Browserbase, Stagehand and the DOM path entirely when both the
+  // env flag and the row's ats agree. Off by default in prod. The selector
+  // is here rather than inside `runSubmitPhase` because the whole point of
+  // the direct path is that no browser session is opened at all, so it has
+  // to precede the fill call below. The direct path returns the same
+  // `SubmitApplicationResult` shape the DOM path does.
+  if (shouldRouteAshbyDirectHttp(row.ats)) {
+    console.log(
+      `${LOG} JOB-214 mode selector: routing applications ${jobApplicationId} through the ` +
+        `Ashby direct HTTP submit path (JOBINNO_ASHBY_SUBMIT_MODE=direct-http, ats=${row.ats})`
+    );
+    return await submitAshbyApplicationDirectly({
+      jobApplicationId,
+      ats: row.ats,
+      applyUrl: row.applyUrl,
+      jobId: row.jobId,
+      company: row.company,
+      jobTitle: row.jobTitle,
+    });
+  }
 
   // ── Phase 1: fill. ACT-007 owns every guard, every status write and every
   // failure mode here; this module adds nothing to it and second-guesses none

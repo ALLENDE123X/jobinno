@@ -1,0 +1,1213 @@
+/**
+ * JOB-214 — the browserless Ashby submit path.
+ *
+ * ── What this replaces, and why it exists ───────────────────────────────────
+ * The DOM path in `lib/submit-application.ts` opens a Browserbase session,
+ * runs Stagehand across the Ashby form, and clicks Submit through Ashby's
+ * own React UI. That works and stays as the default. It also fights every
+ * anti bot signal Ashby's own reCAPTCHA v3 scorer produces on a Browserbase
+ * fingerprint, and JOB-187 was the ticket that documented that failure mode
+ * end to end. `scripts/test-ashby-api.ts` reverse engineered the Ashby non
+ * user GraphQL API and drove a real submit against it, headless, using a
+ * Fly harvester minted reCAPTCHA token in place of the one Ashby's own
+ * client would mint in session. That script proved the flow. This module
+ * promotes that flow from a debug harness into a production submit path.
+ *
+ * ── What lives here ─────────────────────────────────────────────────────────
+ * `runAshbyDirectSubmit(ctx, deps)` is the seam a unit test drives. Every
+ * network dependency (`fetch`, the reCAPTCHA harvester, the Supabase client
+ * that stamps the row status) is behind `deps`, so the tests never touch a
+ * live Ashby endpoint and never touch a live harvester.
+ *
+ * `submitAshbyApplicationDirectly({ jobApplicationId, ... })` is the caller
+ * facing entry, and it does the reads a live run needs — the applications
+ * row's user id, the candidate profile, the resume bytes — before calling
+ * `runAshbyDirectSubmit` with the resolved context. The mode selector in
+ * `lib/submit-application.ts` calls this one and only when the env flag is
+ * on and the row's ats is ashby.
+ *
+ * ── What this deliberately does NOT do ─────────────────────────────────────
+ *   1. It never opens a browser. That is the entire point of the direct
+ *      path. If a future edit reintroduces Browserbase or Stagehand here
+ *      the ticket is wrong.
+ *   2. It never invents an answer that is not in the candidate's own
+ *      intake. HARD STOP 9. `candidateValueForField` is a straight port of
+ *      the same function in `scripts/test-ashby-api.ts`, which was already
+ *      grounded in a fixed intake shape, and every branch here either
+ *      returns a known field, returns `null` (skip), or returns a fallback
+ *      paragraph that describes real work the candidate has done and
+ *      stated in their profile.
+ *   3. It never widens what `submitted` or `submission_unconfirmed` mean.
+ *      Both are terminal, from the moment the submit mutation is issued.
+ *      The classifier below is deliberately narrow: a `FormSubmitSuccess`
+ *      is required for `submitted`, a network throw or a GraphQL `errors`
+ *      response after the submit request went out records
+ *      `submission_unconfirmed`, and anything the module refused to send
+ *      at all lands as `submission_blocked` for a later retry.
+ */
+
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+
+import { APPLICATION_STATUS, type ApplicationStatus } from "@/lib/application-status";
+import { mintAshbyRecaptchaToken } from "@/lib/ashby-recaptcha";
+import { loadCandidate, type CandidateRecord } from "@/lib/candidate-intake";
+import type { CandidateApplicationAnswers } from "@/lib/candidate-intake";
+import { resolveCandidateProfile } from "@/lib/candidate-documents";
+import { loadResume, type ResumeProfile } from "@/lib/resume-parser";
+import {
+  recordSkipQuietly,
+  updateApplication,
+} from "@/lib/application-records";
+import { assertSupabaseProject } from "@/lib/supabase-project-guard";
+import type { SubmitApplicationResult } from "@/lib/submit-application";
+
+const LOG = "[job-214]";
+
+/** The env flag callers gate the mode selector on. */
+export const ASHBY_DIRECT_HTTP_MODE_VALUE = "direct-http";
+export const ASHBY_SUBMIT_MODE_ENV = "JOBINNO_ASHBY_SUBMIT_MODE";
+
+/**
+ * True when both env flag and ats say "route through the direct HTTP path".
+ * Extracted as a pure predicate so a unit test pins it against every case
+ * that could otherwise stray silently — env off, wrong ats, both off.
+ */
+export function shouldRouteAshbyDirectHttp(ats: string): boolean {
+  return (
+    process.env[ASHBY_SUBMIT_MODE_ENV] === ASHBY_DIRECT_HTTP_MODE_VALUE &&
+    ats === "ashby"
+  );
+}
+
+// ── Ashby URL parsing ────────────────────────────────────────────────────
+
+export type ParsedAshbyUrl = { orgName: string; jobPostingId: string; origin: string };
+
+/**
+ * Splits an Ashby job URL into the two identifiers the GraphQL API keys off,
+ * plus the origin used to compose the non user GraphQL endpoint.
+ *
+ * Only `jobs.ashbyhq.com/<org>/<job-id>` is recognised. Ashby also hosts
+ * self branded boards on customer domains but this module ships as an opt
+ * in path for the standard host first; those variants are a follow up.
+ */
+export function parseAshbyUrl(url: string): ParsedAshbyUrl {
+  const parsed = new URL(url);
+  if (parsed.hostname !== "jobs.ashbyhq.com") {
+    throw new Error(
+      `Ashby direct HTTP path only supports jobs.ashbyhq.com URLs today, got ${JSON.stringify(url)}`
+    );
+  }
+  const [orgName, jobPostingId] = parsed.pathname.split("/").filter(Boolean);
+  if (!orgName || !jobPostingId) {
+    throw new Error(
+      `Cannot parse org and job posting id from Ashby URL ${JSON.stringify(url)}`
+    );
+  }
+  return { orgName, jobPostingId, origin: parsed.origin };
+}
+
+// ── GraphQL client ───────────────────────────────────────────────────────
+
+type FetchImpl = typeof globalThis.fetch;
+
+export type AshbyGqlErrors = ReadonlyArray<{
+  message: string;
+  extensions?: { ashbyErrorType?: string };
+}>;
+
+function apolloHeaders(): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "apollographql-client-name": "frontend_non_user",
+    "apollographql-client-version": "0.1.0",
+    "x-ashby-client-request-timestamp": new Date().toISOString(),
+  };
+}
+
+/**
+ * One GraphQL call against the board's own non user GraphQL endpoint.
+ *
+ * Throws `AshbyGqlError` on a transport failure or a bad JSON response, and
+ * on a response whose `errors` array is non empty. The caller catches
+ * these directly rather than trying to interpret them here, because two
+ * different callers (discovery vs submit) treat the same `errors` response
+ * as different verdicts: a discovery failure is safe to retry, a submit
+ * failure crosses the point of no return.
+ */
+export class AshbyGqlError extends Error {
+  readonly op: string;
+  readonly errors?: AshbyGqlErrors;
+  readonly httpStatus?: number;
+
+  constructor(
+    op: string,
+    message: string,
+    options: { errors?: AshbyGqlErrors; httpStatus?: number } = {}
+  ) {
+    super(message);
+    this.name = "AshbyGqlError";
+    this.op = op;
+    if (options.errors) this.errors = options.errors;
+    if (typeof options.httpStatus === "number") this.httpStatus = options.httpStatus;
+  }
+}
+
+async function gql(
+  fetchImpl: FetchImpl,
+  origin: string,
+  op: string,
+  query: string,
+  variables: Record<string, unknown>
+): Promise<{ data: Record<string, unknown> | null; errors?: AshbyGqlErrors }> {
+  const endpoint = `${origin}/api/non-user-graphql?op=${op}`;
+  const resp = await fetchImpl(endpoint, {
+    method: "POST",
+    headers: apolloHeaders(),
+    body: JSON.stringify({ operationName: op, query, variables }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new AshbyGqlError(op, `HTTP ${resp.status}${text ? `: ${text.slice(0, 500)}` : ""}`, {
+      httpStatus: resp.status,
+    });
+  }
+  const body = (await resp.json()) as {
+    data?: Record<string, unknown> | null;
+    errors?: AshbyGqlErrors;
+  };
+  return { data: body.data ?? null, errors: body.errors };
+}
+
+// ── Form discovery ──────────────────────────────────────────────────────
+
+export interface AshbyField {
+  path: string;
+  title: string;
+  type: string;
+}
+
+export interface AshbyFieldEntry {
+  id: string;
+  isRequired: boolean;
+  isHidden: boolean;
+  field: AshbyField;
+}
+
+export interface AshbyDiscoveredForm {
+  jobTitle: string;
+  formRenderIdentifier: string;
+  formDefinitionIdentifier: string;
+  actionIdentifier: string;
+  sections: Array<{ title: string; fieldEntries: AshbyFieldEntry[] }>;
+}
+
+async function discoverForm(
+  fetchImpl: FetchImpl,
+  origin: string,
+  orgName: string,
+  jobPostingId: string
+): Promise<AshbyDiscoveredForm> {
+  const { data, errors } = await gql(
+    fetchImpl,
+    origin,
+    "ApiJobPosting",
+    `query ApiJobPosting($organizationHostedJobsPageName: String!, $jobPostingId: String!) {
+      jobPosting(
+        organizationHostedJobsPageName: $organizationHostedJobsPageName
+        jobPostingId: $jobPostingId
+      ) {
+        id title
+        applicationForm {
+          id
+          sourceFormDefinitionId
+          formControls { identifier title }
+          sections {
+            title
+            fieldEntries { id isRequired isHidden field }
+          }
+        }
+      }
+    }`,
+    { organizationHostedJobsPageName: orgName, jobPostingId }
+  );
+  if (errors && errors.length > 0) {
+    throw new AshbyGqlError("ApiJobPosting", describeErrors(errors), { errors });
+  }
+  const jobPosting = (data?.jobPosting ?? null) as {
+    title?: string;
+    applicationForm?: {
+      id?: string;
+      sourceFormDefinitionId?: string;
+      formControls?: Array<{ identifier: string; title: string }>;
+      sections?: Array<{ title: string; fieldEntries: AshbyFieldEntry[] }>;
+    } | null;
+  } | null;
+  if (!jobPosting || !jobPosting.applicationForm) {
+    throw new AshbyGqlError(
+      "ApiJobPosting",
+      `Job posting not found: org=${JSON.stringify(orgName)} id=${JSON.stringify(jobPostingId)}`
+    );
+  }
+  const form = jobPosting.applicationForm;
+  const actionIdentifier = (form.formControls ?? []).find((c) => c.title === "Submit")?.identifier;
+  if (!actionIdentifier) {
+    throw new AshbyGqlError(
+      "ApiJobPosting",
+      `No Submit formControl in the discovered form. Ashby may have changed the shape.`
+    );
+  }
+  return {
+    jobTitle: String(jobPosting.title ?? ""),
+    formRenderIdentifier: String(form.id ?? ""),
+    formDefinitionIdentifier: String(form.sourceFormDefinitionId ?? ""),
+    actionIdentifier,
+    sections: (form.sections ?? []) as AshbyDiscoveredForm["sections"],
+  };
+}
+
+// ── File upload ─────────────────────────────────────────────────────────
+
+async function createUploadHandle(
+  fetchImpl: FetchImpl,
+  origin: string,
+  orgName: string,
+  fileName: string,
+  contentType: string,
+  contentLength: number
+): Promise<{ handle: string; url: string; fields: Record<string, string> }> {
+  const { data, errors } = await gql(
+    fetchImpl,
+    origin,
+    "ApiCreateFileUploadHandle",
+    `mutation ApiCreateFileUploadHandle(
+      $organizationHostedJobsPageName: String!
+      $fileUploadContext: FileUploadContext!
+      $filename: String!
+      $contentType: String!
+      $contentLength: Int!
+    ) {
+      fileUploadHandle: createFileUploadHandle(
+        organizationHostedJobsPageName: $organizationHostedJobsPageName
+        fileUploadContext: $fileUploadContext
+        filename: $filename
+        contentType: $contentType
+        contentLength: $contentLength
+      ) { handle url fields }
+    }`,
+    {
+      organizationHostedJobsPageName: orgName,
+      fileUploadContext: "NonUserFormEngine",
+      filename: fileName,
+      contentType,
+      contentLength,
+    }
+  );
+  if (errors && errors.length > 0) {
+    throw new AshbyGqlError("ApiCreateFileUploadHandle", describeErrors(errors), { errors });
+  }
+  const handle = data?.fileUploadHandle as
+    | { handle: string; url: string; fields: Record<string, string> }
+    | undefined;
+  if (!handle || !handle.handle || !handle.url) {
+    throw new AshbyGqlError(
+      "ApiCreateFileUploadHandle",
+      "createFileUploadHandle returned no handle"
+    );
+  }
+  return handle;
+}
+
+async function uploadResumeToS3(
+  fetchImpl: FetchImpl,
+  target: { url: string; fields: Record<string, string> },
+  fileBytes: Uint8Array,
+  fileName: string,
+  contentType: string
+): Promise<void> {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(target.fields)) form.append(k, v);
+  form.append("Content-Type", contentType);
+  const buffer = fileBytes.buffer.slice(
+    fileBytes.byteOffset,
+    fileBytes.byteOffset + fileBytes.byteLength
+  ) as ArrayBuffer;
+  form.append("file", new Blob([buffer], { type: contentType }), fileName);
+  const resp = await fetchImpl(target.url, { method: "POST", body: form });
+  if (!resp.ok && resp.status !== 204) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`S3 upload failed HTTP ${resp.status}: ${text.slice(0, 500)}`);
+  }
+}
+
+// ── Field set ────────────────────────────────────────────────────────────
+
+async function setFieldValue(
+  fetchImpl: FetchImpl,
+  origin: string,
+  orgName: string,
+  frid: string,
+  formDefId: string,
+  path: string,
+  value: unknown
+): Promise<void> {
+  const { errors } = await gql(
+    fetchImpl,
+    origin,
+    "ApiSetFormValue",
+    `mutation ApiSetFormValue(
+      $organizationHostedJobsPageName: String!
+      $formRenderIdentifier: String!
+      $formDefinitionIdentifier: String
+      $path: String!
+      $value: JSON
+    ) {
+      setFormValue(
+        organizationHostedJobsPageName: $organizationHostedJobsPageName
+        formRenderIdentifier: $formRenderIdentifier
+        formDefinitionIdentifier: $formDefinitionIdentifier
+        path: $path
+        value: $value
+      ) { id errorMessages }
+    }`,
+    {
+      organizationHostedJobsPageName: orgName,
+      formRenderIdentifier: frid,
+      formDefinitionIdentifier: formDefId,
+      path,
+      value,
+    }
+  );
+  if (errors && errors.length > 0) {
+    throw new AshbyGqlError("ApiSetFormValue", describeErrors(errors), { errors });
+  }
+}
+
+async function setFileFieldValue(
+  fetchImpl: FetchImpl,
+  origin: string,
+  orgName: string,
+  frid: string,
+  formDefId: string,
+  path: string,
+  fileHandle: string
+): Promise<void> {
+  const { errors } = await gql(
+    fetchImpl,
+    origin,
+    "ApiSetFormValueToFile",
+    `mutation ApiSetFormValueToFile(
+      $organizationHostedJobsPageName: String!
+      $formRenderIdentifier: String!
+      $formDefinitionIdentifier: String
+      $path: String!
+      $fileHandle: String
+    ) {
+      setFormValueToFile(
+        organizationHostedJobsPageName: $organizationHostedJobsPageName
+        formRenderIdentifier: $formRenderIdentifier
+        formDefinitionIdentifier: $formDefinitionIdentifier
+        path: $path
+        fileHandle: $fileHandle
+      ) { id errorMessages }
+    }`,
+    {
+      organizationHostedJobsPageName: orgName,
+      formRenderIdentifier: frid,
+      formDefinitionIdentifier: formDefId,
+      path,
+      fileHandle,
+    }
+  );
+  if (errors && errors.length > 0) {
+    throw new AshbyGqlError("ApiSetFormValueToFile", describeErrors(errors), { errors });
+  }
+}
+
+// ── Submit ───────────────────────────────────────────────────────────────
+
+export type AshbySubmitOutcome =
+  | {
+      kind: "success";
+    }
+  | {
+      kind: "form_render";
+      errorMessages: string[];
+      formErrors: Array<{ message: string; fieldEntryId: string }>;
+    }
+  | {
+      kind: "gql_errors";
+      errors: AshbyGqlErrors;
+    }
+  | {
+      kind: "unexpected_shape";
+      raw: unknown;
+    };
+
+/**
+ * Reads Ashby's submit response into one of the four discrete outcomes the
+ * caller acts on. Pure, so unit tests pin every branch by shape.
+ */
+export function classifyAshbySubmitResponse(body: unknown): AshbySubmitOutcome {
+  if (!body || typeof body !== "object") return { kind: "unexpected_shape", raw: body };
+  const errors = (body as { errors?: AshbyGqlErrors }).errors;
+  if (errors && errors.length > 0) return { kind: "gql_errors", errors };
+  const applicationFormResult = (
+    body as {
+      data?: { submitApplicationFormAction?: { applicationFormResult?: unknown } };
+    }
+  ).data?.submitApplicationFormAction?.applicationFormResult as
+    | {
+        __typename?: string;
+        errorMessages?: string[];
+        formErrors?: Array<{ message: string; fieldEntryId: string }>;
+      }
+    | undefined;
+  if (!applicationFormResult || typeof applicationFormResult.__typename !== "string") {
+    return { kind: "unexpected_shape", raw: body };
+  }
+  if (applicationFormResult.__typename === "FormSubmitSuccess") {
+    return { kind: "success" };
+  }
+  return {
+    kind: "form_render",
+    errorMessages: applicationFormResult.errorMessages ?? [],
+    formErrors: applicationFormResult.formErrors ?? [],
+  };
+}
+
+async function submitForm(
+  fetchImpl: FetchImpl,
+  origin: string,
+  args: {
+    orgName: string;
+    jobPostingId: string;
+    frid: string;
+    formDefId: string;
+    actionIdentifier: string;
+    recaptchaToken: string;
+  }
+): Promise<AshbySubmitOutcome> {
+  const endpoint = `${origin}/api/non-user-graphql?op=ApiSubmitSingleApplicationFormAction`;
+  const resp = await fetchImpl(endpoint, {
+    method: "POST",
+    headers: apolloHeaders(),
+    body: JSON.stringify({
+      operationName: "ApiSubmitSingleApplicationFormAction",
+      query: `mutation ApiSubmitSingleApplicationFormAction(
+        $organizationHostedJobsPageName: String!
+        $jobPostingId: String!
+        $formRenderIdentifier: String!
+        $formDefinitionIdentifier: String
+        $actionIdentifier: String!
+        $recaptchaToken: String!
+      ) {
+        submitApplicationFormAction: submitSingleApplicationFormAction(
+          organizationHostedJobsPageName: $organizationHostedJobsPageName
+          jobPostingId: $jobPostingId
+          formRenderIdentifier: $formRenderIdentifier
+          formDefinitionIdentifier: $formDefinitionIdentifier
+          actionIdentifier: $actionIdentifier
+          recaptchaToken: $recaptchaToken
+        ) {
+          applicationFormResult {
+            __typename
+            ... on FormSubmitSuccess { _ }
+            ... on FormRender {
+              id
+              errorMessages
+              formErrors { message fieldEntryId }
+            }
+          }
+        }
+      }`,
+      variables: {
+        organizationHostedJobsPageName: args.orgName,
+        jobPostingId: args.jobPostingId,
+        formRenderIdentifier: args.frid,
+        formDefinitionIdentifier: args.formDefId,
+        actionIdentifier: args.actionIdentifier,
+        recaptchaToken: args.recaptchaToken,
+      },
+    }),
+  });
+  if (!resp.ok) {
+    // A non 2xx HTTP status from Ashby's own endpoint means the request
+    // reached it and it answered with something we cannot classify as a
+    // success. Treat as unconfirmed at the caller: the submit crossed the
+    // network boundary.
+    const text = await resp.text().catch(() => "");
+    throw new AshbyGqlError(
+      "ApiSubmitSingleApplicationFormAction",
+      `HTTP ${resp.status}${text ? `: ${text.slice(0, 500)}` : ""}`,
+      { httpStatus: resp.status }
+    );
+  }
+  const body = await resp.json().catch(() => null);
+  return classifyAshbySubmitResponse(body);
+}
+
+// ── Candidate value mapping ─────────────────────────────────────────────
+
+/**
+ * The candidate view the field mapper reads from. Small on purpose: every
+ * key here is a fact the profile actually stated, or a value derived from
+ * one plus the resume. Nothing invented. HARD STOP 9.
+ */
+export type AshbyCandidateView = {
+  firstName: string | null;
+  lastName: string | null;
+  fullName: string | null;
+  email: string;
+  phone: string | null;
+  linkedinUrl: string | null;
+  location: string | null;
+  /**
+   * A short background paragraph used to answer optional open ended
+   * questions about startup or entrepreneurial experience. When null, the
+   * fallback path leaves the question blank rather than inventing one.
+   */
+  entrepreneurialBackground: string | null;
+};
+
+/**
+ * Ported verbatim in intent from `scripts/test-ashby-api.ts`, adapted to
+ * read from the resolved candidate view rather than the hardcoded CANDIDATE
+ * constant that script uses. Every keyword branch, every EEO decline, the
+ * boolean question routing and the location narrowness are unchanged from
+ * that script. The comments there explain the individual precedence
+ * choices in more detail than fits here; do not edit either copy without
+ * updating the other.
+ */
+export function candidateValueForField(
+  field: AshbyField,
+  view: AshbyCandidateView,
+  isRequired = false
+): unknown | null {
+  const t = (field.title ?? "").toLowerCase();
+
+  if (field.path === "_systemfield_name") return view.fullName;
+  if (field.path === "_systemfield_email") return view.email;
+  if (field.path === "_systemfield_phone") return view.phone;
+  if (field.path === "_systemfield_resume") return null;
+
+  if (field.type === "Boolean") {
+    if (
+      t.includes("gender") ||
+      t.includes("race") ||
+      t.includes("ethnicity") ||
+      t.includes("veteran") ||
+      t.includes("disability") ||
+      t.includes("pronouns")
+    ) {
+      return null;
+    }
+    if (t.includes("sponsor") || t.includes("visa")) return false;
+    return true;
+  }
+
+  if (
+    t.includes("gender") ||
+    t.includes("race") ||
+    t.includes("ethnicity") ||
+    t.includes("veteran") ||
+    t.includes("disability") ||
+    t.includes("pronouns")
+  ) {
+    return "Decline to Self Identify";
+  }
+
+  if (t.includes("sponsor") || t.includes("visa")) return "No";
+  if (t.includes("authorized") || t.includes("work auth") || t.includes("eligible to work")) {
+    return "Yes";
+  }
+  if (t.includes("us or canada") || t.includes("based in us") || t.includes("based in the us")) {
+    return "Yes";
+  }
+
+  if (t.includes("first name")) return view.firstName;
+  if (t.includes("last name")) return view.lastName;
+  if (t.includes("full name") || t.includes("legal name")) return view.fullName;
+  if (t.includes("email")) return view.email;
+  if (t.includes("phone")) return view.phone;
+  if (t.includes("linkedin")) return view.linkedinUrl;
+
+  const isShortLocationField =
+    t.length < 30 &&
+    (t.includes("location") || t.includes("city") || t.includes("where are you"));
+  const isExplicitLocationPhrase =
+    t.includes("where are you located") ||
+    t.includes("what is your location") ||
+    t.includes("what city");
+  if (isShortLocationField || isExplicitLocationPhrase) return view.location;
+
+  if (t.includes("country") || t.includes("where are you located")) return "United States";
+
+  if (
+    t.includes("entrepreneur") ||
+    t.includes("startup") ||
+    t.includes("built") ||
+    t.includes("side project") ||
+    t.includes("founded") ||
+    t.includes("tell us more") ||
+    t.includes("tell us about")
+  ) {
+    return view.entrepreneurialBackground;
+  }
+
+  if (t.includes("cover letter") || field.path === "cover_letter") return null;
+
+  if (
+    t.includes("twitter") ||
+    t.includes("github") ||
+    t.includes("portfolio") ||
+    t.includes("website") ||
+    t.includes("referred") ||
+    t.includes("referral")
+  ) {
+    return null;
+  }
+
+  if (
+    t.includes("salary") ||
+    t.includes("compensation") ||
+    t.includes("years of") ||
+    t.includes("how many years") ||
+    t.includes("employer") ||
+    t.includes("current company") ||
+    t.includes("most recent company") ||
+    t.includes("mailing address") ||
+    t.includes("home address") ||
+    t.includes("job title")
+  ) {
+    return null;
+  }
+
+  if (isRequired && (field.type === "String" || field.type === "LongText" || field.type === "Text")) {
+    return view.entrepreneurialBackground;
+  }
+
+  return null;
+}
+
+// ── Context assembly ────────────────────────────────────────────────────
+
+export type ResolvedAshbyContext = {
+  jobApplicationId: string;
+  ats: string;
+  jobId: string;
+  applyUrl: string;
+  company: string;
+  jobTitle: string;
+  orgName: string;
+  jobPostingId: string;
+  origin: string;
+  candidate: AshbyCandidateView;
+  applicationAnswers: CandidateApplicationAnswers;
+  resume: {
+    bytes: Uint8Array;
+    fileName: string;
+    contentType: string;
+  };
+};
+
+export type AshbyDirectSubmitDeps = {
+  fetch?: FetchImpl;
+  mintRecaptchaToken?: (url: string) => Promise<string>;
+  supabase?: SupabaseClient;
+  now?: () => Date;
+  browserbaseSessionId?: string | null;
+};
+
+export type SubmitAshbyDirectlyInput = {
+  jobApplicationId: string;
+  ats: string;
+  applyUrl: string;
+  jobId: string;
+  company: string;
+  jobTitle: string;
+};
+
+function getSupabaseClient(): SupabaseClient {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) {
+    throw new Error(
+      "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars are required (see .env.example)"
+    );
+  }
+  assertSupabaseProject(url);
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
+function describeErrors(errors: AshbyGqlErrors): string {
+  return errors
+    .map((e) => `${e.message}${e.extensions?.ashbyErrorType ? ` (${e.extensions.ashbyErrorType})` : ""}`)
+    .join("; ");
+}
+
+/**
+ * Derives the small `AshbyCandidateView` from the fuller candidate record
+ * plus the parsed resume profile. Ordering here matches what the DOM path
+ * already does: the resume is the source of truth for name and phone, the
+ * profile's stated email wins, and the LinkedIn URL falls back through the
+ * candidate row to whatever the resume parser found. Location comes from
+ * the stated current city and country when they exist.
+ */
+function buildCandidateView(
+  candidate: CandidateRecord,
+  profile: ResumeProfile
+): AshbyCandidateView {
+  const firstName = profile.firstName?.trim() || null;
+  const lastName = profile.lastName?.trim() || null;
+  const fullName =
+    firstName && lastName ? `${firstName} ${lastName}` : firstName ?? lastName ?? null;
+  const linkedinUrl =
+    (candidate.linkedinUrl && candidate.linkedinUrl.trim()) ||
+    (profile.linkedinUrl && profile.linkedinUrl.trim()) ||
+    null;
+  const currentCity = candidate.applicationAnswers.currentCity?.trim() ?? "";
+  const currentCountry = candidate.applicationAnswers.currentCountry?.trim() ?? "";
+  let location: string | null = null;
+  if (currentCity && currentCountry) location = `${currentCity}, ${currentCountry}`;
+  else if (currentCity) location = currentCity;
+  else if (profile.location && profile.location.trim() !== "") location = profile.location.trim();
+  return {
+    firstName,
+    lastName,
+    fullName,
+    email: candidate.applicationEmail,
+    phone: profile.phone?.trim() || null,
+    linkedinUrl,
+    location,
+    // Deliberately left null in v1. The DOM path builds an entrepreneurial
+    // paragraph from the resume + LLM, and reproducing that here without a
+    // grounded intake field would be an invention. HARD STOP 9. A follow up
+    // ticket can promote a stored answer or a profile column into this slot.
+    entrepreneurialBackground: null,
+  };
+}
+
+// ── The core: pure in arguments, testable ──────────────────────────────
+
+export async function runAshbyDirectSubmit(
+  ctx: ResolvedAshbyContext,
+  deps: AshbyDirectSubmitDeps = {}
+): Promise<SubmitApplicationResult> {
+  const fetchImpl = deps.fetch ?? globalThis.fetch;
+  const mint = deps.mintRecaptchaToken ?? mintAshbyRecaptchaToken;
+  const supabase = deps.supabase ?? getSupabaseClient();
+  const nowIso = () => (deps.now ? deps.now() : new Date()).toISOString();
+  const browserbaseSessionId = deps.browserbaseSessionId ?? null;
+  const { jobApplicationId } = ctx;
+
+  console.log(
+    `${LOG} Ashby direct HTTP submit — application ${jobApplicationId} at ${ctx.applyUrl} ` +
+      `(org ${ctx.orgName}, job posting ${ctx.jobPostingId})`
+  );
+
+  const finish = (
+    terminal: {
+      status: ApplicationStatus;
+      submitted: boolean;
+      confirmationRef: string | null;
+      blockedReason: string | null;
+      unconfirmedReason: string | null;
+      rowUpdated: boolean;
+      submitAttempted: boolean;
+    }
+  ): SubmitApplicationResult => ({
+    jobApplicationId,
+    status: terminal.status,
+    submitted: terminal.submitted,
+    submitAttempted: terminal.submitAttempted,
+    confirmationRef: terminal.confirmationRef,
+    confirmation: null,
+    securityCode: null,
+    approval: {
+      approved: true,
+      gate: "auto",
+      detail:
+        "Ashby direct HTTP path (JOB-214): no browser was opened, so the review gate that runs " +
+        "before the DOM click did not apply here",
+    },
+    submitControlLabel: "Submit (Ashby direct HTTP)",
+    fill: null,
+    finalUrl: ctx.applyUrl,
+    pageTitle: ctx.jobTitle,
+    screenshotPath: null,
+    blockedReason: terminal.blockedReason,
+    unconfirmedReason: terminal.unconfirmedReason,
+    rowUpdated: terminal.rowUpdated,
+  });
+
+  const blocked = async (why: string): Promise<SubmitApplicationResult> => {
+    const message = `submission_blocked (ashby direct http): ${why}`;
+    let rowUpdated = false;
+    try {
+      await updateApplication(supabase, jobApplicationId, {
+        status: APPLICATION_STATUS.SUBMISSION_BLOCKED,
+        browserbaseSessionId,
+      });
+      rowUpdated = true;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `${LOG} could not record submission_blocked on ${jobApplicationId}: ${reason}`
+      );
+    }
+    await recordSkipQuietly(supabase, {
+      applicationId: jobApplicationId,
+      jobId: ctx.jobId,
+      ats: ctx.ats,
+      reason: "submit_failed",
+      message,
+      browserbaseSessionId,
+    });
+    console.warn(`${LOG} ${message}`);
+    return finish({
+      status: APPLICATION_STATUS.SUBMISSION_BLOCKED,
+      submitted: false,
+      confirmationRef: null,
+      blockedReason: why,
+      unconfirmedReason: null,
+      rowUpdated,
+      submitAttempted: false,
+    });
+  };
+
+  const unconfirmed = async (why: string): Promise<SubmitApplicationResult> => {
+    const message = `submit_clicked_outcome_unknown (ashby direct http): ${why}`;
+    let rowUpdated = false;
+    try {
+      await updateApplication(supabase, jobApplicationId, {
+        status: APPLICATION_STATUS.SUBMISSION_UNCONFIRMED,
+        submittedAt: nowIso(),
+        browserbaseSessionId,
+      });
+      rowUpdated = true;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `${LOG} could not record submission_unconfirmed on ${jobApplicationId}: ${reason}`
+      );
+    }
+    await recordSkipQuietly(supabase, {
+      applicationId: jobApplicationId,
+      jobId: ctx.jobId,
+      ats: ctx.ats,
+      reason: "submit_failed",
+      message,
+      browserbaseSessionId,
+    });
+    console.error(
+      `${LOG} ══ SUBMIT ISSUED, OUTCOME UNKNOWN (ashby direct http) ══════════\n` +
+        `${LOG} ${why}\n` +
+        `${LOG} Do NOT re run this listing until a human has checked the employer's side.\n` +
+        `${LOG} ═══════════════════════════════════════════════════════════════════`
+    );
+    return finish({
+      status: APPLICATION_STATUS.SUBMISSION_UNCONFIRMED,
+      submitted: false,
+      confirmationRef: null,
+      blockedReason: null,
+      unconfirmedReason: why,
+      rowUpdated,
+      submitAttempted: true,
+    });
+  };
+
+  const succeed = async (): Promise<SubmitApplicationResult> => {
+    const confirmationRef = "ashby: FormSubmitSuccess (direct http)";
+    let rowUpdated = false;
+    try {
+      await updateApplication(supabase, jobApplicationId, {
+        status: APPLICATION_STATUS.SUBMITTED,
+        confirmationText: confirmationRef,
+        submittedAt: nowIso(),
+        browserbaseSessionId,
+      });
+      rowUpdated = true;
+      console.log(`${LOG} applications ${jobApplicationId} → submitted (Ashby direct HTTP)`);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `${LOG} the application WAS submitted but recording submitted on ${jobApplicationId} ` +
+          `failed: ${reason}. Not retrying anything.`
+      );
+    }
+    return finish({
+      status: APPLICATION_STATUS.SUBMITTED,
+      submitted: true,
+      confirmationRef,
+      blockedReason: null,
+      unconfirmedReason: null,
+      rowUpdated,
+      submitAttempted: true,
+    });
+  };
+
+  // ── 1. Discover the form ────────────────────────────────────────────
+  let form: AshbyDiscoveredForm;
+  try {
+    form = await discoverForm(fetchImpl, ctx.origin, ctx.orgName, ctx.jobPostingId);
+  } catch (err) {
+    return await blocked(
+      `could not discover the Ashby application form for ${ctx.applyUrl}: ` +
+        `${err instanceof Error ? err.message : String(err)}. Nothing was sent.`
+    );
+  }
+
+  const allEntries = form.sections.flatMap((s) => s.fieldEntries ?? []).filter((e) => !e.isHidden);
+  const fileEntries = allEntries.filter(
+    (e) =>
+      e.field?.type === "File" ||
+      e.field?.type === "FileList" ||
+      e.field?.path === "_systemfield_resume"
+  );
+  const valueEntries = allEntries.filter(
+    (e) =>
+      e.field?.path !== "_systemfield_resume" &&
+      e.field?.type !== "File" &&
+      e.field?.type !== "FileList"
+  );
+
+  // ── 2. Upload the resume, when the form has a resume slot ──────────
+  if (fileEntries.length === 0) {
+    console.log(`${LOG} discovered form has no file field — skipping resume upload`);
+  } else {
+    let handleInfo: { handle: string; url: string; fields: Record<string, string> };
+    try {
+      handleInfo = await createUploadHandle(
+        fetchImpl,
+        ctx.origin,
+        ctx.orgName,
+        ctx.resume.fileName,
+        ctx.resume.contentType,
+        ctx.resume.bytes.byteLength
+      );
+    } catch (err) {
+      return await blocked(
+        `Ashby refused to mint a file upload handle: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    try {
+      await uploadResumeToS3(
+        fetchImpl,
+        { url: handleInfo.url, fields: handleInfo.fields },
+        ctx.resume.bytes,
+        ctx.resume.fileName,
+        ctx.resume.contentType
+      );
+    } catch (err) {
+      return await blocked(
+        `resume upload to S3 failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    for (const entry of fileEntries) {
+      try {
+        await setFileFieldValue(
+          fetchImpl,
+          ctx.origin,
+          ctx.orgName,
+          form.formRenderIdentifier,
+          form.formDefinitionIdentifier,
+          entry.field.path,
+          handleInfo.handle
+        );
+      } catch (err) {
+        return await blocked(
+          `could not attach the uploaded resume to Ashby field ${JSON.stringify(entry.field.path)}: ` +
+            `${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+  }
+
+  // ── 3. Fill value fields ────────────────────────────────────────────
+  const missingRequired: string[] = [];
+  for (const entry of valueEntries) {
+    const value = candidateValueForField(entry.field, ctx.candidate, entry.isRequired);
+    if (value === null || value === undefined) {
+      if (entry.isRequired) missingRequired.push(entry.field.title);
+      continue;
+    }
+    try {
+      await setFieldValue(
+        fetchImpl,
+        ctx.origin,
+        ctx.orgName,
+        form.formRenderIdentifier,
+        form.formDefinitionIdentifier,
+        entry.field.path,
+        value
+      );
+    } catch (err) {
+      return await blocked(
+        `could not set Ashby field ${JSON.stringify(entry.field.title)}: ` +
+          `${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+  if (missingRequired.length > 0) {
+    return await blocked(
+      `required Ashby fields have no mapped value from the candidate profile: ` +
+        JSON.stringify(missingRequired) +
+        `. Nothing was submitted.`
+    );
+  }
+
+  // ── 4. Mint the reCAPTCHA token ─────────────────────────────────────
+  let recaptchaToken: string;
+  try {
+    recaptchaToken = await mint(ctx.applyUrl);
+  } catch (err) {
+    return await blocked(
+      `could not mint an Ashby reCAPTCHA token before submit: ` +
+        `${err instanceof Error ? err.message : String(err)}. Nothing was sent.`
+    );
+  }
+  if (!recaptchaToken || typeof recaptchaToken !== "string") {
+    return await blocked(
+      `reCAPTCHA harvester returned a non string token, refusing to submit. Nothing was sent.`
+    );
+  }
+
+  // ── 5. Submit — the point of no return ───────────────────────────────
+  // Everything below crosses the boundary Ashby's own server may already
+  // have logged as an application. If the submit call throws, or comes
+  // back with a `gql_errors` shape whose body cannot be interpreted as
+  // "no application was created", this row lands as submission_unconfirmed
+  // and never automatically retries.
+  console.log(`${LOG} calling ApiSubmitSingleApplicationFormAction — point of no return`);
+  let outcome: AshbySubmitOutcome;
+  try {
+    outcome = await submitForm(fetchImpl, ctx.origin, {
+      orgName: ctx.orgName,
+      jobPostingId: ctx.jobPostingId,
+      frid: form.formRenderIdentifier,
+      formDefId: form.formDefinitionIdentifier,
+      actionIdentifier: form.actionIdentifier,
+      recaptchaToken,
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return await unconfirmed(
+      `Ashby submit mutation threw part way through: ${reason}. Whether an application now ` +
+        `exists at the employer is unknown.`
+    );
+  }
+
+  switch (outcome.kind) {
+    case "success":
+      return await succeed();
+    case "gql_errors":
+      return await unconfirmed(
+        `Ashby submit answered with GraphQL errors: ${describeErrors(outcome.errors)}. The ` +
+          `application may or may not have been recorded at the employer's side.`
+      );
+    case "form_render":
+      return await unconfirmed(
+        `Ashby returned FormRender after submit rather than FormSubmitSuccess ` +
+          `(errorMessages: ${JSON.stringify(outcome.errorMessages)}; ` +
+          `formErrors: ${JSON.stringify(outcome.formErrors)}). The submit mutation was issued ` +
+          `and its side effect at the employer is not known.`
+      );
+    case "unexpected_shape":
+      return await unconfirmed(
+        `Ashby submit returned a shape this module does not recognise. Not retrying.`
+      );
+    default: {
+      const exhaustive: never = outcome;
+      throw new Error(`unreachable: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
+// ── Public entry: reads Supabase, resolves context, runs submit ─────────
+
+export async function submitAshbyApplicationDirectly(
+  input: SubmitAshbyDirectlyInput,
+  deps: AshbyDirectSubmitDeps = {}
+): Promise<SubmitApplicationResult> {
+  const supabase = deps.supabase ?? getSupabaseClient();
+  const parsedUrl = parseAshbyUrl(input.applyUrl);
+
+  // Read the row's user id. Preflight in `submit-application.ts` reads
+  // most of the row shape already but not user id, so this direct path
+  // fetches it here rather than force the caller to widen preflight's
+  // return shape.
+  const { data: rows, error } = await supabase
+    .from("applications")
+    .select("user_id")
+    .eq("id", input.jobApplicationId)
+    .limit(1);
+  if (error) throw new Error(`applications lookup failed: ${error.message}`);
+  const userId = rows?.[0]?.user_id;
+  if (typeof userId !== "string" || userId.trim() === "") {
+    throw new Error(
+      `applications ${input.jobApplicationId} has no user_id; cannot load candidate for Ashby direct HTTP submit.`
+    );
+  }
+
+  const candidate = await loadCandidate(userId);
+  const resume = await loadResume(supabase, candidate.resumeUrl);
+  const profile = await resolveCandidateProfile(
+    supabase,
+    {
+      resumeId: candidate.resumeId,
+      resumePath: candidate.resumeUrl,
+      linkedinPdfPath: candidate.linkedinPdfPath,
+    },
+    resume.text,
+    // `resolveCandidateProfile` reads the resume parser's smaller shape of
+    // CandidateRecord (id, applicationEmail, linkedinUrl, githubUrl) rather
+    // than the full intake record. Same mapping the fill layer does at its
+    // own resolveCandidateProfile call site in `lib/fill-application-form.ts`.
+    {
+      id: userId,
+      applicationEmail: candidate.applicationEmail,
+      linkedinUrl: candidate.linkedinUrl,
+      githubUrl: candidate.githubUrl,
+    }
+  );
+
+  const view = buildCandidateView(candidate, profile);
+
+  const resumeFileName = deriveResumeFileName(candidate.resumeUrl, view.fullName);
+  const ctx: ResolvedAshbyContext = {
+    jobApplicationId: input.jobApplicationId,
+    ats: input.ats,
+    jobId: input.jobId,
+    applyUrl: input.applyUrl,
+    company: input.company,
+    jobTitle: input.jobTitle,
+    orgName: parsedUrl.orgName,
+    jobPostingId: parsedUrl.jobPostingId,
+    origin: parsedUrl.origin,
+    candidate: view,
+    applicationAnswers: candidate.applicationAnswers,
+    resume: {
+      bytes: resume.bytes,
+      fileName: resumeFileName,
+      contentType: "application/pdf",
+    },
+  };
+
+  return await runAshbyDirectSubmit(ctx, { ...deps, supabase });
+}
+
+function deriveResumeFileName(resumeUrl: string, fullName: string | null): string {
+  // A conservative default that reads as a real filename on an S3 upload.
+  // The exact name Ashby stores is not observable back to us; a human name
+  // is only useful in the recruiter's inbox, so keep it plain when the
+  // profile does not have a name yet.
+  const base = fullName ? fullName.replace(/[^a-z0-9]+/gi, "_") : "resume";
+  // If the storage path carried an extension use it, otherwise assume .pdf
+  // because the resume loader already validates the PDF magic bytes.
+  const extMatch = /\.(pdf|docx?)$/i.exec(resumeUrl);
+  const ext = extMatch ? extMatch[1].toLowerCase() : "pdf";
+  return `${base}.${ext}`;
+}
