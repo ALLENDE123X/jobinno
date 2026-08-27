@@ -21,6 +21,36 @@ vi.mock("@/app/dashboard/actions", () => ({
   findJobsNow: async () => ({ ok: true as const }),
 }));
 
+// `DashboardView` renders inside `PageShell`, which always includes
+// `SignOutButton`. That button calls `useRouter()` unconditionally, on every
+// render, before it ever checks whether there is a session to sign out of, so
+// rendering this view at all needs a mounted app router regardless of what
+// this suite is actually asserting on.
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({
+    push: vi.fn(),
+    refresh: vi.fn(),
+  }),
+}));
+
+// `SignOutButton` also opens a real Supabase browser client on mount to ask
+// whether anyone is signed in, which throws in this environment because
+// `NEXT_PUBLIC_SUPABASE_URL`/`NEXT_PUBLIC_SUPABASE_ANON_KEY` are not set for a
+// plain test run. Stubbed to "nobody is signed in" for the same reason
+// `@/app/dashboard/actions` above is stubbed: this suite is about what a
+// person sees on the dashboard itself, not about the sign out control in the
+// shared shell around it.
+vi.mock("@/lib/supabase/client", () => ({
+  createClient: () => ({
+    auth: {
+      getUser: async () => ({ data: { user: null } }),
+      onAuthStateChange: () => ({
+        data: { subscription: { unsubscribe: vi.fn() } },
+      }),
+    },
+  }),
+}));
+
 const { DashboardView } = await import("@/app/dashboard/dashboard-view");
 const { toQuota } = await import("@/lib/dashboard/dashboard-data");
 const { APPLICATION_STATUS } = await import("@/lib/application-status");
