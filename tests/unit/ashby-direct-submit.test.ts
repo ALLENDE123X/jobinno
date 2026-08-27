@@ -256,6 +256,97 @@ function discoveryWithTwoMappedFields(): Response {
   });
 }
 
+/**
+ * A discovery response carrying one file field (the resume slot) followed
+ * by one mapped system field (name), both required. Used by the JOB-227
+ * file attach tests below to walk the `setFileFieldValue` call path and
+ * confirm the FRID it returns threads into the value fill that follows.
+ */
+function discoveryWithFileAndNameField(): Response {
+  return jsonResponse({
+    data: {
+      jobPosting: {
+        id: "job-1",
+        title: "Test Engineer",
+        applicationForm: {
+          id: "frid-1",
+          sourceFormDefinitionId: "formdef-1",
+          formControls: [{ identifier: "submit-1", title: "Submit" }],
+          sections: [
+            {
+              title: "Application",
+              fieldEntries: [
+                {
+                  id: "entry-resume",
+                  isRequired: true,
+                  isHidden: false,
+                  field: { path: "_systemfield_resume", title: "Resume", type: "File" },
+                },
+                {
+                  id: "entry-name",
+                  isRequired: true,
+                  isHidden: false,
+                  field: { path: "_systemfield_name", title: "Name", type: "String" },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  });
+}
+
+/**
+ * A discovery response carrying only the resume file field. Used by the
+ * JOB-227 rejected file attach test below, which stops the run before any
+ * value field would be reached.
+ */
+function discoveryWithFileEntryOnly(): Response {
+  return jsonResponse({
+    data: {
+      jobPosting: {
+        id: "job-1",
+        title: "Test Engineer",
+        applicationForm: {
+          id: "frid-1",
+          sourceFormDefinitionId: "formdef-1",
+          formControls: [{ identifier: "submit-1", title: "Submit" }],
+          sections: [
+            {
+              title: "Application",
+              fieldEntries: [
+                {
+                  id: "entry-resume",
+                  isRequired: true,
+                  isHidden: false,
+                  field: { path: "_systemfield_resume", title: "Resume", type: "File" },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  });
+}
+
+/**
+ * A minimal successful `ApiCreateFileUploadHandle` response, shared by both
+ * JOB-227 file attach tests below.
+ */
+function uploadHandleResponse(): Response {
+  return jsonResponse({
+    data: {
+      fileUploadHandle: {
+        handle: "upload-handle-1",
+        url: "https://s3.example.com/upload",
+        fields: { key: "uploads/resume.pdf" },
+      },
+    },
+  });
+}
+
 /** Extracts the GraphQL variables body a mocked fetch call was sent. */
 function variablesFromFetchCall(fetchImpl: ReturnType<typeof vi.fn>, callIndex: number): Record<string, unknown> {
   const call = fetchImpl.mock.calls[callIndex] as [string, { body?: string }];
@@ -552,6 +643,108 @@ describe("runAshbyDirectSubmit", () => {
       // field set, no mint, no submit — the module stops the moment a
       // write comes back rejected rather than continuing as if it landed.
       expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(mint).not.toHaveBeenCalled();
+      const skipInsert = calls.find((c) => c.table === "skip_log" && c.op === "insert");
+      expect(skipInsert).toBeDefined();
+    }
+  );
+
+  // JOB-227 gap closed: `setFileFieldValue` (the resume upload path) had
+  // no direct test coverage at all — `_systemfield_resume` is the exact
+  // field named in the 2026-08-27 live incident this ticket traces to.
+  // The fix in `setFileFieldValue` is a byte for byte mirror of
+  // `setFieldValue`'s fix above; these two tests mirror the pair above it.
+
+  it(
+    "threads the render identifier each setFormValueToFile response returns into the next call",
+    async () => {
+      const { client } = makeFakeSupabase();
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(discoveryWithFileAndNameField())
+        .mockResolvedValueOnce(uploadHandleResponse())
+        // The S3 pre signed POST — not a GraphQL call, no variables body.
+        .mockResolvedValueOnce(new Response(null, { status: 204 }))
+        // setFormValueToFile for the resume field returns a fresher id.
+        .mockResolvedValueOnce(
+          jsonResponse({
+            data: { setFormValueToFile: { id: "frid-after-resume", errorMessages: [] } },
+          })
+        )
+        // setFormValue for the name field must carry the id the file
+        // attach call returned, not discovery's.
+        .mockResolvedValueOnce(
+          jsonResponse({ data: { setFormValue: { id: "frid-after-name", errorMessages: [] } } })
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({
+            data: {
+              submitApplicationFormAction: {
+                applicationFormResult: { __typename: "FormSubmitSuccess" },
+              },
+            },
+          })
+        );
+
+      const result = await runAshbyDirectSubmit(baseContext(), {
+        fetch: fetchImpl as unknown as typeof globalThis.fetch,
+        mintRecaptchaToken: async () => "harvester-token-file-frid",
+        supabase: client as never,
+        now: () => new Date("2026-08-27T12:00:00Z"),
+      });
+
+      expect(result.status).toBe(APPLICATION_STATUS.SUBMITTED);
+      // Call 0 is discovery, 1 is createFileUploadHandle, 2 is the S3
+      // POST (no GraphQL variables), 3 is setFormValueToFile for the
+      // resume field (still carrying the FRID discovery returned), 4 is
+      // the name field's setFormValue (must carry the id call 3
+      // returned, not discovery's), 5 is submit (must carry the id call
+      // 4 returned).
+      expect(variablesFromFetchCall(fetchImpl, 3).formRenderIdentifier).toBe("frid-1");
+      expect(variablesFromFetchCall(fetchImpl, 4).formRenderIdentifier).toBe("frid-after-resume");
+      expect(variablesFromFetchCall(fetchImpl, 5).formRenderIdentifier).toBe("frid-after-name");
+    }
+  );
+
+  it(
+    "routes a setFormValueToFile response carrying errorMessages to submission_blocked instead of treating the write as landed",
+    async () => {
+      const { client, calls } = makeFakeSupabase();
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(discoveryWithFileEntryOnly())
+        .mockResolvedValueOnce(uploadHandleResponse())
+        .mockResolvedValueOnce(new Response(null, { status: 204 }))
+        // Transport level `errors` stays empty — the request itself was
+        // fine — but the field level `errorMessages` says the file
+        // attach was rejected. Before JOB-227 this looked identical to a
+        // success.
+        .mockResolvedValueOnce(
+          jsonResponse({
+            data: {
+              setFormValueToFile: { id: "frid-2", errorMessages: ["File type not accepted"] },
+            },
+          })
+        );
+      const mint = vi.fn().mockResolvedValue("harvester-token-should-not-be-called");
+
+      const result = await runAshbyDirectSubmit(baseContext(), {
+        fetch: fetchImpl as unknown as typeof globalThis.fetch,
+        mintRecaptchaToken: mint,
+        supabase: client as never,
+        now: () => new Date("2026-08-27T12:00:00Z"),
+      });
+
+      expect(result.status).toBe(APPLICATION_STATUS.SUBMISSION_BLOCKED);
+      expect(result.submitted).toBe(false);
+      expect(result.submitAttempted).toBe(false);
+      expect(result.blockedReason).toContain("File type not accepted");
+      expect(result.blockedReason).toContain("_systemfield_resume");
+      // Discovery, the upload handle mint, the S3 upload, and the one
+      // rejected setFormValueToFile call. No value field fill, no mint,
+      // no submit — the module stops the moment the file attach comes
+      // back rejected rather than continuing as if the resume landed.
+      expect(fetchImpl).toHaveBeenCalledTimes(4);
       expect(mint).not.toHaveBeenCalled();
       const skipInsert = calls.find((c) => c.table === "skip_log" && c.op === "insert");
       expect(skipInsert).toBeDefined();
