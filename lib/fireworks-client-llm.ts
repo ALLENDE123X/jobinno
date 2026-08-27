@@ -35,6 +35,20 @@
  * guess if a `tool_result` shows up with no matching `tool_use` — that would
  * mean the caller's own turn history is broken, not something this adapter
  * should paper over.
+ *
+ * Live-verified gap, found during the 2026-08-26 conformance check (see
+ * {@link FIREWORKS_DEEPSEEK_MODEL}'s comment): `GET /inference/v1/models`
+ * reports `supports_image_input: false` for this model. `mapMessages` below
+ * still forwards `ImageBlock`s as ordinary user image content with no
+ * validation, so a request that ever carries one (Stagehand's default
+ * `act`/`observe`/`extract` path is DOM/accessibility-tree based and did not
+ * exercise this in the live smoke test run here, but nothing in this file
+ * rules it out for a future caller) would be silently accepted by
+ * `mapMessages` and only fail, if it fails at all, deep inside the Fireworks
+ * request. Not fixed here — this file's live-validation pass is scoped to
+ * confirming the model slug and running one live text/JSON round trip, not to
+ * building out the image path. Worth a follow-up ticket or an explicit
+ * `mapMessages` throw on `ImageBlock` if this model stays the pin.
  */
 
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
@@ -46,15 +60,26 @@ import type { ClientLLM } from "@browserbasehq/stagehand";
 export const FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1";
 
 /**
- * Pinned per the product decision on issue #175. NOT independently verified
- * against `GET /inference/v1/models` in this PR: the `pranavlende` Fireworks
- * account was suspended (billing hold) when this adapter was built, so the
- * live models list returned a `PRECONDITION_FAILED` error rather than data.
- * Re-verify this slug against the live list before this path is switched on
- * in any environment, and update this comment with the date that was done.
+ * Verified live against `GET /inference/v1/models` on 2026-08-26, after
+ * Pranav resolved the `pranavlende` Fireworks account's billing hold (this
+ * adapter was originally built against a suspended account returning
+ * `PRECONDITION_FAILED` for every request, including the models list — see
+ * the PR history for that unverified state).
+ *
+ * The bare slug this constant used to hold,
+ * `accounts/fireworks/models/deepseek-v4-flash`, does not exist on the live
+ * account. Fireworks serves the Flash-class DeepSeek V4 build under a dated
+ * snapshot id instead: `accounts/fireworks/models/deepseek-v4-flash-0731`.
+ * The full live listing (24 models) also has `deepseek-v4-pro` and
+ * `deepseek-v4-pro-0813`, but no undated `deepseek-v4-flash` — the dated
+ * suffix is not optional. Confirmed the corrected slug's own model metadata
+ * (`supports_chat: true`, `supports_tools: true`, `context_length: 1048576`)
+ * matches what this adapter needs for tool-calling; note `supports_image_input:
+ * false` (see the module header for what that means for `mapMessages`'s
+ * image handling).
  */
 export const FIREWORKS_DEEPSEEK_MODEL =
-  "accounts/fireworks/models/deepseek-v4-flash" as const;
+  "accounts/fireworks/models/deepseek-v4-flash-0731" as const;
 
 type GenerateRequest = Parameters<ClientLLM["generate"]>[0];
 type GenerateResponse = Awaited<ReturnType<ClientLLM["generate"]>>;
