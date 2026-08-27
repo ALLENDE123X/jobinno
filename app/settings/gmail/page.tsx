@@ -59,6 +59,7 @@ export default async function GmailSettingsPage() {
     console.error(
       `[settings-gmail-page] could not read gmail_refresh_token for user ${user.id}: ${error.message}`
     );
+    throw new Error("Could not load Gmail connection state. Please refresh and try again.");
   }
 
   const connected =
