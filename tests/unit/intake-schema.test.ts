@@ -44,6 +44,7 @@ function validIntake() {
     salaryExpectation: "$120,000, or negotiable",
     resumePath: RESUME_PATH,
     linkedinPdfPath: LINKEDIN_PATH,
+    githubUrl: "https://github.com/pranavlende",
     attestation: true as const,
   };
 }
@@ -259,6 +260,68 @@ describe("intakeSchema", () => {
           linkedinPdfPath: `${OTHER_USER_ID}/ffffffff-1111-4222-8333-444444444444.pdf`,
         })
       ).toContain("linkedinPdfPath");
+    });
+  });
+
+  // JOB-230. Optional, so a submission with none is not a rejected one, but
+  // whatever is given has to actually be a GitHub URL: `candidateValueForField`
+  // in `lib/ashby-direct-submit.ts` trusts this column outright once it is
+  // set, per HARD STOP 9, so nothing that is not really a GitHub link should
+  // ever land in it.
+  describe("GitHub URL", () => {
+    it("accepts a submission with no GitHub URL", () => {
+      const result = schema.safeParse({ ...validIntake(), githubUrl: null });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.githubUrl).toBeNull();
+    });
+
+    it("treats an empty string the same as none given", () => {
+      const result = schema.safeParse({ ...validIntake(), githubUrl: "" });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.githubUrl).toBeNull();
+    });
+
+    it("accepts a full https URL unchanged", () => {
+      const result = schema.safeParse({
+        ...validIntake(),
+        githubUrl: "https://github.com/pranavlende",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.githubUrl).toBe("https://github.com/pranavlende");
+    });
+
+    it("normalizes a bare github.com handle to a real https URL", () => {
+      const result = schema.safeParse({
+        ...validIntake(),
+        githubUrl: "github.com/pranavlende",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.githubUrl).toBe("https://github.com/pranavlende");
+    });
+
+    it("rejects a URL from a different domain", () => {
+      expect(
+        failedFields({
+          ...validIntake(),
+          githubUrl: "https://gitlab.com/pranavlende",
+        })
+      ).toContain("githubUrl");
+      expect(
+        failedFields({
+          ...validIntake(),
+          githubUrl: "https://linkedin.com/in/pranavlende",
+        })
+      ).toContain("githubUrl");
+    });
+
+    it("rejects a GitHub domain with nothing after it", () => {
+      expect(
+        failedFields({ ...validIntake(), githubUrl: "https://github.com" })
+      ).toContain("githubUrl");
     });
   });
 

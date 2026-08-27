@@ -111,6 +111,12 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
       previously_employed_at_target_employers:
         intake.previouslyEmployedAtTargetEmployers,
       salary_expectation: intake.salaryExpectation,
+      // JOB-230. Optional: null when nobody has stated one, exactly like
+      // every other column here that a person may leave unanswered.
+      // `lib/ashby-direct-submit.ts`'s `candidateValueForField` reads this
+      // straight off `CandidateRecord.githubUrl` for any "GitHub Handle"
+      // style field instead of skipping it outright.
+      github_url: intake.githubUrl,
       updated_at: new Date().toISOString(),
     })
     .eq("id", user.id);

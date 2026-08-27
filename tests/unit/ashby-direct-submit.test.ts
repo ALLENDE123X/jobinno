@@ -172,6 +172,7 @@ function baseContext(): ResolvedAshbyContext {
       phone: "404-444-6018",
       linkedinUrl: "https://www.linkedin.com/in/pranavlende",
       location: "Atlanta, GA",
+      githubUrl: null,
       entrepreneurialBackground: null,
     },
     applicationAnswers: {},
@@ -405,6 +406,11 @@ function baseView(): AshbyCandidateView {
     phone: "404-444-6018",
     linkedinUrl: "https://www.linkedin.com/in/pranavlende",
     location: "Atlanta, GA",
+    // JOB-230. null here on purpose: most of the tests below are about
+    // fields other than GitHub, and a candidate who has not stated one is
+    // the ordinary case, per HARD STOP 9. The GitHub specific tests build
+    // their own view with a value set.
+    githubUrl: null,
     entrepreneurialBackground: null,
   };
 }
@@ -903,5 +909,48 @@ describe("candidateValueForField grounding", () => {
       type: "LongText" as const,
     };
     expect(candidateValueForField(openText, baseView(), emptyAnswers(), true)).toBeNull();
+  });
+
+  // JOB-230. A required "GitHub Handle" field with no honest answer is what
+  // landed the 2026 08 27 live proof of JOB-227 on PostHog's SRE posting as
+  // submission_blocked. These two prove the fix: the value now traces to
+  // `profiles.github_url` through `AshbyCandidateView.githubUrl`, and a
+  // candidate who has not stated one still gets null, not a fabrication.
+  it("returns the candidate's stated GitHub URL for a GitHub titled field", () => {
+    const githubField = {
+      path: "custom_github",
+      title: "GitHub Handle",
+      type: "String" as const,
+    };
+    const view: AshbyCandidateView = {
+      ...baseView(),
+      githubUrl: "https://github.com/pranavlende",
+    };
+    expect(candidateValueForField(githubField, view, emptyAnswers(), true)).toBe(
+      "https://github.com/pranavlende"
+    );
+
+    // A handful of the titles Ashby forms actually use, per the ticket.
+    for (const title of [
+      "GitHub Profile",
+      "Link to GitHub",
+      "GitHub URL",
+      "github handle",
+    ]) {
+      expect(
+        candidateValueForField({ ...githubField, title }, view, emptyAnswers(), true)
+      ).toBe("https://github.com/pranavlende");
+    }
+  });
+
+  it("returns null for a GitHub titled field when the profile has not stated one, per HARD STOP 9", () => {
+    const githubField = {
+      path: "custom_github",
+      title: "GitHub Handle",
+      type: "String" as const,
+    };
+    expect(
+      candidateValueForField(githubField, baseView(), emptyAnswers(), true)
+    ).toBeNull();
   });
 });
