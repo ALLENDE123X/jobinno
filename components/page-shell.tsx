@@ -23,6 +23,7 @@
 import Link from "next/link";
 
 import { Logo } from "@/components/logo";
+import { SettingsLink } from "@/components/settings-link";
 import { SignOutButton } from "@/components/sign-out-button";
 import { ThemeToggle } from "@/components/theme";
 import { DotPattern } from "@/components/ui/dot-pattern";
@@ -40,11 +41,13 @@ export function PageShell({ children }: { children: React.ReactNode }) {
             Jobinno
           </Link>
           {/*
-            SignOutButton self-hides when there is no session, so this same
-            group renders correctly on `/login` (button absent) and on
-            `/dashboard` (button present) without a prop threaded through.
+            SettingsLink and SignOutButton each self-hide when there is no
+            session, so this same group renders correctly on `/login` (both
+            absent) and on `/dashboard` (both present) without a prop
+            threaded through. See components/settings-link.tsx.
           */}
           <div className="flex items-center gap-2">
+            <SettingsLink />
             <SignOutButton />
             <ThemeToggle />
           </div>
