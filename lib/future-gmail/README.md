@@ -40,4 +40,5 @@ One thread now runs the other way: `gmail-verification-listener.ts` imports `ass
 
 * **Do not wire this up without a ticket that explicitly asks for it.** It reads a real person's mailbox. That is a meaningful privacy surface and it needs a deliberate decision, not a passing import.
 * **Do not delete it to tidy up.** If it ever genuinely has to go, that is its own ticket with its own reasoning.
-* The `GOOGLE_OAUTH_*` variables in `.env.example` exist only for this folder. Leaving them blank breaks nothing.
+* `GOOGLE_OAUTH_REFRESH_TOKEN` in `.env.example` exists only for this folder. Leaving it blank breaks nothing here.
+* `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` used to exist only for this folder too, but JOB-189 gave the live routes in `app/api/auth/gmail/` their own reason to read the same two names, against what the ticket says is a differently configured OAuth client on Google's side. See the `.env.example` comment above them for what that leaves open.

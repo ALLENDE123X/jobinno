@@ -1,0 +1,59 @@
+-- Grants `gmail_refresh_token` to `service_role` only. JOB-189.
+--
+-- A second file rather than folding this into 0025, for the reason
+-- 0025's own header gives: `drizzle-kit push`, which CI uses to build its
+-- throwaway database, applies the ALTER TABLE in that file on its own by
+-- diffing lib/db/schema.ts, but cannot see a GRANT at all, so
+-- `.github/workflows/ci.yml` needs to apply this file by explicit name the
+-- same way it already does for `0016_profiles_github_url_privileges.sql`,
+-- `0020_profiles_intake_fields_privileges.sql`,
+-- `0021_resumes_column_privileges.sql` and
+-- `0023_profiles_answer_memory_privileges.sql`.
+--
+-- Hand written rather than generated, same as those four: the Drizzle schema
+-- DSL has no way to express GRANT, so this was created with `drizzle-kit
+-- generate --custom` to stay journalled in `drizzle.__drizzle_migrations`
+-- and then filled in by hand.
+--
+-- ── Not granted to `authenticated`, on purpose ──────────────────────────────
+-- Every other column `_privileges` migration in this folder grants
+-- `authenticated` UPDATE on a column a person owns about themselves —
+-- `github_url`, the JOB-101 intake fields, the JOB-134 answer memory fields.
+-- This one does not, because `gmail_refresh_token` is not something a person
+-- owns or types in; it is a credential we hold on their behalf, on the same
+-- side of the line as `stripe_customer_id` and `browserbase_context_id`
+-- above it in `lib/db/schema.ts`, both of which are likewise granted to
+-- nobody but the service role.
+--
+-- `service_role` already holds a table wide UPDATE and bypasses row level
+-- security besides, so the grant below is redundant in practice — the same
+-- redundancy `0003_profiles_column_privileges.sql` notes for the four
+-- columns it grants back to `service_role` by name. Written down anyway so a
+-- reader can see who the one writer is without checking Supabase's role
+-- defaults.
+--
+-- ── SELECT is not addressed here, and that is a real gap ────────────────────
+-- The ticket asked that only the service role ever read this column too, not
+-- only write it. `profiles` still carries Supabase's original table wide
+-- SELECT grant to `authenticated`, and `0003_profiles_column_privileges.sql`
+-- only ever narrowed the UPDATE half of that grant, not SELECT — so today
+-- `stripe_customer_id` and `browserbase_context_id` are both already
+-- readable by the row's own owner through PostgREST despite being "service
+-- role only" columns in every comment describing them, and this column
+-- would join them unless something changes that.
+--
+-- Doing that properly needs the SELECT equivalent of what 0003 did for
+-- UPDATE: a table wide REVOKE SELECT on `profiles` from `authenticated`, and
+-- a GRANT SELECT back naming every column an authenticated session
+-- legitimately reads today (roughly thirty of them, per `lib/db/schema.ts`).
+-- That is a bigger, table wide migration than this ticket's scope, and it
+-- should fix `stripe_customer_id` and `browserbase_context_id` at the same
+-- time rather than starting the pattern over for a fourth column later.
+-- Left as an explicit open question on this ticket's PR rather than
+-- attempted piecemeal here. In the meantime the real protection on this
+-- column is that the value it stores is ciphertext: see
+-- lib/gmail-token-crypto.ts. A session that could read the row would still
+-- need GMAIL_TOKEN_ENCRYPTION_KEY, which lives only in the server
+-- environment, to make anything of it.
+
+GRANT UPDATE (gmail_refresh_token) ON public.profiles TO service_role;

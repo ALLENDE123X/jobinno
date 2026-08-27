@@ -608,6 +608,38 @@ export const profiles = pgTable(
      */
     browserbaseContextId: text("browserbase_context_id"),
 
+    /**
+     * JOB-189. The encrypted refresh token behind a connected Gmail account.
+     *
+     * Exists for the automated account creation flow `lib/future-gmail/`
+     * documents but does not yet wire up: some ATS platforms gate signup
+     * behind an emailed verification code, and reading that code needs a
+     * standing Gmail grant rather than a one-time password. Nothing reads
+     * this column yet; `app/api/auth/gmail/callback/route.ts` is the only
+     * writer today.
+     *
+     * Never the raw refresh token. The value is
+     * `lib/gmail-token-crypto.ts`'s `encryptGmailRefreshToken` output,
+     * AES-256-GCM under a key that lives only in
+     * `GMAIL_TOKEN_ENCRYPTION_KEY` and never in this database, so a stolen
+     * row is useless without a stolen environment to go with it.
+     *
+     * Ours, not the person's, so it stays out of every grant list: no
+     * `authenticated` UPDATE, matching `stripe_customer_id` and
+     * `browserbase_context_id` above, and — a step further than either of
+     * those two — no `authenticated` SELECT either, which
+     * `drizzle/0025_profiles_gmail_refresh_token.sql` explains is not fully
+     * achieved yet. `profiles` still carries Supabase's original table wide
+     * SELECT grant to `authenticated`, and `0003_profiles_column_privileges.sql`
+     * only ever narrowed the UPDATE half of that; getting this column
+     * genuinely unreadable needs the same table wide REVOKE SELECT / GRANT
+     * SELECT-by-column treatment applied there, done once for this column
+     * and its two service-role-only siblings rather than three times over.
+     * Left as an explicit open question on the PR rather than done
+     * piecemeal here.
+     */
+    gmailRefreshToken: text("gmail_refresh_token"),
+
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
