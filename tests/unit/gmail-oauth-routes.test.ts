@@ -175,8 +175,10 @@ describe("GET /api/auth/gmail/callback", () => {
       expect(response.status).toBe(303);
       const location = locationOf(response);
       // A timed out exchange is a post-auth failure, so it lands on the
-      // dashboard rather than /login, same as every other failure below.
-      expect(location.pathname).toBe("/dashboard");
+      // outcome page rather than /login, same as every other failure below.
+      // The outcome page reads the error param and renders the error card;
+      // /dashboard was tried once and had the same silent drop /login had.
+      expect(location.pathname).toBe("/settings/gmail/success");
       expect(location.searchParams.get("error")).toMatch(/took too long/i);
     });
 
@@ -204,7 +206,12 @@ describe("GET /api/auth/gmail/callback", () => {
       const response = await callCallback("?code=abc123&state=signed-state");
 
       const location = locationOf(response);
-      expect(location.pathname).not.toBe("/settings/gmail/success");
+      // The outcome page renders success when it is reached without an
+      // `error` param, and an error card when `error` is set. A zero row
+      // update lands here with `error` set, so the outcome page renders
+      // the error card. The success and failure branches use the same
+      // path on purpose; the search param is what distinguishes them.
+      expect(location.pathname).toBe("/settings/gmail/success");
       expect(location.searchParams.get("error")).toMatch(/profile row was not found/i);
     });
 
@@ -220,7 +227,7 @@ describe("GET /api/auth/gmail/callback", () => {
   });
 
   describe("JOB-198: where a signed in failure lands", () => {
-    it("sends a state verification failure to the dashboard, not to login", async () => {
+    it("sends a state verification failure to the outcome page, not to login", async () => {
       createServerClient.mockResolvedValue(supabaseStub({ id: USER_ID }));
       verifyGmailOAuthState.mockImplementation(() => {
         throw new GmailOAuthStateError("State has expired. Start the Gmail connection again.");
@@ -229,17 +236,17 @@ describe("GET /api/auth/gmail/callback", () => {
       const response = await callCallback("?code=abc123&state=stale-state");
 
       const location = locationOf(response);
-      expect(location.pathname).toBe("/dashboard");
+      expect(location.pathname).toBe("/settings/gmail/success");
       expect(location.searchParams.get("error")).toBeTruthy();
     });
 
-    it("sends a token exchange failure to the dashboard, not to login", async () => {
+    it("sends a token exchange failure to the outcome page, not to login", async () => {
       createServerClient.mockResolvedValue(supabaseStub({ id: USER_ID }));
       getToken.mockRejectedValue(new Error("invalid_grant"));
 
       const response = await callCallback("?code=abc123&state=signed-state");
 
-      expect(locationOf(response).pathname).toBe("/dashboard");
+      expect(locationOf(response).pathname).toBe("/settings/gmail/success");
     });
 
     it("still sends an unauthenticated visitor to login", async () => {
