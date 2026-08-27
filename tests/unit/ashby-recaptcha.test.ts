@@ -39,9 +39,12 @@ function networkFailure(code: string): Error {
 // environment) had set and never gives it back, which is its own bug
 // independent of anything this test file is actually asserting.
 let priorHarvesterUrl: string | undefined;
+let priorHarvesterApiKey: string | undefined;
 
 beforeEach(() => {
   priorHarvesterUrl = process.env.HARVESTER_URL;
+  priorHarvesterApiKey = process.env.HARVESTER_API_KEY;
+  delete process.env.HARVESTER_API_KEY;
 });
 
 afterEach(() => {
@@ -50,6 +53,11 @@ afterEach(() => {
     delete process.env.HARVESTER_URL;
   } else {
     process.env.HARVESTER_URL = priorHarvesterUrl;
+  }
+  if (priorHarvesterApiKey === undefined) {
+    delete process.env.HARVESTER_API_KEY;
+  } else {
+    process.env.HARVESTER_API_KEY = priorHarvesterApiKey;
   }
 });
 
@@ -77,6 +85,19 @@ describe("mintAshbyRecaptchaToken", () => {
       pageAction: "submit",
       enterprise: false,
     });
+    expect(init.headers as Record<string, string>).not.toHaveProperty("X-API-Key");
+  });
+
+  it("sends X-API-Key when HARVESTER_API_KEY is set", async () => {
+    const fetchMock = mockFetchOnce(async () => jsonResponse(VALID_RESPONSE));
+    process.env.HARVESTER_URL = "https://harvester.internal";
+    process.env.HARVESTER_API_KEY = "sekret-harvester-key";
+
+    await mintAshbyRecaptchaToken("https://jobs.ashbyhq.com/ramp/abc123");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>)["X-API-Key"]).toBe("sekret-harvester-key");
   });
 
   it("falls back to the localhost harvester when HARVESTER_URL is unset", async () => {
