@@ -265,10 +265,22 @@ function mapUsage(usage: {
  * `apiKey` is read by the caller (see `lib/stagehand-session.ts`,
  * `FIREWORKS_API_KEY` falling back to `STAGEHAND_LLM_API_KEY`) so this file
  * stays free of `process.env` and is trivial to unit test.
+ *
+ * JOB-175 review fix: `modelSlug` used to be the module level
+ * `FIREWORKS_DEEPSEEK_MODEL` constant, hardcoded here. That made the
+ * `STAGEHAND_MODEL` env var caller side documented as a runtime override a
+ * lie: an operator who set it would have seen no error and quietly kept
+ * getting the pinned default. `modelSlug` now flows in from the caller,
+ * defaulting to {@link FIREWORKS_DEEPSEEK_MODEL} so existing sites and the
+ * unit tests keep working without a caller change, and so the env var
+ * override actually reaches the request path.
  */
-export function createFireworksClientLLM(apiKey: string): ClientLLM {
+export function createFireworksClientLLM(
+  apiKey: string,
+  modelSlug: string = FIREWORKS_DEEPSEEK_MODEL
+): ClientLLM {
   const provider = createOpenAICompatible({ name: "fireworks", baseURL: FIREWORKS_BASE_URL, apiKey });
-  const model = provider(FIREWORKS_DEEPSEEK_MODEL);
+  const model = provider(modelSlug);
 
   return {
     generate: async (request: GenerateRequest): Promise<GenerateResponse> => {
@@ -291,7 +303,7 @@ export function createFireworksClientLLM(apiKey: string): ClientLLM {
           usage = result.usage;
         } catch (err) {
           throw new Error(
-            `Fireworks adapter: ${FIREWORKS_DEEPSEEK_MODEL} did not return an object matching ` +
+            `Fireworks adapter: ${modelSlug} did not return an object matching ` +
               `the requested schema "${format.name}": ${err instanceof Error ? err.message : String(err)}`
           );
         }
@@ -335,7 +347,7 @@ export function createFireworksClientLLM(apiKey: string): ClientLLM {
         usage = result.usage;
       } catch (err) {
         throw new Error(
-          `Fireworks adapter: ${FIREWORKS_DEEPSEEK_MODEL} request failed: ` +
+          `Fireworks adapter: ${modelSlug} request failed: ` +
             `${err instanceof Error ? err.message : String(err)}`
         );
       }

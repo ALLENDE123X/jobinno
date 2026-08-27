@@ -80,6 +80,26 @@ describe("createFireworksClientLLM", () => {
     expect(modelFn).toHaveBeenCalledWith(FIREWORKS_DEEPSEEK_MODEL);
   });
 
+  it("passes an explicit modelSlug through to Fireworks instead of the default (JOB-175 review fix)", async () => {
+    // The whole point of the STAGEHAND_MODEL env var override is that a
+    // different Fireworks slug reaches the request path. This test would
+    // have failed on the first cut of this PR, before createFireworksClientLLM
+    // took a modelSlug parameter at all.
+    generateTextMock.mockResolvedValue({
+      text: "ok",
+      toolCalls: [],
+      finishReason: "stop",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, inputTokenDetails: {}, outputTokenDetails: {} },
+    });
+
+    const OVERRIDE = "accounts/fireworks/models/deepseek-v4-flash-0813";
+    const client = createFireworksClientLLM("test-key", OVERRIDE);
+    await client.generate(textRequest());
+
+    expect(modelFn).toHaveBeenCalledWith(OVERRIDE);
+    expect(modelFn).not.toHaveBeenCalledWith(FIREWORKS_DEEPSEEK_MODEL);
+  });
+
   it("happy path: maps a plain text completion back into Stagehand's response shape", async () => {
     generateTextMock.mockResolvedValue({
       text: "Clicked the submit button.",
