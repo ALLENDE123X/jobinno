@@ -61,6 +61,27 @@
  *      response after the submit request went out records
  *      `submission_unconfirmed`, and anything the module refused to send
  *      at all lands as `submission_blocked` for a later retry.
+ *
+ * ── JOB-227 ──────────────────────────────────────────────────────────────────
+ * The first live test against a real posting (Zip, Software Engineer
+ * Backend, 2026-08-27) got past the reCAPTCHA composite cleanly but came
+ * back with every field, including the system fields, reported as missing
+ * at submit. Two bugs in `setFieldValue` and `setFileFieldValue` accounted
+ * for it, both fixed here and explained where each function now lives:
+ *   1. Neither function ever read `data.setFormValue.errorMessages` (or
+ *      `setFormValueToFile`'s equivalent). A rejected field write and an
+ *      accepted one were indistinguishable — no transport level `errors`
+ *      either way — so the module logged nothing and moved on as if the
+ *      value had landed.
+ *   2. Both functions reused the single `formRenderIdentifier` discovery
+ *      returned for every later call, including the final submit. If Ashby
+ *      versions the render per write the way the naming (`FormRender`,
+ *      `applicationForm.id` aliased `formRenderIdentifier`) suggests it
+ *      might, every call after the first, and the submit call itself, would
+ *      have been referencing a snapshot that predates its own edit.
+ * Neither is confirmed against a live endpoint — see `runAshbyDirectSubmit`
+ * and the fixed functions below for the reasoning trail, and the PR
+ * description for what still needs a real Ashby posting to prove out.
  */
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
@@ -366,6 +387,14 @@ async function uploadResumeToS3(
 
 // ── Field set ────────────────────────────────────────────────────────────
 
+/**
+ * The render identifier a caller should use for whatever mutation comes
+ * next — the freshest one this write returned, or the one it was called
+ * with when the response carried nothing usable. See the JOB-227 note in
+ * the module header for why this exists.
+ */
+type SetFormValueResult = { nextFrid: string };
+
 async function setFieldValue(
   fetchImpl: FetchImpl,
   origin: string,
@@ -374,8 +403,8 @@ async function setFieldValue(
   formDefId: string,
   path: string,
   value: unknown
-): Promise<void> {
-  const { errors } = await gql(
+): Promise<SetFormValueResult> {
+  const { data, errors } = await gql(
     fetchImpl,
     origin,
     "ApiSetFormValue",
@@ -405,6 +434,28 @@ async function setFieldValue(
   if (errors && errors.length > 0) {
     throw new AshbyGqlError("ApiSetFormValue", describeErrors(errors), { errors });
   }
+  const result = data?.setFormValue as { id?: string; errorMessages?: string[] } | undefined;
+  const fieldErrors = result?.errorMessages ?? [];
+  if (fieldErrors.length > 0) {
+    // JOB-227 bug 1. A non empty `errorMessages` here means Ashby's own
+    // form engine rejected this write — wrong type for the field, a
+    // validation rule, whatever it decided — while the transport level
+    // `errors` array stayed empty because the REQUEST was fine, only the
+    // WRITE was not. The version of this function that shipped in JOB-214
+    // never read this field at all, so a rejected write and an accepted
+    // one were indistinguishable from here. Throwing routes the caller to
+    // `blocked()` with the real reason instead of silently treating a
+    // dropped value as a set one.
+    throw new AshbyGqlError(
+      "ApiSetFormValue",
+      `Ashby rejected the value for field ${JSON.stringify(path)}: ${fieldErrors.join("; ")}`
+    );
+  }
+  // JOB-227 bug 2. `id` is presumed to be the form's freshest render
+  // identifier after this write landed — see the module header. Threading
+  // it forward is free when Ashby does not actually version the FRID (the
+  // value simply repeats call to call) and closes the gap if it does.
+  return { nextFrid: typeof result?.id === "string" && result.id.length > 0 ? result.id : frid };
 }
 
 async function setFileFieldValue(
@@ -415,8 +466,8 @@ async function setFileFieldValue(
   formDefId: string,
   path: string,
   fileHandle: string
-): Promise<void> {
-  const { errors } = await gql(
+): Promise<SetFormValueResult> {
+  const { data, errors } = await gql(
     fetchImpl,
     origin,
     "ApiSetFormValueToFile",
@@ -446,6 +497,18 @@ async function setFileFieldValue(
   if (errors && errors.length > 0) {
     throw new AshbyGqlError("ApiSetFormValueToFile", describeErrors(errors), { errors });
   }
+  // Same JOB-227 pair of fixes as `setFieldValue` above: read the field
+  // level `errorMessages` instead of trusting an empty transport `errors`
+  // array, and thread the returned `id` forward as the next FRID.
+  const result = data?.setFormValueToFile as { id?: string; errorMessages?: string[] } | undefined;
+  const fieldErrors = result?.errorMessages ?? [];
+  if (fieldErrors.length > 0) {
+    throw new AshbyGqlError(
+      "ApiSetFormValueToFile",
+      `Ashby rejected the file attach for field ${JSON.stringify(path)}: ${fieldErrors.join("; ")}`
+    );
+  }
+  return { nextFrid: typeof result?.id === "string" && result.id.length > 0 ? result.id : frid };
 }
 
 // ── Submit ───────────────────────────────────────────────────────────────
@@ -1118,6 +1181,14 @@ export async function runAshbyDirectSubmit(
       e.field?.type !== "FileList"
   );
 
+  // JOB-227. The render identifier every mutation from here on uses.
+  // Starts as what discovery returned and advances after every
+  // `setFieldValue` / `setFileFieldValue` call that comes back with a
+  // fresher one — see the module header and `setFieldValue`'s own comment
+  // for why this exists. `submitForm` below reads whatever this holds by
+  // the time it runs, not `form.formRenderIdentifier` directly.
+  let frid = form.formRenderIdentifier;
+
   // ── 2. Upload the resume, when the form has a resume slot ──────────
   if (fileEntries.length === 0) {
     console.log(`${LOG} discovered form has no file field — skipping resume upload`);
@@ -1152,15 +1223,16 @@ export async function runAshbyDirectSubmit(
     }
     for (const entry of fileEntries) {
       try {
-        await setFileFieldValue(
+        const result = await setFileFieldValue(
           fetchImpl,
           ctx.origin,
           ctx.orgName,
-          form.formRenderIdentifier,
+          frid,
           form.formDefinitionIdentifier,
           entry.field.path,
           handleInfo.handle
         );
+        frid = result.nextFrid;
       } catch (err) {
         return await blocked(
           `could not attach the uploaded resume to Ashby field ${JSON.stringify(entry.field.path)}: ` +
@@ -1184,15 +1256,16 @@ export async function runAshbyDirectSubmit(
       continue;
     }
     try {
-      await setFieldValue(
+      const result = await setFieldValue(
         fetchImpl,
         ctx.origin,
         ctx.orgName,
-        form.formRenderIdentifier,
+        frid,
         form.formDefinitionIdentifier,
         entry.field.path,
         value
       );
+      frid = result.nextFrid;
     } catch (err) {
       return await blocked(
         `could not set Ashby field ${JSON.stringify(entry.field.title)}: ` +
@@ -1242,7 +1315,9 @@ export async function runAshbyDirectSubmit(
     outcome = await submitForm(fetchImpl, ctx.origin, {
       orgName: ctx.orgName,
       jobPostingId: ctx.jobPostingId,
-      frid: form.formRenderIdentifier,
+      // JOB-227: whatever `frid` holds by now, not the value discovery
+      // returned. See the comment where `frid` is declared above.
+      frid,
       formDefId: form.formDefinitionIdentifier,
       actionIdentifier: form.actionIdentifier,
       recaptchaToken,

@@ -216,6 +216,54 @@ function emptyDiscoveryResponse(): Response {
 }
 
 /**
+ * A discovery response carrying two mapped system fields (name, email),
+ * both required. Used by the JOB-227 tests below to walk the
+ * `setFieldValue` call path — `emptyDiscoveryResponse` above has no value
+ * entries at all, so it never reaches that code.
+ */
+function discoveryWithTwoMappedFields(): Response {
+  return jsonResponse({
+    data: {
+      jobPosting: {
+        id: "job-1",
+        title: "Test Engineer",
+        applicationForm: {
+          id: "frid-1",
+          sourceFormDefinitionId: "formdef-1",
+          formControls: [{ identifier: "submit-1", title: "Submit" }],
+          sections: [
+            {
+              title: "Application",
+              fieldEntries: [
+                {
+                  id: "entry-name",
+                  isRequired: true,
+                  isHidden: false,
+                  field: { path: "_systemfield_name", title: "Name", type: "String" },
+                },
+                {
+                  id: "entry-email",
+                  isRequired: true,
+                  isHidden: false,
+                  field: { path: "_systemfield_email", title: "Email", type: "String" },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  });
+}
+
+/** Extracts the GraphQL variables body a mocked fetch call was sent. */
+function variablesFromFetchCall(fetchImpl: ReturnType<typeof vi.fn>, callIndex: number): Record<string, unknown> {
+  const call = fetchImpl.mock.calls[callIndex] as [string, { body?: string }];
+  const body = JSON.parse(call[1]?.body ?? "{}") as { variables?: Record<string, unknown> };
+  return body.variables ?? {};
+}
+
+/**
  * A discovery response carrying one required text field with no keyword
  * `candidateValueForField` will match. Used to prove that a required
  * unmapped field routes to submission_blocked without a submit call.
@@ -423,6 +471,90 @@ describe("runAshbyDirectSubmit", () => {
         message?: string;
       } | undefined;
       expect(skipContext?.message).toContain("What is your favourite prime number?");
+    }
+  );
+
+  // ── JOB-227 ─────────────────────────────────────────────────────────
+
+  it(
+    "threads the render identifier each setFormValue response returns into the next call and into submit",
+    async () => {
+      const { client } = makeFakeSupabase();
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(discoveryWithTwoMappedFields())
+        // setFormValue for the name field returns a fresher id.
+        .mockResolvedValueOnce(
+          jsonResponse({ data: { setFormValue: { id: "frid-after-name", errorMessages: [] } } })
+        )
+        // setFormValue for the email field returns a fresher id again.
+        .mockResolvedValueOnce(
+          jsonResponse({ data: { setFormValue: { id: "frid-after-email", errorMessages: [] } } })
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({
+            data: {
+              submitApplicationFormAction: {
+                applicationFormResult: { __typename: "FormSubmitSuccess" },
+              },
+            },
+          })
+        );
+
+      const result = await runAshbyDirectSubmit(baseContext(), {
+        fetch: fetchImpl as unknown as typeof globalThis.fetch,
+        mintRecaptchaToken: async () => "harvester-token-frid",
+        supabase: client as never,
+        now: () => new Date("2026-08-27T12:00:00Z"),
+      });
+
+      expect(result.status).toBe(APPLICATION_STATUS.SUBMITTED);
+      // Call 0 is discovery, 1 is the name field's setFormValue (still
+      // carrying the FRID discovery returned), 2 is the email field's
+      // setFormValue (must carry the id call 1 returned, not discovery's),
+      // 3 is submit (must carry the id call 2 returned).
+      expect(variablesFromFetchCall(fetchImpl, 1).formRenderIdentifier).toBe("frid-1");
+      expect(variablesFromFetchCall(fetchImpl, 2).formRenderIdentifier).toBe("frid-after-name");
+      expect(variablesFromFetchCall(fetchImpl, 3).formRenderIdentifier).toBe("frid-after-email");
+    }
+  );
+
+  it(
+    "routes a setFormValue response carrying errorMessages to submission_blocked instead of treating the write as landed",
+    async () => {
+      const { client, calls } = makeFakeSupabase();
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(discoveryWithTwoMappedFields())
+        // Transport level `errors` stays empty — the request itself was
+        // fine — but the field level `errorMessages` says the write was
+        // rejected. Before JOB-227 this looked identical to a success.
+        .mockResolvedValueOnce(
+          jsonResponse({
+            data: { setFormValue: { id: "frid-2", errorMessages: ["Value exceeds max length"] } },
+          })
+        );
+      const mint = vi.fn().mockResolvedValue("harvester-token-should-not-be-called");
+
+      const result = await runAshbyDirectSubmit(baseContext(), {
+        fetch: fetchImpl as unknown as typeof globalThis.fetch,
+        mintRecaptchaToken: mint,
+        supabase: client as never,
+        now: () => new Date("2026-08-27T12:00:00Z"),
+      });
+
+      expect(result.status).toBe(APPLICATION_STATUS.SUBMISSION_BLOCKED);
+      expect(result.submitted).toBe(false);
+      expect(result.submitAttempted).toBe(false);
+      expect(result.blockedReason).toContain("Value exceeds max length");
+      expect(result.blockedReason).toContain("Name");
+      // Discovery plus the one rejected setFormValue call. No further
+      // field set, no mint, no submit — the module stops the moment a
+      // write comes back rejected rather than continuing as if it landed.
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(mint).not.toHaveBeenCalled();
+      const skipInsert = calls.find((c) => c.table === "skip_log" && c.op === "insert");
+      expect(skipInsert).toBeDefined();
     }
   );
 });
