@@ -201,7 +201,29 @@ export async function GET(request: NextRequest) {
     });
   }
 
-  const { data: updatedRows, error: writeError } = await createServiceRoleClient()
+  // JOB-200: the service role factory throws a bare `Error` when
+  // `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` are unset. Unwrapped that
+  // surfaces as a framework 500 with a stack trace, past the redirect the
+  // rest of this handler uses on every other failure branch. The detail
+  // names which SUPABASE_* variable is empty and stays in the log; the
+  // redirect reason is generic on purpose. Neither `refreshToken` nor
+  // `encryptedRefreshToken` appears in the log line, matching the header's
+  // "Never logged" rule above.
+  let serviceClient: ReturnType<typeof createServiceRoleClient>;
+  try {
+    serviceClient = createServiceRoleClient();
+  } catch (thrown) {
+    const detail =
+      thrown instanceof Error ? thrown.message : "service role client unavailable";
+    console.error(
+      `${LOG} service role client unavailable for user ${user.id}: ${detail}`
+    );
+    return redirectTo(request, POST_AUTH_FAILURE_PATH, {
+      error: "Gmail connected, but saving it failed. Try again.",
+    });
+  }
+
+  const { data: updatedRows, error: writeError } = await serviceClient
     .from("profiles")
     .update({ gmail_refresh_token: encryptedRefreshToken })
     .eq("id", user.id)
