@@ -2470,6 +2470,16 @@ async function runSubmitPhase(
       // data so `blocked()` below can name the real reason. JOB-202.
       const patchOutcome = await session.page.evaluate(
         (token: string): { __error?: string } | null => {
+          // Local `__name` identity, same shape `inPageExpression()` in
+          // form-fields.ts installs, and for the same reason: tsx compiles
+          // shorthand method definitions and arrow functions into calls to
+          // `__name(fn, "name")` for `.name` metadata at runtime. That helper
+          // does not exist in the page's global scope, so the first line of
+          // the serialized function throws `ReferenceError: __name is not
+          // defined` before anything else can run. A local identity makes
+          // every such call a no op. Observed live 2026 08 27 against Ramp.
+          const __name = <T>(fn: T): T => fn;
+          void __name;
           try {
             type PatchableGrecaptcha = {
               execute?: (...args: unknown[]) => Promise<string>;
