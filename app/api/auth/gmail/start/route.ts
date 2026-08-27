@@ -55,9 +55,16 @@ export async function GET(request: NextRequest) {
 
   let redirectUri: string;
   let clientId: string;
+  let state: string;
   try {
     redirectUri = gmailOAuthRedirectUri(request.nextUrl.origin);
     clientId = requireGoogleOAuthClientId();
+    // signGmailOAuthState throws GmailOAuthStateError when
+    // GMAIL_OAUTH_STATE_SECRET is unset or blank (see lib/gmail-oauth.ts).
+    // That is exactly the same class of misconfiguration as a missing
+    // GOOGLE_OAUTH_CLIENT_ID, so it belongs inside this same try block
+    // rather than escaping uncaught into a generic 500.
+    state = signGmailOAuthState(user.id);
   } catch (err) {
     // Naming what failed in the log is fine here: neither message ever
     // carries a secret, only an origin or an env var name.
@@ -67,8 +74,6 @@ export async function GET(request: NextRequest) {
       { status: 400 }
     );
   }
-
-  const state = signGmailOAuthState(user.id);
 
   const authorizeUrl = new URL(GOOGLE_AUTHORIZE_URL);
   authorizeUrl.searchParams.set("client_id", clientId);

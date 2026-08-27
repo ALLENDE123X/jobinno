@@ -83,12 +83,23 @@ function harvesterApiKey(): string | undefined {
   return configured && configured.length > 0 ? configured : undefined;
 }
 
-/** ECONNREFUSED and ETIMEDOUT are the only two the ticket calls out as transient. */
+/**
+ * ECONNREFUSED, ECONNRESET and ETIMEDOUT are all connection level failures
+ * that a retry can plausibly ride out. EAI_AGAIN is the DNS resolver's own
+ * "temporary failure in name resolution" code and is transient by definition.
+ * ENOTFOUND ("no such host") is deliberately excluded: it means the name did
+ * not resolve to anything, which a retry a few seconds later will not fix.
+ */
 function isTransientNetworkFailure(err: unknown): boolean {
   const code =
     (err as { cause?: { code?: string } } | undefined)?.cause?.code ??
     (err as { code?: string } | undefined)?.code;
-  return code === "ECONNREFUSED" || code === "ETIMEDOUT";
+  return (
+    code === "ECONNREFUSED" ||
+    code === "ECONNRESET" ||
+    code === "ETIMEDOUT" ||
+    code === "EAI_AGAIN"
+  );
 }
 
 /** HTTP statuses that say "the harvester itself is unavailable right now", not "no". */

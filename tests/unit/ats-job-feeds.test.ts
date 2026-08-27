@@ -296,6 +296,34 @@ describe("classifyTitle", () => {
     ).toBe(true);
     expect(classifyTitle("Web Developer - Entry Level").relevant).toBe(true);
   });
+
+  // ── JOB-198: CodeRabbit found two hyphen and phrase gaps on PR #186 ──
+  it("rejects a hyphenated Vice-President title", () => {
+    // SENIORITY_RE previously required whitespace between "vice" and
+    // "president", so the hyphenated form slipped through.
+    expect(
+      classifyTitle("Vice-President, Software Engineer, New Grad Program").relevant
+    ).toBe(false);
+    // The whitespace form and a hyphenated form with extra spacing still
+    // reject, so the fix does not narrow the existing match.
+    expect(
+      classifyTitle("Vice President, Software Engineer, New Grad Program").relevant
+    ).toBe(false);
+    expect(
+      classifyTitle("Vice - President, Software Engineer, New Grad Program").relevant
+    ).toBe(false);
+  });
+
+  it("rejects a product management title as well as product manager", () => {
+    // NON_ENGINEERING_ROLE_RE previously matched "product manager" but not
+    // "product management", so this title slipped through despite carrying
+    // an internship signal and an engineering word.
+    expect(
+      classifyTitle("Product Management Intern - Software Engineering").relevant
+    ).toBe(false);
+    // The existing "product manager" match keeps working.
+    expect(classifyTitle("Product Manager, Growth").relevant).toBe(false);
+  });
 });
 
 describe("toPlainText", () => {
