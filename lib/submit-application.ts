@@ -339,6 +339,32 @@ const AUTOMATION_REJECTION_RE =
 const MAX_REJECTION_QUOTE_CHARS = 300;
 
 /**
+ * JOB-207. What is written into `applications.confirmation_text` when a run
+ * ended `submission_unconfirmed` because the board's own words rejected the
+ * submission as automated. The `rejected:` prefix is the whole point: a human
+ * reading the row in the database — not the skip log, not the reason string —
+ * has to be able to tell this apart from a `submission_unconfirmed` row whose
+ * click landed and whose outcome merely could not be read. `confirmation_text`
+ * is normally the receipt column, so any value in it that is not a receipt has
+ * to name itself as not a receipt right at the front. Kept short and quoted
+ * verbatim from the page rather than paraphrased, for the same reason
+ * `boardRejectedAsAutomated` quotes rather than paraphrases.
+ *
+ * How much of `applications.confirmation_text` this leaves for the quote is
+ * roughly 500 characters — the column has no width limit at the database level,
+ * but downstream consumers (the dashboard, the skip log renderer) truncate
+ * around this range and there is no point storing a longer string.
+ */
+export const REJECTED_CONFIRMATION_TEXT_PREFIX = "rejected: ";
+const MAX_REJECTED_CONFIRMATION_TEXT_CHARS = 500;
+
+export function buildRejectedConfirmationText(rejectionQuote: string): string {
+  const room = MAX_REJECTED_CONFIRMATION_TEXT_CHARS - REJECTED_CONFIRMATION_TEXT_PREFIX.length;
+  const quote = rejectionQuote.length > room ? `${rejectionQuote.slice(0, room - 1)}…` : rejectionQuote;
+  return `${REJECTED_CONFIRMATION_TEXT_PREFIX}${quote}`;
+}
+
+/**
  * The matched accusation plus enough of what surrounds it to read as a
  * sentence, sanitised, or null when the page never made one.
  *
@@ -898,6 +924,27 @@ export function judgeSubmission(capture: ConfirmationCapture, wasAt: string): Su
   const confirmationContradicted = capture.confirmationPresent && continuedToFurtherStep;
   const verdict = { navigated, continuedToFurtherStep, confirmationContradicted, evidence };
 
+  // ══ JOB-207: the board's own accusation vetoes every positive signal ═════
+  // If `automationRejection` is set, the page contains the board's own words
+  // saying the submission was scored as spam or automation and refused. On the
+  // 2026 08 27 Ramp / Ashby run that produced this ticket, Ashby replaced the
+  // form itself with its "we couldn't submit your application" message, so
+  // `applicationFormStillPresent` read as false and `!formStillPresent &&
+  // !continuedToFurtherStep` below routed the outcome to `succeed()`. That
+  // wrote `submitted` — the one terminal status this file exists to be careful
+  // with — to a row the employer had refused. This is the veto that would have
+  // stopped that: the accusation itself outranks every other positive signal
+  // in the capture, because a board's own sentence about what it did with the
+  // click is stronger evidence of what happened than a model's reading of what
+  // else is on the page.
+  //
+  // Written into the pure verdict rather than only into `runSubmitPhase` so
+  // the invariant `automationRejection !== null → !submitted` is a property
+  // of the code checkable by a unit test, and so a future edit that reorders
+  // the branches in `runSubmitPhase` cannot re-open this hole.
+  if (capture.automationRejection !== null) {
+    return { submitted: false, ...verdict };
+  }
   // The board saying so, in its own words. Still the strongest signal there is
   // and the one a board that redirects to a real thank you page will always
   // produce — but no longer sufficient *on its own*, because a model's reading
@@ -2170,7 +2217,18 @@ async function runSubmitPhase(
    * never happen, so a database failure is downgraded to a very loud log rather
    * than allowed to become an exception.
    */
-  const unconfirmed = async (why: string): Promise<SubmitApplicationResult> => {
+  const unconfirmed = async (
+    why: string,
+    // JOB-207. `confirmationText` is normally not written on this path — it is
+    // the column `succeed()` uses for a receipt. But when the reason a run
+    // ended `submission_unconfirmed` was the board saying, in its own words,
+    // that this was a rejection, a human reading only the row (rather than the
+    // skip log) has to be able to tell it apart from a real submit whose
+    // confirmation wording could not be read. The caller writes a
+    // "rejected: ..." string into this argument and it lands in the same
+    // column a receipt would.
+    opts: { confirmationText?: string } = {}
+  ): Promise<SubmitApplicationResult> => {
     // JOB-133. `why` describes the page a capture was read off; this appends
     // the board's disagreement with it, when there is one. Never replaces it:
     // the reason a human is given has to stay the reason the code acted on.
@@ -2187,6 +2245,9 @@ async function runSubmitPhase(
         status: APPLICATION_STATUS.SUBMISSION_UNCONFIRMED,
         submittedAt: new Date().toISOString(),
         browserbaseSessionId: session.browser.sessionId ?? null,
+        ...(opts.confirmationText === undefined
+          ? {}
+          : { confirmationText: opts.confirmationText }),
       });
       rowUpdated = true;
     } catch (err) {
@@ -2234,7 +2295,7 @@ async function runSubmitPhase(
     return await finish({
       status: APPLICATION_STATUS.SUBMISSION_UNCONFIRMED,
       submitted: false,
-      confirmationRef: null,
+      confirmationRef: opts.confirmationText ?? null,
       confirmation: null,
       blockedReason: null,
       unconfirmedReason: reported,
@@ -2633,6 +2694,50 @@ async function runSubmitPhase(
       return await succeed(capture, fill.finalUrl, `the "${choice.label}" click`);
     }
 
+    // ══ JOB-207: the board's own accusation, before anything else ════════════
+    // Hoisted above `confirmationContradicted` and `navigated` because on the
+    // 2026 08 27 Ramp / Ashby run the board replaced the form with its
+    // "flagged as possible spam" page in-place: the form was gone, so
+    // `judgeSubmission` — before JOB-207 — read that as a submission, and the
+    // row went to `submitted` (terminal) instead of `submission_unconfirmed`.
+    // `judgeSubmission` now vetoes `submitted` when `automationRejection` is
+    // set, so control reaches here, and this is the branch that files the run
+    // correctly.
+    //
+    // Taken ahead of `navigated` too, and not only ahead of `verdict.submitted`,
+    // because we do not know whether a future Ashby refusal will render
+    // in-place (as this one did) or redirect: the `verdict.navigated` branch
+    // below files `submit_failed` without the `bot_detected` reason code, and
+    // that classification is what the operator dashboard uses to route
+    // human attention. The board's own words about *why* it refused always
+    // outrank the board's URL about *where* it went.
+    //
+    // `confirmation_text` is set to `rejected: <quote>` so a human reading only
+    // the row can tell this apart from a `submission_unconfirmed` row whose
+    // click landed and whose outcome merely could not be read. Sanitisation
+    // and the length cap have already been applied by `boardRejectedAsAutomated`
+    // when the capture was built; `buildRejectedConfirmationText` only prefixes
+    // and re-caps if the target column is narrower.
+    //
+    // The `submission_unconfirmed` status is deliberate and matches HARD STOP 8
+    // in the memory tree: `submitted` is terminal and can never be undone;
+    // `submission_unconfirmed` means "the button was clicked and the outcome is
+    // negative", and it must never be retried automatically. This module already
+    // guarantees no automatic retry — `preflight` refuses rows at this status —
+    // so this is where the honest outcome for a rejection is filed.
+    if (capture.automationRejection !== null) {
+      return await unconfirmed(
+        `${AUTOMATION_TAG}: "${choice.label}" was clicked at "${capture.url}" and the board ` +
+          `refused the submission as automated traffic, in its own words: ` +
+          `${JSON.stringify(capture.automationRejection)}.${errorsFor(capture)} This is not an ` +
+          `ambiguous outcome and it is not a form the candidate got wrong. The board scored the ` +
+          `browser doing the submitting and declined it, so clicking again from the same browser ` +
+          `would be refused the same way. Nothing is retried and no second click is issued. What ` +
+          `wants fixing is on this side: how the submitting browser presents itself.`,
+        { confirmationText: buildRejectedConfirmationText(capture.automationRejection) }
+      );
+    }
+
     // ══ JOB-124: the page claims a confirmation and names itself a step ══════
     // Its own exit, ahead of both branches below, for two reasons that are
     // about them rather than about this one.
@@ -2727,31 +2832,17 @@ async function runSubmitPhase(
     // `unconfirmed()`.
     const errors = errorsFor(capture);
 
-    // ══ JOB-026: the board sometimes says why, and it used to go unread ══════
-    // Checked before the code prompt reads below, and ahead of them on purpose:
-    // a board that has just called this submission spam is not also asking for
-    // a one-time code, and the two reads underneath are a DOM sweep and a page
-    // evaluate against a page that has already given its answer. Everything
-    // below is written in the language of "most likely"; this is the one branch
-    // here that knows rather than guesses, so it goes first.
-    //
-    // The status stays `submission_unconfirmed` and nothing is retried. That is
-    // not hedging about what happened on the page, which is not in doubt: it is
-    // that the submit control was clicked, and no wording on a page is evidence
-    // about what the employer's own system did with the click before rendering
-    // it. What changes is the reason filed against it, which is now the true
-    // one, and the sentence the person reads on their dashboard.
-    if (capture.automationRejection !== null) {
-      return await unconfirmed(
-        `${AUTOMATION_TAG}: "${choice.label}" was clicked at "${capture.url}" and the board ` +
-          `refused the submission as automated traffic, in its own words: ` +
-          `${JSON.stringify(capture.automationRejection)}.${errors} This is not an ambiguous ` +
-          `outcome and it is not a form the candidate got wrong. The board scored the browser ` +
-          `doing the submitting and declined it, so clicking again from the same browser would ` +
-          `be refused the same way. Nothing is retried and no second click is issued. What ` +
-          `wants fixing is on this side: how the submitting browser presents itself.`
-      );
-    }
+    // JOB-207 moved the `capture.automationRejection` check out of this block
+    // and up above `verdict.confirmationContradicted` and `verdict.navigated`.
+    // The reason it used to live here was that JOB-106 had already ruled out
+    // navigation and a confirmation claim, so "the same URL, form still on
+    // screen, no confirmation" was a safe frame to file a rejection under. That
+    // frame was too narrow for the 2026 08 27 Ramp / Ashby run, whose refusal
+    // page removed the form entirely — `judgeSubmission` read that as a
+    // submission and never reached this block. The check now runs before any
+    // of the branches above, so a board that says in its own words that it
+    // rejected the submission wins over every positive signal in the capture,
+    // whether or not it also navigated. See that branch for the full reasoning.
 
     // Two independent readings have to agree before a code is even looked for:
     // the page saying it emailed one, and a `document.querySelectorAll` sweep
@@ -3027,7 +3118,12 @@ async function runSubmitPhase(
         `${AUTOMATION_TAG}: "${choice.label}" was clicked a second time with the emailed ` +
           `security code entered, and the board refused the submission as automated traffic, in ` +
           `its own words: ${JSON.stringify(resubmitCapture.automationRejection)}.` +
-          `${resubmitErrors} The code was not the problem. There is no third click.`
+          `${resubmitErrors} The code was not the problem. There is no third click.`,
+        // JOB-207. Same as the first-click path: write a `rejected:` prefix
+        // into `confirmation_text` so a human reading only the row can tell
+        // this apart from a `submission_unconfirmed` row whose outcome merely
+        // could not be read.
+        { confirmationText: buildRejectedConfirmationText(resubmitCapture.automationRejection) }
       );
     }
 
