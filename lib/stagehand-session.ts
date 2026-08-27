@@ -50,7 +50,7 @@ import {
   planRecord,
   type ActionPlan,
 } from "@/lib/form-action-cache";
-import { createFireworksClientLLM } from "@/lib/fireworks-client-llm";
+import { FIREWORKS_DEEPSEEK_MODEL, createFireworksClientLLM } from "@/lib/fireworks-client-llm";
 
 /**
  * JOB-029 (issue #47): `@browserbasehq/stagehand`'s package.json declares
@@ -92,20 +92,44 @@ function loadStagehandRuntime(): Promise<StagehandRuntime> {
 }
 
 /**
- * Model driving `act`/`extract`/`observe`. Stagehand validates this string
- * against a closed per-provider allowlist at `Stagehand.create()`, so the
- * provider prefix is mandatory and a typo fails before any request is billed.
+ * Model driving `act`/`extract`/`observe`. The default is Fireworks hosted
+ * DeepSeek V4 Flash (see `lib/fireworks-client-llm.ts` for the model slug's
+ * live verification, the ClientLLM adapter, and the reason a `modelName`
+ * string cannot point at Fireworks directly under Stagehand v4's pinned
+ * `ModelConfigSchema`).
  *
- * JOB-175: this is the default and stays the default. Setting
- * `STAGEHAND_LLM_PROVIDER=fireworks` swaps `openBrowserSession` onto the
- * `lib/fireworks-client-llm.ts` adapter instead (Fireworks-hosted DeepSeek V4
- * Flash), which does not go through this constant or through
- * `ModelConfigSchema` at all — see that file's header for why a `ClientLLM`
- * callback was the only path available under the pinned Stagehand version.
+ * JOB-175 flipped the default here from `openai/gpt-5.6-luna` (OpenCode zen,
+ * $1 in / $6 out per M tokens) to Fireworks DeepSeek V4 Flash ($0.22 in /
+ * $0.66 out per M tokens): ~78% cheaper input and ~89% cheaper output, on
+ * Western infrastructure, with a real capability lift for the structured
+ * DOM and code work `act`/`extract`/`observe` do. The switch itself is the
+ * deliverable of #175; the live end-to-end validation against a real form
+ * fill lands with #207/#211/#212.
+ *
+ * The env var `STAGEHAND_MODEL` overrides this at runtime with no code
+ * change, so a rollback or an A/B swap is one Vercel dashboard edit. The
+ * model id whose prefix is `accounts/fireworks/` is routed through
+ * `createFireworksClientLLM` below; anything else is passed to Stagehand's
+ * built in `ModelConfigSchema` path and must be a slug that schema accepts
+ * (see `node_modules/@browserbasehq/stagehand/dist/index.d.mts` for the
+ * closed union). {@link STAGEHAND_OPENAI_FALLBACK_MODEL} names the specific
+ * OpenAI slug the fallback path uses when a caller opts out via
+ * `STAGEHAND_LLM_PROVIDER=openai`.
  */
-export const STAGEHAND_MODEL = "openai/gpt-5.6-luna" as const;
+/** JOB-175: reads the effective model id from env once, defaulting to the Fireworks DeepSeek V4 Flash slug. Exposed as a function so a test can inject an env without mutating the process's own. The parameter shape matches {@link EnvSource} defined below; a lightweight structural type keeps the model resolver above the browser provider code without forward reference gymnastics. */
+export function resolveStagehandModel(env: Record<string, string | undefined> = process.env): string {
+  const raw = env.STAGEHAND_MODEL;
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  return trimmed.length > 0 ? trimmed : FIREWORKS_DEEPSEEK_MODEL;
+}
 
-/** Set to exactly `"fireworks"` to drive Stagehand with Fireworks' DeepSeek V4 Flash instead of {@link STAGEHAND_MODEL}. Any other value, including unset, keeps the OpenAI path. */
+/** JOB-175: the effective model id at import time. Read once so a session and a log line always name the same string; runtime overrides happen through the env var {@link resolveStagehandModel} consults. */
+export const STAGEHAND_MODEL: string = resolveStagehandModel();
+
+/** JOB-175: the OpenAI slug the fallback path uses when a caller opts out with `STAGEHAND_LLM_PROVIDER=openai`. Held as a literal so it type checks against Stagehand v4's `ModelConfigSchema` closed union without a cast. */
+export const STAGEHAND_OPENAI_FALLBACK_MODEL = "openai/gpt-5.6-luna" as const;
+
+/** Set to exactly `"openai"` to opt out of the JOB-175 Fireworks default and route Stagehand through {@link STAGEHAND_OPENAI_FALLBACK_MODEL} instead. Any other value, including unset, keeps the Fireworks path. */
 export const STAGEHAND_LLM_PROVIDER_ENV_VAR = "STAGEHAND_LLM_PROVIDER";
 
 /**
@@ -827,18 +851,26 @@ async function watchForCaptchaSolvingEvidence(page: Page, logTag: string): Promi
 export async function openBrowserSession(
   options: OpenBrowserSessionOptions
 ): Promise<BrowserSession> {
-  const usesFireworks = process.env[STAGEHAND_LLM_PROVIDER_ENV_VAR] === "fireworks";
+  // JOB-175: Fireworks is the default. Route through the ClientLLM adapter
+  // whenever the resolved model id names a Fireworks slug (which the default
+  // does, and which STAGEHAND_MODEL=... can keep or change without a code
+  // edit). The `STAGEHAND_LLM_PROVIDER=openai` env var is the single
+  // documented opt out from the Fireworks default; it forces the OpenAI
+  // fallback path regardless of the resolved model string, so a rollback is
+  // one env var flip on Vercel with no redeploy.
+  const optedOutToOpenAI = process.env[STAGEHAND_LLM_PROVIDER_ENV_VAR] === "openai";
+  const usesFireworks = !optedOutToOpenAI && STAGEHAND_MODEL.startsWith("accounts/fireworks/");
   const apiKey = usesFireworks
     ? process.env.FIREWORKS_API_KEY || process.env.STAGEHAND_LLM_API_KEY
     : process.env.STAGEHAND_LLM_API_KEY;
   if (!apiKey) {
     throw new Error(
       usesFireworks
-        ? `FIREWORKS_API_KEY env var is required (falls back to STAGEHAND_LLM_API_KEY) when ` +
-          `${STAGEHAND_LLM_PROVIDER_ENV_VAR}=fireworks — see .env.example.`
+        ? `FIREWORKS_API_KEY env var is required (falls back to STAGEHAND_LLM_API_KEY) to pay ` +
+          `for Stagehand calls against ${STAGEHAND_MODEL} on Fireworks. See .env.example.`
         : "STAGEHAND_LLM_API_KEY env var is required (the LLM key Stagehand drives " +
-          `${STAGEHAND_MODEL} with — see .env.example). This is a dedicated key for this ` +
-          `pipeline; do not point it at another project's key.`
+          `${STAGEHAND_OPENAI_FALLBACK_MODEL} with. See .env.example). This is a dedicated ` +
+          `key for this pipeline; do not point it at another project's key.`
     );
   }
 
@@ -914,7 +946,14 @@ export async function openBrowserSession(
   try {
     const stagehand = await Stagehand.create({
       browser,
-      model: usesFireworks ? createFireworksClientLLM(apiKey) : { modelName: STAGEHAND_MODEL, apiKey },
+      // JOB-175: STAGEHAND_OPENAI_FALLBACK_MODEL is a literal type Stagehand v4's
+      // `ModelConfigSchema` accepts. STAGEHAND_MODEL is a wide string because the
+      // env var override can name any Fireworks slug the adapter supports, and
+      // the OpenAI path here is only reached when the caller has explicitly
+      // opted out of Fireworks, so it does not need to carry that wide type.
+      model: usesFireworks
+        ? createFireworksClientLLM(apiKey)
+        : { modelName: STAGEHAND_OPENAI_FALLBACK_MODEL, apiKey },
       domSettleTimeoutMs: DOM_SETTLE_TIMEOUT_MS,
       // Re-find a control whose cached selector no longer resolves rather than
       // failing the run. Only ever re-finds the control the instruction already
