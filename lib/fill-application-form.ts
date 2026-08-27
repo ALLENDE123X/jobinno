@@ -179,6 +179,12 @@ import { checkApplyUrl, forLog } from "@/lib/apply-url-guard";
 // allowlist drift, and a drifted allowlist here means either a dead link or an
 // opened one that should not have been.
 import { allowedSenderDomains } from "@/lib/future-gmail/gmail-verification-listener";
+// JOB-211 — the fresh reader (not from `lib/future-gmail/`) and its per ATS
+// sender allowlist. Wired into `completeVerification` below so a live submit
+// run parked at `awaiting_verification` reads its own code from Gmail when
+// the caller passes no verification input.
+import { lookupVerificationSenders } from "@/lib/ats-verification-senders";
+import { findVerificationCode } from "@/lib/gmail-verification-reader";
 import {
   closeBrowserSession,
   openBrowserSession,
@@ -2155,14 +2161,31 @@ async function completeVerification(
   }
 
   const link = input?.link?.trim() || null;
-  const code = input?.code?.trim() || null;
+  let code = input?.code?.trim() || null;
+  let codeSource: "input" | "gmail" = "input";
   if (link === null && code === null) {
-    throw new FormFillBlockedError(
-      `applications ${state.jobApplicationId} is at ` +
-        `"${APPLICATION_STATUS.AWAITING_VERIFICATION}" but no verification code or link was ` +
-        `supplied. ACT-006 carries both on its \`${"email/verification-received"}\` event ` +
-        `(verificationCode / verificationLink) — pass them through. Nothing was opened.`
-    );
+    // JOB-211 wiring — when the caller passed no verification input, try the
+    // Gmail reader before failing. The manual input path above always wins: a
+    // caller that supplied a code or a link goes through the same branches
+    // that existed before this ticket, and a broken Gmail read here can
+    // never turn a supplied code into a failed run. When no input was passed
+    // and no refresh token exists on the profile, the reader returns
+    // `no_gmail_connection` and the same `FormFillBlockedError` this branch
+    // has always thrown is what a human sees.
+    const readResult = await tryReadVerificationCodeFromGmail(state);
+    if (readResult !== null) {
+      code = readResult;
+      codeSource = "gmail";
+    } else {
+      throw new FormFillBlockedError(
+        `applications ${state.jobApplicationId} is at ` +
+          `"${APPLICATION_STATUS.AWAITING_VERIFICATION}" but no verification code or link was ` +
+          `supplied and no Gmail verification code could be read for user ${state.candidateId}. ` +
+          `Either pass verificationCode / verificationLink through, or make sure the Gmail ` +
+          `connection is set on the profile and the ATS "${state.ats}" is in the sender ` +
+          `allowlist. Nothing was opened.`
+      );
+    }
   }
 
   let method: "link" | "code" = link !== null ? "link" : "code";
@@ -2209,7 +2232,9 @@ async function completeVerification(
           `used, or belonging to a different signup). Nothing else was touched.`
       );
     }
-    detail += `; entered the ${code.length}-character code and the board accepted it`;
+    detail +=
+      `; entered the ${code.length}-character code and the board accepted it` +
+      (codeSource === "gmail" ? " (code read from Gmail by JOB-211)" : "");
   }
 
   // Recorded before the form is touched, on purpose: verification links and
@@ -2222,6 +2247,73 @@ async function completeVerification(
   console.log(`${LOG} applications ${state.jobApplicationId} → ${APPLICATION_STATUS.EMAIL_VERIFIED}`);
 
   return { required: true, method, completed: true, detail, signals };
+}
+
+/**
+ * JOB-211 — try the Gmail reader for a verification code on this ATS.
+ *
+ * Returns the code string on success, or `null` on any outcome that must not
+ * change the caller's behaviour (no Gmail connection, timeout, no match, auth
+ * failure). A `null` here restores the exact pre-JOB-211 behaviour of the
+ * `completeVerification` branch above: the caller throws the same
+ * `FormFillBlockedError` it always has.
+ *
+ * ── Why this is narrow on purpose ────────────────────────────────────────────
+ * The caller is holding a live browser sitting on a half submitted
+ * application. The whole read must fit inside a 60 second wall clock budget,
+ * every failure mode is recoverable by falling back to the manual code entry
+ * path a human can still use, and the reader is only ever called after the
+ * manual input path has already been given precedence. See
+ * `lib/gmail-verification-reader.ts` for the reader's own guardrails.
+ */
+async function tryReadVerificationCodeFromGmail(
+  state: ApplicationState
+): Promise<string | null> {
+  const senderAllowlist = lookupVerificationSenders(state.ats);
+  if (senderAllowlist.length === 0) {
+    console.log(
+      `${LOG} JOB-211: ATS "${state.ats}" has no verification sender allowlist, skipping Gmail read`
+    );
+    return null;
+  }
+
+  // A 15 minute lookback covers the click that put this row into
+  // `awaiting_verification` even if the row has been sitting there for a
+  // while, and the 5 minute lookahead covers clock skew between us and
+  // Google's mail servers. The reader re-checks the exact `internalDate`
+  // against these bounds and its own timeoutMs bounds the wall clock.
+  const now = Date.now();
+  const since = new Date(now - 15 * 60_000);
+  const until = new Date(now + 5 * 60_000);
+
+  // Numeric 4 to 8 character codes, per JOB-211's observation on the three
+  // ATSes V1 targets first (Ashby, Greenhouse, Lever). The anchor phrase is
+  // deliberately conservative and requires the word "code" to precede the
+  // digits, so a stray ticket number in a marketing footer never comes back.
+  const codePattern = /\bcode\b[^0-9]{0,80}?(\d{4,8})\b/i;
+
+  const result = await findVerificationCode({
+    userId: state.candidateId,
+    senderAllowlist,
+    since,
+    until,
+    codePattern,
+    timeoutMs: 60_000,
+  });
+
+  if (result.status === "found") {
+    console.log(
+      `${LOG} JOB-211: read verification code from ${result.match.senderAddress} ` +
+        `received at ${result.match.receivedAt} (message ${result.match.emailId})`
+    );
+    return result.match.code;
+  }
+
+  console.log(
+    `${LOG} JOB-211: Gmail read returned "${result.status}" — falling back to ` +
+      `the manual input path so a human can still finish this run`
+  );
+  return null;
 }
 
 /**
