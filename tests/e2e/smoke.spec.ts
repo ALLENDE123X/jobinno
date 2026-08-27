@@ -48,15 +48,16 @@ test(
 );
 
 /**
- * JOB-031's gate, from the outside, updated for JOB-032's redesign — checked
- * from a real browser hitting the real routes, not by reading the middleware
- * source. `/` now renders the real landing page with the waitlist form added
- * at the top rather than a separate page replacing it entirely, so this
- * checks for both: the new banner, and that the original page underneath is
- * still exactly what it was. `/dashboard` still redirects to `/`, same as
- * before, and lands on that same combined page.
+ * JOB-031's gate, from the outside. Skipped for JOB-210: `WAITLIST_GATE_ACTIVE`
+ * in `lib/waitlist-gate.ts` is `false` on `main` (flipped at #162), and the
+ * banner itself was hidden from the landing page at 95f9992 to match. With
+ * the gate off the middleware no longer redirects `/dashboard` to `/`, and
+ * `app/page.tsx` no longer renders `WaitlistBanner`, so neither assertion
+ * this test made is true any more. Unskipping is the right thing to do the
+ * moment the gate is flipped back on, since the behaviour it checks is real
+ * again then.
  */
-test("the waitlist gate adds the waitlist form to / and redirects everything else there", async ({
+test.skip("the waitlist gate adds the waitlist form to / and redirects everything else there", async ({
   page,
 }) => {
   const response = await page.goto("/");
