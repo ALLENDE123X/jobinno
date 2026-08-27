@@ -185,6 +185,10 @@ import { allowedSenderDomains } from "@/lib/future-gmail/gmail-verification-list
 // the caller passes no verification input.
 import { lookupVerificationSenders } from "@/lib/ats-verification-senders";
 import { findVerificationCode } from "@/lib/gmail-verification-reader";
+// JOB-217 — the deploy time gate for the wiring below. Off by default; the
+// reader only fires when `JOBINNO_GMAIL_AUTO_READ` is exactly `"on"`. See
+// `lib/gmail-auto-read-gate.ts` for the one accepted value.
+import { isGmailAutoReadEnabled } from "@/lib/gmail-auto-read-gate";
 import {
   closeBrowserSession,
   openBrowserSession,
@@ -2269,6 +2273,20 @@ async function completeVerification(
 async function tryReadVerificationCodeFromGmail(
   state: ApplicationState
 ): Promise<string | null> {
+  // JOB-217 — the deploy time gate. Off by default in production so the
+  // deploy that ships this reader does not silently begin reading any
+  // connected user's mailbox. Flipped to `"on"` in Vercel prod only after
+  // the demo test account run has been recorded and the Google OAuth
+  // verification submission is under way. When off, this returns as if
+  // the reader were not wired at all and the caller throws the same
+  // pre JOB-211 `FormFillBlockedError` a human already knows how to act on.
+  if (!isGmailAutoReadEnabled()) {
+    console.log(
+      `${LOG} JOB-217: JOBINNO_GMAIL_AUTO_READ is not "on", skipping the Gmail auto-read entirely`
+    );
+    return null;
+  }
+
   const senderAllowlist = lookupVerificationSenders(state.ats);
   if (senderAllowlist.length === 0) {
     console.log(
