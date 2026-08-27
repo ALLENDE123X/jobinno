@@ -73,6 +73,16 @@ function harvesterBaseUrl(): string {
   );
 }
 
+/**
+ * The loopback default has no auth in front of it. A deployed harvester (for
+ * example on Fly.io) exposes its port publicly and gates `/solve` with this
+ * key instead, so it is sent only when set rather than required outright.
+ */
+function harvesterApiKey(): string | undefined {
+  const configured = process.env.HARVESTER_API_KEY?.trim();
+  return configured && configured.length > 0 ? configured : undefined;
+}
+
 /** ECONNREFUSED and ETIMEDOUT are the only two the ticket calls out as transient. */
 function isTransientNetworkFailure(err: unknown): boolean {
   const code =
@@ -92,11 +102,17 @@ async function requestToken(endpoint: string, body: string): Promise<string> {
   const timer = setTimeout(() => controller.abort(), MINT_TIMEOUT_MS);
 
   try {
+    const apiKey = harvesterApiKey();
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) {
+      headers["X-API-Key"] = apiKey;
+    }
+
     let response: Response;
     try {
       response = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body,
         signal: controller.signal,
       });
