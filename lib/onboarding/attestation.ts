@@ -2,9 +2,9 @@
  * The one time grant of free applications, and the stamp that intake happened.
  *
  * ── The bug this closes ─────────────────────────────────────────────────────
- * `app/page.tsx` and `tests/e2e/smoke.spec.ts` both promise "10 applications,
+ * `app/page.tsx` and `tests/e2e/smoke.spec.ts` both promise "3 applications,
  * total" on the Free plan, and `lib/billing/plans.ts` has argued for a while
- * that the ten are "a one time trial granted at signup" — but nothing ever
+ * that the three are "a one time trial granted at signup" — but nothing ever
  * granted them. `profiles.applications_cap` defaults to zero
  * (`lib/db/schema.ts`), `app/auth/callback/route.ts`'s upsert only ever writes
  * `id` and `email`, and the only two writers of the column are
@@ -18,7 +18,7 @@
  * `@supabase/supabase-js`, same as the rest of that file, but PostgREST's
  * update payload is a plain JSON object: it cannot express "set this column
  * from what another column already holds", only "set this column to a value I
- * already know." Deciding whether to grant ten needs exactly that: the
+ * already know." Deciding whether to grant three needs exactly that: the
  * profile's *current* `plan` at the instant of the write. Fetching it first
  * and branching in application code would reopen the read then write race this
  * codebase has already ruled out twice, in `lib/application-quota.ts`'s
@@ -92,7 +92,7 @@ export async function recordAttestation(
     .where(and(eq(profiles.id, userId), isNull(profiles.attestedAt)))
     // `plan` is read back rather than assumed, so `granted` reflects the row
     // the `CASE` actually saw rather than guessing from the cap it wrote: a
-    // paid plan whose cap already happened to read ten would otherwise look
+    // paid plan whose cap already happened to read three would otherwise look
     // like a grant that never happened.
     .returning({ plan: profiles.plan });
 
