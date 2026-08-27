@@ -86,17 +86,34 @@ export class GmailOAuthStateError extends Error {
 /** How long a signed state parameter is considered fresh, per the ticket. */
 const STATE_MAX_AGE_MS = 10 * 60 * 1000;
 
+/** `.env.example` documents this as 32 hex characters (16 bytes). */
+const STATE_SECRET_LENGTH_BYTES = 16;
+
 interface GmailOAuthStatePayload {
   userId: string;
   ts: number;
 }
 
+/**
+ * Reads and validates `GMAIL_OAUTH_STATE_SECRET`. Fails closed, mirroring
+ * `loadKey()` in `lib/gmail-token-crypto.ts`: an unset, short, or non hex
+ * value is a `GmailOAuthStateError` rather than a weak secret silently
+ * accepted, since an HMAC key shorter than intended is easier to guess and a
+ * malformed one would only fail confusingly the first time `sign` ran.
+ */
 function requireStateSecret(): string {
   const secret = process.env.GMAIL_OAUTH_STATE_SECRET?.trim();
   if (!secret) {
     throw new GmailOAuthStateError(
       "GMAIL_OAUTH_STATE_SECRET is required but not set. See .env.example; " +
         "generate one with `openssl rand -hex 16`."
+    );
+  }
+  const expectedHexLength = STATE_SECRET_LENGTH_BYTES * 2;
+  if (secret.length !== expectedHexLength || !/^[0-9a-f]+$/i.test(secret)) {
+    throw new GmailOAuthStateError(
+      `GMAIL_OAUTH_STATE_SECRET must be exactly ${expectedHexLength} hex characters ` +
+        `(${STATE_SECRET_LENGTH_BYTES} bytes). Generate one with \`openssl rand -hex 16\`.`
     );
   }
   return secret;

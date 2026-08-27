@@ -105,8 +105,41 @@ describe("decryptGmailRefreshToken with a tampered ciphertext", () => {
     expect(() => decryptGmailRefreshToken("zz.zz.zz")).toThrow(GmailTokenCryptoError);
   });
 
+  it("throws on an odd length hex segment instead of silently dropping the trailing nibble", () => {
+    const ciphertext = encryptGmailRefreshToken("1//0gExampleRefreshTokenValue");
+    const [ivHex, authTagHex, dataHex] = ciphertext.split(".");
+    const oddLengthDataHex = dataHex.slice(0, -1);
+    const tampered = [ivHex, authTagHex, oddLengthDataHex].join(".");
+
+    expect(() => decryptGmailRefreshToken(tampered)).toThrow(GmailTokenCryptoError);
+  });
+
   it("throws on an empty ciphertext", () => {
     expect(() => decryptGmailRefreshToken("")).toThrow(GmailTokenCryptoError);
+  });
+});
+
+describe("decryptGmailRefreshToken with a wrong length auth tag", () => {
+  it("throws on a truncated auth tag rather than accepting a weaker check", () => {
+    const ciphertext = encryptGmailRefreshToken("1//0gExampleRefreshTokenValue");
+    const [ivHex, authTagHex, dataHex] = ciphertext.split(".");
+    // Drop the last byte (two hex characters) of a valid 16 byte auth tag,
+    // leaving 15 bytes. Node's GCM implementation accepts a truncated tag
+    // unless `authTagLength` is passed explicitly to `createDecipheriv`, so
+    // this only throws once that option is set.
+    const truncatedAuthTagHex = authTagHex.slice(0, -2);
+    const tampered = [ivHex, truncatedAuthTagHex, dataHex].join(".");
+
+    expect(() => decryptGmailRefreshToken(tampered)).toThrow(GmailTokenCryptoError);
+  });
+
+  it("throws on an oversized auth tag", () => {
+    const ciphertext = encryptGmailRefreshToken("1//0gExampleRefreshTokenValue");
+    const [ivHex, authTagHex, dataHex] = ciphertext.split(".");
+    const oversizedAuthTagHex = authTagHex + "ab";
+    const tampered = [ivHex, oversizedAuthTagHex, dataHex].join(".");
+
+    expect(() => decryptGmailRefreshToken(tampered)).toThrow(GmailTokenCryptoError);
   });
 });
 

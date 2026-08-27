@@ -29,6 +29,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 const ALGORITHM = "aes-256-gcm";
 const KEY_LENGTH_BYTES = 32;
 const IV_LENGTH_BYTES = 12;
+const AUTH_TAG_LENGTH_BYTES = 16;
 
 export class GmailTokenCryptoError extends Error {
   constructor(message: string) {
@@ -63,17 +64,26 @@ function loadKey(): Buffer {
 }
 
 /**
- * A hex string, decoded, or `null` when it is not valid hex at all.
+ * A hex string, decoded, or a thrown `GmailTokenCryptoError` when it is not
+ * valid hex.
  *
  * `Buffer.from(value, "hex")` does not throw on invalid input; it stops
- * decoding at the first character it cannot read and returns whatever it
+ * decoding at the first character it cannot read (or, on an odd length
+ * string, silently drops the trailing nibble) and returns whatever it
  * managed so far, which is exactly the kind of silent partial success this
- * module exists to avoid. Validating the string first is what turns a
- * malformed segment into a thrown error instead of a truncated buffer.
+ * module exists to avoid. Checking the decoded length against half the
+ * input's length is what catches both cases and turns a malformed segment
+ * into a thrown error instead of a truncated buffer.
  */
-function decodeHex(value: string): Buffer | null {
-  if (value === "" || !/^[0-9a-f]+$/i.test(value)) return null;
-  return Buffer.from(value, "hex");
+function decodeHex(hex: string): Buffer {
+  if (hex.length % 2 !== 0) {
+    throw new GmailTokenCryptoError("input is not valid hex (odd length)");
+  }
+  const buf = Buffer.from(hex, "hex");
+  if (buf.length !== hex.length / 2) {
+    throw new GmailTokenCryptoError("input is not valid hex");
+  }
+  return buf;
 }
 
 /**
@@ -87,7 +97,7 @@ export function encryptGmailRefreshToken(token: string): string {
 
   const key = loadKey();
   const iv = randomBytes(IV_LENGTH_BYTES);
-  const cipher = createCipheriv(ALGORITHM, key, iv);
+  const cipher = createCipheriv(ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH_BYTES });
   const ciphertext = Buffer.concat([cipher.update(token, "utf8"), cipher.final()]);
   const authTag = cipher.getAuthTag();
 
@@ -116,10 +126,14 @@ export function decryptGmailRefreshToken(ciphertext: string): string {
   }
   const [ivHex, authTagHex, dataHex] = parts;
 
-  const iv = decodeHex(ivHex);
-  const authTag = decodeHex(authTagHex);
-  const data = decodeHex(dataHex);
-  if (iv === null || authTag === null || data === null) {
+  let iv: Buffer;
+  let authTag: Buffer;
+  let data: Buffer;
+  try {
+    iv = decodeHex(ivHex);
+    authTag = decodeHex(authTagHex);
+    data = decodeHex(dataHex);
+  } catch {
     throw new GmailTokenCryptoError(
       "Malformed Gmail refresh token ciphertext: one or more segments are not valid hex."
     );
@@ -129,11 +143,20 @@ export function decryptGmailRefreshToken(ciphertext: string): string {
       `Malformed Gmail refresh token ciphertext: the IV must be ${IV_LENGTH_BYTES} bytes, got ${iv.length}.`
     );
   }
+  // GCM accepts a truncated auth tag by default, which would let an attacker
+  // brute force a short tag far more cheaply than the full 16 bytes buys.
+  // Rejecting anything but the exact length here, before it ever reaches
+  // `setAuthTag`, is what keeps the full 128 bit authentication guarantee.
+  if (authTag.length !== AUTH_TAG_LENGTH_BYTES) {
+    throw new GmailTokenCryptoError(
+      `Malformed Gmail refresh token ciphertext: the auth tag must be ${AUTH_TAG_LENGTH_BYTES} bytes, got ${authTag.length}.`
+    );
+  }
 
   const key = loadKey();
 
   try {
-    const decipher = createDecipheriv(ALGORITHM, key, iv);
+    const decipher = createDecipheriv(ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH_BYTES });
     decipher.setAuthTag(authTag);
     const plaintext = Buffer.concat([decipher.update(data), decipher.final()]);
     return plaintext.toString("utf8");
