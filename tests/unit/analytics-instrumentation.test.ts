@@ -89,6 +89,23 @@ vi.mock("@/lib/candidate-document-trigger", () => ({
     requestDocumentParse(userId, resumeId),
 }));
 
+// `recordAttestation` writes through the direct Postgres connection
+// `lib/db/client.ts` opens from `DATABASE_URL`, which this file has no reason
+// to provision: its own correctness, including the conditional grant and the
+// "runs twice" guard, is already exercised against a real database by
+// `tests/unit/onboarding-attestation.test.ts` under the `live-db-gate`
+// pattern. This file is about which analytics event fires and when, so the
+// call is stubbed at the same boundary as `requestJobSearch` and
+// `requestDocumentParse` above rather than left to reach a database that a
+// plain `npm test` run, local or in CI, does not provision.
+const recordAttestation = vi.fn(async (userId: string) => {
+  void userId;
+  return { recorded: true, granted: true };
+});
+vi.mock("@/lib/onboarding/attestation", () => ({
+  recordAttestation: (userId: string) => recordAttestation(userId),
+}));
+
 // `claimSearchSlot` is one conditional UPDATE against the real `profiles`
 // table in Postgres — see `tests/unit/dashboard-find-jobs-cooldown.test.ts`,
 // which is where that claim is actually exercised, live, against a fixture
@@ -160,6 +177,8 @@ beforeEach(() => {
   requestDocumentParse.mockClear();
   claimSearchSlot.mockClear();
   claimSearchSlot.mockResolvedValue({ allowed: true });
+  recordAttestation.mockClear();
+  recordAttestation.mockResolvedValue({ recorded: true, granted: true });
   profileUpdateError = null;
   resumeInsertError = null;
   profile = { attested_at: "2026-07-01T00:00:00.000Z", applications_used: 3, applications_cap: 150 };
