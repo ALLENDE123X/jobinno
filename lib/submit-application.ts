@@ -114,6 +114,9 @@ import { recordSkipQuietly, updateApplication } from "@/lib/application-records"
 // for the measurements off the live page.
 import { dismissConsentBanner, type ConsentBannerOutcome } from "@/lib/consent-banner";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
+// JOB-187. Replaces whatever token Ashby's own client script would otherwise
+// mint inside this Browserbase session — see that module's header for why.
+import { mintAshbyRecaptchaToken } from "@/lib/ashby-recaptcha";
 
 const LOG = "[act-008]";
 
@@ -2429,6 +2432,63 @@ async function runSubmitPhase(
         unconfirmedReason: null,
         rowUpdated: false,
       });
+    }
+
+    // ── JOB-187: an externally minted reCAPTCHA token, Ashby only ────────────
+    // Ashby's own client bundle calls `grecaptcha.execute()` itself the moment
+    // Submit is pressed, and the score that call earns from inside a
+    // Browserbase session is exactly what issue #187 exists to route around.
+    // Minting happens here, before the point of no return, so a harvester
+    // failure stops this run the same way every other pre-click stop in this
+    // function does: through `blocked()`, with nothing clicked and the row left
+    // at a status ACT-007's `READY_STATUSES` will pick up again. Every other
+    // board's submit control is untouched — this block does not run for them.
+    if (row.ats === "ashby") {
+      let mintedToken: string;
+      try {
+        mintedToken = await mintAshbyRecaptchaToken(fill.finalUrl);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        return await blocked(
+          `could not mint an Ashby reCAPTCHA token before submit: ${reason}. Nothing was clicked.`
+        );
+      }
+      // Patches whichever of "grecaptcha already exists" or "grecaptcha loads
+      // later" is true at this instant — a property of how far the board
+      // bundle has loaded, not something this module controls. Every call to
+      // `execute()` afterwards resolves with the harvester's token instead of
+      // asking Google's own script to mint one in this session.
+      await session.page.evaluate((token: string) => {
+        type PatchableGrecaptcha = {
+          execute?: (...args: unknown[]) => Promise<string>;
+          __jobinnoPatched?: boolean;
+        };
+        const patch = (candidate: unknown): void => {
+          if (candidate === null || typeof candidate !== "object") return;
+          const gr = candidate as PatchableGrecaptcha;
+          if (gr.__jobinnoPatched) return;
+          gr.execute = () => Promise.resolve(token);
+          gr.__jobinnoPatched = true;
+        };
+        const win = window as unknown as { grecaptcha?: PatchableGrecaptcha };
+        let current = win.grecaptcha;
+        patch(current);
+        try {
+          Object.defineProperty(window, "grecaptcha", {
+            configurable: true,
+            get: () => current,
+            set: (value: PatchableGrecaptcha) => {
+              current = value;
+              patch(current);
+            },
+          });
+        } catch {
+          // Google's own script may already have made this non configurable.
+          // Best effort only — the direct patch above already covers the
+          // common case where grecaptcha has loaded by the time the form is
+          // filled.
+        }
+      }, mintedToken);
     }
 
     // ── the point of no return ───────────────────────────────────────────────
