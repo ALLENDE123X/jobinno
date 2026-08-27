@@ -185,6 +185,117 @@ describe("classifyTitle", () => {
       classifyTitle("New Grad Software Engineer, Leadership Development Program").relevant
     ).toBe(true);
   });
+
+  // ── JOB-183: the widened SWE_RE vocabulary ──────────────────────────────
+  // Every title below has a real career stage signal alongside the new role
+  // word, so each one exercises the AND gate rather than only the discipline
+  // regex. "Junior Developer" and "Junior Engineer" pair with an explicit
+  // career stage word because "junior" by itself is a role level, not the
+  // career stage signal this filter requires.
+  const widenedSweVocabulary: [string, string][] = [
+    ["Backend Engineer", "New Grad Backend Engineer, Growth Team"],
+    ["Frontend Engineer", "Frontend Engineer, University Graduate Program"],
+    ["Full Stack Engineer", "Full Stack Engineer Intern, Summer 2027"],
+    ["Fullstack", "Fullstack Engineer Intern, Personalization Platform"],
+    ["Full-Stack", "Full-Stack Engineer, New Grad Program"],
+    ["Software Developer", "Software Developer, New Grad Program"],
+    ["Platform Engineer", "Platform Engineer, Early Career"],
+    ["Applications Engineer", "Applications Engineer, New Grad Rotation"],
+    ["Application Engineer", "Application Engineer Intern"],
+    ["Web Developer", "Web Developer, Entry Level"],
+    ["Mobile Engineer", "Mobile Engineer, New Grad"],
+    ["iOS Engineer", "iOS Engineer, New Grad Program"],
+    ["Android Engineer", "Android Engineer Intern"],
+    ["Machine Learning Engineer", "Machine Learning Engineer, New Grad"],
+    ["ML Engineer", "ML Engineer Intern, Summer 2027"],
+    ["AI Engineer", "AI Engineer, New Grad Program"],
+    ["Data Engineer", "Data Engineer Intern"],
+    ["DevOps Engineer", "DevOps Engineer, New Grad Program"],
+    ["Site Reliability Engineer", "Site Reliability Engineer, New Grad"],
+    ["SRE", "SRE Intern, Summer 2027"],
+    ["Junior Developer", "Junior Developer, New Grad Program"],
+    ["Junior Engineer", "Junior Engineer, Entry Level"],
+  ];
+
+  it.each(widenedSweVocabulary)("accepts the widened role word %s", (_label, title) => {
+    expect(classifyTitle(title).relevant).toBe(true);
+  });
+
+  // ── JOB-183: the widened NEW_GRAD_RE vocabulary ─────────────────────────
+  // Same shape in reverse: a fixed, already accepted role word paired with
+  // each new career stage word.
+  const widenedNewGradVocabulary: [string, string][] = [
+    ["entry level", "Software Engineer, Entry Level"],
+    ["entry-level", "Software Engineer - Entry-Level"],
+    ["entrylevel", "Software Engineer (Entrylevel)"],
+    ["graduate program", "Software Engineer, Graduate Program"],
+    ["campus", "Software Engineer, Campus Hire"],
+    ["class of 2026", "Software Engineer, Class of 2026"],
+    ["class of 2027", "Software Engineer, Class of 2027"],
+  ];
+
+  it.each(widenedNewGradVocabulary)("accepts the widened career stage word %s", (_label, title) => {
+    expect(classifyTitle(title).relevant).toBe(true);
+  });
+
+  it("does not fold an internship's career stage into is_new_grad", () => {
+    // Deliberately not covered by NEW_GRAD_RE. lib/job-matching.ts reads
+    // is_new_grad OR NOT is_intern for a non-intern seeking user, so an
+    // internship that also set is_new_grad would leak into full time new
+    // grad search results.
+    expect(classifyTitle("Software Engineer Intern, Summer 2027").isNewGrad).toBe(false);
+  });
+
+  it("rejects senior, staff and principal titles even with a widened role word", () => {
+    expect(classifyTitle("Senior Software Engineer").relevant).toBe(false);
+    expect(classifyTitle("Staff Software Engineer").relevant).toBe(false);
+    expect(classifyTitle("Principal Engineer").relevant).toBe(false);
+    expect(classifyTitle("Engineering Manager").relevant).toBe(false);
+    // Paired with a career stage word so the seniority gate, not a missing
+    // role or career stage signal, is what actually rejects these two.
+    expect(classifyTitle("VP of Software Engineering, New Grad Program").relevant).toBe(false);
+    expect(
+      classifyTitle("Head of Platform Engineering, New Grad Program").relevant
+    ).toBe(false);
+  });
+
+  it("rejects sales, marketing, design and recruiting titles even with a career stage word", () => {
+    expect(classifyTitle("Product Manager, Growth").relevant).toBe(false);
+    expect(classifyTitle("Marketing Manager").relevant).toBe(false);
+    expect(classifyTitle("UX Designer").relevant).toBe(false);
+    expect(classifyTitle("Sales Development Representative").relevant).toBe(false);
+    expect(classifyTitle("Recruiter").relevant).toBe(false);
+    // A plain "Software Engineer" has no career stage signal at all.
+    expect(classifyTitle("Software Engineer").relevant).toBe(false);
+    // "Intern" alone has no role signal at all.
+    expect(classifyTitle("Intern").relevant).toBe(false);
+  });
+
+  it("rejects a non-engineering role even when it shares a word with an accepted role", () => {
+    // NON_ENGINEERING_ROLE_RE is defense in depth: it fires even when the
+    // rest of the title would otherwise pass, so a future SWE_RE widening
+    // that admits a phrase like "design engineer" stays covered.
+    expect(
+      classifyTitle("New Grad Software Engineer - Technical Recruiter Team").relevant
+    ).toBe(false);
+    // Field Application Engineer is a pre-sales, customer-facing role, not
+    // software engineering, even though "applications engineer" alone is in
+    // SWE_RE's vocabulary. The "field" qualifier is what distinguishes it.
+    expect(classifyTitle("Field Application Engineer - Entry Level").relevant).toBe(false);
+    expect(classifyTitle("Field Applications Engineer, New Grad").relevant).toBe(false);
+  });
+
+  // ── JOB-183: spot checks against real postings already in the jobs table ──
+  // Both pulled live from `jobs` (ats in smartrecruiters, breezy) on
+  // 2026-08-26. Both currently fail classifyTitle on main and should now pass.
+  it("accepts real postings that the old vocabulary rejected", () => {
+    expect(
+      classifyTitle(
+        "Intern - Software Developer (Studying Bachelor Degree) - Start in January 2027"
+      ).relevant
+    ).toBe(true);
+    expect(classifyTitle("Web Developer - Entry Level").relevant).toBe(true);
+  });
 });
 
 describe("toPlainText", () => {
