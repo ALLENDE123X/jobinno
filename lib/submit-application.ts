@@ -332,8 +332,109 @@ const CODE_PROMPT_RE =
  * next board to do this will not copy Ashby's phrasing, and tight around what
  * the accusation has to be about.
  */
-const AUTOMATION_REJECTION_RE =
-  /\bflagged\s+as\s+(?:possible\s+|potential\s+|suspected\s+|likely\s+)?(?:spam|a\s+bot|bot|automated)\b|\b(?:detected|identified|classified)\s+as\s+(?:a\s+)?(?:bot|automated|spam)\b|\bautomated\s+(?:traffic|submissions?|activity)\b|\bsuspected\s+(?:bot|automation|spam)\b|\bbot\s+(?:traffic|activity)\b/i;
+/**
+ * ── JOB-207: why the pattern is scoped to a rejection verb ─────────────────
+ * The pre-JOB-207 version of this regex matched bare noun phrases:
+ * `automated (traffic|submissions?|activity)`, `bot (traffic|activity)`,
+ * `suspected (bot|automation|spam)`. That was safe while a match only ever
+ * relabelled an outcome the pipeline had already decided was negative — a run
+ * that reached the check was already in the ACT-017 "same URL, form still on
+ * screen, no confirmation" block, so a false positive there could only turn a
+ * generic `submit_failed` skip row into a `bot_detected` one and never into a
+ * different terminal status.
+ *
+ * JOB-207 changed the stakes. `judgeSubmission` now vetoes `submitted` when
+ * this regex matches, and `runSubmitPhase` hoists the rejection routing above
+ * `confirmationContradicted` and `navigated`. That means a match on a real
+ * success page can now DOWNGRADE a genuine submission to
+ * `submission_unconfirmed`, which is terminal and can never be revisited. A
+ * happy-path failure mode this used to be immune to is now the failure mode
+ * this pattern's width decides.
+ *
+ * Adversarial review of PR #220 (both the human reviewer and CodeRabbit) ran
+ * the previous regex against plausible legitimate success-page phrases —
+ * "we monitor bot traffic on this site", "automated submissions in general",
+ * "flagged as spam by our filters" out of context, "bot activity prevention" —
+ * and got matches on all four. Every one of those is a phrase that could
+ * appear inside help copy or legal boilerplate that a board keeps on every
+ * page it renders, including its own thank-you page. This tighter pattern
+ * refuses each, and the negative half of the test file next to this pins that.
+ *
+ * ── The rule ───────────────────────────────────────────────────────────────
+ * A match now requires two independent things:
+ *
+ *   1. A subject that names the specific submission being rejected — one of
+ *      "your/this/the application/submission/request/attempt" or a bare leading
+ *      "Submission" — or a first-person subject taking the rejection action
+ *      itself ("we blocked/refused/rejected this ..."). A bare word "spam" or
+ *      "bot" appearing in help text or legal copy without one of these
+ *      subjects in front of it does not match.
+ *
+ *   2. A rejection verb belonging to a fixed closed set —
+ *      flagged/detected/identified/classified/blocked/refused/rejected/marked/
+ *      denied/declined — attached to the subject. Neutral verbs like
+ *      "monitor", "receive", "process" do not count as rejection, so a
+ *      sentence like "we monitor bot traffic" does not match even though it
+ *      contains a first-person subject and a bot noun.
+ *
+ * And the accusation still has to be one of spam / bot / automated / automation,
+ * within the same non-terminal window as the subject and verb — the `[^.!?]`
+ * class in each pattern prevents crossing a sentence boundary, so a page that
+ * happens to place a rejection verb in one sentence and the noun in the next
+ * does not accidentally join them.
+ *
+ * ── The evidence base for the surviving patterns ───────────────────────────
+ * Pattern A ("your/this/the ... was flagged/detected/... as ... spam/bot/
+ * automated") covers the five real Ashby captures from 2026 08 20–21 recorded
+ * in `submit-automation-rejection.test.ts` — verbatim "Your application
+ * submission was flagged as possible spam" — and every constructed positive
+ * that file's original author added ("Your submission was flagged as spam",
+ * "This request was detected as a bot", "Submission identified as automated").
+ * Pattern B ("we blocked/refused/... this as ... automated traffic") covers
+ * the one construction that has a first-person subject rather than a
+ * possessive one. Pattern C ("Blocked: ... bot") covers a leading rejection
+ * verb with a colon, the terse shape a status banner tends to take.
+ *
+ * No new patterns were added on speculation. The other phrasings the ticket
+ * suggested — "your application was blocked", "unable to process your
+ * submission", "we could not submit" — are not added, because they can appear
+ * with or without a bot/spam accusation, and matching them alone would replay
+ * exactly the false-positive failure mode this rewrite exists to close.
+ */
+const AUTOMATION_REJECTION_RE = new RegExp(
+  [
+    // Pattern A: a specific-attempt subject, a rejection verb (optionally with
+    // an auxiliary), an optional "as" or "for", and a bot/spam/automation
+    // noun. "your/this/the application/submission/request/attempt" or a bare
+    // leading "Submission" (at a sentence boundary) satisfies the subject; the
+    // `[^.!?]{0,80}?` between subject and verb allows short prepositional
+    // phrases like "was flagged" but never crosses a sentence boundary.
+    "\\b(?:(?:your|this|the)\\s+(?:application\\s+submission|application|submission|request|attempt)" +
+      "|(?:^|[.!?\\n]\\s*)submission)" +
+      "[^.!?]{0,80}?\\b(?:(?:was|is|were|has\\s+been|got)\\s+)?" +
+      "(?:flagged|detected|identified|classified|blocked|refused|rejected|marked|denied|declined)" +
+      "\\s+(?:as\\s+|for\\s+)?(?:a\\s+|an\\s+|the\\s+)?" +
+      "(?:possible\\s+|potential\\s+|suspected\\s+|likely\\s+)?" +
+      "(?:spam|bot|automated|automation)\\b",
+    // Pattern B: a first-person subject explicitly rejecting the current
+    // attempt with a bot/spam/automation reason. The verb list is deliberately
+    // narrow so that neutral verbs like "monitor" and "prevent" do not qualify.
+    "\\b(?:we|the\\s+(?:system|form|site))\\s+" +
+      "(?:blocked|refused|rejected|declined|denied|flagged|stopped)\\s+" +
+      "(?:this|the|your|it)(?:\\s+(?:submission|application|request|attempt))?" +
+      "\\s+(?:as|because|due\\s+to|for)\\s+" +
+      "(?:possible\\s+|potential\\s+|suspected\\s+|likely\\s+)?" +
+      "(?:a\\s+|an\\s+|the\\s+)?" +
+      "(?:spam|bot|automated(?:\\s+(?:traffic|submissions?|activity|behaviou?r))?|automation)\\b",
+    // Pattern C: a leading rejection verb with a colon, followed by a
+    // bot/spam/automation noun. "Blocked: suspected bot."
+    "(?:^|[.!?\\n]\\s*)(?:blocked|rejected|refused|denied|declined):\\s*" +
+      "(?:possible\\s+|potential\\s+|suspected\\s+|likely\\s+)?" +
+      "(?:a\\s+|an\\s+|the\\s+)?" +
+      "(?:spam|bot|automated|automation)\\b",
+  ].join("|"),
+  "i"
+);
 
 /** How much of the board's refusal is quoted back into the skip message. */
 const MAX_REJECTION_QUOTE_CHARS = 300;
@@ -3079,6 +3180,25 @@ async function runSubmitPhase(
     }
 
     const resubmitErrors = errorsFor(resubmitCapture);
+    // ══ JOB-207: mirror the first-click hoist ═════════════════════════════════
+    // Same reasoning as at the first click: the board's own words about what it
+    // did with the click outrank every other signal in the capture, and that
+    // has to hold whether the board renders the refusal in place or redirects.
+    // Filing this branch below `confirmationContradicted` or `navigated` would
+    // strip the `AUTOMATION_TAG` / `bot_detected` reason code that the
+    // operator dashboard routes on, and would drop the `rejected:` prefix on
+    // `applications.confirmation_text` — both of which are the whole point of
+    // the fix. Adversarial review of PR #220 flagged the missing symmetric
+    // hoist; this is it.
+    if (resubmitCapture.automationRejection !== null) {
+      return await unconfirmed(
+        `${AUTOMATION_TAG}: "${choice.label}" was clicked a second time with the emailed ` +
+          `security code entered, and the board refused the submission as automated traffic, in ` +
+          `its own words: ${JSON.stringify(resubmitCapture.automationRejection)}.` +
+          `${resubmitErrors} The code was not the problem. There is no third click.`,
+        { confirmationText: buildRejectedConfirmationText(resubmitCapture.automationRejection) }
+      );
+    }
     // JOB-124, the same rule as after the first click, and taken first here for
     // the second of the two reasons given there: there is no third click either
     // way, so nothing about the click budget turns on this, but both messages
@@ -3113,19 +3233,10 @@ async function runSubmitPhase(
           `and at the ACT-006 inbox before anything clicks here again.`
       );
     }
-    if (resubmitCapture.automationRejection !== null) {
-      return await unconfirmed(
-        `${AUTOMATION_TAG}: "${choice.label}" was clicked a second time with the emailed ` +
-          `security code entered, and the board refused the submission as automated traffic, in ` +
-          `its own words: ${JSON.stringify(resubmitCapture.automationRejection)}.` +
-          `${resubmitErrors} The code was not the problem. There is no third click.`,
-        // JOB-207. Same as the first-click path: write a `rejected:` prefix
-        // into `confirmation_text` so a human reading only the row can tell
-        // this apart from a `submission_unconfirmed` row whose outcome merely
-        // could not be read.
-        { confirmationText: buildRejectedConfirmationText(resubmitCapture.automationRejection) }
-      );
-    }
+    // JOB-207 hoisted the `resubmitCapture.automationRejection` check above
+    // `confirmationContradicted` and `navigated`; the branch that used to sit
+    // here is unreachable now that the accusation wins over every positive
+    // signal, and has been removed. See the branch above.
 
     return await unconfirmed(
       `"${choice.label}" was clicked a second time with the emailed security code entered, and ` +

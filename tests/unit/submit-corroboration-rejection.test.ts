@@ -117,6 +117,69 @@ describe("JOB-207: the corroboration read cannot overrule the board's own reject
   });
 });
 
+describe("JOB-207 review round 2: bot-adjacent success copy must not downgrade a real submit", () => {
+  // Before JOB-207 tightened `AUTOMATION_REJECTION_RE`, the regex matched bare
+  // noun phrases like "bot traffic", "bot activity", "automated submissions" and
+  // "flagged as spam" without any subject naming the current attempt. That was
+  // safe when a match only relabelled an already-negative outcome. It stopped
+  // being safe when `judgeSubmission` started using it to VETO `submitted`, at
+  // which point the same match on a real thank-you page would DOWNGRADE a
+  // genuine successful submission to `submission_unconfirmed` (terminal, never
+  // revisited). Adversarial review of PR #220 identified four legitimate-looking
+  // success-page phrases the old regex would have matched. Each case below
+  // builds a capture that reads as a real confirmation from the board's URL and
+  // wording, layers the reviewer's phrase into the page text, and confirms the
+  // verdict stays `submitted`.
+  const legitConfirmation = (bodyPhrase: string): ConfirmationCapture =>
+    capture({
+      confirmationPresent: true,
+      confirmationText: `Your application has been submitted. ${bodyPhrase}`,
+      applicationFormStillPresent: false,
+      identityFieldsPresent: false,
+      url: "https://jobs.ashbyhq.com/ramp/apply/success",
+      title: "Application submitted — Ramp",
+      // The rejection regex runs off the page's own rendered text, which is
+      // captured into `automationRejection` before `judgeSubmission` ever sees
+      // the capture. Simulating that here directly is what pins the ordering
+      // failure the reviewer described.
+      automationRejection: boardRejectedAsAutomated(
+        `Your application has been submitted. ${bodyPhrase}`
+      ),
+    });
+
+  it.each([
+    ["we monitor bot traffic on this site"],
+    ["Our system helps prevent automated submissions in general."],
+    ["This message may be flagged as spam by our filters — please add us to your allow list."],
+    ["Bot activity prevention is enabled for this account."],
+  ])(
+    "reads a real confirmation carrying %j as `submitted`, not as a rejection",
+    (bodyPhrase) => {
+      const cap = legitConfirmation(bodyPhrase);
+      // The regex itself must not flag the phrase as a rejection.
+      expect(cap.automationRejection).toBeNull();
+      // And the verdict has to stay `submitted: true`, because a false positive
+      // here writes a terminal `submission_unconfirmed` over a real submit.
+      expect(judgeSubmission(cap, FILL_STEP).submitted).toBe(true);
+    }
+  );
+
+  it.each([
+    // The four reviewer phrases in isolation, so a regression here is obvious.
+    ["we monitor bot traffic on this site"],
+    ["Our platform prevents automated submissions in general."],
+    ["This message may be flagged as spam by our filters."],
+    ["Bot activity prevention is enabled."],
+    // Two more shapes the tightened regex was written to reject: help copy
+    // that lists what the board watches for, and legal boilerplate.
+    ["We use bot detection to keep our systems secure."],
+    ["The site monitors bot activity to protect your account."],
+    ["Applications flagged as spam by our filters are reviewed by our team."],
+  ])("does not read %j as a rejection accusation on its own", (pageText) => {
+    expect(boardRejectedAsAutomated(pageText)).toBeNull();
+  });
+});
+
 describe("JOB-207: buildRejectedConfirmationText", () => {
   it("prefixes the quote with `rejected: ` so a row can identify itself", () => {
     // A human reading only `applications.confirmation_text` — not the skip log,
