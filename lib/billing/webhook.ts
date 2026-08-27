@@ -232,8 +232,8 @@ export type ApplyPlanChangeResult =
  * resets the counter too.
  *
  * "150 applications per month" has to mean 150 from the moment the person pays,
- * and somebody who upgrades after burning all ten free applications would
- * otherwise be sold 150 and handed 140. So the reset is right the first time.
+ * and somebody who upgrades after burning all three free applications would
+ * otherwise be sold 150 and handed 147. So the reset is right the first time.
  *
  * ── Why the reset is conditional ────────────────────────────────────────────
  * It used to be unconditional, which made it a way to get free applications.
