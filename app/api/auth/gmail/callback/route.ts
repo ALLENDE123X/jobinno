@@ -33,6 +33,35 @@ import { createServerClient, createServiceRoleClient } from "@/lib/supabase/serv
 const LOG = "[gmail-oauth-callback]";
 const LOGIN_PATH = "/login";
 const SUCCESS_PATH = "/settings/gmail/success";
+/**
+ * Where a signed in user goes when something after the session check fails.
+ * There is no general `/settings` page yet (the only route under
+ * `app/settings/` is the success page above), so this points at the
+ * dashboard, the one page a signed in, onboarded user can actually land on
+ * and read an `error` query parameter from. `/login` is wrong for this case:
+ * `app/login/page.tsx` redirects a signed in visitor straight to `/dashboard`
+ * before it ever reads `error`, so a signed in user bounced there never sees
+ * why the connection failed.
+ */
+const POST_AUTH_FAILURE_PATH = "/dashboard";
+const TOKEN_EXCHANGE_TIMEOUT_MS = 15_000;
+
+/**
+ * `OAuth2Client#getToken` has no documented way to accept a signal or a per
+ * call timeout of its own: it always runs to completion through Gaxios's
+ * default, timeout free transporter. Left alone, a stalled call to Google's
+ * token endpoint hangs until the platform's own function timeout (about 30s
+ * on Vercel) cuts the request off with no typed error and no chance to send
+ * the user anywhere useful. Racing it against a timer, below, cannot cancel
+ * the underlying socket, but it does guarantee this handler stops waiting,
+ * and fails closed, well before the platform does it for us.
+ */
+class GmailTokenExchangeTimeoutError extends Error {
+  constructor() {
+    super(`Gmail token exchange timed out after ${TOKEN_EXCHANGE_TIMEOUT_MS}ms.`);
+    this.name = "GmailTokenExchangeTimeoutError";
+  }
+}
 
 function redirectTo(request: NextRequest, pathname: string, params?: Record<string, string>) {
   const url = request.nextUrl.clone();
@@ -90,7 +119,7 @@ export async function GET(request: NextRequest) {
   } catch (err) {
     const reason = err instanceof GmailOAuthStateError ? err.message : "invalid state";
     console.warn(`${LOG} state verification failed for user ${user.id}: ${reason}`);
-    return redirectTo(request, LOGIN_PATH, {
+    return redirectTo(request, POST_AUTH_FAILURE_PATH, {
       error: "Gmail connection request expired or was invalid. Try again.",
     });
   }
@@ -103,7 +132,7 @@ export async function GET(request: NextRequest) {
     ({ clientId, clientSecret } = requireGoogleOAuthCredentials());
   } catch (err) {
     console.error(`${LOG} ${err instanceof Error ? err.message : String(err)}`);
-    return redirectTo(request, LOGIN_PATH, {
+    return redirectTo(request, POST_AUTH_FAILURE_PATH, {
       error: "Gmail connect is not available from this origin right now.",
     });
   }
@@ -111,17 +140,30 @@ export async function GET(request: NextRequest) {
   const oauthClient = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
 
   let refreshToken: string | null;
+  const timeoutController = new AbortController();
+  const timeoutTimer = setTimeout(() => timeoutController.abort(), TOKEN_EXCHANGE_TIMEOUT_MS);
   try {
-    const { tokens } = await oauthClient.getToken(code);
+    const tokenExchange = oauthClient.getToken(code);
+    const timedOut = new Promise<never>((_, reject) => {
+      timeoutController.signal.addEventListener("abort", () => {
+        reject(new GmailTokenExchangeTimeoutError());
+      });
+    });
+    const { tokens } = await Promise.race([tokenExchange, timedOut]);
     refreshToken = tokens.refresh_token ?? null;
   } catch (err) {
+    const timedOut = err instanceof GmailTokenExchangeTimeoutError;
     console.error(
       `${LOG} token exchange failed for user ${user.id}: ` +
         `${err instanceof Error ? err.message : "unknown error"}`
     );
-    return redirectTo(request, LOGIN_PATH, {
-      error: "Could not complete the Gmail connection. Try again.",
+    return redirectTo(request, POST_AUTH_FAILURE_PATH, {
+      error: timedOut
+        ? "Google took too long to respond. Try again."
+        : "Could not complete the Gmail connection. Try again.",
     });
+  } finally {
+    clearTimeout(timeoutTimer);
   }
 
   if (!refreshToken) {
@@ -132,7 +174,7 @@ export async function GET(request: NextRequest) {
     // that, which is worth a loud log line rather than a silent partial
     // connection.
     console.error(`${LOG} token exchange for user ${user.id} returned no refresh_token`);
-    return redirectTo(request, LOGIN_PATH, {
+    return redirectTo(request, POST_AUTH_FAILURE_PATH, {
       error: "Google did not issue a refresh token for this Gmail connection. Try again.",
     });
   }
@@ -147,20 +189,36 @@ export async function GET(request: NextRequest) {
       `${LOG} could not encrypt the refresh token for user ${user.id}: ` +
         `${err instanceof Error ? err.message : "unknown error"}`
     );
-    return redirectTo(request, LOGIN_PATH, {
+    return redirectTo(request, POST_AUTH_FAILURE_PATH, {
       error: "Gmail connected, but saving it failed. Try again.",
     });
   }
 
-  const { error: writeError } = await createServiceRoleClient()
+  const { data: updatedRows, error: writeError } = await createServiceRoleClient()
     .from("profiles")
     .update({ gmail_refresh_token: encryptedRefreshToken })
-    .eq("id", user.id);
+    .eq("id", user.id)
+    .select("id");
 
   if (writeError) {
     console.error(`${LOG} could not store refresh token for user ${user.id}: ${writeError.message}`);
-    return redirectTo(request, LOGIN_PATH, {
+    return redirectTo(request, POST_AUTH_FAILURE_PATH, {
       error: "Gmail connected, but saving it failed. Try again.",
+    });
+  }
+
+  if (updatedRows?.length !== 1) {
+    // Supabase reports no error at all when an UPDATE matches zero rows, so
+    // `writeError` above stays null even though nothing was actually stored.
+    // Reporting success here would show "Gmail is connected" for a refresh
+    // token that has nowhere to live; the encrypted value is discarded and
+    // the only recovery is a full re-consent.
+    console.error(
+      `${LOG} update matched ${updatedRows?.length ?? 0} profiles rows for user ${user.id}; ` +
+        "refresh token not stored"
+    );
+    return redirectTo(request, POST_AUTH_FAILURE_PATH, {
+      error: "Gmail connected, but the profile row was not found. Try again.",
     });
   }
 

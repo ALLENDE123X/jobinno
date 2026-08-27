@@ -392,9 +392,9 @@ const NEW_GRAD_RE =
 const SWE_RE =
   /\bsoftware\s+engineer|\bswe\b|\bsoftware\s+developer|\bback[\s-]?end\s+engineer|\bfront[\s-]?end\s+engineer|\bfull[\s-]?stack\s+engineer|\bplatform\s+engineer|\bapplications?\s+engineer|\bweb\s+developer|\bmobile\s+engineer|\bios\s+engineer|\bandroid\s+engineer|\bmachine\s+learning\s+engineer|\bml\s+engineer|\bai\s+engineer|\bdata\s+engineer|\bdevops\s+engineer|\bsite\s+reliability\s+engineer|\bsre\b|\bjunior\s+developer|\bjunior\s+engineer/i;
 const SENIORITY_RE =
-  /\b(senior|sr|staff|principal|manager|director|vp)\b|\blead\b|\bhead\s+of\b|\bvice\s+president\b/i;
+  /\b(senior|sr|staff|principal|manager|director|vp)\b|\blead\b|\bhead\s+of\b|\bvice[\s-]+president\b/i;
 const NON_ENGINEERING_ROLE_RE =
-  /\bsales\b|\bmarketing\b|\bproduct\s+manager\b|\bdesigner\b|\bdesign\s+engineer\b|\brecruiter\b|\bfield\s+applications?\s+engineer\b/i;
+  /\bsales\b|\bmarketing\b|\bproduct\s+(?:manager|management)\b|\bdesigner\b|\bdesign\s+engineer\b|\brecruiter\b|\bfield\s+applications?\s+engineer\b/i;
 
 export type TitleRelevance = {
   /** Whether this listing belongs in `jobs` at all. */

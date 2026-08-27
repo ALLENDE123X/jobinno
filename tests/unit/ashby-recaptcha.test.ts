@@ -196,6 +196,55 @@ describe("mintAshbyRecaptchaToken", () => {
     );
     expect(calls).toBe(2);
   });
+
+  // ── JOB-198: CodeRabbit found isTransientNetworkFailure missed ECONNRESET
+  // and EAI_AGAIN, leaving mintAshbyRecaptchaToken to give up after one
+  // attempt on failures a retry can plausibly ride out.
+  it("retries once on ECONNRESET and succeeds on the second attempt", async () => {
+    let calls = 0;
+    mockFetchOnce(async () => {
+      calls += 1;
+      if (calls === 1) throw networkFailure("ECONNRESET");
+      return jsonResponse(VALID_RESPONSE);
+    });
+
+    const token = await mintAshbyRecaptchaToken("https://jobs.ashbyhq.com/ramp/abc123");
+
+    expect(token).toBe(VALID_RESPONSE.token);
+    expect(calls).toBe(2);
+  });
+
+  it("retries once on EAI_AGAIN and succeeds on the second attempt", async () => {
+    // EAI_AGAIN is the DNS resolver's own "temporary failure in name
+    // resolution" code, so it is transient by definition.
+    let calls = 0;
+    mockFetchOnce(async () => {
+      calls += 1;
+      if (calls === 1) throw networkFailure("EAI_AGAIN");
+      return jsonResponse(VALID_RESPONSE);
+    });
+
+    const token = await mintAshbyRecaptchaToken("https://jobs.ashbyhq.com/ramp/abc123");
+
+    expect(token).toBe(VALID_RESPONSE.token);
+    expect(calls).toBe(2);
+  });
+
+  it("does not retry on ENOTFOUND", async () => {
+    // ENOTFOUND means the host name did not resolve to anything at all; a
+    // retry a few seconds later will not change that, so it is deliberately
+    // excluded from the transient set.
+    let calls = 0;
+    mockFetchOnce(async () => {
+      calls += 1;
+      throw networkFailure("ENOTFOUND");
+    });
+
+    await expect(mintAshbyRecaptchaToken("https://jobs.ashbyhq.com/ramp/abc123")).rejects.toThrow(
+      HarvesterError
+    );
+    expect(calls).toBe(1);
+  });
 });
 
 describe("HARVESTER_URL test isolation", () => {
