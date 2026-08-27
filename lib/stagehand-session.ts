@@ -123,7 +123,7 @@ export function resolveStagehandModel(env: Record<string, string | undefined> = 
   return trimmed.length > 0 ? trimmed : FIREWORKS_DEEPSEEK_MODEL;
 }
 
-/** JOB-175: the effective model id at import time. Read once so a session and a log line always name the same string; runtime overrides happen through the env var {@link resolveStagehandModel} consults. */
+/** JOB-175: the effective model id at import time, kept as a stable snapshot for logs and tests. `openBrowserSession` re-reads {@link resolveStagehandModel} per call so a runtime env change (or an injected env in a test) reaches Stagehand without waiting for a process restart. */
 export const STAGEHAND_MODEL: string = resolveStagehandModel();
 
 /** JOB-175: the OpenAI slug the fallback path uses when a caller opts out with `STAGEHAND_LLM_PROVIDER=openai`. Held as a literal so it type checks against Stagehand v4's `ModelConfigSchema` closed union without a cast. */
@@ -858,8 +858,15 @@ export async function openBrowserSession(
   // documented opt out from the Fireworks default; it forces the OpenAI
   // fallback path regardless of the resolved model string, so a rollback is
   // one env var flip on Vercel with no redeploy.
+  //
+  // Read fresh from process.env on every call (not the module level
+  // STAGEHAND_MODEL snapshot) so a redeployed dyno picking up a new env
+  // var value uses it on its next session without waiting for a process
+  // restart, and so the review fix's integration tests can inject an env
+  // override and see it reach Stagehand.create.
+  const resolvedModel = resolveStagehandModel(process.env);
   const optedOutToOpenAI = process.env[STAGEHAND_LLM_PROVIDER_ENV_VAR] === "openai";
-  const usesFireworks = !optedOutToOpenAI && STAGEHAND_MODEL.startsWith("accounts/fireworks/");
+  const usesFireworks = !optedOutToOpenAI && resolvedModel.startsWith("accounts/fireworks/");
   const apiKey = usesFireworks
     ? process.env.FIREWORKS_API_KEY || process.env.STAGEHAND_LLM_API_KEY
     : process.env.STAGEHAND_LLM_API_KEY;
@@ -867,10 +874,11 @@ export async function openBrowserSession(
     throw new Error(
       usesFireworks
         ? `FIREWORKS_API_KEY env var is required (falls back to STAGEHAND_LLM_API_KEY) to pay ` +
-          `for Stagehand calls against ${STAGEHAND_MODEL} on Fireworks. See .env.example.`
+          `for Stagehand calls against ${resolvedModel} on Fireworks. See .env.example.`
         : "STAGEHAND_LLM_API_KEY env var is required (the LLM key Stagehand drives " +
-          `${STAGEHAND_OPENAI_FALLBACK_MODEL} with. See .env.example). This is a dedicated ` +
-          `key for this pipeline; do not point it at another project's key.`
+          `${optedOutToOpenAI ? STAGEHAND_OPENAI_FALLBACK_MODEL : resolvedModel} with. See ` +
+          `.env.example). This is a dedicated key for this pipeline; do not point it at ` +
+          `another project's key.`
     );
   }
 
@@ -946,14 +954,26 @@ export async function openBrowserSession(
   try {
     const stagehand = await Stagehand.create({
       browser,
-      // JOB-175: STAGEHAND_OPENAI_FALLBACK_MODEL is a literal type Stagehand v4's
-      // `ModelConfigSchema` accepts. STAGEHAND_MODEL is a wide string because the
-      // env var override can name any Fireworks slug the adapter supports, and
-      // the OpenAI path here is only reached when the caller has explicitly
-      // opted out of Fireworks, so it does not need to carry that wide type.
+      // JOB-175 review fix: pass the resolved STAGEHAND_MODEL id through to
+      // whichever factory owns the request path. The Fireworks adapter takes
+      // the slug so an operator's env override (STAGEHAND_MODEL=accounts/
+      // fireworks/models/<other>) actually reaches Fireworks. On the opt out
+      // rollback path (STAGEHAND_LLM_PROVIDER=openai), the literal typed
+      // STAGEHAND_OPENAI_FALLBACK_MODEL is passed instead so ModelConfigSchema
+      // accepts it even when STAGEHAND_MODEL was left at the Fireworks
+      // default. When STAGEHAND_MODEL is itself an OpenAI slug and the caller
+      // has NOT opted out, that slug reaches Stagehand directly; the cast
+      // widens the wide string to the schema's closed union, which
+      // Stagehand's own zod parser then validates at Stagehand.create()
+      // time, keeping runtime validation on the invalid slug path.
       model: usesFireworks
-        ? createFireworksClientLLM(apiKey)
-        : { modelName: STAGEHAND_OPENAI_FALLBACK_MODEL, apiKey },
+        ? createFireworksClientLLM(apiKey, resolvedModel)
+        : {
+            modelName: (optedOutToOpenAI
+              ? STAGEHAND_OPENAI_FALLBACK_MODEL
+              : (resolvedModel as typeof STAGEHAND_OPENAI_FALLBACK_MODEL)),
+            apiKey,
+          },
       domSettleTimeoutMs: DOM_SETTLE_TIMEOUT_MS,
       // Re-find a control whose cached selector no longer resolves rather than
       // failing the run. Only ever re-finds the control the instruction already
