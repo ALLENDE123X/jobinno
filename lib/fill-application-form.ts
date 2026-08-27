@@ -202,6 +202,7 @@ import {
   type CoreSlot,
 } from "@/lib/form-action-cache";
 import { resolveCandidateProfile } from "@/lib/candidate-documents";
+import { humanizedSleep, HUMANIZE_TIMINGS } from "@/lib/humanized-delays";
 import {
   decideFieldAnswers,
   generateCoverLetter,
@@ -823,20 +824,16 @@ const CONTENT_ATTACH_TIMEOUT_MS = 20_000;
 const DOM_STABLE_POLL_MS = 500;
 
 /**
- * Random delay between successive field interactions.
- *
- * Breaks the constant-cadence typing pattern that bot detectors key on. The
- * 300–1200 ms window is wide enough to look human without slowing the run to
- * the point where the session timeout becomes a concern.
- */
-function randomInteractionDelayMs(): number {
-  return Math.floor(Math.random() * 901) + 300; // 300–1200 ms
-}
-
-/**
  * Random dwell time on the warm-up page before navigating to the specific job
  * URL. Two to four seconds — enough to register as a human browsing the
  * careers site, not long enough to idle past a Stagehand DOM-settle timeout.
+ *
+ * The between-field jitter that used to live next to this helper as
+ * `randomInteractionDelayMs` (300–1200 ms) was folded into
+ * `humanizedSleep("field_jitter", ...)` in JOB-212, so every dwell in this
+ * module is driven by one env-gated helper. The warm-up dwell is not touched:
+ * it fires on a different page, before the form is reached, and is unrelated to
+ * the submit-timing anti-spam signal JOB-212 addresses.
  */
 function warmUpDwellMs(): number {
   return Math.floor(Math.random() * 2001) + 2000; // 2000–4000 ms
@@ -2984,7 +2981,11 @@ async function fillFields(
       checkVia = checked.check.via;
     }
 
-    await sleep(randomInteractionDelayMs());
+    await humanizedSleep(
+      "field_jitter",
+      HUMANIZE_TIMINGS.fieldJitterMs[0],
+      HUMANIZE_TIMINGS.fieldJitterMs[1]
+    );
     const used = await typeInto(session, url, field.instruction, field.value);
     const readBack = await readControlValue(session.page, used.selector);
     const matches =
@@ -5372,7 +5373,11 @@ async function fillRepeatingSections(
     for (let entry = 0; entry < MAX_ENTRIES_PER_REPEATING_SECTION; entry++) {
       const before = new Set((await enumerateFormFields(session.page)).map((f) => f.selector));
 
-      await sleep(randomInteractionDelayMs());
+      await humanizedSleep(
+        "field_jitter",
+        HUMANIZE_TIMINGS.fieldJitterMs[0],
+        HUMANIZE_TIMINGS.fieldJitterMs[1]
+      );
       const added = await pressAddEntry(session.page, section);
       if (!added.ok) {
         outcomes.push({
@@ -5500,7 +5505,11 @@ async function fillRepeatingSections(
           continue;
         }
 
-        await sleep(randomInteractionDelayMs());
+        await humanizedSleep(
+          "field_jitter",
+          HUMANIZE_TIMINGS.fieldJitterMs[0],
+          HUMANIZE_TIMINGS.fieldJitterMs[1]
+        );
         const value = resolution.value;
         const outcome = await applyWithReadBackTolerance(session.page, field, value, {
           allowContains: OPTION_KINDS.has(field.kind) && field.options.length === 0,
@@ -5565,7 +5574,11 @@ async function fillRepeatingSections(
       // pressed: the fields can read back perfectly and the section still
       // reports itself empty. A board with no such control says so, and that is
       // not a failure — it commits the entry as it is typed.
-      await sleep(randomInteractionDelayMs());
+      await humanizedSleep(
+        "field_jitter",
+        HUMANIZE_TIMINGS.fieldJitterMs[0],
+        HUMANIZE_TIMINGS.fieldJitterMs[1]
+      );
       const committed = await pressCommitEntry(session.page, section);
       console.log(`${LOG} ${section.heading}: commit — ${committed.detail}`);
 
@@ -5774,7 +5787,11 @@ async function fillRemainingFields(
     if (CONFIRM_EMAIL_RE.test(field.label)) {
       const emailFact = factsByKey.get("email");
       if (emailFact !== undefined) {
-        await sleep(randomInteractionDelayMs());
+        await humanizedSleep(
+          "field_jitter",
+          HUMANIZE_TIMINGS.fieldJitterMs[0],
+          HUMANIZE_TIMINGS.fieldJitterMs[1]
+        );
         const outcome = await applyWithReadBackTolerance(session.page, field, emailFact.value, {});
         if (outcome.ok) {
           record(field, "filled", outcome.typedValue, `confirm-email — filled with the email fact; ${outcome.detail}`, outcome.readBack);
@@ -5805,7 +5822,11 @@ async function fillRemainingFields(
     // authorized to work in the US". Still only when exactly one option contains
     // what they said — see `chooseFromMenu` — so an ambiguous answer comes back
     // to them rather than being resolved for them.
-    await sleep(randomInteractionDelayMs());
+    await humanizedSleep(
+      "field_jitter",
+      HUMANIZE_TIMINGS.fieldJitterMs[0],
+      HUMANIZE_TIMINGS.fieldJitterMs[1]
+    );
     const outcome = await applyWithReadBackTolerance(session.page, field, supplied, {
       allowContains: OPTION_KINDS.has(field.kind),
     });
@@ -5932,7 +5953,11 @@ async function fillRemainingFields(
       declined = resolution.declined;
     }
 
-    await sleep(randomInteractionDelayMs());
+    await humanizedSleep(
+      "field_jitter",
+      HUMANIZE_TIMINGS.fieldJitterMs[0],
+      HUMANIZE_TIMINGS.fieldJitterMs[1]
+    );
     const outcome = await applyWithReadBackTolerance(session.page, field, value, {
       // No fixed option list means this is a search control that answers a
       // query rather than a menu with a fixed set — see `chooseFromMenu`.
@@ -6366,7 +6391,11 @@ async function fillRemainingFields(
       afterFabrication.push(item);
       continue;
     }
-    await sleep(randomInteractionDelayMs());
+    await humanizedSleep(
+      "field_jitter",
+      HUMANIZE_TIMINGS.fieldJitterMs[0],
+      HUMANIZE_TIMINGS.fieldJitterMs[1]
+    );
     const outcome = await applyWithReadBackTolerance(session.page, field, resolved.answer, {
       allowContains: OPTION_KINDS.has(field.kind),
     });
@@ -7575,6 +7604,17 @@ async function runBrowserFlow(
 
     let signals = await reachApplicationForm(session, state, verification.signals);
     console.log(`${LOG} application form reached at ${signals.url}`);
+
+    // JOB-212. Read-through dwell. A real applicant scans the form before they
+    // start filling. Ashby's anti-spam layer keys on the "landed → first
+    // keystroke" gap being tiny, so this pause happens BEFORE cover-letter
+    // routing, resume upload, or any field fill. No-op unless
+    // `JOBINNO_HUMANIZE_TIMINGS=on` is set.
+    await humanizedSleep(
+      "readthrough",
+      HUMANIZE_TIMINGS.readthroughMs[0],
+      HUMANIZE_TIMINGS.readthroughMs[1]
+    );
 
     // The cover letter needs somewhere to go before anything is typed. Doing
     // this first means a required-but-impossible cover letter blocks the run

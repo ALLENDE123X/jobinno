@@ -123,6 +123,7 @@ import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 // JOB-187. Replaces whatever token Ashby's own client script would otherwise
 // mint inside this Browserbase session — see that module's header for why.
 import { mintAshbyRecaptchaToken } from "@/lib/ashby-recaptcha";
+import { humanizedSleep, HUMANIZE_TIMINGS } from "@/lib/humanized-delays";
 
 const LOG = "[act-008]";
 
@@ -2509,6 +2510,21 @@ async function runSubmitPhase(
         rowUpdated: false,
       });
     }
+
+    // ── JOB-212: pre-submit review dwell ─────────────────────────────────────
+    // A real applicant does not click Submit the instant the last field is
+    // filled. 5–12 seconds of dwell here mirrors the pause a person spends
+    // scanning the form one last time before pressing the button. Fires for
+    // every ATS, not just Ashby: the anti-spam signal this closes is not
+    // Ashby-specific, and the cost is a handful of extra seconds per run.
+    //
+    // Strictly before the point-of-no-return block below. No-op unless
+    // `JOBINNO_HUMANIZE_TIMINGS=on` is set.
+    await humanizedSleep(
+      "presubmit_review",
+      HUMANIZE_TIMINGS.presubmitReviewMs[0],
+      HUMANIZE_TIMINGS.presubmitReviewMs[1]
+    );
 
     // ── JOB-187: an externally minted reCAPTCHA token, Ashby only ────────────
     // Ashby's own client bundle calls `grecaptcha.execute()` itself the moment
