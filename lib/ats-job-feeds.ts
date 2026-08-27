@@ -335,11 +335,66 @@ export function qualifyExternalId(boardToken: string, nativeId: string): string 
  *    fails `SWE_RE` and is dropped. Widening the discipline vocabulary is a
  *    real improvement to make, and is a deliberate change to `SWE_RE` with its
  *    own evidence, not a side effect of this one.
+ *
+ * ── JOB-183: the evidence for widening `SWE_RE` and `NEW_GRAD_RE` ───────────
+ * The paragraph above named this as its own ticket with its own evidence, and
+ * JOB-176's sourcing dispatch supplied it: 21 newly registered SmartRecruiters
+ * boards, sourced specifically from GitHub new grad listing repos, produced
+ * zero postings that cleared this filter. A cross employer keyword search
+ * across 65 SR keywords plus a BuiltIn crawl surfaced dozens more candidate
+ * boards and hit the same wall (issue #182). The bottleneck was this
+ * classifier's vocabulary, not the discovery mechanisms feeding it.
+ *
+ * `SWE_RE` widens from "software engineer" and "swe" to the other names real
+ * boards give the same job: "software developer", "backend engineer",
+ * "frontend engineer", "full stack engineer" (and "fullstack" / "full-stack"),
+ * "platform engineer", "applications engineer", "web developer", "mobile
+ * engineer", "ios engineer", "android engineer", "machine learning engineer"
+ * (and "ml engineer"), "ai engineer", "data engineer", "devops engineer",
+ * "site reliability engineer" (and "sre"), and "junior developer" / "junior
+ * engineer". Two titles pulled live from the `jobs` table prove the gap this
+ * closes: "Intern - Software Developer (Studying Bachelor Degree) - Start in
+ * January 2027" and "Web Developer - Entry Level" both currently fail
+ * `classifyTitle` even though both are exactly this product's audience.
+ *
+ * `NEW_GRAD_RE` widens from "new grad", "early career" and "university" to
+ * also accept "entry level" (and "entry-level" / "entrylevel"), "graduate
+ * program", "campus" (which also covers "campus hire"), and "class of
+ * <year>" for any year rather than hardcoding 2026 and 2027, so this list
+ * does not need a ticket every January to stay current. "Intern" and
+ * "internship" are deliberately NOT added here even though JOB-183 listed
+ * them as a plausible seniority signal: `isIntern` already carries that
+ * signal into `matchesInterest` below through its own regex, and folding it
+ * into `isNewGrad` too would flip `is_new_grad` true on every internship
+ * posting. `internshipStagePredicate` in `lib/job-matching.ts` reads
+ * `is_new_grad OR NOT is_intern` for a non-intern seeking user specifically
+ * because `is_new_grad` and `is_intern` are assumed mutually informative but
+ * not both true on an internship row; making that assumption false would
+ * leak internships into full time new grad search results.
+ *
+ * The AND gate itself, and the seniority exclusion's list of words, are
+ * unchanged in shape by this widening: a title still needs a role signal AND
+ * a career stage signal, and an explicit internship still outranks every
+ * seniority word for the reason given above. Two words join the seniority
+ * exclusion list itself: "vp" and "head of" / "vice president" name the same
+ * kind of role the existing list already excludes and were simply missing.
+ *
+ * `NON_ENGINEERING_ROLE_RE` is new: a title naming sales, marketing, a
+ * product manager, a designer, a design engineer or a recruiter is rejected
+ * outright, intern or not. Nothing in the current `SWE_RE` vocabulary matches
+ * any of those phrases on its own, so this rule does not change any of
+ * today's outcomes; it exists so the next widening of `SWE_RE` does not have
+ * to re-derive this exclusion list from scratch to stay safe.
  */
 const INTERN_RE = /\bintern(ship|ships|s)?\b/i;
-const NEW_GRAD_RE = /\bnew[\s-]?grad(uate|uates|s)?\b|\bearly[\s-]?career\b|\buniversity\b/i;
-const SWE_RE = /\bsoftware\s+engineer|\bswe\b/i;
-const SENIORITY_RE = /\b(senior|sr|staff|principal|manager|director)\b|\blead\b/i;
+const NEW_GRAD_RE =
+  /\bnew[\s-]?grad(uate|uates|s)?\b|\bearly[\s-]?career\b|\buniversity\b|\bentry[\s-]?level\b|\bgraduate\s+program\b|\bcampus\b|\bclass\s+of\s+20\d{2}\b/i;
+const SWE_RE =
+  /\bsoftware\s+engineer|\bswe\b|\bsoftware\s+developer|\bback[\s-]?end\s+engineer|\bfront[\s-]?end\s+engineer|\bfull[\s-]?stack\s+engineer|\bplatform\s+engineer|\bapplications?\s+engineer|\bweb\s+developer|\bmobile\s+engineer|\bios\s+engineer|\bandroid\s+engineer|\bmachine\s+learning\s+engineer|\bml\s+engineer|\bai\s+engineer|\bdata\s+engineer|\bdevops\s+engineer|\bsite\s+reliability\s+engineer|\bsre\b|\bjunior\s+developer|\bjunior\s+engineer/i;
+const SENIORITY_RE =
+  /\b(senior|sr|staff|principal|manager|director|vp)\b|\blead\b|\bhead\s+of\b|\bvice\s+president\b/i;
+const NON_ENGINEERING_ROLE_RE =
+  /\bsales\b|\bmarketing\b|\bproduct\s+manager\b|\bdesigner\b|\bdesign\s+engineer\b|\brecruiter\b/i;
 
 export type TitleRelevance = {
   /** Whether this listing belongs in `jobs` at all. */
@@ -358,7 +413,15 @@ export function classifyTitle(rawTitle: string): TitleRelevance {
   const matchesInterest = SWE_RE.test(title) && (isIntern || isNewGrad);
 
   // An explicit internship outranks every seniority word. See above.
-  const relevant = matchesInterest && (isIntern || !SENIORITY_RE.test(title));
+  const passesSeniorityGate = isIntern || !SENIORITY_RE.test(title);
+
+  // Defense in depth for the widened `SWE_RE`: a non-engineering discipline
+  // word rejects the title outright, intern or not, so a future widening
+  // that accidentally admits a phrase like "design engineer" does not also
+  // have to get this list right on its own. See above.
+  const isNonEngineeringRole = NON_ENGINEERING_ROLE_RE.test(title);
+
+  const relevant = matchesInterest && passesSeniorityGate && !isNonEngineeringRole;
 
   return { relevant, isIntern, isNewGrad };
 }
