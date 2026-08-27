@@ -35,7 +35,7 @@ test(
     await page.goto("/#pricing");
 
     await expect(page.getByText("$0", { exact: true })).toBeVisible();
-    await expect(page.getByText("10 applications, total")).toBeVisible();
+    await expect(page.getByText("3 applications, total")).toBeVisible();
 
     await expect(page.getByText("$29", { exact: true })).toBeVisible();
     await expect(page.getByText("150 applications every month")).toBeVisible();

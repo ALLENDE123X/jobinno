@@ -159,7 +159,7 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // connection `lib/application-quota.ts` and `lib/search-cooldown.ts` already
   // use, which bypasses row level security the same way the service role did,
   // so this id is the whole of what keeps the write on the right row. It is
-  // also, in the same statement, the one and only grant of the Free plan's ten
+  // also, in the same statement, the one and only grant of the Free plan's three
   // applications: see `lib/onboarding/attestation.ts` for why that has to be
   // conditional on `attested_at` still being null rather than something this
   // action decides.

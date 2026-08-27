@@ -111,7 +111,7 @@ export type PlanSlug = "free" | PaidPlanSlug;
  * `attested_at`, and nowhere else. `free` has no entry in `PAID_PLANS` because
  * nothing is bought to get it, but the number still belongs here rather than
  * inline at the grant site: the landing page's pricing card
- * (`app/page.tsx`) and `tests/e2e/smoke.spec.ts`'s assertion on "10
+ * (`app/page.tsx`) and `tests/e2e/smoke.spec.ts`'s assertion on "3
  * applications, total" both promise this exact figure, and JOB-010 already
  * proved what happens when a number like this lives in two places, which is
  * that they drift.
