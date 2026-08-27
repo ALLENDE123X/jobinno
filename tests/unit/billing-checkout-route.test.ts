@@ -28,18 +28,33 @@ const EMAIL = "someone@university.edu";
 
 const createCheckoutSession = vi.fn();
 const createServerClient = vi.fn();
+const createServiceRoleClient = vi.fn();
 
 /**
- * Just enough Supabase to answer "who is this" and "what plan are they on".
- * `profile` of null stands for somebody with no row yet.
+ * A signed in session, with none of the profile reads the route no longer
+ * asks it for. Since JOB-192 revoked `authenticated`'s SELECT on
+ * `stripe_customer_id`, both columns the checkout handler needs (`plan` and
+ * `stripe_customer_id`) are read through the service role instead, so this
+ * stub only has to answer "who is this".
  */
-function supabaseStub(profile: Record<string, unknown> | null) {
+function sessionStub() {
   return {
     auth: {
       async getUser() {
         return { data: { user: { id: USER_ID, email: EMAIL } } };
       },
     },
+  };
+}
+
+/**
+ * The service role client, answering the one query the handler makes: read
+ * `plan, stripe_customer_id` for this user's own row. `profile` of null
+ * stands for somebody with no row yet, matching what
+ * `.maybeSingle()` returns when a filter matches nothing.
+ */
+function serviceRoleStub(profile: Record<string, unknown> | null) {
+  return {
     from() {
       return {
         select() {
@@ -87,11 +102,23 @@ function billingErrorOf(response: Response): string | null {
   return new URL(location).searchParams.get(BILLING_ERROR_PARAM);
 }
 
+/**
+ * Wires up both Supabase clients for one test: `createServerClient` returns
+ * a session that answers `getUser()`, and `createServiceRoleClient` returns
+ * a client that answers the single `profiles` read the handler makes.
+ * `profile` of null is the "no row yet" case.
+ */
+function mockSession(profile: Record<string, unknown> | null) {
+  createServerClient.mockResolvedValue(sessionStub());
+  createServiceRoleClient.mockReturnValue(serviceRoleStub(profile));
+}
+
 describe("the checkout route", () => {
   beforeEach(() => {
     vi.resetModules();
     createCheckoutSession.mockReset();
     createServerClient.mockReset();
+    createServiceRoleClient.mockReset();
 
     createCheckoutSession.mockResolvedValue({
       ok: true,
@@ -101,7 +128,7 @@ describe("the checkout route", () => {
     vi.doMock("@/lib/billing/stripe", () => ({ createCheckoutSession }));
     vi.doMock("@/lib/supabase/server", () => ({
       createServerClient,
-      createServiceRoleClient: vi.fn(),
+      createServiceRoleClient,
       RESUMES_BUCKET: "resumes",
     }));
   });
@@ -112,7 +139,7 @@ describe("the checkout route", () => {
   });
 
   it("opens a checkout for somebody on the free tier", async () => {
-    createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+    mockSession({ plan: "free", stripe_customer_id: null });
 
     const response = await pressBuy("starter");
 
@@ -124,7 +151,7 @@ describe("the checkout route", () => {
   it("refuses to open a second checkout for a plan somebody already has", async () => {
     // The reported bug, pressed twice: the plan is already written, so the
     // second press must not reach Stripe at all.
-    createServerClient.mockResolvedValue(supabaseStub({ plan: "starter" }));
+    mockSession({ plan: "starter", stripe_customer_id: "cus_test_starter" });
 
     const response = await pressBuy("starter");
 
@@ -134,7 +161,7 @@ describe("the checkout route", () => {
   });
 
   it("refuses to sell Starter to somebody holding the Season Pass", async () => {
-    createServerClient.mockResolvedValue(supabaseStub({ plan: "season_pass" }));
+    mockSession({ plan: "season_pass", stripe_customer_id: "cus_test_sp" });
 
     await pressBuy("starter");
 
@@ -142,7 +169,7 @@ describe("the checkout route", () => {
   });
 
   it("still lets somebody upgrade from Starter to the Season Pass", async () => {
-    createServerClient.mockResolvedValue(supabaseStub({ plan: "starter" }));
+    mockSession({ plan: "starter", stripe_customer_id: "cus_test_starter" });
 
     await pressBuy("season_pass");
 
@@ -150,7 +177,7 @@ describe("the checkout route", () => {
   });
 
   it("sells to somebody who has no profile row yet", async () => {
-    createServerClient.mockResolvedValue(supabaseStub(null));
+    mockSession(null);
 
     await pressBuy("starter");
 
@@ -158,7 +185,7 @@ describe("the checkout route", () => {
   });
 
   it("sends back a code and never a plan slug of the caller's choosing", async () => {
-    createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+    mockSession({ plan: "free", stripe_customer_id: null });
 
     const response = await pressBuy("<b>enterprise</b>");
 
@@ -168,7 +195,7 @@ describe("the checkout route", () => {
   });
 
   it("does not put a Stripe failure into the URL", async () => {
-    createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+    mockSession({ plan: "free", stripe_customer_id: null });
     createCheckoutSession.mockResolvedValue({
       ok: false,
       message:
@@ -192,7 +219,7 @@ describe("the checkout route", () => {
    */
   describe("the Origin check", () => {
     it("refuses a cross-origin POST, the hidden-form attack the ticket describes", async () => {
-      createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+      mockSession({ plan: "free", stripe_customer_id: null });
 
       const response = await pressBuy("starter", {
         origin: "https://evil.example",
@@ -203,7 +230,7 @@ describe("the checkout route", () => {
     });
 
     it("refuses a request with neither an Origin nor a Referer, rather than failing open", async () => {
-      createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+      mockSession({ plan: "free", stripe_customer_id: null });
 
       const response = await pressBuy("starter", {});
 
@@ -212,7 +239,7 @@ describe("the checkout route", () => {
     });
 
     it("refuses a request with no Origin and a Referer pointing elsewhere", async () => {
-      createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+      mockSession({ plan: "free", stripe_customer_id: null });
 
       const response = await pressBuy("starter", {
         referer: "https://evil.example/attack.html",
@@ -225,7 +252,7 @@ describe("the checkout route", () => {
     it("falls back to a same-origin Referer when Origin is missing", async () => {
       // Some browser/referrer-policy combinations omit Origin on a same-origin
       // form post. That should not be treated as an attack.
-      createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+      mockSession({ plan: "free", stripe_customer_id: null });
 
       const response = await pressBuy("starter", {
         referer: "https://jobinno.app/",
@@ -236,7 +263,7 @@ describe("the checkout route", () => {
     });
 
     it("accepts the www production origin, JOB-023's second real hostname", async () => {
-      createServerClient.mockResolvedValue(supabaseStub({ plan: "free" }));
+      mockSession({ plan: "free", stripe_customer_id: null });
 
       const response = await pressBuy("starter", {
         origin: "https://www.jobinno.app",

@@ -146,34 +146,23 @@ async function startCheckout(request: NextRequest, planSlug: string | null) {
   // The plan they are on, and the Stripe customer from an earlier purchase when
   // there is one, so a second plan does not mint a duplicate customer.
   //
-  // Two queries rather than one, because they now run as different roles.
-  // `plan` still reads through the user's own session:
-  // `profiles_select_own` limits it to their row and the column has an
-  // ordinary SELECT grant to `authenticated`. `stripe_customer_id` no longer
-  // does, per `drizzle/0027_profiles_column_select_lockdown.sql`, and its
-  // one caller on the user side is this one, so it reads through the service
-  // role and is pinned to `user.id` here rather than by a policy. The
-  // service role bypasses row level security, so treat the id it filters on
-  // as already authorised — which it is: `getUser()` above returned it from
-  // the caller's session.
-  const [{ data: planRow }, { data: customerRow }] = await Promise.all([
-    supabase
-      .from("profiles")
-      .select("plan")
-      .eq("id", user.id)
-      .maybeSingle(),
-    createServiceRoleClient()
-      .from("profiles")
-      .select("stripe_customer_id")
-      .eq("id", user.id)
-      .maybeSingle(),
-  ]);
-  const profile = planRow
-    ? {
-        plan: planRow.plan,
-        stripe_customer_id: customerRow?.stripe_customer_id ?? null,
-      }
-    : null;
+  // Read through the service role rather than the session client, pinned to
+  // `user.id` here rather than by a policy. `stripe_customer_id` used to
+  // come back through the session client too, but
+  // `drizzle/0027_profiles_column_select_lockdown.sql` revoked the
+  // `authenticated` SELECT grant on that column: the Stripe customer id is
+  // ours, not the person's, so exactly one role reads it now, and that role
+  // is the service role. Reading both columns in one query keeps the read
+  // atomic across `plan` and `stripe_customer_id`, so a webhook that writes
+  // both between two separate reads can never leave this handler with a
+  // mismatched view. The service role bypasses row level security, so treat
+  // the id it filters on as already authorised, which it is: `getUser()`
+  // above returned it from the caller's own session.
+  const { data: profile } = await createServiceRoleClient()
+    .from("profiles")
+    .select("plan, stripe_customer_id")
+    .eq("id", user.id)
+    .maybeSingle();
 
   // ── Do not sell somebody something they already have ──────────────────────
   // Pressing "Get Starter" a second time used to open a second Checkout
