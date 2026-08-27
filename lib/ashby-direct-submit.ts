@@ -650,6 +650,16 @@ export type AshbyCandidateView = {
   linkedinUrl: string | null;
   location: string | null;
   /**
+   * JOB-230. Sourced from `profiles.github_url` (JOB-044), which is read
+   * onto `CandidateRecord.githubUrl` by `lib/candidate-intake.ts`, and since
+   * JOB-230 is also collected on the onboarding intake form. Null when the
+   * profile has not stated one, exactly like every other field here, per
+   * HARD STOP 9. The 2026 08 27 live proof of JOB-227 on PostHog's SRE
+   * posting is why this exists: a required "GitHub Handle" field had no
+   * honest answer to give and the row landed submission_blocked.
+   */
+  githubUrl: string | null;
+  /**
    * A short background paragraph used to answer optional open ended
    * questions about startup or entrepreneurial experience. When null, the
    * fallback path leaves the question blank rather than inventing one.
@@ -818,9 +828,14 @@ export function candidateValueForField(
 
   if (t.includes("cover letter") || field.path === "cover_letter") return null;
 
+  // GitHub (JOB-230, see the AshbyCandidateView comment above). Only from
+  // the stated profile column, same as linkedin above. Not a hardcoded
+  // refusal any more: null when the profile has none, the real URL when it
+  // does.
+  if (t.includes("github")) return view.githubUrl;
+
   if (
     t.includes("twitter") ||
-    t.includes("github") ||
     t.includes("portfolio") ||
     t.includes("website") ||
     t.includes("referred") ||
@@ -962,6 +977,7 @@ function buildCandidateView(
   if (currentCity && currentCountry) location = `${currentCity}, ${currentCountry}`;
   else if (currentCity) location = currentCity;
   else if (profile.location && profile.location.trim() !== "") location = profile.location.trim();
+  const githubUrl = (candidate.githubUrl && candidate.githubUrl.trim()) || null;
   return {
     firstName,
     lastName,
@@ -970,6 +986,7 @@ function buildCandidateView(
     phone: profile.phone?.trim() || null,
     linkedinUrl,
     location,
+    githubUrl,
     // Deliberately left null in v1. The DOM path builds an entrepreneurial
     // paragraph from the resume + LLM, and reproducing that here without a
     // grounded intake field would be an invention. HARD STOP 9. A follow up

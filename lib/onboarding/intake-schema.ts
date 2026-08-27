@@ -93,6 +93,42 @@ const requiredText = (field: string, max = 120) =>
     .max(max, `${field} is too long.`);
 
 /**
+ * JOB-230. Matches `github.com/handle`, with or without a leading `https://`
+ * or `www.`, and with or without a trailing slash. Anything that names a
+ * different domain fails this, on purpose: a candidate who pastes their
+ * portfolio site here by mistake should see an error under the field, not
+ * have it saved as their GitHub.
+ */
+const GITHUB_URL_PATTERN = /^(?:https?:\/\/)?(?:www\.)?github\.com\/[^\s]+$/i;
+
+/**
+ * The candidate's GitHub, stated at intake. Optional, the same way the
+ * LinkedIn export below is: plenty of candidates do not have one, and
+ * `lib/ashby-direct-submit.ts`'s `candidateValueForField` already falls back
+ * to null on a "GitHub Handle" field when this is unset rather than
+ * fabricating one, per HARD STOP 9.
+ *
+ * A bare `github.com/handle` is accepted and normalized to a real
+ * `https://` URL here, so every value this schema outputs is one an
+ * application form can actually use as a link. An empty string means "not
+ * given" and becomes null, the same way `f1Status` collapses an unanswered
+ * selection to null further down.
+ */
+const githubUrlText = z
+  .string()
+  .max(200, "That GitHub URL is too long.")
+  .regex(
+    GITHUB_URL_PATTERN,
+    "Enter a GitHub URL, like https://github.com/yourhandle."
+  )
+  .transform((value) => (/^https?:\/\//i.test(value) ? value : `https://${value}`));
+
+const githubUrl = z.preprocess((raw) => {
+  const trimmed = typeof raw === "string" ? raw.trim() : raw;
+  return trimmed === "" ? null : trimmed;
+}, githubUrlText.nullable());
+
+/**
  * A key inside the private `resumes` bucket, which by convention is
  * `{userId}/{uuid}.pdf`. The first segment is not decoration: it is what the
  * bucket's storage policies compare against `auth.uid()`, so a path with the
@@ -233,6 +269,13 @@ export function intakeSchema(userId: string) {
        * entirely rather than having to spell out a null.
        */
       linkedinPdfPath: ownedObjectPath.nullable().default(null),
+
+      /**
+       * JOB-230. Optional, and written straight to `profiles.github_url` in
+       * `app/onboarding/actions.ts`. See the `githubUrl` builder above for
+       * the validation and normalization rules.
+       */
+      githubUrl: githubUrl.default(null),
 
       /**
        * Not decorative, and not a terms of service checkbox. Every free text

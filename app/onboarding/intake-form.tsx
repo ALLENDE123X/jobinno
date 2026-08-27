@@ -204,6 +204,10 @@ export function IntakeForm({ userId }: { userId: string }) {
   const [salaryExpectation, setSalaryExpectation] = useState("");
   const [resumeFile, setResumeFile] = useState<File | null>(null);
   const [linkedinFile, setLinkedinFile] = useState<File | null>(null);
+  // JOB-230. Optional, and left as the raw text the person typed: the schema
+  // normalizes a bare "github.com/handle" and validates the domain, both on
+  // submit here and again on the server.
+  const [githubUrl, setGithubUrl] = useState("");
   const [attestation, setAttestation] = useState(false);
 
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -260,6 +264,7 @@ export function IntakeForm({ userId }: { userId: string }) {
           .filter(Boolean),
         gradDate,
         earliestStart,
+        githubUrl,
         highSchoolName,
         // Left as a string when it is not a whole number, so that "twenty
         // twenty two" fails the schema and comes back as a message under the
@@ -354,6 +359,20 @@ export function IntakeForm({ userId }: { userId: string }) {
             onChange={(event) =>
               setLinkedinFile(event.target.files?.[0] ?? null)
             }
+          />
+        </Field>
+
+        <Field
+          label="GitHub, optional"
+          htmlFor="github"
+          error={errors.githubUrl}
+          hint="A growing share of engineering applications ask for this by name."
+        >
+          <Input
+            id="github"
+            value={githubUrl}
+            onChange={(event) => setGithubUrl(event.target.value)}
+            placeholder="https://github.com/yourhandle"
           />
         </Field>
       </section>
