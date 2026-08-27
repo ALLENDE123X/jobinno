@@ -77,11 +77,14 @@ describe("what each plan costs and buys", () => {
     expect(LAPSED_PLAN_CAP).toBe(0);
   });
 
-  it("promises the same ten applications the landing page and smoke test do", () => {
-    // `app/page.tsx` and `tests/e2e/smoke.spec.ts` both say "10 applications,
-    // total". `lib/onboarding/attestation.ts` is the one place that number is
-    // actually granted, and it reads this constant rather than a literal 10.
-    expect(FREE_PLAN_APPLICATIONS_CAP).toBe(10);
+  it("promises the same three applications the landing page does", () => {
+    // `app/page.tsx`'s pricing card and hero subhead both say "3 applications,
+    // total" as of the 2026-08-25 product decision to cap the free trial at 3
+    // while v1 iterates on submit success rate (see the commit message on
+    // `lib/billing/plans.ts`). `lib/onboarding/attestation.ts` is the one place
+    // that number is actually granted, and it reads this constant rather than
+    // a literal 3.
+    expect(FREE_PLAN_APPLICATIONS_CAP).toBe(3);
   });
 });
 
