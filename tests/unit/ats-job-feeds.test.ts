@@ -278,6 +278,11 @@ describe("classifyTitle", () => {
     expect(
       classifyTitle("New Grad Software Engineer - Technical Recruiter Team").relevant
     ).toBe(false);
+    // Field Application Engineer is a pre-sales, customer-facing role, not
+    // software engineering, even though "applications engineer" alone is in
+    // SWE_RE's vocabulary. The "field" qualifier is what distinguishes it.
+    expect(classifyTitle("Field Application Engineer - Entry Level").relevant).toBe(false);
+    expect(classifyTitle("Field Applications Engineer, New Grad").relevant).toBe(false);
   });
 
   // ── JOB-183: spot checks against real postings already in the jobs table ──

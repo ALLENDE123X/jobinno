@@ -394,7 +394,7 @@ const SWE_RE =
 const SENIORITY_RE =
   /\b(senior|sr|staff|principal|manager|director|vp)\b|\blead\b|\bhead\s+of\b|\bvice\s+president\b/i;
 const NON_ENGINEERING_ROLE_RE =
-  /\bsales\b|\bmarketing\b|\bproduct\s+manager\b|\bdesigner\b|\bdesign\s+engineer\b|\brecruiter\b/i;
+  /\bsales\b|\bmarketing\b|\bproduct\s+manager\b|\bdesigner\b|\bdesign\s+engineer\b|\brecruiter\b|\bfield\s+applications?\s+engineer\b/i;
 
 export type TitleRelevance = {
   /** Whether this listing belongs in `jobs` at all. */
