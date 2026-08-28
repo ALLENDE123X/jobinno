@@ -172,6 +172,11 @@ import { APPLICATION_STATUS, type ApplicationStatus } from "@/lib/application-st
 // application", shared with `submit-application.ts` rather than restated here.
 import { pageReadsAsFurtherStep } from "@/lib/application-wizard";
 import { checkApplyUrl, forLog } from "@/lib/apply-url-guard";
+// JOB-260 — the same host table `lib/ats-boards.ts` uses everywhere else to
+// answer "which platform runs this page", reused here so the
+// SmartRecruiters only scoping below can never drift from the one real host
+// list.
+import { matchAtsHost } from "@/lib/ats-boards";
 // Single source of truth for "which domains may speak for this board". ACT-006
 // applies it when it decides a link is safe to *report*; this module applies it
 // again before it is safe to *open*. Importing it costs a googleapis module load
@@ -2845,6 +2850,28 @@ export function canonicalizeTypedValue(rawValue: string): CanonicalizedValue {
 type TolerantApplyResult = ApplyOutcome & { typedValue: string };
 
 /**
+ * JOB-260. True when the page currently open is a SmartRecruiters listing, by
+ * the same host table `lib/ats-boards.ts` uses for every other "which
+ * platform is this" question in the codebase.
+ *
+ * `page.url()` rather than a board identity threaded down from the caller:
+ * `applyWithReadBackTolerance` is reached from every general-pass call site
+ * in this file, and none of them currently pass one. Adding that plumbing for
+ * one ticket's narrowly scoped fix would be a wider change than the fix
+ * itself, and the URL is already right there on the page this function is
+ * already holding.
+ */
+async function isSmartRecruitersPage(page: Page): Promise<boolean> {
+  try {
+    const current = await page.url();
+    const hostname = new URL(String(current)).hostname;
+    return matchAtsHost(hostname)?.ats === "smartrecruiters";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Applies one answer through `applyFieldValue`, with issue #172's two pieces
  * wrapped around it for single-line text controls: digit-shaped answers are
  * canonicalized before they are typed, and a failed strict read-back gets one
@@ -2888,6 +2915,40 @@ export async function applyWithReadBackTolerance(
           "characters were ignored (the board reformats this field)",
         typedValue: canonical.value,
       };
+    }
+    // ── JOB-260 ──────────────────────────────────────────────────────────
+    // SmartRecruiters' OneClick UI phone widget, on its larger enterprise
+    // templates, reformats the visible input by inserting a space every
+    // three digits and, on those same templates, drops the country code the
+    // pipeline typed. The generic check above already folds whitespace, so
+    // it absorbs the first difference; it never drops a leading "+1" or "1",
+    // so it does not absorb the second, and six of ten SmartRecruiters
+    // submits blocked on exactly that gap the night of 2026 08 28.
+    // `normalizeForComparison`'s own phone branch already does both — it
+    // exists for the named "phone" field's strict comparison a few hundred
+    // lines up — it was just never reached from here, which is where a
+    // phone-labeled field lands when it is not the one control the named
+    // pass filled (a duplicate "Mobile phone" box, for instance, or a
+    // control the named pass's own corroboration declined to touch).
+    //
+    // Scoped twice over so no other board's comparator changes shape from
+    // this ticket, which is scoped to SmartRecruiters only: the field's own
+    // label has to say "phone" — the same `FIELD_KEYWORDS.phone` pattern
+    // used everywhere else in this file to recognize one — and the page has
+    // to be a SmartRecruiters host.
+    if (FIELD_KEYWORDS.phone.test(field.label) && (await isSmartRecruitersPage(page))) {
+      const phoneTypedCore = normalizeForComparison(canonical.value, "phone");
+      const phoneReadCore = normalizeForComparison(applied.readBack, "phone");
+      if (phoneTypedCore !== "" && phoneTypedCore === phoneReadCore) {
+        return {
+          ok: true,
+          readBack: applied.readBack,
+          detail:
+            "typed and read back the same ten digits once formatting and a leading country code " +
+            "were ignored (SmartRecruiters' OneClick UI phone widget reformats this field)",
+          typedValue: canonical.value,
+        };
+      }
     }
   }
   return { ...applied, typedValue: canonical.value };
