@@ -11,15 +11,48 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ASHBY_DIRECT_HTTP_MODE_VALUE,
   ASHBY_SUBMIT_MODE_ENV,
+  ashbyDirectSolver,
   candidateValueForField,
   classifyAshbySubmitResponse,
   runAshbyDirectSubmit,
   shouldRouteAshbyDirectHttp,
   type AshbyCandidateView,
   type ResolvedAshbyContext,
-} from "@/lib/ashby-direct-submit";
+} from "@/lib/solvers/ashby-direct";
 import type { CandidateApplicationAnswers } from "@/lib/candidate-intake";
 import { APPLICATION_STATUS } from "@/lib/application-status";
+import type { PreflightRow, SubmitApplicationInput } from "@/lib/submit-application";
+
+// JOB-232. `ashbyDirectSolver` calls `getSupabaseClient()` internally rather
+// than accepting an injected client the way `runAshbyDirectSubmit` does — it
+// has no `deps` parameter, since `SolverFn` does not carry one. The env vars
+// below satisfy that internal client build (`localhost` is always allowed by
+// `assertSupabaseProject`, so no `EXPECTED_SUPABASE_PROJECT_REF` is needed),
+// and `@supabase/supabase-js` is mocked below so the applications lookup
+// never leaves the process. `vi.hoisted` is required here, not a plain outer
+// `let`, because this file's imports of `@/lib/solvers/ashby-direct` are
+// static and that module itself statically imports `@supabase/supabase-js`
+// — a factory closing over a normally declared variable would run before
+// that variable's initializer and throw.
+process.env.SUPABASE_URL ??= "http://localhost:54321";
+process.env.SUPABASE_SERVICE_ROLE_KEY ??= "test-service-role-key";
+
+const { capturedApplicationsIdFilters } = vi.hoisted(() => ({
+  capturedApplicationsIdFilters: [] as unknown[],
+}));
+
+vi.mock("@supabase/supabase-js", () => ({
+  createClient: () => ({
+    from: () => ({
+      select: () => ({
+        eq: (column: string, value: unknown) => {
+          if (column === "id") capturedApplicationsIdFilters.push(value);
+          return { limit: async () => ({ data: [], error: null }) };
+        },
+      }),
+    }),
+  }),
+}));
 
 let priorEnvValue: string | undefined;
 
@@ -952,5 +985,61 @@ describe("candidateValueForField grounding", () => {
     expect(
       candidateValueForField(githubField, baseView(), emptyAnswers(), true)
     ).toBeNull();
+  });
+});
+
+// ── ashbyDirectSolver: the SolverFn shim ────────────────────────────────
+//
+// Regression coverage for the finding that `ashbyDirectSolver` passed
+// `input.jobApplicationId` straight through to `submitAshbyApplicationDirectly`
+// without the `.trim()` the old inline `submitApplication()` used to apply
+// before this became a registry entry. An untrimmed id passes `preflight()`
+// (which is called with the trimmed value already) and then misses the row
+// lookup `submitAshbyApplicationDirectly` does itself, because a
+// whitespace padded id is never equal to the stored uuid. The row lookup is
+// mocked to answer "no row found" for every id, so this only has to observe
+// which id value reached the `.eq("id", ...)` filter, not carry a submission
+// all the way through.
+
+function baseSolverInput(jobApplicationId: string): SubmitApplicationInput {
+  return { jobApplicationId, requiresCoverLetter: false };
+}
+
+function baseSolverRow(): PreflightRow {
+  return {
+    status: "ready",
+    company: "Test Co",
+    jobTitle: "Test Engineer",
+    jobId: "00000000-0000-0000-0000-000000000002",
+    jobDescription: null,
+    ats: "ashby",
+    confirmationRef: null,
+    applyUrl: "https://jobs.ashbyhq.com/testorg/00000000-0000-0000-0000-000000000003",
+  };
+}
+
+describe("ashbyDirectSolver", () => {
+  beforeEach(() => {
+    capturedApplicationsIdFilters.length = 0;
+  });
+
+  it("trims a whitespace padded jobApplicationId before the applications lookup", async () => {
+    const paddedId = "  00000000-0000-0000-0000-000000000001  ";
+    await expect(
+      ashbyDirectSolver(baseSolverInput(paddedId), baseSolverRow())
+    ).rejects.toThrow(/not found/);
+
+    expect(capturedApplicationsIdFilters).toEqual([
+      "00000000-0000-0000-0000-000000000001",
+    ]);
+  });
+
+  it("passes an already trimmed jobApplicationId through unchanged", async () => {
+    const cleanId = "00000000-0000-0000-0000-000000000001";
+    await expect(
+      ashbyDirectSolver(baseSolverInput(cleanId), baseSolverRow())
+    ).rejects.toThrow(/not found/);
+
+    expect(capturedApplicationsIdFilters).toEqual([cleanId]);
   });
 });
