@@ -429,8 +429,8 @@ export default async function Home({
             covers your whole inbox. Jobinno&apos;s code is written to
             restrict itself to reading that one verification code and
             nothing else in your inbox. This capability is not live yet:
-            connecting Gmail today stores the access for when it ships, and
-            the app does not open any messages until then.
+            connecting Gmail today stores the refresh token for when it
+            ships, and the app does not open any messages until then.
           </p>
         </Section>
 
