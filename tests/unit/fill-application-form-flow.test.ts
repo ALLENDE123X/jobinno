@@ -120,6 +120,16 @@ const h = vi.hoisted(() => {
     shapes: [] as { fingerprint: string; slots: string[] }[],
     /** What the listing row says its URL is. Overridden by the guard tests. */
     applyUrl: APPLY_URL,
+    /** `jobs.ats`. Overridden by the JOB-261 tests, which need "smartrecruiters" or "breezy". */
+    ats: "greenhouse" as string,
+    /**
+     * JOB-261. What `findVisibleApplyIntentControlInPage`'s DOM scan reports —
+     * a visible Apply-ish control on screen, independent of what the page
+     * reader itself said in `applyControlPresent`.
+     */
+    applyIntentButtonVisible: false,
+    /** Every URL `page.goto` was asked to visit, in order. */
+    gotoUrls: [] as string[],
     /**
      * Where the browser really is, which is not the same question as what the
      * row says. Null means it went where it was sent; a string is a redirect the
@@ -217,6 +227,9 @@ const h = vi.hoisted(() => {
     state.events = [];
     state.shapes = [];
     state.applyUrl = APPLY_URL;
+    state.ats = "greenhouse";
+    state.applyIntentButtonVisible = false;
+    state.gotoUrls = [];
     state.landedUrl = null;
     state.moveOnFirstType = null;
     state.fileInputs = 0;
@@ -344,7 +357,14 @@ const h = vi.hoisted(() => {
   };
 
   const page = {
-    goto: async () => undefined,
+    goto: async (url: string) => {
+      // Recorded only — never changes where `page.url()` reports the browser
+      // to be. The JOB-261 tests that care where the browser really ended up
+      // (`landedUrl`/`moveOnFirstType`) still set that explicitly, the same
+      // way every other redirect test in this file already does.
+      state.gotoUrls.push(url);
+      return undefined;
+    },
     // Where the browser is, not where it was sent. `goto` follows redirects, so
     // these are two different strings whenever `landedUrl` is set.
     url: async () => state.landedUrl ?? state.applyUrl,
@@ -362,6 +382,12 @@ const h = vi.hoisted(() => {
     evaluate: async (script: unknown) => {
       const source = String(script);
       if (source.includes("passwordFields")) return readFloor();
+      // JOB-261. `pageHasVisibleApplyIntentControl`'s DOM scan, told apart from
+      // every other evaluated script by the name of the function it ships into
+      // the page.
+      if (source.includes("findVisibleApplyIntentControlInPage")) {
+        return state.applyIntentButtonVisible;
+      }
       // Issue #100. `readFieldValue`'s script is the only one that asks a
       // control whether it is checked, which is what identifies it here. The
       // selector it was built for is embedded in the script as a literal, so
@@ -493,7 +519,7 @@ vi.mock("@supabase/supabase-js", () => {
         jobs: {
           title: "Software Engineer Intern",
           url: h.state.applyUrl,
-          ats: "greenhouse",
+          ats: h.state.ats,
           boards: { company: "Example", board_token: h.BOARD_TOKEN },
         },
       },
@@ -1468,6 +1494,130 @@ describe("an apply control labelled the way SmartRecruiters labels it", () => {
     expect(result.status).toBe("form_fill_blocked");
     expect(result.blockedReason).toContain("Refusing to click");
     expect(result.blockedReason).toContain("SUBMITS the application");
+  });
+});
+
+// ───────────────────────────────────
+// JOB-261 — SR + Breezy job description pages the reader missed
+// ───────────────────────────────────
+//
+// Renesas Electronics (SR) and two Breezy postings (Sports Reference, VetsEZ
+// Dallas) all terminated at `form_fill_blocked` having landed on the job
+// description page with `applyControlPresent: false`, even though a working
+// Apply control was on screen. `h.state.applyIntentButtonVisible` stands in
+// for that control: it is what `findVisibleApplyIntentControlInPage`'s DOM
+// scan reports, independent of what the page reader itself claimed.
+//
+// Every test here also sets `h.state.domHasForm = false`, the same flag the
+// "no form" tests above use, because the fixed three-field DOM the rest of
+// this file reads by default would otherwise make `isJdOnlyPageShape` false
+// before this ticket's logic ever gets a say — see `MIN_IDENTITY_SLOTS_FOR_FORM`
+// two file sections up. It is flipped back to `true` from inside a test's own
+// `signalsOverride`, once the fixture wants to say the form has appeared.
+describe("a job description page on SR or Breezy that the reader called formless", () => {
+  const applyStartResolve = (description: string) => (instruction: string) =>
+    instruction.includes("opens this listing's job application form")
+      ? { selector: "xpath=/html[1]/body[1]/main[1]/a[1]", description, replayed: false }
+      : h.manualEntryOnly(instruction);
+
+  it("SmartRecruiters: clicks through the DOM's own Apply control and reaches the form", async () => {
+    h.state.ats = "smartrecruiters";
+    h.state.applyUrl = "https://jobs.smartrecruiters.com/example/744000145339679";
+    h.state.applyIntentButtonVisible = true;
+    h.state.domHasForm = false;
+    h.state.resolve = applyStartResolve(
+      "The “I'm interested” link that opens this listing's job application form."
+    );
+    h.state.signalsOverride = (call) => {
+      // Calls 1 through 3 are the initial read plus the two empty-handed
+      // rereads JOB-021 already does before giving up on those — this fixture
+      // is saying the reader keeps calling it formless throughout, exactly as
+      // Renesas's real skip_log ("read 3 times") did. Only the read after the
+      // click shows a real form.
+      if (call <= 3) return { applicationFormPresent: false, applyControlPresent: false };
+      h.state.domHasForm = true;
+      return {};
+    };
+
+    const result = await run();
+
+    expect(result.status).toBe("form_filled");
+    expect(result.blockedReason).toBeNull();
+    // Clicked, not URL-synthesised: SR's OneClick form only exists at a URL
+    // carrying a per-employer token this ticket does not try to invent.
+    expect(h.state.gotoUrls.some((url) => url.includes("/apply"))).toBe(false);
+  });
+
+  it("Breezy: tries the /apply suffix first, and it reaches the form without a click", async () => {
+    h.state.ats = "breezy";
+    h.state.applyUrl = "https://example.breezy.hr/p/79e583d55a8f-software-engineer";
+    h.state.applyIntentButtonVisible = true;
+    h.state.domHasForm = false;
+    h.state.signalsOverride = (call) => {
+      // Calls 1 through 3: the initial read plus the two empty-handed rereads.
+      // Call 4 is what appending /apply led to, and it has the real form on
+      // it — tonight's working Bitdeer / Bear Robotics / Sentinel Blue /
+      // Computer Information Concepts shape.
+      if (call <= 3) return { applicationFormPresent: false, applyControlPresent: false };
+      h.state.domHasForm = true;
+      return {};
+    };
+
+    const result = await run();
+
+    expect(result.status).toBe("form_filled");
+    expect(result.blockedReason).toBeNull();
+    expect(h.state.gotoUrls).toContain(
+      "https://example.breezy.hr/p/79e583d55a8f-software-engineer/apply"
+    );
+  });
+
+  it("Breezy: falls back to clicking Apply when the /apply suffix does not produce a form", async () => {
+    h.state.ats = "breezy";
+    h.state.applyUrl = "https://example.breezy.hr/p/79e583d55a8f-software-engineer";
+    h.state.applyIntentButtonVisible = true;
+    h.state.domHasForm = false;
+    h.state.resolve = applyStartResolve("the Apply Now button");
+    h.state.signalsOverride = (call) => {
+      // Calls 1 through 3 are the JD page (the initial read plus the two
+      // empty-handed rereads); call 4 is the /apply attempt, which this
+      // listing does not actually have — still the JD shape. Call 5 is what
+      // the fallback click led to.
+      if (call <= 4) return { applicationFormPresent: false, applyControlPresent: false };
+      h.state.domHasForm = true;
+      return {};
+    };
+
+    const result = await run();
+
+    expect(result.status).toBe("form_filled");
+    expect(result.blockedReason).toBeNull();
+    // Both were tried, in order: the suffix first, then back to the listing
+    // the click loop already knows how to handle.
+    const suffixIndex = h.state.gotoUrls.indexOf(
+      "https://example.breezy.hr/p/79e583d55a8f-software-engineer/apply"
+    );
+    const backIndex = h.state.gotoUrls.lastIndexOf(
+      "https://example.breezy.hr/p/79e583d55a8f-software-engineer"
+    );
+    expect(suffixIndex).toBeGreaterThanOrEqual(0);
+    expect(backIndex).toBeGreaterThan(suffixIndex);
+  });
+
+  it("does not touch any board outside SR and Breezy, even with the same DOM evidence", async () => {
+    // The ticket's own non-goal: this is not a generic Apply-button-clicking
+    // behaviour. A Greenhouse job description page with the exact same shape
+    // must still fail exactly as it always has.
+    h.state.applyIntentButtonVisible = true;
+    h.state.domHasForm = false;
+    h.state.signalsOverride = () => ({ applicationFormPresent: false, applyControlPresent: false });
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("Could not reach the job application form");
+    expect(result.blockedReason).toContain("Nothing was clicked or typed.");
+    expect(h.state.gotoUrls.some((url) => url.includes("/apply"))).toBe(false);
   });
 });
 
