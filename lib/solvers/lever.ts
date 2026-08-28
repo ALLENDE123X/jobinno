@@ -150,6 +150,15 @@ export type LeverHcaptchaGateProbe = {
   hiddenSubmitPresent: boolean;
   /** That element's own `type` attribute, or null when it is not present. */
   hiddenSubmitType: string | null;
+  /**
+   * Whether `#hcaptchaSubmitBtn` is actually hidden from the page — via
+   * `classList.contains("hidden")`, the `hidden` attribute, or a computed
+   * `display: none` / `visibility: hidden`. `hiddenSubmitPresent` alone only
+   * says the element exists; this is what makes it the element the module
+   * header and `hiddenSubmitPresent`'s own name claim it is. False when the
+   * element is not present at all.
+   */
+  hiddenSubmitIsHidden: boolean;
   /** Whether `input[name="h-captcha-response"]` exists on the page. */
   responseTokenPresent: boolean;
   /** That input's `value`, or null when the input is not present. */
@@ -173,9 +182,19 @@ const LEVER_HCAPTCHA_GATE_SCRIPT = `(() => {
   const response = document.querySelector('input[name="h-captcha-response"]');
   const sitekeyEl = document.querySelector('[data-sitekey]');
   const visible = document.querySelector('#btn-submit');
+  let hiddenSubmitIsHidden = false;
+  if (hidden) {
+    const style = window.getComputedStyle(hidden);
+    hiddenSubmitIsHidden =
+      hidden.classList.contains('hidden') ||
+      hidden.hasAttribute('hidden') ||
+      style.display === 'none' ||
+      style.visibility === 'hidden';
+  }
   return {
     hiddenSubmitPresent: hidden !== null,
     hiddenSubmitType: hidden ? hidden.getAttribute('type') : null,
+    hiddenSubmitIsHidden,
     responseTokenPresent: response !== null,
     responseTokenValue: response ? response.value : null,
     sitekey: sitekeyEl ? sitekeyEl.getAttribute('data-sitekey') : null,
@@ -189,6 +208,7 @@ function isLeverHcaptchaGateProbe(value: unknown): value is LeverHcaptchaGatePro
   return (
     typeof v.hiddenSubmitPresent === "boolean" &&
     (typeof v.hiddenSubmitType === "string" || v.hiddenSubmitType === null) &&
+    typeof v.hiddenSubmitIsHidden === "boolean" &&
     typeof v.responseTokenPresent === "boolean" &&
     (typeof v.responseTokenValue === "string" || v.responseTokenValue === null) &&
     (typeof v.sitekey === "string" || v.sitekey === null) &&
@@ -219,19 +239,25 @@ async function probeLeverHcaptchaGate(page: Page): Promise<LeverHcaptchaGateProb
  * `pageReadsAsFurtherStep` use elsewhere in this codebase for exactly this
  * reason.
  *
- * Two signals have to agree, the same "not either alone" rule
+ * Three signals have to agree, the same "not either alone" rule
  * `runSubmitPhase` applies to its own security-code check: the real submit
- * control has to actually exist and actually be the `submit` type Lever wires
- * up (not just any element happening to share the id), and the token field
- * it depends on has to exist and be empty. Either alone is weaker evidence —
- * a hidden submit button with a *populated* token means hCaptcha succeeded
- * and something else is the real story; an empty token with no hidden submit
- * button in sight means this was never Lever's template to begin with.
+ * control has to actually exist, actually be the `submit` type Lever wires
+ * up (not just any element happening to share the id), and actually be
+ * hidden from the page the way Lever's own template hides it (not just
+ * present with a matching id and type) — and the token field it depends on
+ * has to exist and be empty. Any one of these alone is weaker evidence — a
+ * hidden submit button with a *populated* token means hCaptcha succeeded and
+ * something else is the real story; an empty token with no hidden submit
+ * button in sight means this was never Lever's template to begin with; and a
+ * *visible* `type="submit"` control that happens to reuse this id and type,
+ * with an empty token for some unrelated reason, is not this gate either —
+ * a real applicant could simply not have reached it yet.
  */
 export function leverHcaptchaGateBlocked(probe: LeverHcaptchaGateProbe): boolean {
   return (
     probe.hiddenSubmitPresent &&
     probe.hiddenSubmitType === "submit" &&
+    probe.hiddenSubmitIsHidden &&
     probe.responseTokenPresent &&
     (probe.responseTokenValue ?? "").trim() === ""
   );

@@ -31,6 +31,7 @@ const LEVER_SITEKEY = "e33f87f8-88ec-4e1a-9a13-df9bbb1d8120";
 const withheldTokenProbe: LeverHcaptchaGateProbe = {
   hiddenSubmitPresent: true,
   hiddenSubmitType: "submit",
+  hiddenSubmitIsHidden: true,
   responseTokenPresent: true,
   responseTokenValue: "",
   sitekey: LEVER_SITEKEY,
@@ -62,6 +63,7 @@ describe("leverHcaptchaGateBlocked", () => {
       leverHcaptchaGateBlocked({
         hiddenSubmitPresent: false,
         hiddenSubmitType: null,
+        hiddenSubmitIsHidden: false,
         responseTokenPresent: false,
         responseTokenValue: null,
         sitekey: null,
@@ -87,6 +89,22 @@ describe("leverHcaptchaGateBlocked", () => {
         ...withheldTokenProbe,
         responseTokenPresent: false,
         responseTokenValue: null,
+      })
+    ).toBe(false);
+  });
+
+  it("does not fire when the id and type match but the control is actually visible", () => {
+    // MAJOR finding from PR #242 review: a future Lever variant, or any
+    // other board entirely, could reuse the id `#hcaptchaSubmitBtn` with
+    // `type="submit"` on a control that is genuinely on screen, with an
+    // empty h-captcha-response for a reason that has nothing to do with
+    // this gate. Matching id and type alone is not enough evidence — the
+    // control also has to actually be hidden the way Lever's own template
+    // hides it.
+    expect(
+      leverHcaptchaGateBlocked({
+        ...withheldTokenProbe,
+        hiddenSubmitIsHidden: false,
       })
     ).toBe(false);
   });
@@ -116,6 +134,7 @@ describe("describeLeverHcaptchaGate", () => {
       {
         hiddenSubmitPresent: true,
         hiddenSubmitType: null,
+        hiddenSubmitIsHidden: true,
         responseTokenPresent: true,
         responseTokenValue: "",
         sitekey: null,
