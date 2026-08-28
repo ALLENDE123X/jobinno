@@ -13,6 +13,22 @@
  * other file changes, and nothing in `lib/submit-application.ts` has to move
  * again.
  *
+ * ── A registered solver does not mean a live platform ───────────────────────
+ * Registering an entry here says the code exists to run a listing on that
+ * platform through. It says nothing about whether `boards` rows for that
+ * platform are actually matched against candidates: that is
+ * `boards.active`, a separate, manually curated gate (see its column comment
+ * in `lib/db/schema.ts`), and it stays `false` until a real submission on
+ * that exact ATS has actually been confirmed working. `bamboohr.ts` is the
+ * clearest example: it is registered below the same as every other entry,
+ * and its own header explains why it ships as a deliberate stub with no
+ * board specific classifier, because BambooHR's real obstacle is not
+ * something a classifier can fix — a reCAPTCHA v2 iframe in front of the
+ * form, confirmed unsolvable by synthetic clicks (see
+ * `lib/known-unsolved-platforms.ts`). A solver landing here is necessary
+ * work toward a platform going live; it is never by itself the signal that
+ * it should.
+ *
  * `lookupSolver` takes `AtsPlatform`, not `string`: the row `submitApplication`'s
  * `preflight()` reads carries `ats` as a plain string off the `jobs` table (see
  * `PreflightRow` in `lib/submit-application.ts`), so the router narrows it with

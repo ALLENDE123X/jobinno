@@ -108,7 +108,7 @@ import {
   releaseApplicationSlot,
   reserveApplicationSlot,
 } from "@/lib/application-quota";
-import { claimApplicationRow } from "@/lib/application-records";
+import { claimApplicationRow, recordSkipQuietly } from "@/lib/application-records";
 import { APPLICATION_STATUS } from "@/lib/application-status";
 import { FormFillBlockedError } from "@/lib/fill-application-form";
 import {
@@ -119,6 +119,7 @@ import {
   searchBlockedReason,
   type MatchPreferences,
 } from "@/lib/job-matching";
+import { knownUnsolvedPlatform } from "@/lib/known-unsolved-platforms";
 import { InjectionSuspectedError } from "@/lib/resume-parser";
 import { requiresCoverLetterFromQuestions } from "@/lib/search-job-listings";
 import { browserConcurrencyLimit } from "@/lib/stagehand-session";
@@ -777,6 +778,65 @@ export const applyToJob = inngest.createFunction(
       `${LOG} applications ${applicationId} — ${claim.company} / ${claim.title} ` +
         `(${claim.created ? "new" : "reusing existing row"})`
     );
+
+    // ── Refuse before the browser, if this platform is a known dead end ─────
+    // See `lib/known-unsolved-platforms.ts` for what this checks and why it
+    // exists at all: `boards.active` is a manually curated gate and nothing
+    // stops it being flipped on for a platform that was never actually made
+    // to work. This is the second, code level line of defense, and it has to
+    // run here — after the claim above, before `reserve-application-slot`
+    // below — because a real captcha block on a platform like BambooHR
+    // writes `form_fill_blocked`, a status `CAP_CONSUMING_STATUSES` charges
+    // for. Refusing before a slot is ever reserved is what keeps a match
+    // against a known-unsolvable platform free.
+    //
+    // The `applications` row stays at `discovered`: nothing was attempted, so
+    // nothing about what the row says happened changes. The `skip_log` row
+    // carries the "why", under its own reason (`platform_unsolved`) rather
+    // than `captcha`, because nothing here ever reached a form to find a
+    // challenge on it — that distinction is the whole reason the reason
+    // exists, see its comment in `lib/db/schema.ts`.
+    //
+    // `recordSkipQuietly`, not `recordSkip`: the property this branch exists
+    // to guarantee is "no slot reserved, no browser opened", and that has to
+    // hold whether or not the `skip_log` insert itself succeeds.
+    // `platform_unsolved` needs `drizzle/0028_platform_unsolved_skip_reason.sql`
+    // applied before Postgres will accept it — see that migration's own header
+    // — and a run must not turn into a retried, eventually-failed Inngest step
+    // (still no slot reserved, but noisy and confusing) just because that
+    // migration has not landed in production yet.
+    const unsolved = knownUnsolvedPlatform(claim.ats);
+    if (unsolved) {
+      await step.run("auto-skip-unsolved-platform", async () => {
+        const supabase = getSupabaseClient();
+        await recordSkipQuietly(supabase, {
+          applicationId,
+          jobId,
+          ats: claim.ats,
+          reason: "platform_unsolved",
+          message:
+            `${claim.company} / ${claim.title} — ${unsolved.ats} is a known unsolved ` +
+            `platform (confirmed ${unsolved.confirmedAt}): ${unsolved.reason} Refused ` +
+            `before a browser opened; no allowance was spent.`,
+        }, LOG);
+      });
+
+      console.warn(
+        `${LOG} applications ${applicationId} — ${claim.company} / ${claim.title}: ` +
+          `${unsolved.ats} is a known unsolved platform, refused before reserving an ` +
+          `allowance or opening a browser. See lib/known-unsolved-platforms.ts.`
+      );
+
+      return {
+        applicationId,
+        jobId,
+        status: APPLICATION_STATUS.DISCOVERED,
+        submitted: false,
+        confirmationRef: null,
+        listing: summary,
+        needsHuman: false,
+      };
+    }
 
     // ── Take the application off the plan's allowance ───────────────────────
     // This is the cap, and it is enforced here rather than in the claim above

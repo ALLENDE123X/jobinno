@@ -1,0 +1,29 @@
+-- JOB-237 round 2: one more value for `skip_log.reason`, `platform_unsolved`.
+--
+-- The column's CHECK constraint is built from `SKIP_REASONS` in
+-- `lib/db/schema.ts`, so the two have to move together, exactly as
+-- `drizzle/0007_skip_reason_taxonomy.sql` and
+-- `drizzle/0008_bot_detected_skip_reason.sql` did before it. See the comment
+-- beside the value for what it names and why `captcha` does not already cover
+-- it: `captcha` means a run reached a form and found a challenge on it,
+-- `platform_unsolved` means `lib/known-unsolved-platforms.ts` refused the
+-- match before any browser opened at all.
+--
+-- ── Read this before applying ────────────────────────────────────────────────
+-- Not applied against the production database by this change. HARD STOP 5
+-- forbids running any write against a real `DATABASE_URL` without an explicit
+-- opt in, and this round's own instructions were to make code and test
+-- changes only. Until this migration lands, Postgres refuses a `skip_log`
+-- insert carrying `platform_unsolved`, and the auto-skip path in
+-- `inngest/job-application-pipeline.ts` calls `recordSkipQuietly` rather than
+-- `recordSkip` specifically so that refusal degrades to a loud
+-- `console.error` instead of a thrown, retried Inngest step: the property
+-- that path exists to guarantee (no allowance reserved, no browser opened)
+-- has to hold either way. Applying this migration is still what makes the
+-- reason actually land in the table rather than only in the log. Apply
+-- through the IPv4 session mode pooler per CLAUDE.md's own instructions on
+-- `drizzle-kit migrate` against Supabase, then confirm the constraint changed
+-- against the live database rather than trusting the command's exit code.
+ALTER TABLE "skip_log" DROP CONSTRAINT IF EXISTS "skip_log_reason_check";
+--> statement-breakpoint
+ALTER TABLE "skip_log" ADD CONSTRAINT "skip_log_reason_check" CHECK ("reason" in ('unanswerable_required', 'verification_required', 'captcha', 'dom_changed', 'timeout', 'submit_failed', 'blocked_redirect', 'needs_attestation', 'internal_error', 'bot_detected', 'platform_unsolved'));
