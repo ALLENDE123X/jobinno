@@ -91,7 +91,8 @@
  * `lib/form-fields.ts`, not in a solver file that is not supposed to touch
  * either — see this file's own scope below. What ships here is an accurate,
  * field named diagnosis in place of the generic hedge, so the next person
- * who picks this up starts from a fact instead of a guess.
+ * who picks this up starts from a fact instead of a guess. That next ticket
+ * is filed: issue #246 tracks the actual fill time fix.
  *
  * ── Why DOM, not direct HTTP ─────────────────────────────────────────────────
  * The ticket authorizes a direct HTTP solver, on the Ashby model, only if
@@ -255,7 +256,15 @@ export function greenhouseRequiredFieldsGateBlocked(
  * specific field labels rather than repeating `runSubmitPhase`'s own hedge
  * ("most likely rejected... validation, or an anti bot check"), because
  * this row exists specifically to replace a guess with a fact once one is
- * available.
+ * available: which named fields Greenhouse's own validation marked empty
+ * at submit time. It stops there deliberately. The probe's only signal is
+ * the `select__label--error` class, and react-select puts that same class
+ * on every required combobox variant alike, fixed option list and async
+ * search alike, so this message never claims which widget flow is behind
+ * a given field. Saying more than the probe can actually tell would risk
+ * misreading a real regression of issue #93 as something else entirely.
+ * Establishing which widget variant is at fault, field by field, and fixing
+ * the fill time commit bug behind it, is issue #246's job, not this one's.
  */
 export function describeGreenhouseRequiredFieldsGate(
   probe: GreenhouseRequiredFieldGateProbe,
@@ -270,12 +279,12 @@ export function describeGreenhouseRequiredFieldsGate(
   return (
     `Greenhouse's own client side validation blocked this submission. It was not a bot check, ` +
     `and it is not the generic guess the reading above already made. ${count} required ${plural} ` +
-    `still read as empty at "${finalUrl}" after the click: ${names}. Each one reads as Greenhouse's ` +
-    `own async search combobox, where a person types a query and picks a result the server sends ` +
-    `back, a different widget flow from the fixed option list dropdowns issue #93 already covers ` +
-    `(see lib/form-fields.ts's highlightOption, which does not reach this flow). Whatever the fill ` +
-    `wrote into ${pronoun} never registered as a real choice with Greenhouse, so nothing was ever ` +
-    `posted to the board. A person should check whether the candidate's stored data actually ` +
+    `still read as empty at "${finalUrl}" after the click: ${names}. Greenhouse's own validation ` +
+    `marked ${pronoun} as empty at submit time; that reading is a fact, not a guess, but nothing ` +
+    `here identifies which kind of dropdown widget is behind ${pronoun}. Whatever the fill wrote ` +
+    `into ${pronoun} never registered as a real choice with Greenhouse, so nothing was ever posted ` +
+    `to the board. See issue #246 for the tracked follow up that will fix how these fields commit ` +
+    `their value during fill. A person should check whether the candidate's stored data actually ` +
     `answers ${pronoun} before this is retried by hand. Nothing here is retried automatically.`
   );
 }

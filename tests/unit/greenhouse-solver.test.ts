@@ -72,10 +72,16 @@ describe("describeGreenhouseRequiredFieldsGate", () => {
       "https://job-boards.greenhouse.io/embed/job_app?for=virtu&token=8624410002"
     );
     expect(message).toContain("2 required fields");
-    expect(message).toContain("#93");
+    expect(message).toContain("#246");
     // The point of this row is that it replaces a guess with a fact — it
     // must never repeat the generic branch's own hedge.
     expect(message).not.toContain("most likely rejected");
+    // The probe cannot tell a fixed option dropdown from an async search
+    // combobox — both carry the same `select__label--error` class — so the
+    // message must never claim a specific widget variant. Claiming one
+    // would misdiagnose a real regression of issue #93 as something else.
+    expect(message).not.toContain("async search combobox");
+    expect(message).not.toContain("#93");
   });
 
   it("uses the singular field wording for exactly one empty field", () => {
