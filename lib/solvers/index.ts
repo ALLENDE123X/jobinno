@@ -39,6 +39,7 @@ import type { SolverFn } from "@/lib/solvers/types";
 import { ashbyDirectSolver, shouldRouteAshbyDirectHttp } from "@/lib/solvers/ashby-direct";
 import { greenhouseSolver } from "@/lib/solvers/greenhouse";
 import { leverSolver } from "@/lib/solvers/lever";
+import { recruiteeSolver } from "@/lib/solvers/recruitee";
 import { workableSolver } from "@/lib/solvers/workable";
 
 const solvers: Record<AtsPlatform, SolverFn | undefined> = {
@@ -62,10 +63,16 @@ const solvers: Record<AtsPlatform, SolverFn | undefined> = {
   // Workable, plus a Workable specific read of the one confirmed failure
   // shape (see `lib/solvers/workable.ts`'s header).
   workable: workableSolver,
+  // JOB-236. Unconditional, unlike Ashby's gate below, for the same reason
+  // the other four entries above are — see those comments. This is the same
+  // DOM fill and submit flow `domFallbackSolver` already ran for Recruitee,
+  // plus the #140 phone country code fix and a Recruitee specific read of
+  // the one confirmed failure shape (see `lib/solvers/recruitee.ts`'s
+  // header).
+  recruitee: recruiteeSolver,
   bamboohr: undefined,
   breezy: undefined,
   jazzhr: undefined,
-  recruitee: undefined,
   teamtailor: undefined,
   smartrecruiters: undefined,
 };
