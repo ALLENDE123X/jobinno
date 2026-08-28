@@ -414,15 +414,23 @@ export default async function Home({
 
           {/* Gmail scope justification (JOB-245). Mirrors the framing already
               on /privacy: optional, narrow, and not live yet. Do not
-              overclaim past what that page says. */}
+              overclaim past what that page says. Also mirrors /privacy's
+              gmail.readonly disclosure (app/privacy/page.tsx around line
+              136) so a Google OAuth reviewer sees the same distinction
+              between what the permission grants and what the code reads,
+              rather than a discrepancy between the two pages. */}
           <p className="mx-auto mt-12 max-w-2xl text-center text-sm text-pretty text-muted-foreground">
             Some job boards require creating an account before you can apply,
             which means receiving a security code by email. Jobinno can
             optionally connect to Gmail to read just that verification code
-            for the boards that need it, nothing else in your inbox. This
-            capability is not live yet: connecting Gmail today stores the
-            access for when it ships, and the app does not open any messages
-            until then.
+            for the boards that need it. The Gmail permission itself is
+            broader than that: Google labels it &quot;View your email
+            messages and settings&quot; on the consent screen, and that
+            covers your whole inbox. Jobinno&apos;s code is written to
+            restrict itself to reading that one verification code and
+            nothing else in your inbox. This capability is not live yet:
+            connecting Gmail today stores the access for when it ships, and
+            the app does not open any messages until then.
           </p>
         </Section>
 
