@@ -98,6 +98,7 @@ import {
 } from "@/lib/application-records";
 import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 import type { SubmitApplicationResult } from "@/lib/submit-application";
+import type { SolverFn } from "@/lib/solvers/types";
 
 const LOG = "[job-214]";
 
@@ -1484,3 +1485,23 @@ function deriveResumeFileName(resumeUrl: string, fullName: string | null): strin
   const ext = extMatch ? extMatch[1].toLowerCase() : "pdf";
   return `${base}.${ext}`;
 }
+
+// ── JOB-232: SolverFn shim ──────────────────────────────────────────────────
+
+/**
+ * Presents `submitAshbyApplicationDirectly` as a `SolverFn` so the registry
+ * in `lib/solvers/index.ts` can hold it next to every future dedicated
+ * solver. Purely a shape adapter: it reads the six fields
+ * `SubmitAshbyDirectlyInput` needs off `input` and the row `submitApplication`
+ * already preflighted, and calls straight through. Nothing above this line
+ * changed to make this possible.
+ */
+export const ashbyDirectSolver: SolverFn = async (input, row) =>
+  submitAshbyApplicationDirectly({
+    jobApplicationId: input.jobApplicationId,
+    ats: row.ats,
+    applyUrl: row.applyUrl,
+    jobId: row.jobId,
+    company: row.company,
+    jobTitle: row.jobTitle,
+  });

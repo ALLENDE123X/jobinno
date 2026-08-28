@@ -17,7 +17,7 @@ import {
   shouldRouteAshbyDirectHttp,
   type AshbyCandidateView,
   type ResolvedAshbyContext,
-} from "@/lib/ashby-direct-submit";
+} from "@/lib/solvers/ashby-direct";
 import type { CandidateApplicationAnswers } from "@/lib/candidate-intake";
 import { APPLICATION_STATUS } from "@/lib/application-status";
 

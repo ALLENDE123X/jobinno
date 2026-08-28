@@ -63,6 +63,17 @@
  *
  * Targets Jobinno's own Supabase project, guarded by the shared
  * `assertSupabaseProject()` check every module here imports.
+ *
+ * ── JOB-232 ──────────────────────────────────────────────────────────────────
+ * `runSubmitPhase()` below is exported now and still does exactly what it
+ * always did, but the call into `fillApplicationFormRetainingSession()` then
+ * `runSubmitPhase()` described two paragraphs up no longer happens inside
+ * `submitApplication()` in this file. It happens in
+ * `lib/solvers/dom-fallback.ts`, the universal fallback solver every ats
+ * without a dedicated one — and, as of this ticket, only Ashby has one —
+ * still runs. `submitApplication()` now does the preflight, then hands the
+ * row to whichever solver `lookupSolver()` returns or to that fallback. See
+ * `lib/solvers/types.ts` for the `SolverFn` seam this composes through.
  */
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
@@ -81,14 +92,12 @@ import {
   SUBMIT_WORD_RE,
   applicantIdentitySlots,
   describeControl,
-  fillApplicationFormRetainingSession,
   readCoreSlotsFromDom,
   type ControlDescriptor,
   type FillApplicationFormResult,
   type VerificationInput,
 } from "@/lib/fill-application-form";
 import {
-  closeBrowserSession,
   samePage,
   sleep,
   tryResolveAction,
@@ -124,13 +133,15 @@ import { assertSupabaseProject } from "@/lib/supabase-project-guard";
 // mint inside this Browserbase session — see that module's header for why.
 import { mintAshbyRecaptchaToken } from "@/lib/ashby-recaptcha";
 import { humanizedSleep, HUMANIZE_TIMINGS } from "@/lib/humanized-delays";
-// JOB-214. The browserless Ashby submit path. Off by default; the mode
-// selector at the top of `submitApplication` is the only place it is called
-// from and the ats gate lives there too.
-import {
-  shouldRouteAshbyDirectHttp,
-  submitAshbyApplicationDirectly,
-} from "@/lib/ashby-direct-submit";
+// JOB-232. The per-board solver registry. `lookupSolver` returns the
+// dedicated solver for a given ats when one is registered and its own gate
+// (if it has one) is open, or null otherwise; `domFallbackSolver` is what
+// every ats without a dedicated solver — and every registered one whose gate
+// is closed — runs through instead. Together they replace what used to be a
+// single hardcoded `if (shouldRouteAshbyDirectHttp) ...` branch here. See
+// `lib/solvers/index.ts` and `lib/solvers/dom-fallback.ts`.
+import { lookupSolver } from "@/lib/solvers";
+import { domFallbackSolver } from "@/lib/solvers/dom-fallback";
 
 const LOG = "[act-008]";
 
@@ -1252,7 +1263,10 @@ function getSupabaseClient(): SupabaseClient {
   });
 }
 
-type PreflightRow = {
+// JOB-232. Exported so `lib/solvers/dom-fallback.ts` and `lib/solvers/types.ts`
+// can read the same row shape the router already preflighted, instead of a
+// second hand copied one. Nothing about the type itself changed.
+export type PreflightRow = {
   status: string;
   company: string;
   jobTitle: string;
@@ -2063,90 +2077,25 @@ export async function submitApplication(
     `${LOG} ── this run will submit a REAL application to a REAL employer. There is no undo. ──`
   );
 
-  // ── JOB-214: Ashby direct HTTP mode selector ─────────────────────────────
-  // Skips Browserbase, Stagehand and the DOM path entirely when both the
-  // env flag and the row's ats agree. Off by default in prod. The selector
-  // is here rather than inside `runSubmitPhase` because the whole point of
-  // the direct path is that no browser session is opened at all, so it has
-  // to precede the fill call below. The direct path returns the same
-  // `SubmitApplicationResult` shape the DOM path does.
-  if (shouldRouteAshbyDirectHttp(row.ats)) {
-    console.log(
-      `${LOG} JOB-214 mode selector: routing applications ${jobApplicationId} through the ` +
-        `Ashby direct HTTP submit path (JOBINNO_ASHBY_SUBMIT_MODE=direct-http, ats=${row.ats})`
-    );
-    return await submitAshbyApplicationDirectly({
-      jobApplicationId,
-      ats: row.ats,
-      applyUrl: row.applyUrl,
-      jobId: row.jobId,
-      company: row.company,
-      jobTitle: row.jobTitle,
-    });
-  }
-
-  // ── Phase 1: fill. ACT-007 owns every guard, every status write and every
-  // failure mode here; this module adds nothing to it and second-guesses none
-  // of it. A throw propagates untouched (ACT-007 has already recorded
-  // `form_fill_blocked` or `error` on the row), and no browser exists yet on
-  // that path — `runBrowserFlow` closed it before rethrowing.
-  const { result: fill, session } = await fillApplicationFormRetainingSession({
-    jobApplicationId,
-    requiresCoverLetter: input.requiresCoverLetter,
-    // The caller's copy if it gave one, otherwise the listing's own, off the
-    // row `preflight` already read. Never undefined: the fill layer reads null
-    // as "no description available" and would read undefined the same way, but
-    // only one of the two is a decision.
-    jobDescription: input.jobDescription ?? row.jobDescription,
-    ...(input.verification === undefined ? {} : { verification: input.verification }),
-    ...(input.additionalAnswers === undefined
-      ? {}
-      : { additionalAnswers: input.additionalAnswers }),
-    ...(input.headless === undefined ? {} : { headless: input.headless }),
-    ...(input.fillScreenshotDir === undefined
-      ? {}
-      : { screenshotDir: input.fillScreenshotDir }),
-  });
-
-  if (fill.blockedReason !== null || session === null) {
-    // ACT-007 stopped for a human and closed its own browser. Nothing was
-    // clicked here, and nothing here writes to the row: `form_fill_blocked` and
-    // its `skip_log` row are already recorded and are the accurate description.
-    if (session !== null) await closeBrowserSession(session);
-    console.warn(`${LOG} the fill did not complete — nothing to submit. Not clicking anything.`);
-    return {
-      jobApplicationId,
-      status: fill.status,
-      submitted: false,
-      submitAttempted: false,
-      confirmationRef: null,
-      confirmation: null,
-      securityCode: null,
-      approval: { approved: false, gate: gateName(input), detail: "never reached — the fill stopped first" },
-      submitControlLabel: null,
-      fill,
-      finalUrl: fill.finalUrl,
-      pageTitle: fill.pageTitle,
-      screenshotPath: fill.screenshotPath,
-      blockedReason:
-        fill.blockedReason ??
-        "the form fill returned no live browser session, so there was nothing to submit",
-      unconfirmedReason: null,
-      rowUpdated: false,
-    };
-  }
-
-  // ── Phase 2: submit. The browser is live and on the filled form from here.
-  try {
-    return await runSubmitPhase(supabase, session, input, jobApplicationId, row, fill);
-  } finally {
-    // Ours to close, whatever happened. `closeBrowserSession` never throws, so
-    // this cannot replace a result or an error with a teardown failure.
-    await closeBrowserSession(session);
-  }
+  // ── JOB-232: per-board solver router ──────────────────────────────────────
+  // `lookupSolver` returns a dedicated solver for this ats when one is
+  // registered and its own gate (if it has one) is open — today that is only
+  // JOB-214's Ashby direct HTTP path, gated on
+  // `JOBINNO_ASHBY_SUBMIT_MODE=direct-http` inside the registry itself, off by
+  // default in prod — or null otherwise. `domFallbackSolver` is the universal
+  // DOM path every other ats, and a gated-off Ashby, still runs: it calls
+  // `fillApplicationFormRetainingSession` (ACT-007) then `runSubmitPhase`
+  // (below in this file) in the same order this function used to, on one
+  // Browserbase session it opens and closes itself. Either way the return
+  // value is the same `SubmitApplicationResult` shape.
+  const solver = lookupSolver(row.ats) ?? domFallbackSolver;
+  return await solver(input, row);
 }
 
-function gateName(input: SubmitApplicationInput): "auto" | "custom" {
+// JOB-232. Exported so `lib/solvers/dom-fallback.ts` can compute the same
+// `approval.gate` value the fallback branch below has always computed, rather
+// than re-deriving the rule for what counts as "auto" a second time.
+export function gateName(input: SubmitApplicationInput): "auto" | "custom" {
   return input.approveSubmission === undefined ||
     input.approveSubmission === AUTO_APPROVE_SUBMISSION
     ? "auto"
@@ -2228,8 +2177,12 @@ function patchGrecaptchaInPage(token: string): null {
  * result. **Never throws.** Every exit is a `SubmitApplicationResult`, which is
  * what makes it impossible for a failure on this side of the click to escape
  * into a caller's generic error handling and come back as a retry.
+ *
+ * JOB-232. Exported so `lib/solvers/dom-fallback.ts` can call this exact
+ * function rather than a re-implementation of it. The logic below is
+ * unchanged by that move; only its visibility is.
  */
-async function runSubmitPhase(
+export async function runSubmitPhase(
   supabase: SupabaseClient,
   session: BrowserSession,
   input: SubmitApplicationInput,
