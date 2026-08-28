@@ -37,6 +37,7 @@
 import type { AtsPlatform } from "@/lib/db/schema";
 import type { SolverFn } from "@/lib/solvers/types";
 import { ashbyDirectSolver, shouldRouteAshbyDirectHttp } from "@/lib/solvers/ashby-direct";
+import { bamboohrSolver } from "@/lib/solvers/bamboohr";
 import { greenhouseSolver } from "@/lib/solvers/greenhouse";
 import { leverSolver } from "@/lib/solvers/lever";
 import { recruiteeSolver } from "@/lib/solvers/recruitee";
@@ -70,7 +71,12 @@ const solvers: Record<AtsPlatform, SolverFn | undefined> = {
   // the one confirmed failure shape (see `lib/solvers/recruitee.ts`'s
   // header).
   recruitee: recruiteeSolver,
-  bamboohr: undefined,
+  // JOB-237. A deliberate stub, unlike the five entries above: the same DOM
+  // fill and submit flow `domFallbackSolver` already ran for BambooHR, with
+  // no board specific read added on top yet. See `lib/solvers/bamboohr.ts`'s
+  // header for why this ships without one — no real `applications` row has
+  // ever hit a BambooHR submission to diagnose a patch from.
+  bamboohr: bamboohrSolver,
   breezy: undefined,
   jazzhr: undefined,
   teamtailor: undefined,

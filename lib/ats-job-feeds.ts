@@ -385,8 +385,38 @@ export function qualifyExternalId(boardToken: string, nativeId: string): string 
  * any of those phrases on its own, so this rule does not change any of
  * today's outcomes; it exists so the next widening of `SWE_RE` does not have
  * to re-derive this exclusion list from scratch to stay safe.
+ *
+ * ── JOB-237: "Co-Op" joins the career stage vocabulary ──────────────────────
+ * Found while diagnosing why BambooHR sourcing produced zero listings despite
+ * two active boards: `specteraerospace.bamboohr.com` publishes 33 postings,
+ * several of them real software roles ("Front-End Software Developer Co-Op
+ * Spring 2027", "Full Stack Developer Co-Op Spring 2027", "Embedded Software
+ * Co-Op Spring 2027"), and every one of them failed `classifyTitle` before
+ * this change because none said "intern," "new grad" or any of the other
+ * `NEW_GRAD_RE` synonyms. They all said "Co-Op" instead, which
+ * `INTERN_RE` did not recognise. This is not a BambooHR quirk to special
+ * case in `readBambooHr`: "co-op" is the standard term for a structured,
+ * for-credit work term at employers in aerospace, manufacturing and
+ * government, the exact population this product's two BambooHR boards
+ * belong to (the other, `alleghenycounty`, is a county government board with
+ * no engineering roles at all — its zero relevant listings are a fact about
+ * that employer, not about this filter). A co-op is structurally an
+ * internship, not a new grad hire — temporary, tied to a school term, not a
+ * standing offer of full time employment — so `COOP_RE` folds into
+ * `isIntern` below rather than into `isNewGrad`.
  */
 const INTERN_RE = /\bintern(ship|ships|s)?\b/i;
+/**
+ * "Co-Op", "Co Op" and "Coop", each accepted with or without the hyphen. Kept
+ * as its own pattern rather than folded into `INTERN_RE` so a future reader
+ * of that regex is not left wondering why "intern" grew a "co op" branch with
+ * no shared root. Matched only where `isIntern` is computed below, never on
+ * its own: a title still needs `SWE_RE` to match too, so "co-op" alone (a
+ * grocery co-op, a housing co-op) is never enough to admit a listing — see
+ * the "discipline and seniority are both required" note above, which this
+ * addition does not relax.
+ */
+const COOP_RE = /\bco[\s-]?op\b/i;
 const NEW_GRAD_RE =
   /\bnew[\s-]?grad(uate|uates|s)?\b|\bearly[\s-]?career\b|\buniversity\b|\bentry[\s-]?level\b|\bgraduate\s+program\b|\bcampus\b|\bclass\s+of\s+20\d{2}\b/i;
 const SWE_RE =
@@ -406,7 +436,7 @@ export type TitleRelevance = {
 export function classifyTitle(rawTitle: string): TitleRelevance {
   const title = String(rawTitle ?? "");
 
-  const isIntern = INTERN_RE.test(title);
+  const isIntern = INTERN_RE.test(title) || COOP_RE.test(title);
   const isNewGrad = NEW_GRAD_RE.test(title);
   // Both, not either: the discipline and the career stage. See above for what
   // the "or" this replaced actually admitted, and for what the "and" costs.
