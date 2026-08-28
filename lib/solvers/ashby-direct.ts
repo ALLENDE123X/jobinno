@@ -1498,7 +1498,7 @@ function deriveResumeFileName(resumeUrl: string, fullName: string | null): strin
  */
 export const ashbyDirectSolver: SolverFn = async (input, row) =>
   submitAshbyApplicationDirectly({
-    jobApplicationId: input.jobApplicationId,
+    jobApplicationId: input.jobApplicationId.trim(),
     ats: row.ats,
     applyUrl: row.applyUrl,
     jobId: row.jobId,

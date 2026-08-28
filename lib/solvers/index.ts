@@ -5,12 +5,21 @@
  * `AtsPlatform`. Every platform without an entry here — and, today, a
  * registered entry whose own gate is closed — falls through to
  * `domFallbackSolver` at the call site in `lib/submit-application.ts`:
- * `const solver = lookupSolver(row.ats) ?? domFallbackSolver`.
+ * `const platform = isAtsPlatform(row.ats) ? row.ats : null;`
+ * `const solver = (platform && lookupSolver(platform)) ?? domFallbackSolver`.
  *
  * Adding the next dedicated solver (Greenhouse, Lever, ...) is meant to be
  * one new file under `lib/solvers/` plus one line in `solvers` below — no
  * other file changes, and nothing in `lib/submit-application.ts` has to move
  * again.
+ *
+ * `lookupSolver` takes `AtsPlatform`, not `string`: the row `submitApplication`'s
+ * `preflight()` reads carries `ats` as a plain string off the `jobs` table (see
+ * `PreflightRow` in `lib/submit-application.ts`), so the router narrows it with
+ * an `isAtsPlatform()` type guard before calling in here. That keeps the
+ * runtime check at the one call site this ticket authorizes touching, and
+ * keeps a typo'd platform key inside `solvers` below a compile time error
+ * rather than a silent `null`.
  *
  * ── The Ashby gate ───────────────────────────────────────────────────────────
  * JOB-214's Ashby direct HTTP path is still off by default in prod, behind
@@ -25,7 +34,7 @@
  * unchanged.
  */
 
-import { ATS_PLATFORMS, type AtsPlatform } from "@/lib/db/schema";
+import type { AtsPlatform } from "@/lib/db/schema";
 import type { SolverFn } from "@/lib/solvers/types";
 import { ashbyDirectSolver, shouldRouteAshbyDirectHttp } from "@/lib/solvers/ashby-direct";
 
@@ -42,27 +51,18 @@ const solvers: Record<AtsPlatform, SolverFn | undefined> = {
   smartrecruiters: undefined,
 };
 
-const ATS_PLATFORM_SET: ReadonlySet<string> = new Set(ATS_PLATFORMS);
-
 /**
  * Returns the dedicated solver for `ats`, or null when there is none
- * registered, `ats` is not a recognized platform, or a registered entry's
- * own gate is closed. A null return is the router's signal to fall through
- * to `domFallbackSolver`.
+ * registered, or a registered entry's own gate is closed. A null return is
+ * the router's signal to fall through to `domFallbackSolver`.
  *
- * Takes `string` rather than `AtsPlatform`: the row `submitApplication`'s
- * `preflight()` reads carries `ats` straight off the `jobs` table as a plain
- * string (see `PreflightRow` in `lib/submit-application.ts`), not narrowed to
- * the platform union, and narrowing it there is outside this ticket's scope
- * of "only the router changes". This function does the narrowing itself
- * instead, so a value that is not one of `ATS_PLATFORMS` reads the same as
- * "no solver registered" rather than a type error at the call site.
+ * Takes `AtsPlatform`, already narrowed by the caller's `isAtsPlatform()`
+ * guard — see the module header for why the narrowing lives at the router
+ * rather than in here.
  */
-export function lookupSolver(ats: string): SolverFn | null {
-  if (!ATS_PLATFORM_SET.has(ats)) return null;
-  const platform = ats as AtsPlatform;
-  const entry = solvers[platform];
+export function lookupSolver(ats: AtsPlatform): SolverFn | null {
+  const entry = solvers[ats];
   if (entry === undefined) return null;
-  if (platform === "ashby" && !shouldRouteAshbyDirectHttp(platform)) return null;
+  if (ats === "ashby" && !shouldRouteAshbyDirectHttp(ats)) return null;
   return entry;
 }

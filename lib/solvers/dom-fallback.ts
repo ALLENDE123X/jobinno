@@ -8,8 +8,8 @@
  * `lib/submit-application.ts` did this work itself, inline, after its own
  * `if (shouldRouteAshbyDirectHttp) ...` branch. This is that same code,
  * unchanged, moved behind the `SolverFn` seam so the router can pick it the
- * same way it picks a dedicated solver, with `lookupSolver(row.ats) ??
- * domFallbackSolver`.
+ * same way it picks a dedicated solver, with `(platform && lookupSolver(platform))
+ * ?? domFallbackSolver`.
  *
  * It calls `fillApplicationFormRetainingSession()` (ACT-007) then
  * `runSubmitPhase()` (ACT-008's own submit phase, still defined and now

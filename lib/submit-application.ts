@@ -142,6 +142,7 @@ import { humanizedSleep, HUMANIZE_TIMINGS } from "@/lib/humanized-delays";
 // `lib/solvers/index.ts` and `lib/solvers/dom-fallback.ts`.
 import { lookupSolver } from "@/lib/solvers";
 import { domFallbackSolver } from "@/lib/solvers/dom-fallback";
+import { ATS_PLATFORMS, type AtsPlatform } from "@/lib/db/schema";
 
 const LOG = "[act-008]";
 
@@ -1294,6 +1295,17 @@ export type PreflightRow = {
   applyUrl: string;
 };
 
+// JOB-232. `PreflightRow.ats` is a plain string straight off the `jobs`
+// table, not narrowed to `AtsPlatform`. Narrowing `PreflightRow` itself is
+// out of this ticket's scope, so the narrowing happens here instead, at the
+// one call site `lookupSolver` has: a typo'd or unrecognized platform value
+// reads the same as "no dedicated solver for this ats" rather than a type
+// error, and `lookupSolver` itself can take `AtsPlatform` and drop its own
+// runtime check.
+function isAtsPlatform(ats: string): ats is AtsPlatform {
+  return (ATS_PLATFORMS as readonly string[]).includes(ats);
+}
+
 /**
  * Reads the row *before* anything is opened, and refuses the two statuses that
  * mean a submit click has already been issued against it.
@@ -2088,7 +2100,8 @@ export async function submitApplication(
   // (below in this file) in the same order this function used to, on one
   // Browserbase session it opens and closes itself. Either way the return
   // value is the same `SubmitApplicationResult` shape.
-  const solver = lookupSolver(row.ats) ?? domFallbackSolver;
+  const platform = isAtsPlatform(row.ats) ? row.ats : null;
+  const solver = (platform && lookupSolver(platform)) ?? domFallbackSolver;
   return await solver(input, row);
 }
 
