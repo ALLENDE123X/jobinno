@@ -82,6 +82,16 @@ describe("describeGreenhouseRequiredFieldsGate", () => {
     // would misdiagnose a real regression of issue #93 as something else.
     expect(message).not.toContain("async search combobox");
     expect(message).not.toContain("#93");
+    // The probe only reads a client side validation state at one moment; it
+    // cannot establish whether a request ever reached Greenhouse's server.
+    // Asserting "nothing was ever posted" as fact would contradict what
+    // `submission_unconfirmed` means (CLAUDE.md: the click happened and the
+    // result is unknown) and could read as license to retry by hand as if
+    // no submission had occurred. CodeRabbit flagged the earlier wording as
+    // a MAJOR on PR #244; this pins the fix.
+    expect(message).not.toContain("nothing was ever posted");
+    expect(message).toContain("submission unconfirmed");
+    expect(message).toContain("unresolved");
   });
 
   it("uses the singular field wording for exactly one empty field", () => {

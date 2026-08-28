@@ -282,10 +282,16 @@ export function describeGreenhouseRequiredFieldsGate(
     `still read as empty at "${finalUrl}" after the click: ${names}. Greenhouse's own validation ` +
     `marked ${pronoun} as empty at submit time; that reading is a fact, not a guess, but nothing ` +
     `here identifies which kind of dropdown widget is behind ${pronoun}. Whatever the fill wrote ` +
-    `into ${pronoun} never registered as a real choice with Greenhouse, so nothing was ever posted ` +
-    `to the board. See issue #246 for the tracked follow up that will fix how these fields commit ` +
-    `their value during fill. A person should check whether the candidate's stored data actually ` +
-    `answers ${pronoun} before this is retried by hand. Nothing here is retried automatically.`
+    `into ${pronoun} never registered as a real choice with Greenhouse, at least not by the moment ` +
+    `this probe read the page. That is where the probe's own reach ends: it can see that the ` +
+    `client side check still called ${pronoun} empty right then, and it says nothing about whether ` +
+    `a request ever reached Greenhouse's server, whether a value was written and failed to commit, ` +
+    `or whether nothing was ever written at all. This row stays submission unconfirmed for exactly ` +
+    `that reason: the click happened and what became of it past that point is not known. See issue ` +
+    `#246 for the tracked follow up that will fix how these fields commit their value during fill. ` +
+    `A person should check whether the candidate's stored data actually answers ${pronoun} and ` +
+    `should treat this row as unresolved, not as a confirmed non submission, before deciding ` +
+    `whether and how to proceed by hand. Nothing here is retried automatically.`
   );
 }
 
