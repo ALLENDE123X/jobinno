@@ -13,6 +13,22 @@
  * other file changes, and nothing in `lib/submit-application.ts` has to move
  * again.
  *
+ * ── A registered solver does not mean a live platform ───────────────────────
+ * Registering an entry here says the code exists to run a listing on that
+ * platform through. It says nothing about whether `boards` rows for that
+ * platform are actually matched against candidates: that is
+ * `boards.active`, a separate, manually curated gate (see its column comment
+ * in `lib/db/schema.ts`), and it stays `false` until a real submission on
+ * that exact ATS has actually been confirmed working. `bamboohr.ts` is the
+ * clearest example: it is registered below the same as every other entry,
+ * and its own header explains why it ships as a deliberate stub with no
+ * board specific classifier, because BambooHR's real obstacle is not
+ * something a classifier can fix — a reCAPTCHA v2 iframe in front of the
+ * form, confirmed unsolvable by synthetic clicks (see
+ * `lib/known-unsolved-platforms.ts`). A solver landing here is necessary
+ * work toward a platform going live; it is never by itself the signal that
+ * it should.
+ *
  * `lookupSolver` takes `AtsPlatform`, not `string`: the row `submitApplication`'s
  * `preflight()` reads carries `ats` as a plain string off the `jobs` table (see
  * `PreflightRow` in `lib/submit-application.ts`), so the router narrows it with
@@ -37,6 +53,7 @@
 import type { AtsPlatform } from "@/lib/db/schema";
 import type { SolverFn } from "@/lib/solvers/types";
 import { ashbyDirectSolver, shouldRouteAshbyDirectHttp } from "@/lib/solvers/ashby-direct";
+import { bamboohrSolver } from "@/lib/solvers/bamboohr";
 import { greenhouseSolver } from "@/lib/solvers/greenhouse";
 import { leverSolver } from "@/lib/solvers/lever";
 import { recruiteeSolver } from "@/lib/solvers/recruitee";
@@ -70,7 +87,12 @@ const solvers: Record<AtsPlatform, SolverFn | undefined> = {
   // the one confirmed failure shape (see `lib/solvers/recruitee.ts`'s
   // header).
   recruitee: recruiteeSolver,
-  bamboohr: undefined,
+  // JOB-237. A deliberate stub, unlike the five entries above: the same DOM
+  // fill and submit flow `domFallbackSolver` already ran for BambooHR, with
+  // no board specific read added on top yet. See `lib/solvers/bamboohr.ts`'s
+  // header for why this ships without one — no real `applications` row has
+  // ever hit a BambooHR submission to diagnose a patch from.
+  bamboohr: bamboohrSolver,
   breezy: undefined,
   jazzhr: undefined,
   teamtailor: undefined,

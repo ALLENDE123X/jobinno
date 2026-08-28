@@ -314,6 +314,41 @@ describe("classifyTitle", () => {
     ).toBe(false);
   });
 
+  // ── JOB-237: "Co-Op" joins the career stage vocabulary ──────────────────
+  // Real titles pulled from specteraerospace.bamboohr.com while diagnosing
+  // why BambooHR sourcing produced zero listings — see `classifyTitle`'s own
+  // header for the full account.
+  it("accepts a software role that says Co-Op instead of intern or new grad", () => {
+    expect(
+      classifyTitle("Front-End Software Developer Co-Op Spring 2027").relevant
+    ).toBe(true);
+    expect(classifyTitle("Software Developer, Co-Op").relevant).toBe(true);
+    // With and without the hyphen, and the closed up spelling too.
+    expect(classifyTitle("Software Developer, Co Op").relevant).toBe(true);
+    expect(classifyTitle("Software Developer, Coop").relevant).toBe(true);
+  });
+
+  it("records a Co-Op title as an internship, not a new grad role", () => {
+    // Structurally a co-op is a temporary, school-term work placement, the
+    // same shape as an internship — not a standing full time offer.
+    expect(classifyTitle("Software Developer, Co-Op")).toEqual({
+      relevant: true,
+      isIntern: true,
+      isNewGrad: false,
+    });
+  });
+
+  it("still requires a software role alongside Co-Op, not the word alone", () => {
+    // Every other BambooHR co-op title pulled from the same board: real
+    // engineering roles, but none of them software ones, so none should
+    // pass just because the career stage word now matches.
+    expect(classifyTitle("Mechanical Engineer Co-Op Spring 2027").relevant).toBe(false);
+    expect(classifyTitle("Electrical Engineering Co-Op Spring 2027").relevant).toBe(false);
+    expect(classifyTitle("Vehicle Design Co-Op Spring 2027").relevant).toBe(false);
+    // Nor does the word alone, with no role signal at all.
+    expect(classifyTitle("Housing Co-Op Coordinator").relevant).toBe(false);
+  });
+
   it("rejects a product management title as well as product manager", () => {
     // NON_ENGINEERING_ROLE_RE previously matched "product manager" but not
     // "product management", so this title slipped through despite carrying

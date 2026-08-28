@@ -186,6 +186,14 @@ export const SKIP_REASON_TEXT: Record<SkipReason, string> = {
   internal_error: "Something on our side went wrong. This one is on us and we are looking at it.",
   bot_detected:
     "We filled this application in and pressed submit, and the job board turned it down because it thought a robot was filling it in. That is about us and how we reach the board, not about you or anything you wrote. Nothing you can do at your end will change it, and we are working on it. If you want this job, the surest fix today is to apply once yourself.",
+  // JOB-237 round 2. Distinct wording from `captcha` on purpose: `captcha`
+  // means a run reached the form and found a robot check on it. This means
+  // we never opened the form at all, because we already know this board's
+  // platform blocks every automated submission the same way, and nothing
+  // was spent from the applicant's plan trying it. See
+  // `lib/known-unsolved-platforms.ts` for the registry this reads from.
+  platform_unsolved:
+    "This job board runs on a platform we already know blocks automated submissions, so we did not try. This one did not count against your application limit.",
 };
 
 /** Why a run stopped, or null when the reason code is not one we know. */

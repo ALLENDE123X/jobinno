@@ -190,6 +190,23 @@ export const SKIP_REASONS = [
   // submitting to change, because nothing on the employer's side is going to
   // improve on its own.
   "bot_detected",
+  // ── JOB-237 round 2: refused before a browser ever opened ────────────────
+  //
+  // Distinct from `captcha`, which means a run reached the form, found a
+  // challenge on the page, and stopped there. This one means no run happened
+  // at all: `lib/known-unsolved-platforms.ts` matched the listing's `ats`
+  // against a platform level blocker confirmed on a prior run (BambooHR's
+  // reCAPTCHA v2 iframe, first), and `applyToJob` refused the match before
+  // `reserveApplicationSlot` and before any browser opened. Tagging that
+  // `captcha` would read as "we tried, we hit a captcha, we stopped" when
+  // what actually happened is "we already know this platform is unsolved and
+  // did not try" — a different fact, and one worth keeping distinguishable in
+  // the log the same way `bot_detected` above is kept distinguishable from
+  // `submit_failed`. See `CAP_CONSUMING_STATUSES` in `lib/application-status.ts`
+  // for why the row this reason is attached to keeps its `discovered` status
+  // rather than moving to `form_fill_blocked`: no attempt was made, so nothing
+  // is charged against the person's allowance.
+  "platform_unsolved",
 ] as const;
 export type SkipReason = (typeof SKIP_REASONS)[number];
 
@@ -741,6 +758,30 @@ export const boards = pgTable(
     ats: text("ats").notNull(),
     company: text("company").notNull(),
     boardToken: text("board_token").notNull(),
+    /**
+     * A manual curation gate, not a lifecycle flag. `true` means a human has
+     * confirmed a real submission on this exact board actually goes through;
+     * it does not mean "the sync found it" or "a solver exists for this ATS".
+     * `lib/job-matching.ts` filters candidate matches on `active = true`, so
+     * flipping this column is what turns a board's listings on for real
+     * applicants — which is why it has been curated by hand for months rather
+     * than defaulted on: Breezy and SmartRecruiters sit near 100% active
+     * because submissions on them are confirmed working, while Greenhouse,
+     * Ashby, Lever and Workable sit mostly inactive because their captcha or
+     * bot detection is not solved yet, and Recruitee's one row stayed
+     * `active = false` even after JOB-236 shipped a dedicated solver for it,
+     * deliberately, until a live submission actually confirms it.
+     *
+     * A dedicated solver landing in `lib/solvers/` (see that directory's
+     * header) is necessary but never sufficient to flip this to `true` on its
+     * own — see the header on `lib/known-unsolved-platforms.ts` for the
+     * second, code level gate that exists precisely because this column has
+     * no enforcement behind it: nothing stops a row from being flipped by
+     * hand without a confirmed working submission path, and JOB-237's own
+     * round 1 did exactly that, caught only by a red team review. Never flip
+     * this column to `true` for a platform without a real, confirmed
+     * submission on it first.
+     */
     active: boolean("active").notNull().default(true),
     lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
   },
