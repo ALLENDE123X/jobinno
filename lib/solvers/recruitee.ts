@@ -184,26 +184,50 @@ export type RecruiteePhoneProbe = {
 // `aria-describedby` is allowed to hold a space separated list of element
 // ids, not just one — the ARIA spec's own shape for it. Reading it with a
 // single `document.getElementById(describedBy)` call, which is what this
-// probe did before, returns null the moment Recruitee renders more than one
-// id there, which makes `errorText` read null and the whole downstream gate
-// silently stop firing. Split on plain spaces (not a regex — see this file's
-// header for why a template literal like this one is not a safe place for a
-// backslash escape) and read the first id that actually resolves to non
-// empty text.
+// probe did originally, returns null the moment Recruitee renders more than
+// one id there, which makes `errorText` read null and the whole downstream
+// gate silently stop firing. Split on plain spaces (not a regex — see this
+// file's header for why a template literal like this one is not a safe place
+// for a backslash escape).
+//
+// A first pass at fixing that split simply returned the first id's non empty
+// text, but `aria-describedby` commonly lists a hint or help text id before
+// the actual error message id, and a field can carry both at once (a always
+// present placeholder hint plus a validation message that only exists once
+// the field is invalid). Returning whichever text happens to come first
+// silently reads the hint back as `errorText` on exactly the pages where the
+// real error message was listed second, which defeats
+// `recruiteePhoneValidationStillBlocked`'s own text match below without ever
+// looking like a bug from this probe's own return value. This loop instead
+// walks every id, remembers the first non empty text as a fallback, and
+// prefers whichever text belongs to an element whose own id or class name
+// names it as an error: `error` or `invalid` appearing in either, the two
+// words Recruitee's own markup and most component libraries use for exactly
+// this. Only when nothing in the list matches that heuristic does the
+// fallback (the first non empty text found, this probe's original behavior)
+// get used, so a Recruitee page that never adopts that naming convention
+// still reads something rather than nothing.
 const RECRUITEE_PHONE_PROBE_SCRIPT = `(() => {
   const input = document.querySelector('input.PhoneInputInput') || document.querySelector('input[type="tel"]');
   if (!input) return { present: false, value: null, invalid: false, errorText: null };
   const describedBy = input.getAttribute('aria-describedby') || '';
   const ids = describedBy.split(' ').filter(Boolean);
   let errorText = null;
+  let fallbackText = null;
   for (const id of ids) {
     const el = document.getElementById(id);
     const text = el ? (el.textContent || '').trim() : '';
-    if (text.length > 0) {
+    if (text.length === 0) continue;
+    if (fallbackText === null) fallbackText = text;
+    const idLower = id.toLowerCase();
+    const classLower = (el && el.className ? String(el.className) : '').toLowerCase();
+    const looksLikeError = idLower.indexOf('error') !== -1 || classLower.indexOf('error') !== -1 || classLower.indexOf('invalid') !== -1;
+    if (looksLikeError) {
       errorText = text;
       break;
     }
   }
+  if (errorText === null) errorText = fallbackText;
   return {
     present: true,
     value: input.value,
@@ -349,11 +373,11 @@ export function dialCodeForCountry(country: string | null): string {
  * One more shape has to be handled before that final concatenation: most
  * countries outside the North American Numbering Plan write their own
  * national numbers with a leading trunk zero that is dropped the moment a
- * calling code is added in front of it. Seven of the entries in
+ * calling code is added in front of it. Six of the entries in
  * `COUNTRY_DIAL_CODES` above work this way (the United Kingdom, Germany,
- * France, Italy, Spain, the Netherlands and Ireland, among others this table
- * does not carry), and a resume parsed local number for any of them, for
- * example the United Kingdom's "07911123456", already starts with that zero.
+ * France, Spain, the Netherlands and Ireland, among others this table does
+ * not carry), and a resume parsed local number for any of them, for example
+ * the United Kingdom's "07911123456", already starts with that zero.
  * Prepending "+44" straight onto it without stripping the zero first
  * produces "+4407911123456", a number with the wrong shape and the wrong
  * digit count for the country it names, silently, on the candidate's real
@@ -361,16 +385,43 @@ export function dialCodeForCountry(country: string | null): string {
  * start with one), so the strip only ever needs to be withheld from dial
  * code "1", not from a specific list this table would otherwise have to keep
  * in step with `COUNTRY_DIAL_CODES` by hand.
+ *
+ * Italy is the well known real world exception to that trunk zero rule: an
+ * Italian landline number keeps its leading zero even once the "+39" calling
+ * code is in front of it, because Italy's own numbering plan treats that
+ * zero as part of the subscriber number rather than as a trunk prefix to
+ * dial around. Stripping it the way this function does for the United
+ * Kingdom or Germany would produce a number one digit short of a real
+ * Italian one. `KEEPS_TRUNK_ZERO_COUNTRIES` below names the dial codes this
+ * function knows keep that zero; today that is Italy alone, since it is the
+ * one this file has a reported real world counter example for, not a claim
+ * that no other country works the same way.
+ *
+ * A value can also arrive already written for international dialing rather
+ * than for a national context: a leading "00" is the international dial out
+ * prefix a resume parsed number sometimes carries in place of a "+", and the
+ * digits after it are already a complete international number, own calling
+ * code included. That shape is read first, before either the trunk zero
+ * question or the dial code prepend below even come up, because treating
+ * "00" as if it were an ordinary trunk zero and prepending this call's own
+ * dial code on top of it would double up a calling code the value already
+ * carries, for example turning the United Kingdom's "00447911123456" into
+ * the wrong shaped "+440447911123456" instead of the correct "+447911123456".
  */
+const KEEPS_TRUNK_ZERO_COUNTRIES: ReadonlySet<string> = new Set(["39"]);
+
 export function formatRecruiteePhoneE164(rawValue: string, dialCode: string): string {
   const trimmed = rawValue.trim();
   if (trimmed.startsWith("+")) return trimmed;
   let digits = trimmed.replace(/\D/g, "");
   if (digits.length === 0) return trimmed;
+  if (digits.length > 2 && digits.startsWith("00")) {
+    return `+${digits.slice(2)}`;
+  }
   if (dialCode === "1" && digits.length === 11 && digits.startsWith("1")) {
     return `+${digits}`;
   }
-  if (dialCode !== "1" && digits.startsWith("0")) {
+  if (dialCode !== "1" && !KEEPS_TRUNK_ZERO_COUNTRIES.has(dialCode) && digits.startsWith("0")) {
     digits = digits.slice(1);
   }
   return `+${dialCode}${digits}`;
@@ -515,7 +566,7 @@ async function patchRecruiteePhoneCountryCode(
       `${LOG} rewrote ${jobApplicationId}'s phone field to carry a calling code before ` +
         `submitting: was ${redactPhoneForLog(probe.value)}, now ${redactPhoneForLog(corrected)} ` +
         `(dial code +${dialCode}` +
-        `${country ? ` from the candidate's stated country "${country}"` : ", defaulted, no stored country on file"})`
+        `${country ? ", from the candidate's stored country" : ", defaulted, no stored country on file"})`
     );
     return { outcome: "attempted", correctedValue: corrected };
   } catch (err) {

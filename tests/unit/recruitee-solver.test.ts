@@ -159,10 +159,11 @@ describe("formatRecruiteePhoneE164", () => {
   // countries outside the North American Numbering Plan write their own
   // numbers, and it has to be stripped before a calling code is prepended,
   // or the result carries the wrong shape and the wrong digit count for the
-  // country it names. Seven of `COUNTRY_DIAL_CODES`'s entries use this
+  // country it names. Six of `COUNTRY_DIAL_CODES`'s entries use this
   // convention; the United Kingdom, Germany and France below are three of
   // them, reproducing the exact mechanism CodeRabbit's own review flagged
-  // against this function's earlier version.
+  // against this function's earlier version. Italy is the one entry that
+  // does not, covered separately below.
   describe("a national trunk prefix on a non NANP number", () => {
     it("strips the leading zero for a United Kingdom number", () => {
       expect(formatRecruiteePhoneE164("07911123456", "44")).toBe("+447911123456");
@@ -184,6 +185,36 @@ describe("formatRecruiteePhoneE164", () => {
   // given rather than silently dropped.
   it("does not strip a leading zero for a North American Numbering Plan dial code", () => {
     expect(formatRecruiteePhoneE164("0212345678", "1")).toBe("+10212345678");
+  });
+
+  // Italy is the well known real world exception to the trunk zero rule
+  // above: an Italian subscriber number keeps its leading zero even once the
+  // "+39" calling code is in front of it. Stripping it the way this function
+  // does for the United Kingdom or Germany would silently produce a number
+  // one digit short of a real Italian one. Two independently reported
+  // counter examples from an earlier round of review pinned this and the
+  // "00" prefix case just below.
+  it("keeps the leading zero for an Italy number rather than stripping it", () => {
+    expect(formatRecruiteePhoneE164("0612345678", "39")).toBe("+390612345678");
+  });
+
+  // A resume parsed number can also arrive already written for international
+  // dialing, a leading "00" in place of a "+". The digits after it are
+  // already a complete international number, own calling code included, so
+  // this function has to strip the "00" and add a "+" directly rather than
+  // prepending this call's own dial code on top of it, which would double up
+  // the calling code the value already carries.
+  describe("an international dial out prefix", () => {
+    it("strips a leading 00 and does not double up the dial code that follows it", () => {
+      expect(formatRecruiteePhoneE164("00447911123456", "44")).toBe("+447911123456");
+    });
+
+    it("still strips 00 even when the resolved dial code names a different country", () => {
+      // The value already names its own country via the digits after "00";
+      // whatever `dialCodeForCountry` resolved for this candidate is beside
+      // the point once an explicit "00" prefix is present.
+      expect(formatRecruiteePhoneE164("003312345678", "1")).toBe("+3312345678");
+    });
   });
 });
 
