@@ -33,6 +33,7 @@ import { describe, expect, it } from "vitest";
 import {
   blockedForAnswers,
   buildFactCatalog,
+  countryContextTermsWithResumeFallback,
   isAttestationField,
   resolveAdditionalAnswer,
   resolveDecision,
@@ -444,6 +445,46 @@ describe("an ordinary required field is answered rather than escalated", () => {
       facts({ currentCountry: undefined })
     );
     expect(resolution.kind).not.toBe("apply");
+  });
+
+  describe("the context term a search combobox is given when nothing was attested", () => {
+    // JOB-246. `resolveDecision`'s own `matchOption` already breaks a location
+    // tie with `geographyHints`, which falls back to the resume's own printed
+    // location when `currentCountry` was never attested. `chooseFromMenuOnce`'s
+    // `contextTerms` — used at fill time for a search combobox like Greenhouse's
+    // Location (City), whose options do not exist until something is typed —
+    // had no equivalent fallback, which is what left Freeform's Location field
+    // unresolved on a live 2026-08-28 run even though the candidate's resume
+    // plainly read "San Francisco, California, United States". These tests
+    // cover `countryContextTermsWithResumeFallback` directly, the pure
+    // function `fillRemainingFields` and `fillRepeatingSections` both call to
+    // compute that value.
+
+    it("prefers the attested country and never reads the resume when one was given", () => {
+      expect(
+        countryContextTermsWithResumeFallback(
+          "Canada",
+          "San Francisco, California, United States"
+        )
+      ).toEqual(["Canada"]);
+    });
+
+    it("falls back to the resume's own country when nothing was attested", () => {
+      expect(
+        countryContextTermsWithResumeFallback(undefined, "San Francisco, California, United States")
+      ).toEqual(["United States|USA|US|U.S."]);
+    });
+
+    it("reads the resume's last comma-separated segment for a non-US country too", () => {
+      expect(countryContextTermsWithResumeFallback(undefined, "London, England, United Kingdom")).toEqual([
+        "United Kingdom",
+      ]);
+    });
+
+    it("returns nothing when neither the intake nor the resume names a country", () => {
+      expect(countryContextTermsWithResumeFallback(undefined, undefined)).toEqual([]);
+      expect(countryContextTermsWithResumeFallback("", "")).toEqual([]);
+    });
   });
 
   it("leaves an optional field it cannot answer blank instead of asking", () => {

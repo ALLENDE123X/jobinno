@@ -482,6 +482,28 @@ describe("a location search whose suggestions all contain the query", () => {
     expect(SAN_FRANCISCO_SUGGESTIONS).not.toContain(outcome.readBack);
   });
 
+  it("does not let a short country abbreviation match inside an unrelated word", async () => {
+    // JOB-246. `countryContextTerms` writes the US alternation as
+    // "United States|USA|US|U.S.", and the bare two-letter spelling "US" is a
+    // literal substring of "Agusan" in "San Francisco, Agusan del Sur,
+    // Philippines" — so before this test's fix landed, providing the
+    // candidate's own attested country term still left two survivors (the
+    // real California suggestion and the Philippine one, matched by
+    // accident) and the tie-break correctly, but wrongly, refused both.
+    // Verified live against Freeform's Location (City) field on 2026-08-28:
+    // supplying the attested country term alone did not fix the field until
+    // the boundary check went in.
+    const { page } = searchMenu(SAN_FRANCISCO_SUGGESTIONS);
+
+    const outcome = await applyFieldValue(page as never, locationField(), "San Francisco", {
+      allowContains: true,
+      contextTerms: ["United States|USA|US|U.S."],
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("San Francisco, California, United States");
+  });
+
   it("recognises the attested country however the board abbreviates it", async () => {
     // JOB-047. SmartRecruiters' location service writes the same six-suggestion
     // answer as "San Francisco, CA, US". A context term of only "United States"
