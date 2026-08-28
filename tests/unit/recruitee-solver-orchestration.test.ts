@@ -162,22 +162,37 @@ function makeFakeSession(evaluateResults: unknown[]): BrowserSession {
   };
 }
 
-function makeFakeSupabase(country: string | null | "throws"): unknown {
+/** One recorded `eq(column, value)` call, tagged with the table it ran against. */
+type RecordedFilter = { table: string; column: string; value: unknown };
+
+// A wrong column bug in `loadCandidateCountry` (querying `profiles` by
+// something other than `application.user_id`, say) would still pass every
+// test in this file if the fake `eq()` accepted and ignored its arguments —
+// CodeRabbit's own review flagged this same gap. Recording what each call
+// actually asked for, and asserting it in the tests below that exercise the
+// country lookup, closes it.
+function makeFakeSupabase(
+  country: string | null | "throws",
+  recordedFilters: RecordedFilter[] = []
+): unknown {
   return {
     from: (table: string) => ({
       select: () => ({
-        eq: () => ({
-          maybeSingle: async () => {
-            if (table === "applications") {
-              return { data: { user_id: "user-1" }, error: null };
-            }
-            if (table === "profiles") {
-              if (country === "throws") throw new Error("connection reset");
-              return { data: country === null ? null : { current_country: country }, error: null };
-            }
-            return { data: null, error: null };
-          },
-        }),
+        eq: (column: string, value: unknown) => {
+          recordedFilters.push({ table, column, value });
+          return {
+            maybeSingle: async () => {
+              if (table === "applications") {
+                return { data: { user_id: "user-1" }, error: null };
+              }
+              if (table === "profiles") {
+                if (country === "throws") throw new Error("connection reset");
+                return { data: country === null ? null : { current_country: country }, error: null };
+              }
+              return { data: null, error: null };
+            },
+          };
+        },
       }),
     }),
   };
@@ -244,6 +259,38 @@ describe("recruiteeSolver — the #140 patch fires and the submission succeeds",
     expect(mockRecordSkipQuietly).not.toHaveBeenCalled();
     expect(mockCloseBrowserSession).toHaveBeenCalledTimes(1);
     expect(mockCloseBrowserSession).toHaveBeenCalledWith(session);
+  });
+
+  it("looks up the candidate's country by the application's own user id, not any other column", async () => {
+    const recordedFilters: RecordedFilter[] = [];
+    mockCreateClient.mockReturnValue(makeFakeSupabase("United States", recordedFilters));
+    const session = makeFakeSession([missingCodeProbe]);
+    mockFillApplicationFormRetainingSession.mockResolvedValue({
+      result: makeFillResult(),
+      session,
+    });
+    mockRunSubmitPhase.mockResolvedValue(
+      makeSubmitResult({ submitted: true, status: APPLICATION_STATUS.SUBMITTED })
+    );
+
+    await recruiteeSolver(baseInput, baseRow);
+
+    // `loadCandidateCountry` (see `lib/solvers/recruitee.ts`) reads
+    // `applications` by the application's own id, then `profiles` by that
+    // row's `user_id` — a wrong column on either read would silently default
+    // the dial code rather than fail loudly, so the exact filter each query
+    // used is worth pinning here rather than trusting the fake to be right
+    // regardless of what was asked.
+    expect(recordedFilters).toContainEqual({
+      table: "applications",
+      column: "id",
+      value: baseInput.jobApplicationId,
+    });
+    expect(recordedFilters).toContainEqual({
+      table: "profiles",
+      column: "id",
+      value: "user-1",
+    });
   });
 });
 
@@ -352,7 +399,7 @@ describe("recruiteeSolver — an unconfirmed result that is not this gate", () =
 });
 
 describe("recruiteeSolver — the patch attempt itself fails", () => {
-  it("still proceeds to submit, and the post submit row names that nothing was rewritten", async () => {
+  it("still proceeds to submit, and the post submit row names that a rewrite was attempted and did not complete", async () => {
     const session = makeFakeSession([missingCodeProbe, stillBlockedProbe]);
     mockTypeInto.mockRejectedValueOnce(new Error("selector no longer resolves"));
     mockFillApplicationFormRetainingSession.mockResolvedValue({
@@ -370,7 +417,16 @@ describe("recruiteeSolver — the patch attempt itself fails", () => {
     const outcome = await recruiteeSolver(baseInput, baseRow);
 
     expect(mockRunSubmitPhase).toHaveBeenCalledTimes(1);
-    expect(outcome.unconfirmedReason).toContain("found nothing to rewrite");
+    // The BLOCKING fix this test pins: a failed rewrite attempt must not be
+    // reported with the same sentence a skipped patch uses. Before this fix
+    // both paths returned `{ attempted: false, correctedValue: null }`, so a
+    // typeInto failure was rendered as "found nothing to rewrite", which was
+    // false — a rewrite plainly was attempted, it just did not finish. See
+    // `RecruiteePhonePatchOutcome` in `lib/solvers/recruitee.ts`.
+    expect(outcome.unconfirmedReason).toContain("rewrite itself failed");
+    expect(outcome.unconfirmedReason).toContain("selector no longer resolves");
+    expect(outcome.unconfirmedReason).toContain("did not complete");
+    expect(outcome.unconfirmedReason).not.toContain("found nothing to rewrite");
     expect(mockCloseBrowserSession).toHaveBeenCalledTimes(1);
   });
 });

@@ -78,11 +78,13 @@
  * a missing calling code, a second, more specific `skip_log` row is written
  * alongside the generic one `runSubmitPhase` already wrote, naming whether
  * this solver's own patch had already run against that exact value. This
- * matters because two honest but different stories are possible after a
+ * matters because three honest but different stories are possible after a
  * patch attempt: the patched value itself still failed Recruitee's own check
- * for a reason this solver cannot see, or the patch was never attempted
- * because the field did not match the shape #140 diagnosed. Saying which one
- * happened is the entire value this second row adds over the generic hedge.
+ * for a reason this solver cannot see, the patch was never attempted because
+ * the field did not match the shape #140 diagnosed, or a rewrite was judged
+ * necessary and itself failed to complete before the click. Saying which one
+ * happened is the entire value this second row adds over the generic hedge —
+ * see `RecruiteePhonePatchOutcome` for the three states this is built on.
  * `applications.status` is left exactly as `runSubmitPhase` wrote it, still
  * `submission_unconfirmed`, still terminal, still never retried.
  *
@@ -179,16 +181,34 @@ export type RecruiteePhoneProbe = {
 // renders the same field without that exact class, so this probe still finds
 // something to read rather than reporting `present: false` on a page that
 // plainly has a phone box.
+// `aria-describedby` is allowed to hold a space separated list of element
+// ids, not just one — the ARIA spec's own shape for it. Reading it with a
+// single `document.getElementById(describedBy)` call, which is what this
+// probe did before, returns null the moment Recruitee renders more than one
+// id there, which makes `errorText` read null and the whole downstream gate
+// silently stop firing. Split on plain spaces (not a regex — see this file's
+// header for why a template literal like this one is not a safe place for a
+// backslash escape) and read the first id that actually resolves to non
+// empty text.
 const RECRUITEE_PHONE_PROBE_SCRIPT = `(() => {
   const input = document.querySelector('input.PhoneInputInput') || document.querySelector('input[type="tel"]');
   if (!input) return { present: false, value: null, invalid: false, errorText: null };
-  const describedBy = input.getAttribute('aria-describedby');
-  const errorEl = describedBy ? document.getElementById(describedBy) : null;
+  const describedBy = input.getAttribute('aria-describedby') || '';
+  const ids = describedBy.split(' ').filter(Boolean);
+  let errorText = null;
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    const text = el ? (el.textContent || '').trim() : '';
+    if (text.length > 0) {
+      errorText = text;
+      break;
+    }
+  }
   return {
     present: true,
     value: input.value,
     invalid: input.getAttribute('aria-invalid') === 'true',
-    errorText: errorEl ? (errorEl.textContent || '').trim() : null,
+    errorText,
   };
 })()`;
 
@@ -325,14 +345,33 @@ export function dialCodeForCountry(country: string | null): string {
  * this function keeps: separators, spaces and parentheses are Recruitee's
  * own formatting choice to make on read back, not something this fix needs
  * to reproduce.
+ *
+ * One more shape has to be handled before that final concatenation: most
+ * countries outside the North American Numbering Plan write their own
+ * national numbers with a leading trunk zero that is dropped the moment a
+ * calling code is added in front of it. Seven of the entries in
+ * `COUNTRY_DIAL_CODES` above work this way (the United Kingdom, Germany,
+ * France, Italy, Spain, the Netherlands and Ireland, among others this table
+ * does not carry), and a resume parsed local number for any of them, for
+ * example the United Kingdom's "07911123456", already starts with that zero.
+ * Prepending "+44" straight onto it without stripping the zero first
+ * produces "+4407911123456", a number with the wrong shape and the wrong
+ * digit count for the country it names, silently, on the candidate's real
+ * application. NANP numbers never lead with a zero (an area code cannot
+ * start with one), so the strip only ever needs to be withheld from dial
+ * code "1", not from a specific list this table would otherwise have to keep
+ * in step with `COUNTRY_DIAL_CODES` by hand.
  */
 export function formatRecruiteePhoneE164(rawValue: string, dialCode: string): string {
   const trimmed = rawValue.trim();
   if (trimmed.startsWith("+")) return trimmed;
-  const digits = trimmed.replace(/\D/g, "");
+  let digits = trimmed.replace(/\D/g, "");
   if (digits.length === 0) return trimmed;
   if (dialCode === "1" && digits.length === 11 && digits.startsWith("1")) {
     return `+${digits}`;
+  }
+  if (dialCode !== "1" && digits.startsWith("0")) {
+    digits = digits.slice(1);
   }
   return `+${dialCode}${digits}`;
 }
@@ -389,6 +428,54 @@ async function loadCandidateCountry(
 const RECRUITEE_PHONE_FIELD_INSTRUCTION = "the phone number input on the job application form";
 
 /**
+ * A candidate's phone number is personal data. It has no business sitting in
+ * plain text in a process log or in a persisted `skip_log.raw_context.message`
+ * row, both of which live for as long as this project's own retention policy
+ * says, not the candidate's. What a human reading either of those needs is
+ * the shape, not the digits: whether a calling code prefix was present, and
+ * enough of the tail to recognize which application a log line is talking
+ * about without the full number being readable off it. Returns something
+ * like "+...6018" or, for a value this solver could not even read, the
+ * literal string "unreadable". Used everywhere this file would otherwise
+ * have written `probe.value` or `corrected` straight into a message.
+ */
+function redactPhoneForLog(value: string | null): string {
+  if (value === null) return "unreadable";
+  const trimmed = value.trim();
+  const hadPlus = trimmed.startsWith("+");
+  const digits = trimmed.replace(/\D/g, "");
+  const lastFour = digits.length > 4 ? digits.slice(-4) : digits;
+  return `${hadPlus ? "+" : ""}...${lastFour.length > 0 ? lastFour : "?"}`;
+}
+
+/**
+ * What `patchRecruiteePhoneCountryCode` did, told apart into the three
+ * outcomes a person reading a downstream skip row needs distinguished, not
+ * folded into one boolean the way an earlier version of this file did:
+ *
+ * - `"skipped"`: the field either could not be read, already carried its own
+ *   plus prefix, or formatted to the exact same value it already held. There
+ *   was nothing here to rewrite, and nothing was.
+ * - `"attempted"`: a rewrite ran and `typeInto` reported success. Whatever
+ *   Recruitee's own validation does with that value afterward is a separate
+ *   fact this type says nothing about.
+ * - `"failed"`: a rewrite was judged necessary and `typeInto` itself threw,
+ *   an unreadable field, a selector that no longer resolves, anything. The
+ *   field was left exactly as the fill wrote it, and the caller still goes
+ *   on to attempt the real submit either way — see this function's own
+ *   docstring for why a failed patch is not treated as a reason to stop.
+ *
+ * Collapsing `"failed"` back into `"skipped"`, which is what this file did
+ * before, states something false: `"skipped"` says nothing was attempted,
+ * and on the failed path something plainly was. `describeRecruiteePhoneStillBlocked`
+ * below writes a different, accurate sentence for each of the three.
+ */
+export type RecruiteePhonePatchOutcome =
+  | { outcome: "skipped"; correctedValue: null }
+  | { outcome: "attempted"; correctedValue: string }
+  | { outcome: "failed"; correctedValue: null; failureReason: string };
+
+/**
  * The #140 fix. Reads the live phone box; when its value is present and
  * missing a calling code, rewrites it to E.164 shape through `typeInto`, the
  * same primitive the fill itself used, so a `react-phone-number-input`
@@ -400,23 +487,25 @@ const RECRUITEE_PHONE_FIELD_INSTRUCTION = "the phone number input on the job app
  * rather than allowed to stop the run. The worst outcome of a failed patch
  * attempt is the same `submission_unconfirmed` result this row already
  * carried before this file existed, not a worse one, and the caller still
- * goes on to attempt the real submit either way.
+ * goes on to attempt the real submit either way. What changed is that a
+ * failed attempt is no longer reported the same way as nothing needing
+ * fixing — see `RecruiteePhonePatchOutcome` above.
  */
 async function patchRecruiteePhoneCountryCode(
   session: BrowserSession,
   supabase: SupabaseClient,
   jobApplicationId: string
-): Promise<{ attempted: boolean; correctedValue: string | null }> {
+): Promise<RecruiteePhonePatchOutcome> {
   const probe = await probeRecruiteePhoneField(session.page);
   if (probe === null || probe.value === null || !recruiteePhoneMissingCountryCode(probe)) {
-    return { attempted: false, correctedValue: null };
+    return { outcome: "skipped", correctedValue: null };
   }
 
   const country = await loadCandidateCountry(supabase, jobApplicationId);
   const dialCode = dialCodeForCountry(country);
   const corrected = formatRecruiteePhoneE164(probe.value, dialCode);
   if (corrected === probe.value) {
-    return { attempted: false, correctedValue: null };
+    return { outcome: "skipped", correctedValue: null };
   }
 
   try {
@@ -424,41 +513,50 @@ async function patchRecruiteePhoneCountryCode(
     await typeInto(session, url, RECRUITEE_PHONE_FIELD_INSTRUCTION, corrected);
     console.warn(
       `${LOG} rewrote ${jobApplicationId}'s phone field to carry a calling code before ` +
-        `submitting: was "${probe.value}", now "${corrected}" (dial code +${dialCode}` +
+        `submitting: was ${redactPhoneForLog(probe.value)}, now ${redactPhoneForLog(corrected)} ` +
+        `(dial code +${dialCode}` +
         `${country ? ` from the candidate's stated country "${country}"` : ", defaulted, no stored country on file"})`
     );
-    return { attempted: true, correctedValue: corrected };
+    return { outcome: "attempted", correctedValue: corrected };
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(
-      `${LOG} found a phone value missing a calling code ("${probe.value}") for ` +
+      `${LOG} found a phone value missing a calling code (${redactPhoneForLog(probe.value)}) for ` +
         `${jobApplicationId} but could not rewrite it (${reason}); leaving it as the fill wrote ` +
         `it and continuing to the submit attempt`
     );
-    return { attempted: false, correctedValue: null };
+    return { outcome: "failed", correctedValue: null, failureReason: reason };
   }
 }
 
 /**
  * The sentence a human reads in `skip_log.raw_context.message` when Recruitee
- * still names a missing calling code after the click. Says plainly whether
- * this solver's own patch already ran against the value Recruitee is still
- * rejecting, or whether nothing here found a value to rewrite in the first
- * place, since those are two different facts a person deciding what to do
- * next needs told apart.
+ * still names a missing calling code after the click. Writes a different,
+ * accurate sentence for each of `RecruiteePhonePatchOutcome`'s three states,
+ * since a person deciding what to do next needs three different facts told
+ * apart, not folded into one: nothing here needed fixing, a rewrite ran and
+ * Recruitee still rejected the result, or a rewrite was attempted and never
+ * completed. Never embeds the candidate's own phone digits — see
+ * `redactPhoneForLog`.
  */
 export function describeRecruiteePhoneStillBlocked(
   probe: RecruiteePhoneProbe,
-  patch: { attempted: boolean; correctedValue: string | null },
+  patch: RecruiteePhonePatchOutcome,
   finalUrl: string
 ): string {
-  const patchNote = patch.attempted
-    ? `This solver had already rewritten the field to "${patch.correctedValue}" before the ` +
-      `click, specifically to add a calling code, and Recruitee's own validation still names ` +
-      `the same complaint against that value.`
-    : `This solver found nothing to rewrite before the click: the field's value ` +
-      `${probe.value === null ? "could not be read" : `("${probe.value}")`} did not match the ` +
-      `missing calling code shape #140 diagnosed, so nothing was changed.`;
+  const patchNote =
+    patch.outcome === "attempted"
+      ? `This solver had already rewritten the field to ${redactPhoneForLog(patch.correctedValue)} ` +
+        `before the click, specifically to add a calling code, and Recruitee's own validation ` +
+        `still names the same complaint against that value.`
+      : patch.outcome === "failed"
+        ? `This solver found a phone value missing a calling code and tried to rewrite the field ` +
+          `before the click, but that rewrite itself failed (${patch.failureReason}), so the ` +
+          `field was left exactly as the fill wrote it and the click still went ahead. This is ` +
+          `not the same as nothing needing fixing: a rewrite was attempted and did not complete.`
+        : `This solver found nothing to rewrite before the click: the field's value ` +
+          `${probe.value === null ? "could not be read" : "did not match"} the missing calling ` +
+          `code shape #140 diagnosed, so nothing was changed.`;
   return (
     `Recruitee's own client side validation is still calling this phone number invalid for ` +
     `missing its country calling code` +

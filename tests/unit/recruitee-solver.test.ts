@@ -154,16 +154,51 @@ describe("formatRecruiteePhoneE164", () => {
   it("returns the trimmed original when there are no digits at all", () => {
     expect(formatRecruiteePhoneE164("  ", "1")).toBe("");
   });
+
+  // A national trunk prefix ("0" in front of a local number) is how most
+  // countries outside the North American Numbering Plan write their own
+  // numbers, and it has to be stripped before a calling code is prepended,
+  // or the result carries the wrong shape and the wrong digit count for the
+  // country it names. Seven of `COUNTRY_DIAL_CODES`'s entries use this
+  // convention; the United Kingdom, Germany and France below are three of
+  // them, reproducing the exact mechanism CodeRabbit's own review flagged
+  // against this function's earlier version.
+  describe("a national trunk prefix on a non NANP number", () => {
+    it("strips the leading zero for a United Kingdom number", () => {
+      expect(formatRecruiteePhoneE164("07911123456", "44")).toBe("+447911123456");
+    });
+
+    it("strips the leading zero for a Germany number", () => {
+      expect(formatRecruiteePhoneE164("030 12345678", "49")).toBe("+493012345678");
+    });
+
+    it("strips the leading zero for a France number", () => {
+      expect(formatRecruiteePhoneE164("06 12 34 56 78", "33")).toBe("+33612345678");
+    });
+  });
+
+  // NANP numbers (dial code "1") never lead with a trunk zero, so the strip
+  // above must never run for them — the guard is `dialCode !== "1"`, not a
+  // list of countries kept in step with `COUNTRY_DIAL_CODES` by hand. This
+  // pins that a leading zero on a "1" dial code number is left exactly as
+  // given rather than silently dropped.
+  it("does not strip a leading zero for a North American Numbering Plan dial code", () => {
+    expect(formatRecruiteePhoneE164("0212345678", "1")).toBe("+10212345678");
+  });
 });
 
 describe("describeRecruiteePhoneStillBlocked", () => {
-  it("names that this solver's own patch already ran when it did", () => {
+  it("names that this solver's own patch already ran when it did, without embedding the raw digits", () => {
     const message = describeRecruiteePhoneStillBlocked(
       STILL_BLOCKED_PROBE,
-      { attempted: true, correctedValue: "+14044446018" },
+      { outcome: "attempted", correctedValue: "+14044446018" },
       "https://transperfect.recruitee.com/o/junior-frontend-engineer-4/c/new"
     );
-    expect(message).toContain("+14044446018");
+    // The candidate's own phone digits never reach this message — see
+    // `redactPhoneForLog` in `lib/solvers/recruitee.ts`. Only the last four
+    // digits, behind a redaction marker, are allowed to show.
+    expect(message).not.toContain("+14044446018");
+    expect(message).toContain("...6018");
     expect(message).toContain("already rewritten");
     expect(message).toContain("#140");
     expect(message).toContain("country calling code");
@@ -173,20 +208,50 @@ describe("describeRecruiteePhoneStillBlocked", () => {
   it("names that nothing was rewritten when the patch never fired", () => {
     const message = describeRecruiteePhoneStillBlocked(
       STILL_BLOCKED_PROBE,
-      { attempted: false, correctedValue: null },
+      { outcome: "skipped", correctedValue: null },
       "https://transperfect.recruitee.com/o/junior-frontend-engineer-4/c/new"
     );
     expect(message).toContain("found nothing to rewrite");
+    expect(message).not.toContain("already rewritten");
+    expect(message).not.toContain("rewrite itself failed");
+  });
+
+  // The BLOCKING gap this test closes: an earlier version of this file
+  // reported a failed rewrite attempt with the exact same "found nothing to
+  // rewrite" sentence the skipped case uses, which is false on the failed
+  // path — a rewrite plainly was attempted, it just did not complete. See
+  // `RecruiteePhonePatchOutcome` in `lib/solvers/recruitee.ts`.
+  it("names that a rewrite was attempted and failed, distinctly from nothing needing fixing", () => {
+    const message = describeRecruiteePhoneStillBlocked(
+      STILL_BLOCKED_PROBE,
+      { outcome: "failed", correctedValue: null, failureReason: "selector no longer resolves" },
+      "https://transperfect.recruitee.com/o/junior-frontend-engineer-4/c/new"
+    );
+    expect(message).toContain("rewrite itself failed");
+    expect(message).toContain("selector no longer resolves");
+    expect(message).toContain("did not complete");
+    expect(message).not.toContain("found nothing to rewrite");
     expect(message).not.toContain("already rewritten");
   });
 
   it("includes the board's own error text when the probe carried one", () => {
     const message = describeRecruiteePhoneStillBlocked(
       STILL_BLOCKED_PROBE,
-      { attempted: false, correctedValue: null },
+      { outcome: "skipped", correctedValue: null },
       "https://transperfect.recruitee.com/o/junior-frontend-engineer-4/c/new"
     );
     expect(message).toContain(STILL_BLOCKED_PROBE.errorText!);
+  });
+});
+
+describe("redactPhoneForLog behavior surfaced through describeRecruiteePhoneStillBlocked", () => {
+  it("reports an unreadable value as such rather than as a redacted number", () => {
+    const message = describeRecruiteePhoneStillBlocked(
+      { present: true, value: null, invalid: true, errorText: STILL_BLOCKED_PROBE.errorText },
+      { outcome: "skipped", correctedValue: null },
+      "https://transperfect.recruitee.com/o/junior-frontend-engineer-4/c/new"
+    );
+    expect(message).toContain("could not be read");
   });
 });
 
