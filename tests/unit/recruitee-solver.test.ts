@@ -124,9 +124,29 @@ describe("dialCodeForCountry", () => {
     expect(dialCodeForCountry("Germany")).toBe("49");
   });
 
-  it("falls back to United States for a null or unrecognised country", () => {
-    expect(dialCodeForCountry(null)).toBe("1");
-    expect(dialCodeForCountry("Wakanda")).toBe("1");
+  // JOB-255 review: this table used to fall back to United States ("1") for
+  // any null or unrecognised country. Review found that fallback was itself
+  // a corruption path (see `lib/solvers/recruitee.ts`'s own JOB-255 review
+  // section for the live shape it produced), so `dialCodeForCountry` now
+  // signals "unresolved" with `null` instead of guessing. Mentally revert
+  // this function to the old `?? "1"` default and every case below fails.
+  it("returns null rather than guessing for a null country", () => {
+    expect(dialCodeForCountry(null)).toBeNull();
+  });
+
+  it("returns null rather than guessing for an empty string country", () => {
+    expect(dialCodeForCountry("")).toBeNull();
+    expect(dialCodeForCountry("   ")).toBeNull();
+  });
+
+  it("returns null rather than guessing for a country not in the lookup table", () => {
+    expect(dialCodeForCountry("Wakanda")).toBeNull();
+    expect(dialCodeForCountry("Ukraine")).toBeNull();
+    expect(dialCodeForCountry("some-random-string")).toBeNull();
+  });
+
+  it("regression: a known country still resolves its real dial code", () => {
+    expect(dialCodeForCountry("United States")).toBe("1");
   });
 });
 
@@ -172,6 +192,23 @@ describe("formatRecruiteePhoneE164", () => {
 
   it("does not double up a North American trunk digit already present", () => {
     expect(formatRecruiteePhoneE164("14044446018", "1")).toBe("+14044446018");
+  });
+
+  // Red team minor: a sub ten digit NANP input has fewer digits than a real
+  // national number can have. `formatRecruiteePhoneE164`'s own NANP branch
+  // (see its doc comment) takes "the last ten digits, or the whole string
+  // when there are ten or fewer" — for a nine digit string that is the whole
+  // string, so this documents current behavior rather than adding a length
+  // check: the function still prepends "+1" and produces a plausible looking
+  // but wrong length result. This is deliberately left as is rather than
+  // rejected up front, because Recruitee's own client side validation
+  // already rejects a malformed number loudly (see this file's own header,
+  // the exact "including the country calling code" complaint this solver was
+  // built to react to) — a loud downstream failure is an acceptable outcome
+  // for a shape this solver has no real production evidence for, unlike the
+  // silent wrong country corruption `dialCodeForCountry` used to allow.
+  it("documents current behavior for a sub ten digit NANP input: prepends +1 without a length check", () => {
+    expect(formatRecruiteePhoneE164("404444601", "1")).toBe("+1404444601");
   });
 
   it("uses a non United States dial code as given, without the trunk digit special case", () => {
@@ -298,13 +335,36 @@ describe("describeRecruiteePhoneStillBlocked", () => {
     expect(message).toContain("retried automatically");
   });
 
-  it("names that nothing was rewritten when the patch never fired", () => {
+  it("names that nothing was rewritten when the value already carried the right dial code", () => {
     const message = describeRecruiteePhoneStillBlocked(
       STILL_BLOCKED_PROBE,
-      { outcome: "skipped", correctedValue: null },
+      { outcome: "skipped", correctedValue: null, skipReason: "already_correct" },
       "https://transperfect.recruitee.com/o/junior-frontend-engineer-4/c/new"
     );
     expect(message).toContain("found nothing to rewrite");
+    expect(message).not.toContain("already rewritten");
+    expect(message).not.toContain("rewrite itself failed");
+    expect(message).not.toContain("could not resolve");
+  });
+
+  // JOB-255 review — the corruption fix's own regression coverage. A skip
+  // caused by an unresolved country has to read differently from a skip
+  // caused by the value already being correct: the first never checked the
+  // value at all, the second checked it and found nothing wrong. Folding
+  // them into the same sentence would tell a reader "this was verified fine"
+  // when it was actually "this was never verified." Mentally revert
+  // `describeRecruiteePhoneStillBlocked` to ignore `skipReason` and this test
+  // fails, since both skip reasons would render the same "found nothing to
+  // rewrite" sentence this test explicitly rejects.
+  it("names that this solver declined to guess a dial code, distinctly from nothing needing fixing", () => {
+    const message = describeRecruiteePhoneStillBlocked(
+      STILL_BLOCKED_PROBE,
+      { outcome: "skipped", correctedValue: null, skipReason: "country_unresolved" },
+      "https://transperfect.recruitee.com/o/junior-frontend-engineer-4/c/new"
+    );
+    expect(message).toContain("could not resolve");
+    expect(message).toContain("deliberately left");
+    expect(message).not.toContain("found nothing to rewrite");
     expect(message).not.toContain("already rewritten");
     expect(message).not.toContain("rewrite itself failed");
   });
@@ -330,7 +390,7 @@ describe("describeRecruiteePhoneStillBlocked", () => {
   it("includes the board's own error text when the probe carried one", () => {
     const message = describeRecruiteePhoneStillBlocked(
       STILL_BLOCKED_PROBE,
-      { outcome: "skipped", correctedValue: null },
+      { outcome: "skipped", correctedValue: null, skipReason: "already_correct" },
       "https://transperfect.recruitee.com/o/junior-frontend-engineer-4/c/new"
     );
     expect(message).toContain(STILL_BLOCKED_PROBE.errorText!);
@@ -341,7 +401,7 @@ describe("redactPhoneForLog behavior surfaced through describeRecruiteePhoneStil
   it("reports an unreadable value as such rather than as a redacted number", () => {
     const message = describeRecruiteePhoneStillBlocked(
       { present: true, value: null, invalid: true, errorText: STILL_BLOCKED_PROBE.errorText },
-      { outcome: "skipped", correctedValue: null },
+      { outcome: "skipped", correctedValue: null, skipReason: "unreadable" },
       "https://transperfect.recruitee.com/o/junior-frontend-engineer-4/c/new"
     );
     expect(message).toContain("could not be read");

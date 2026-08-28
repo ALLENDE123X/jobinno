@@ -431,8 +431,17 @@ describe("recruiteeSolver — the patch attempt itself fails", () => {
   });
 });
 
+// JOB-255 review: `loadCandidateCountry` reading nothing (a failed lookup, or
+// a candidate who never stated a country) used to be treated the same as a
+// resolved United States country, defaulting the dial code to "1". Review
+// found that default was itself a corruption path — see
+// `lib/solvers/recruitee.ts`'s own JOB-255 review header section and
+// `dialCodeForCountry`'s doc comment for the live shape it produced. These
+// three describe blocks pin the fix: mentally revert `dialCodeForCountry` to
+// its old `?? "1"` default and every test below fails, since `mockTypeInto`
+// would then have been called.
 describe("recruiteeSolver — the candidate country lookup itself fails", () => {
-  it("still patches the phone field, defaulting to the United States dial code", async () => {
+  it("does not patch the phone field — an unresolved country is left alone rather than defaulted", async () => {
     mockCreateClient.mockReturnValue(makeFakeSupabase("throws"));
     const session = makeFakeSession([missingCodeProbe]);
     mockFillApplicationFormRetainingSession.mockResolvedValue({
@@ -445,9 +454,65 @@ describe("recruiteeSolver — the candidate country lookup itself fails", () => 
 
     await recruiteeSolver(baseInput, baseRow);
 
-    expect(mockTypeInto).toHaveBeenCalledTimes(1);
-    const [, , , correctedValue] = mockTypeInto.mock.calls[0]!;
-    expect(correctedValue).toBe("+14044446018");
+    expect(mockTypeInto).not.toHaveBeenCalled();
+  });
+});
+
+describe("recruiteeSolver — the candidate's stored country is not in the lookup table", () => {
+  // The exact corruption shape review found: a candidate who stated a
+  // country outside `COUNTRY_DIAL_CODES` (Ukraine here) with an already
+  // correct international number in the phone box (an Indian
+  // "+919876543210"). Before this fix, `dialCodeForCountry("Ukraine")`
+  // defaulted to "1", and `formatRecruiteePhoneE164`'s own North American
+  // Numbering Plan branch would take the last ten digits of that Indian
+  // number and rebuild a wrong but plausible looking United States one,
+  // "+19876543210". This test pins that the field is left untouched instead.
+  const indianNumberProbe = {
+    present: true,
+    value: "+919876543210",
+    invalid: false,
+    errorText: null,
+  };
+
+  it("does not rewrite an already correct international number when the country cannot be resolved", async () => {
+    mockCreateClient.mockReturnValue(makeFakeSupabase("Ukraine"));
+    const session = makeFakeSession([indianNumberProbe]);
+    mockFillApplicationFormRetainingSession.mockResolvedValue({
+      result: makeFillResult(),
+      session,
+    });
+    mockRunSubmitPhase.mockResolvedValue(
+      makeSubmitResult({ submitted: true, status: APPLICATION_STATUS.SUBMITTED })
+    );
+
+    await recruiteeSolver(baseInput, baseRow);
+
+    expect(mockTypeInto).not.toHaveBeenCalled();
+  });
+
+  it("writes a skip_log message naming that the dial code could not be resolved, distinct from nothing needing fixing", async () => {
+    mockCreateClient.mockReturnValue(makeFakeSupabase("Ukraine"));
+    const session = makeFakeSession([indianNumberProbe, stillBlockedProbe]);
+    mockFillApplicationFormRetainingSession.mockResolvedValue({
+      result: makeFillResult(),
+      session,
+    });
+    mockRunSubmitPhase.mockResolvedValue(
+      makeSubmitResult({
+        submitted: false,
+        status: APPLICATION_STATUS.SUBMISSION_UNCONFIRMED,
+        unconfirmedReason: null,
+      })
+    );
+
+    const outcome = await recruiteeSolver(baseInput, baseRow);
+
+    expect(mockTypeInto).not.toHaveBeenCalled();
+    expect(outcome.unconfirmedReason).not.toBeNull();
+    expect(outcome.unconfirmedReason).toContain("could not resolve");
+    expect(outcome.unconfirmedReason).not.toContain(
+      "already named the candidate's own dial code"
+    );
   });
 });
 

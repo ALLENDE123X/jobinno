@@ -100,6 +100,32 @@
  * original case), or a digit string that already carries a plausible looking
  * but wrong calling code the widget itself introduced (this ticket's case).
  *
+ * ── JOB-255 review: the United States fallback was itself a corruption risk ──
+ * `dialCodeForCountry` originally fell back to United States (dial code "1")
+ * whenever the candidate's stored `profiles.current_country` was missing or
+ * named a country this file's own lookup table did not carry. Review after
+ * the fix above shipped found that fallback was itself a corruption path, not
+ * a safe default. `formatRecruiteePhoneE164`'s own North American Numbering
+ * Plan branch takes the last ten digits of whatever is present in the box and
+ * rebuilds a "+1" number from those, so a correct international number for a
+ * candidate this file's table does not carry, an Indian "+919876543210" for
+ * example, would read as twelve digits, keep the last ten, and come back
+ * "+19876543210": a number that still parses and still looks plausible, so
+ * nothing downstream would catch it before the application submitted. That
+ * outcome is worse than the pre #140 state, which at least failed loud.
+ *
+ * `dialCodeForCountry` now returns `null` for that unresolved case rather
+ * than a guessed dial code, and `patchRecruiteePhoneCountryCode` does not
+ * rewrite the field at all when it sees `null`: it leaves whatever the fill
+ * layer typed in place, right or wrong, rather than overwrite it with a
+ * fabricated calling code. Shipping the fill layer's own guess was judged the
+ * safer failure mode than silently replacing it with a wrong but plausible
+ * looking one. Recruitee's own post submit validation, the same probe this
+ * file already reads after the click, is still the backstop that turns an
+ * actually wrong number into the `internal_error` skip_log row below rather
+ * than a silent submit. See `dialCodeForCountry` and
+ * `RecruiteePhoneSkipReason`'s own doc comments for the mechanism.
+ *
  * ── What this file also adds: a post submit read ─────────────────────────────
  * The same append only pattern `leverSolver`, `greenhouseSolver` and
  * `workableSolver` use: after `runSubmitPhase` returns unconfirmed, this
@@ -340,9 +366,9 @@ export function recruiteePhoneValidationStillBlocked(probe: RecruiteePhoneProbe)
 /**
  * Calling codes for the countries `profiles.current_country` is most likely
  * to name, keyed lower case. Not exhaustive: a country this table does not
- * carry falls back to United States (dial code "1") in `dialCodeForCountry`
- * below, which is a practical default rather than a claim about any
- * particular candidate, documented at that function.
+ * carry reads as unresolved in `dialCodeForCountry` below, not as a guessed
+ * dial code — see that function's own doc comment for why a guess here is
+ * not a safe default.
  */
 const COUNTRY_DIAL_CODES: Readonly<Record<string, string>> = {
   "united states": "1",
@@ -376,21 +402,31 @@ const COUNTRY_DIAL_CODES: Readonly<Record<string, string>> = {
 
 /**
  * The dial code to prepend when a Recruitee phone box is missing one of its
- * own. Falls back to United States ("1") when `country` is null or names a
- * country this file's small table does not carry. That default is not a
- * fabricated fact about any one candidate (see HARD STOP 9 in this repo's own
- * `CLAUDE.md`, the exact rule this default is written to respect): it changes
- * nothing about what was typed into the box, only how the digits already
- * typed are punctuated, and the one candidate this solver has real data for
- * today stated their own country as United States. A future candidate whose
- * stated country is not in this table gets the same default rather than a run
- * that stops here; widening the table as real inventory shows a need for it
- * is a small, low risk follow up, not a design change.
+ * own, or `null` when `country` is missing or names a country this file's
+ * small table does not carry.
+ *
+ * This used to fall back to United States ("1") for exactly that unresolved
+ * case, reasoned as a practical default rather than a fabricated fact about
+ * any one candidate. A live corruption case found by review after JOB-255
+ * shipped showed that reasoning was wrong: `formatRecruiteePhoneE164`'s own
+ * North American Numbering Plan branch takes the last ten digits of whatever
+ * is present and rebuilds a "+1" number from those, so a candidate whose
+ * stated country falls outside this table (or who never stated one at all)
+ * could have a correct international number, an Indian "+919876543210" for
+ * example, silently rewritten into a wrong but still plausible looking
+ * United States one. That is a worse outcome than doing nothing, so this
+ * function no longer guesses. Returning `null` here is what lets
+ * `patchRecruiteePhoneCountryCode` below tell "the candidate's own dial code
+ * is known" apart from "it is not," and leave the field alone on the second
+ * one rather than rewrite it with a fabricated calling code. Widening
+ * `COUNTRY_DIAL_CODES` as real inventory shows a need for it is still a
+ * small, low risk follow up; guessing at the gap in the meantime is not.
  */
-export function dialCodeForCountry(country: string | null): string {
-  if (country === null) return "1";
+export function dialCodeForCountry(country: string | null): string | null {
+  if (country === null) return null;
   const key = country.trim().toLowerCase();
-  return COUNTRY_DIAL_CODES[key] ?? "1";
+  if (key.length === 0) return null;
+  return COUNTRY_DIAL_CODES[key] ?? null;
 }
 
 /**
@@ -524,9 +560,11 @@ export function recruiteePhoneNeedsRewrite(rawValue: string, dialCode: string): 
  * other read in this file.
  *
  * Never throws. A missing application row, a missing profile row, or any
- * error from either query reads as null, the same "nothing to see here"
- * outcome `dialCodeForCountry` already turns into its own documented
- * default. A phone format fix is not worth failing a real submission over.
+ * error from either query reads as null, the same "unresolved" input
+ * `dialCodeForCountry` now turns into its own documented `null` return
+ * rather than a guessed dial code. A phone format fix is not worth failing a
+ * real submission over, and is not worth guessing a wrong number over
+ * either — see `dialCodeForCountry`'s own doc comment for why.
  */
 async function loadCandidateCountry(
   supabase: SupabaseClient,
@@ -586,13 +624,31 @@ function redactPhoneForLog(value: string | null): string {
 }
 
 /**
+ * Why a `"skipped"` outcome happened, for the three genuinely different
+ * reasons a person reading a downstream skip row needs told apart:
+ *
+ * - `"unreadable"`: the field either was not found, or its value read empty.
+ *   There was nothing here to sensibly rewrite.
+ * - `"already_correct"`: `recruiteePhoneNeedsRewrite` found the value already
+ *   names the candidate's own dial code once normalized to digits. Nothing
+ *   needed changing.
+ * - `"country_unresolved"`: `dialCodeForCountry` returned `null` for the
+ *   candidate's stored country, missing or not in `COUNTRY_DIAL_CODES`. This
+ *   solver deliberately declined to rewrite the field here, on purpose, to
+ *   avoid the wrong country corruption `dialCodeForCountry`'s own doc comment
+ *   describes. This is not the same fact as `"already_correct"`: the value
+ *   was never actually checked against a known dial code, so it could be
+ *   right or wrong, and this solver chose not to guess either way.
+ */
+export type RecruiteePhoneSkipReason = "unreadable" | "already_correct" | "country_unresolved";
+
+/**
  * What `patchRecruiteePhoneCountryCode` did, told apart into the three
  * outcomes a person reading a downstream skip row needs distinguished, not
  * folded into one boolean the way an earlier version of this file did:
  *
- * - `"skipped"`: the field either could not be read, or `recruiteePhoneNeedsRewrite`
- *   found its value already names the candidate's own dial code once
- *   normalized to digits. There was nothing here to rewrite, and nothing was.
+ * - `"skipped"`: nothing was rewritten. `skipReason` names which of the
+ *   three reasons in `RecruiteePhoneSkipReason` applied.
  * - `"attempted"`: a rewrite ran and `typeInto` reported success. Whatever
  *   Recruitee's own validation does with that value afterward is a separate
  *   fact this type says nothing about.
@@ -605,10 +661,10 @@ function redactPhoneForLog(value: string | null): string {
  * Collapsing `"failed"` back into `"skipped"`, which is what this file did
  * before, states something false: `"skipped"` says nothing was attempted,
  * and on the failed path something plainly was. `describeRecruiteePhoneStillBlocked`
- * below writes a different, accurate sentence for each of the three.
+ * below writes a different, accurate sentence for each of these.
  */
 export type RecruiteePhonePatchOutcome =
-  | { outcome: "skipped"; correctedValue: null }
+  | { outcome: "skipped"; correctedValue: null; skipReason: RecruiteePhoneSkipReason }
   | { outcome: "attempted"; correctedValue: string }
   | { outcome: "failed"; correctedValue: null; failureReason: string };
 
@@ -620,6 +676,14 @@ export type RecruiteePhonePatchOutcome =
  * same primitive the fill itself used, so a `react-phone-number-input`
  * controlled input's own React state updates the trusted way rather than
  * through a direct DOM write that library would simply ignore or revert.
+ *
+ * When `dialCodeForCountry` cannot resolve the candidate's stored country to
+ * a known dial code, this function does not rewrite the field at all — it
+ * leaves whatever the fill layer typed in place, right or wrong, rather than
+ * guess a dial code and risk turning a correct number into a wrong but
+ * plausible looking one. See `dialCodeForCountry`'s own doc comment for the
+ * live corruption case that made this the deliberate behavior rather than an
+ * oversight.
  *
  * Never throws: a probe that finds nothing to fix, a `typeInto` call that
  * fails because the field no longer resolves, anything, is caught and logged
@@ -637,13 +701,22 @@ async function patchRecruiteePhoneCountryCode(
 ): Promise<RecruiteePhonePatchOutcome> {
   const probe = await probeRecruiteePhoneField(session.page);
   if (probe === null || probe.value === null || probe.value.trim().length === 0) {
-    return { outcome: "skipped", correctedValue: null };
+    return { outcome: "skipped", correctedValue: null, skipReason: "unreadable" };
   }
 
   const country = await loadCandidateCountry(supabase, jobApplicationId);
   const dialCode = dialCodeForCountry(country);
+  if (dialCode === null) {
+    console.warn(
+      `${LOG} could not resolve a dial code for ${jobApplicationId}'s candidate ` +
+        `(${country === null ? "no stored country on file" : `stored country "${country}" is not in this file's lookup table`}); ` +
+        `leaving the phone field exactly as the fill wrote it rather than rewriting it with a ` +
+        `guessed calling code`
+    );
+    return { outcome: "skipped", correctedValue: null, skipReason: "country_unresolved" };
+  }
   if (!recruiteePhoneNeedsRewrite(probe.value, dialCode)) {
-    return { outcome: "skipped", correctedValue: null };
+    return { outcome: "skipped", correctedValue: null, skipReason: "already_correct" };
   }
   const corrected = formatRecruiteePhoneE164(probe.value, dialCode);
 
@@ -653,8 +726,7 @@ async function patchRecruiteePhoneCountryCode(
     console.warn(
       `${LOG} rewrote ${jobApplicationId}'s phone field to carry the right calling code before ` +
         `submitting: was ${redactPhoneForLog(probe.value)}, now ${redactPhoneForLog(corrected)} ` +
-        `(dial code +${dialCode}` +
-        `${country ? ", from the candidate's stored country" : ", defaulted, no stored country on file"})`
+        `(dial code +${dialCode}, from the candidate's stored country)`
     );
     return { outcome: "attempted", correctedValue: corrected };
   } catch (err) {
@@ -671,19 +743,26 @@ async function patchRecruiteePhoneCountryCode(
 /**
  * The sentence a human reads in `skip_log.raw_context.message` when Recruitee
  * still names a missing calling code after the click. Writes a different,
- * accurate sentence for each of `RecruiteePhonePatchOutcome`'s three states,
- * since a person deciding what to do next needs three different facts told
- * apart, not folded into one: nothing here needed fixing, a rewrite ran and
- * Recruitee still rejected the result, or a rewrite was attempted and never
- * completed. Never embeds the candidate's own phone digits — see
- * `redactPhoneForLog`.
+ * accurate sentence for each of `RecruiteePhonePatchOutcome`'s states, since a
+ * person deciding what to do next needs those facts told apart, not folded
+ * into one: nothing here needed fixing, this solver declined to guess a dial
+ * code, a rewrite ran and Recruitee still rejected the result, or a rewrite
+ * was attempted and never completed. Never embeds the candidate's own phone
+ * digits — see `redactPhoneForLog`.
  *
  * JOB-255 broadened what "nothing here needed fixing" actually means: the
  * gate is no longer just a missing leading plus, it is whether the value
  * already names the candidate's own dial code once reduced to digits (see
- * `recruiteePhoneNeedsRewrite`). The "skipped" sentence below is worded to
- * stay true either way, since a value this solver left alone could be
- * missing a calling code entirely or could already carry the right one.
+ * `recruiteePhoneNeedsRewrite`).
+ *
+ * A later review of that same change found a second, distinct "skipped"
+ * story worth telling apart from "already correct": a candidate whose
+ * stored country `dialCodeForCountry` could not resolve. Folding that case
+ * into "already named the candidate's own dial code" would tell a reader the
+ * value was checked and found fine, when it was never checked at all — this
+ * solver deliberately declined to guess rather than risk rewriting a correct
+ * number into a wrong one. `RecruiteePhoneSkipReason` names which of the two
+ * actually happened, and the sentence below says so honestly for each.
  */
 export function describeRecruiteePhoneStillBlocked(
   probe: RecruiteePhoneProbe,
@@ -700,9 +779,15 @@ export function describeRecruiteePhoneStillBlocked(
           `field before the click, but that rewrite itself failed (${patch.failureReason}), so the ` +
           `field was left exactly as the fill wrote it and the click still went ahead. This is ` +
           `not the same as nothing needing fixing: a rewrite was attempted and did not complete.`
-        : `This solver found nothing to rewrite before the click: the field's value ` +
-          `${probe.value === null ? "could not be read" : "already named the candidate's own dial code once normalized, or carried nothing this solver could sensibly rewrite"}, ` +
-          `so nothing was changed.`;
+        : patch.skipReason === "country_unresolved"
+          ? `This solver found a phone value here but could not resolve the candidate's stored ` +
+            `country to a known dial code, so it deliberately left the field exactly as the fill ` +
+            `wrote it rather than rewrite it with a guessed calling code that could have been ` +
+            `wrong. This value was never checked against a known dial code, so it may or may not ` +
+            `be correct; a person should look at it directly.`
+          : `This solver found nothing to rewrite before the click: the field's value ` +
+            `${probe.value === null ? "could not be read" : "already named the candidate's own dial code once normalized, or carried nothing this solver could sensibly rewrite"}, ` +
+            `so nothing was changed.`;
   return (
     `Recruitee's own client side validation is still calling this phone number invalid for ` +
     `missing its country calling code` +
