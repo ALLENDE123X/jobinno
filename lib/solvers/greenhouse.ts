@@ -281,9 +281,9 @@ export function describeGreenhouseRequiredFieldsGate(
     `and it is not the generic guess the reading above already made. ${count} required ${plural} ` +
     `still read as empty at "${finalUrl}" after the click: ${names}. Greenhouse's own validation ` +
     `marked ${pronoun} as empty at submit time; that reading is a fact, not a guess, but nothing ` +
-    `here identifies which kind of dropdown widget is behind ${pronoun}. Whatever the fill wrote ` +
-    `into ${pronoun} never registered as a real choice with Greenhouse, at least not by the moment ` +
-    `this probe read the page. That is where the probe's own reach ends: it can see that the ` +
+    `here identifies which kind of dropdown widget is behind ${pronoun}. Whether the fill wrote ` +
+    `anything into ${pronoun}, and if so what became of that write, is not something this probe ` +
+    `can see. That is where the probe's own reach ends: it can see that the ` +
     `client side check still called ${pronoun} empty right then, and it says nothing about whether ` +
     `a request ever reached Greenhouse's server, whether a value was written and failed to commit, ` +
     `or whether nothing was ever written at all. This row stays submission unconfirmed for exactly ` +
