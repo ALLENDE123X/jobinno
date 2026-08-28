@@ -21,6 +21,7 @@ import {
   dialCodeForCountry,
   formatRecruiteePhoneE164,
   recruiteePhoneMissingCountryCode,
+  recruiteePhoneNeedsRewrite,
   recruiteePhoneValidationStillBlocked,
   type RecruiteePhoneProbe,
 } from "@/lib/solvers/recruitee";
@@ -134,13 +135,39 @@ describe("formatRecruiteePhoneE164", () => {
     expect(formatRecruiteePhoneE164("4044446018", "1")).toBe("+14044446018");
   });
 
-  it("leaves a value that already starts with a plus sign unchanged", () => {
+  it("leaves a value already carrying the candidate's own dial code unchanged", () => {
     expect(formatRecruiteePhoneE164("+14044446018", "1")).toBe("+14044446018");
-    expect(formatRecruiteePhoneE164("+40 44446018", "1")).toBe("+40 44446018");
+  });
+
+  // JOB-255 — the live verify reproducer. A plus sign alone does not mean
+  // the digits behind it name the right calling code: this is the exact
+  // value Recruitee's own `react-phone-number-input` widget left behind when
+  // its country selector defaulted to Romania for a United States candidate
+  // (see this file's own header, and `lib/solvers/recruitee.ts`'s JOB-255
+  // section). Before this fix, this exact input returned unchanged — that
+  // was the bug.
+  it("JOB-255: recovers the correct number when the widget prepended the wrong calling code", () => {
+    expect(formatRecruiteePhoneE164("+40 44446018", "1")).toBe("+14044446018");
+  });
+
+  // A calling code can also be wrong in a way that adds digits rather than
+  // just relabeling them — a country selector default that glues its own
+  // dial code onto the full raw string rather than absorbing part of it.
+  it("JOB-255: recovers the correct number when a wrong calling code was prepended onto the whole raw string", () => {
+    expect(formatRecruiteePhoneE164("+404044446018", "1")).toBe("+14044446018");
+  });
+
+  it("JOB-255: leaves a non NANP value that already carries its own correct dial code unchanged in substance", () => {
+    const corrected = formatRecruiteePhoneE164("+380 442 30 30 30", "380");
+    expect(corrected.replace(/\D/g, "")).toBe("380442303030");
   });
 
   it("strips separators and parentheses down to digits before prepending", () => {
     expect(formatRecruiteePhoneE164("(404) 444-6018", "1")).toBe("+14044446018");
+  });
+
+  it("strips a dash formatted value down to digits before prepending", () => {
+    expect(formatRecruiteePhoneE164("404-444-6018", "1")).toBe("+14044446018");
   });
 
   it("does not double up a North American trunk digit already present", () => {
@@ -215,6 +242,41 @@ describe("formatRecruiteePhoneE164", () => {
       // the point once an explicit "00" prefix is present.
       expect(formatRecruiteePhoneE164("003312345678", "1")).toBe("+3312345678");
     });
+  });
+});
+
+// JOB-255 — the broadened gate `patchRecruiteePhoneCountryCode` actually uses
+// now, in place of `recruiteePhoneMissingCountryCode`'s narrower "no leading
+// plus" question. Every case here mentally breaks the old implementation: a
+// pre JOB-255 `recruiteePhoneMissingCountryCode(probe)` reads `false` for
+// every value that already carries a plus sign, which is exactly how the
+// live "+40 44446018" value slipped through and reached Recruitee's own
+// validation unfixed. `recruiteePhoneNeedsRewrite` has to read `true` for
+// that shape for this regression to actually be caught.
+describe("recruiteePhoneNeedsRewrite", () => {
+  it("JOB-255: the real production case — a plausible looking but wrong calling code needs a rewrite", () => {
+    expect(recruiteePhoneNeedsRewrite("+40 44446018", "1")).toBe(true);
+  });
+
+  it("a value already carrying the candidate's own correct dial code needs no rewrite", () => {
+    expect(recruiteePhoneNeedsRewrite("+14044446018", "1")).toBe(false);
+  });
+
+  it("raw digits with no calling code at all need a rewrite", () => {
+    expect(recruiteePhoneNeedsRewrite("4044446018", "1")).toBe(true);
+  });
+
+  it("a dash formatted value with no calling code needs a rewrite", () => {
+    expect(recruiteePhoneNeedsRewrite("404-444-6018", "1")).toBe(true);
+  });
+
+  it("a different country's already correct value needs no rewrite", () => {
+    expect(recruiteePhoneNeedsRewrite("+380 442 30 30 30", "380")).toBe(false);
+  });
+
+  it("an empty or whitespace only value needs no rewrite — nothing to sensibly change it to", () => {
+    expect(recruiteePhoneNeedsRewrite("", "1")).toBe(false);
+    expect(recruiteePhoneNeedsRewrite("   ", "1")).toBe(false);
   });
 });
 

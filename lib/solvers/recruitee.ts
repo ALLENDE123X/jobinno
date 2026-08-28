@@ -71,6 +71,35 @@
  * to stop the run: the worst outcome of a failed patch is the same
  * `submission_unconfirmed` outcome this row already carries, not a worse one.
  *
+ * ── JOB-255: the trigger above was too narrow ────────────────────────────────
+ * A live verify pass on 2026 08 28, run against this exact board and this
+ * exact application row a second time, found the #140 fix did not actually
+ * stop the failure it was built for. The fill layer typed the candidate's raw
+ * digits ("4044446018", a United States number with no calling code of its
+ * own) into the box as before, but this time `react-phone-number-input`'s own
+ * country selector had defaulted to Romania rather than to whatever it showed
+ * during #140's own diagnosis, and it read the whole raw string as if it were
+ * already a Romanian number: "+40" (the selector's own dial code, not
+ * anything this pipeline typed) plus "44446018" (the digits left over once
+ * the widget's own display logic treated the leading "40" as spoken for). The
+ * box now carried a leading plus sign, so `recruiteePhoneMissingCountryCode`
+ * correctly saw nothing to fix by its own definition and skipped, and
+ * Recruitee's own validation rejected the result anyway: a plus sign alone
+ * does not make a calling code correct, only present.
+ *
+ * The gate below no longer asks whether the box's value merely lacks a
+ * leading plus. It asks whether the box's value, once reduced to its own
+ * candidate for a corrected shape by `formatRecruiteePhoneE164`, still names
+ * the same phone number a person would recognize as the candidate's own once
+ * the country selector's guess is discounted, compared digit by digit rather
+ * than character by character so a spacing or punctuation only difference
+ * never triggers a rewrite the field does not need. See
+ * `recruiteePhoneNeedsRewrite` and `formatRecruiteePhoneE164`'s own doc
+ * comments for the mechanism, which now recovers the correct number from
+ * either shape: a bare digit string missing its calling code entirely (#140's
+ * original case), or a digit string that already carries a plausible looking
+ * but wrong calling code the widget itself introduced (this ticket's case).
+ *
  * ── What this file also adds: a post submit read ─────────────────────────────
  * The same append only pattern `leverSolver`, `greenhouseSolver` and
  * `workableSolver` use: after `runSubmitPhase` returns unconfirmed, this
@@ -272,6 +301,13 @@ async function probeRecruiteePhoneField(page: Page): Promise<RecruiteePhoneProbe
  * calling code: there is nothing this solver could sensibly rewrite it to,
  * and a truly empty required field is a different, already handled shape
  * (Recruitee's own required field validation, not this one).
+ *
+ * JOB-255: this predicate is kept for what it honestly says, that the value
+ * lacks a leading plus, but it is no longer the sole gate `patchRecruiteePhoneCountryCode`
+ * uses to decide whether to rewrite the field. A value can carry a leading
+ * plus and still be wrong, the shape #255's live verify pass found (see this
+ * file's own header) — `recruiteePhoneNeedsRewrite` is the broader check that
+ * actually gates the rewrite now.
  */
 export function recruiteePhoneMissingCountryCode(probe: RecruiteePhoneProbe): boolean {
   if (!probe.present || probe.value === null) return false;
@@ -359,21 +395,51 @@ export function dialCodeForCountry(country: string | null): string {
 
 /**
  * Formats a raw phone value read off a Recruitee phone box into E.164 shape.
- * A value that already starts with a plus sign is returned unchanged: it
- * already carries its own calling code, whatever it is, and this function
- * never second guesses one that is already there. An 11 digit value that
- * already begins with "1" and whose dial code is also "1" is treated as
- * already carrying the North American trunk digit rather than doubled up
- * with a second one. Everything else is the dial code followed by whatever
- * digits were present, since digits are the only part of the original value
- * this function keeps: separators, spaces and parentheses are Recruitee's
- * own formatting choice to make on read back, not something this fix needs
- * to reproduce.
+ * Digits are the only part of the original value this function trusts:
+ * separators, spaces, parentheses, and (as of JOB-255) even an existing plus
+ * sign are all stripped and re derived rather than kept as given, because
+ * #255's live verify pass found a plus sign alone does not mean the digits
+ * behind it name the right calling code — see this file's own header for the
+ * production case that proved it (Recruitee's own country selector guessed
+ * Romania for a United States number and rewrote the box to "+40 44446018").
  *
- * One more shape has to be handled before that final concatenation: most
- * countries outside the North American Numbering Plan write their own
- * national numbers with a leading trunk zero that is dropped the moment a
- * calling code is added in front of it. Six of the entries in
+ * A leading "00" is read first, before anything else: it is the
+ * international dial out prefix a resume parsed number sometimes carries in
+ * place of a "+", and the digits after it are already a complete
+ * international number, own calling code included. Treating it as an
+ * ordinary trunk zero and prepending this call's own dial code on top of it
+ * would double up a calling code the value already carries, for example
+ * turning the United Kingdom's "00447911123456" into the wrong shaped
+ * "+440447911123456" instead of the correct "+447911123456".
+ *
+ * North American Numbering Plan numbers (dial code "1") get their own path,
+ * because this is exactly the shape JOB-255's own production case broke: a
+ * `react-phone-number-input` widget defaulted to the wrong country and read
+ * some of the candidate's own raw digits as if they were a calling code,
+ * which means the front of the string is not trustworthy but the true ten
+ * digit national number is still in there, at the tail. Rather than trust
+ * whatever the widget decided sat at the front, this function takes the last
+ * ten digits of whatever is present (the whole string when there are ten or
+ * fewer) as the actual national number and prepends a single United States
+ * trunk digit in front of it. This one rule covers every NANP shape this
+ * file has real evidence for: a bare ten digit local number ("4044446018"),
+ * an already correct eleven digit value that leads with its own trunk digit
+ * ("+14044446018", the last ten digits are unchanged so nothing is lost), and
+ * a value some other calling code got glued onto by a defaulted country
+ * selector ("+404044446018", where the real ten digit number is still the
+ * tail and the bogus leading "40" is simply not part of it).
+ *
+ * A non NANP value that already leads with its own correct dial code is left
+ * alone rather than doubled up: an Ukrainian number already read as
+ * "+380442303030" should stay "+380442303030", not become
+ * "+380380442303030". This is the one case where JOB-255's own broader gate
+ * (`recruiteePhoneNeedsRewrite`) reports nothing needs to change, since the
+ * digits before and after this function runs are identical either way.
+ *
+ * Everything else still needs a trunk zero handled before the dial code is
+ * prepended: most countries outside the North American Numbering Plan write
+ * their own national numbers with a leading trunk zero that is dropped the
+ * moment a calling code is added in front of it. Six of the entries in
  * `COUNTRY_DIAL_CODES` above work this way (the United Kingdom, Germany,
  * France, Spain, the Netherlands and Ireland, among others this table does
  * not carry), and a resume parsed local number for any of them, for example
@@ -381,10 +447,7 @@ export function dialCodeForCountry(country: string | null): string {
  * Prepending "+44" straight onto it without stripping the zero first
  * produces "+4407911123456", a number with the wrong shape and the wrong
  * digit count for the country it names, silently, on the candidate's real
- * application. NANP numbers never lead with a zero (an area code cannot
- * start with one), so the strip only ever needs to be withheld from dial
- * code "1", not from a specific list this table would otherwise have to keep
- * in step with `COUNTRY_DIAL_CODES` by hand.
+ * application.
  *
  * Italy is the well known real world exception to that trunk zero rule: an
  * Italian landline number keeps its leading zero even once the "+39" calling
@@ -396,35 +459,58 @@ export function dialCodeForCountry(country: string | null): string {
  * function knows keep that zero; today that is Italy alone, since it is the
  * one this file has a reported real world counter example for, not a claim
  * that no other country works the same way.
- *
- * A value can also arrive already written for international dialing rather
- * than for a national context: a leading "00" is the international dial out
- * prefix a resume parsed number sometimes carries in place of a "+", and the
- * digits after it are already a complete international number, own calling
- * code included. That shape is read first, before either the trunk zero
- * question or the dial code prepend below even come up, because treating
- * "00" as if it were an ordinary trunk zero and prepending this call's own
- * dial code on top of it would double up a calling code the value already
- * carries, for example turning the United Kingdom's "00447911123456" into
- * the wrong shaped "+440447911123456" instead of the correct "+447911123456".
  */
 const KEEPS_TRUNK_ZERO_COUNTRIES: ReadonlySet<string> = new Set(["39"]);
 
+/** North American Numbering Plan national numbers are always ten digits. */
+const NANP_NSN_LENGTH = 10;
+
 export function formatRecruiteePhoneE164(rawValue: string, dialCode: string): string {
   const trimmed = rawValue.trim();
-  if (trimmed.startsWith("+")) return trimmed;
-  let digits = trimmed.replace(/\D/g, "");
+  const digits = trimmed.replace(/\D/g, "");
   if (digits.length === 0) return trimmed;
+
   if (digits.length > 2 && digits.startsWith("00")) {
     return `+${digits.slice(2)}`;
   }
-  if (dialCode === "1" && digits.length === 11 && digits.startsWith("1")) {
+
+  if (dialCode === "1") {
+    const nationalNumber =
+      digits.length >= NANP_NSN_LENGTH ? digits.slice(-NANP_NSN_LENGTH) : digits;
+    return `+1${nationalNumber}`;
+  }
+
+  if (digits.startsWith(dialCode) && digits.length > dialCode.length) {
     return `+${digits}`;
   }
-  if (dialCode !== "1" && !KEEPS_TRUNK_ZERO_COUNTRIES.has(dialCode) && digits.startsWith("0")) {
-    digits = digits.slice(1);
+
+  let nationalDigits = digits;
+  if (!KEEPS_TRUNK_ZERO_COUNTRIES.has(dialCode) && nationalDigits.startsWith("0")) {
+    nationalDigits = nationalDigits.slice(1);
   }
-  return `+${dialCode}${digits}`;
+  return `+${dialCode}${nationalDigits}`;
+}
+
+/**
+ * Whether `formatRecruiteePhoneE164` would actually change the box's value in
+ * a way that matters, compared digit by digit rather than character by
+ * character so a spacing or punctuation only difference (the Ukrainian
+ * "+380 442 30 30 30" case, reformatted but not renumbered) never reports a
+ * rewrite is needed when the box already names the right number. This is the
+ * gate `patchRecruiteePhoneCountryCode` actually uses as of JOB-255, wider
+ * than `recruiteePhoneMissingCountryCode`'s own narrower "no leading plus"
+ * question — see this file's own header for why that narrower question
+ * stopped being sufficient.
+ *
+ * An empty or unreadable value reports false: there is nothing to rewrite it
+ * to, the same reasoning `recruiteePhoneMissingCountryCode` already
+ * documents for its own empty value case.
+ */
+export function recruiteePhoneNeedsRewrite(rawValue: string, dialCode: string): boolean {
+  const trimmed = rawValue.trim();
+  if (trimmed.length === 0) return false;
+  const corrected = formatRecruiteePhoneE164(rawValue, dialCode);
+  return corrected.replace(/\D/g, "") !== trimmed.replace(/\D/g, "");
 }
 
 /**
@@ -504,9 +590,9 @@ function redactPhoneForLog(value: string | null): string {
  * outcomes a person reading a downstream skip row needs distinguished, not
  * folded into one boolean the way an earlier version of this file did:
  *
- * - `"skipped"`: the field either could not be read, already carried its own
- *   plus prefix, or formatted to the exact same value it already held. There
- *   was nothing here to rewrite, and nothing was.
+ * - `"skipped"`: the field either could not be read, or `recruiteePhoneNeedsRewrite`
+ *   found its value already names the candidate's own dial code once
+ *   normalized to digits. There was nothing here to rewrite, and nothing was.
  * - `"attempted"`: a rewrite ran and `typeInto` reported success. Whatever
  *   Recruitee's own validation does with that value afterward is a separate
  *   fact this type says nothing about.
@@ -527,8 +613,10 @@ export type RecruiteePhonePatchOutcome =
   | { outcome: "failed"; correctedValue: null; failureReason: string };
 
 /**
- * The #140 fix. Reads the live phone box; when its value is present and
- * missing a calling code, rewrites it to E.164 shape through `typeInto`, the
+ * The #140 fix, broadened by JOB-255. Reads the live phone box; when its
+ * value, once normalized to E.164 shape, would actually change (per
+ * `recruiteePhoneNeedsRewrite`, not the narrower "no leading plus" check this
+ * function used before), rewrites it to that shape through `typeInto`, the
  * same primitive the fill itself used, so a `react-phone-number-input`
  * controlled input's own React state updates the trusted way rather than
  * through a direct DOM write that library would simply ignore or revert.
@@ -548,22 +636,22 @@ async function patchRecruiteePhoneCountryCode(
   jobApplicationId: string
 ): Promise<RecruiteePhonePatchOutcome> {
   const probe = await probeRecruiteePhoneField(session.page);
-  if (probe === null || probe.value === null || !recruiteePhoneMissingCountryCode(probe)) {
+  if (probe === null || probe.value === null || probe.value.trim().length === 0) {
     return { outcome: "skipped", correctedValue: null };
   }
 
   const country = await loadCandidateCountry(supabase, jobApplicationId);
   const dialCode = dialCodeForCountry(country);
-  const corrected = formatRecruiteePhoneE164(probe.value, dialCode);
-  if (corrected === probe.value) {
+  if (!recruiteePhoneNeedsRewrite(probe.value, dialCode)) {
     return { outcome: "skipped", correctedValue: null };
   }
+  const corrected = formatRecruiteePhoneE164(probe.value, dialCode);
 
   try {
     const url = await session.page.url();
     await typeInto(session, url, RECRUITEE_PHONE_FIELD_INSTRUCTION, corrected);
     console.warn(
-      `${LOG} rewrote ${jobApplicationId}'s phone field to carry a calling code before ` +
+      `${LOG} rewrote ${jobApplicationId}'s phone field to carry the right calling code before ` +
         `submitting: was ${redactPhoneForLog(probe.value)}, now ${redactPhoneForLog(corrected)} ` +
         `(dial code +${dialCode}` +
         `${country ? ", from the candidate's stored country" : ", defaulted, no stored country on file"})`
@@ -572,8 +660,8 @@ async function patchRecruiteePhoneCountryCode(
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(
-      `${LOG} found a phone value missing a calling code (${redactPhoneForLog(probe.value)}) for ` +
-        `${jobApplicationId} but could not rewrite it (${reason}); leaving it as the fill wrote ` +
+      `${LOG} found a phone value not already correctly coded (${redactPhoneForLog(probe.value)}) ` +
+        `for ${jobApplicationId} but could not rewrite it (${reason}); leaving it as the fill wrote ` +
         `it and continuing to the submit attempt`
     );
     return { outcome: "failed", correctedValue: null, failureReason: reason };
@@ -589,6 +677,13 @@ async function patchRecruiteePhoneCountryCode(
  * Recruitee still rejected the result, or a rewrite was attempted and never
  * completed. Never embeds the candidate's own phone digits — see
  * `redactPhoneForLog`.
+ *
+ * JOB-255 broadened what "nothing here needed fixing" actually means: the
+ * gate is no longer just a missing leading plus, it is whether the value
+ * already names the candidate's own dial code once reduced to digits (see
+ * `recruiteePhoneNeedsRewrite`). The "skipped" sentence below is worded to
+ * stay true either way, since a value this solver left alone could be
+ * missing a calling code entirely or could already carry the right one.
  */
 export function describeRecruiteePhoneStillBlocked(
   probe: RecruiteePhoneProbe,
@@ -598,23 +693,24 @@ export function describeRecruiteePhoneStillBlocked(
   const patchNote =
     patch.outcome === "attempted"
       ? `This solver had already rewritten the field to ${redactPhoneForLog(patch.correctedValue)} ` +
-        `before the click, specifically to add a calling code, and Recruitee's own validation ` +
+        `before the click, specifically to correct its calling code, and Recruitee's own validation ` +
         `still names the same complaint against that value.`
       : patch.outcome === "failed"
-        ? `This solver found a phone value missing a calling code and tried to rewrite the field ` +
-          `before the click, but that rewrite itself failed (${patch.failureReason}), so the ` +
+        ? `This solver found a phone value not already correctly coded and tried to rewrite the ` +
+          `field before the click, but that rewrite itself failed (${patch.failureReason}), so the ` +
           `field was left exactly as the fill wrote it and the click still went ahead. This is ` +
           `not the same as nothing needing fixing: a rewrite was attempted and did not complete.`
         : `This solver found nothing to rewrite before the click: the field's value ` +
-          `${probe.value === null ? "could not be read" : "did not match"} the missing calling ` +
-          `code shape #140 diagnosed, so nothing was changed.`;
+          `${probe.value === null ? "could not be read" : "already named the candidate's own dial code once normalized, or carried nothing this solver could sensibly rewrite"}, ` +
+          `so nothing was changed.`;
   return (
     `Recruitee's own client side validation is still calling this phone number invalid for ` +
     `missing its country calling code` +
     `${probe.errorText ? `: "${probe.errorText}"` : ""} at "${finalUrl}" after the click. ` +
-    `${patchNote} See issue #140 for the mechanism this solver was built to absorb. A person ` +
-    `should check the board directly before deciding whether and how to proceed. Nothing here ` +
-    `is retried automatically.`
+    `${patchNote} See issue #140 for the mechanism this solver was built to absorb, and issue ` +
+    `#255 for why the fix now rewrites more than a bare missing leading plus. A person should ` +
+    `check the board directly before deciding whether and how to proceed. Nothing here is ` +
+    `retried automatically.`
   );
 }
 
