@@ -279,7 +279,39 @@ export function createFireworksClientLLM(
   apiKey: string,
   modelSlug: string = FIREWORKS_DEEPSEEK_MODEL
 ): ClientLLM {
-  const provider = createOpenAICompatible({ name: "fireworks", baseURL: FIREWORKS_BASE_URL, apiKey });
+  /**
+   * JOB-253 fix: `@ai-sdk/openai-compatible`'s `supportsStructuredOutputs`
+   * config option defaults to `false`
+   * (`node_modules/@ai-sdk/openai-compatible/dist/index.js`, `this.supportsStructuredOutputs
+   * = config.supportsStructuredOutputs ?? false`). Left at that default, a
+   * `generateObject` call with a schema does not send the schema to
+   * Fireworks at all: the provider downgrades `response_format` to the
+   * bare `{ type: "json_object" }` mode and only logs a console warning
+   * ("JSON response format schema is only supported with
+   * structuredOutputs"). DeepSeek V4 Flash then has no idea what shape is
+   * expected and free-invents its own JSON — live-verified 2026-08-27 on
+   * a Stagehand-style extract call: with the default `false`, the raw
+   * Fireworks response body was `{"controls": []}` for a request that
+   * asked for `applicationFormPresent`/`applyControlPresent`/
+   * `signInFormPresent`/`emailFieldPresent` booleans, which is exactly the
+   * shape of the production Zod failure in issue #253 (those fields
+   * missing, `expected boolean, received undefined`). Setting
+   * `supportsStructuredOutputs: true` makes the provider forward the real
+   * `json_schema` in `response_format`, and the same live call then
+   * returned a schema-conformant object every time (repro script and raw
+   * before/after bodies in the JOB-253 PR description). This is not a
+   * `reasoning_content`-vs-`content` bug: Fireworks does put the model's
+   * chain of thought in `reasoning_content` for this reasoning model, but
+   * the AI SDK already reads the final answer from `content`, which is
+   * empty of anything useful only because the schema-carrying request
+   * never reached the model in the first place.
+   */
+  const provider = createOpenAICompatible({
+    name: "fireworks",
+    baseURL: FIREWORKS_BASE_URL,
+    apiKey,
+    supportsStructuredOutputs: true,
+  });
   const model = provider(modelSlug);
 
   return {
