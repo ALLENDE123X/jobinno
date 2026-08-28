@@ -37,10 +37,17 @@
 import type { AtsPlatform } from "@/lib/db/schema";
 import type { SolverFn } from "@/lib/solvers/types";
 import { ashbyDirectSolver, shouldRouteAshbyDirectHttp } from "@/lib/solvers/ashby-direct";
+import { leverSolver } from "@/lib/solvers/lever";
 
 const solvers: Record<AtsPlatform, SolverFn | undefined> = {
   greenhouse: undefined,
-  lever: undefined,
+  // JOB-233. Unconditional, unlike Ashby's gate below — the Lever solver has
+  // no feature flag of its own, because unlike JOB-214's Ashby direct HTTP
+  // path it does not bypass ACT-007/ACT-008 at all; it is the same DOM fill
+  // and submit flow `domFallbackSolver` already ran for Lever, plus a
+  // Lever-specific read of the page afterward. There is no riskier code path
+  // here to gate behind a flag.
+  lever: leverSolver,
   ashby: ashbyDirectSolver,
   workable: undefined,
   bamboohr: undefined,
