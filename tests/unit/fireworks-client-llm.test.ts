@@ -80,6 +80,31 @@ describe("createFireworksClientLLM", () => {
     expect(modelFn).toHaveBeenCalledWith(FIREWORKS_DEEPSEEK_MODEL);
   });
 
+  it("JOB-253: opts the provider into structuredOutputs so a json_schema request actually reaches Fireworks", async () => {
+    // Regression guard for issue #253. `@ai-sdk/openai-compatible` defaults
+    // `supportsStructuredOutputs` to `false`; left at that default, a
+    // schema passed to `generateObject` never reaches Fireworks at all
+    // (the provider silently downgrades `response_format` to
+    // `{ type: "json_object" }` and only logs a warning), so DeepSeek V4
+    // Flash free-invents its own JSON shape instead of the one Stagehand's
+    // extract call actually asked for. This test would have failed before
+    // the JOB-253 fix, since createOpenAICompatibleMock would have been
+    // called without `supportsStructuredOutputs: true` at all.
+    generateTextMock.mockResolvedValue({
+      text: "clicked",
+      toolCalls: [],
+      finishReason: "stop",
+      usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12, inputTokenDetails: {}, outputTokenDetails: {} },
+    });
+
+    const client = createFireworksClientLLM("test-key");
+    await client.generate(textRequest());
+
+    expect(createOpenAICompatibleMock).toHaveBeenCalledWith(
+      expect.objectContaining({ supportsStructuredOutputs: true })
+    );
+  });
+
   it("passes an explicit modelSlug through to Fireworks instead of the default (JOB-175 review fix)", async () => {
     // The whole point of the STAGEHAND_MODEL env var override is that a
     // different Fireworks slug reaches the request path. This test would
