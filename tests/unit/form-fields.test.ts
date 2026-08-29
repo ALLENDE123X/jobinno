@@ -66,7 +66,19 @@ function field(over: Partial<EnumeratedField> & { label: string; selector: strin
   };
 }
 
-type MenuState = { texts: string[]; selectors: string[]; count: number; expanded: boolean };
+type MenuState = {
+  texts: string[];
+  selectors: string[];
+  count: number;
+  expanded: boolean;
+  /**
+   * JOB-266. Whether the fixture's open menu reports itself as an
+   * `aria-multiselectable` listbox — see `chooseFromMenuOnce`'s
+   * SmartRecruiters-scoped `Space`-versus-`Enter` branch. Defaults to
+   * `false`, matching every menu this file tested before that ticket.
+   */
+  multiselectable?: boolean;
+};
 
 /**
  * How the fixture's menu behaves, beyond what is in it.
@@ -96,6 +108,14 @@ type MenuBehaviour = {
    * ever looking again.
    */
   marksHighlightOnlyAfterArrow?: boolean;
+  /**
+   * JOB-266. The URL `isSmartRecruitersPage` reads to decide whether the
+   * SR-scoped `Space` commit branch applies. Defaults to a Greenhouse URL —
+   * a board this ticket must not change behaviour on — so every existing
+   * test in this file, none of which set this, keeps exercising a
+   * non-SmartRecruiters page exactly as before.
+   */
+  url?: string;
 };
 
 /**
@@ -115,6 +135,11 @@ function fakePage(initialMenu: MenuState, options: MenuBehaviour = {}) {
   const marksLate = options.marksHighlightOnlyAfterArrow ?? false;
   const exposesHighlight = options.exposesHighlight ?? false;
   const highlightStuck = options.highlightStuck ?? false;
+  // JOB-266. A Greenhouse URL by default — `isSmartRecruitersPage` reads this
+  // through the same `matchAtsHost` table the real board guard uses, and a
+  // board this ticket must not touch stays a board this ticket must not touch
+  // even in the fixture's own default.
+  const url = options.url ?? "https://boards.greenhouse.io/example/jobs/1";
   let arrowed = false;
   const menu: MenuState = { ...initialMenu };
   let fieldValue = "";
@@ -128,8 +153,13 @@ function fakePage(initialMenu: MenuState, options: MenuBehaviour = {}) {
   const locatorClicks: Record<string, number> = {};
   const locatorFills: string[] = [];
   const keyPresses: string[] = [];
+  // JOB-266. Every selector `dispatchOptionEvents` was asked to commit an
+  // option through — the SmartRecruiters aria-multiselectable branch's own
+  // mechanism, never a click or a key press.
+  const dispatchCalls: string[] = [];
 
   const page = {
+    url: vi.fn(async () => url),
     evaluate: vi.fn(async (script: string) => {
       // `readOpenMenuInPage` is a named function; `inPageExpression` splices its
       // own `.toString()` into the script, so its name survives verbatim.
@@ -138,6 +168,7 @@ function fakePage(initialMenu: MenuState, options: MenuBehaviour = {}) {
         const focused = marks ? highlighted : -1;
         return {
           ...menu,
+          multiselectable: menu.multiselectable ?? false,
           focused,
           focusedText: focused === -1 ? "" : (menu.texts[focused] ?? ""),
         };
@@ -151,9 +182,26 @@ function fakePage(initialMenu: MenuState, options: MenuBehaviour = {}) {
         const index = menu.selectors.indexOf(scriptSelector(script));
         return index === -1 ? "" : menu.texts[index];
       }
+      // `dispatchOptionEvents`'s script — matched on `pointerdown`, unique to
+      // it among everything else this file evaluates. Checked before
+      // `.focus(` below: `dispatchOptionEvents` also calls `target.focus()`
+      // as part of its own sequence, so that check would otherwise catch
+      // this script first and never reach this branch. This fixture cannot
+      // use `scriptSelector` here: `dispatchOptionEvents` addresses the
+      // option directly (`optionSelector`, not a field's own selector), and
+      // that is exactly what `dispatchCalls` below records, so a well-behaved
+      // widget commits the option that selector names.
+      if (script.includes("pointerdown")) {
+        const called = scriptSelector(script);
+        dispatchCalls.push(called);
+        const optionIndex = menu.selectors.indexOf(called);
+        if (optionIndex !== -1) fieldValue = menu.texts[optionIndex]!;
+        return null;
+      }
       // `focusElement`'s script — the only one of these three whose caller
       // reads the return value, since this fix. Matched on `.focus(`, which is
-      // unique to this script among everything `form-fields.ts` evaluates.
+      // unique to this script among everything `form-fields.ts` evaluates,
+      // apart from `dispatchOptionEvents` above, which is checked first.
       if (script.includes(".focus(")) return focusSucceeds;
       // `scrollIntoView`, `scrollIfOffscreen` — neither return value is read
       // by any caller.
@@ -187,7 +235,7 @@ function fakePage(initialMenu: MenuState, options: MenuBehaviour = {}) {
     waitForTimeout: vi.fn(async () => {}),
   };
 
-  return { page, menu, locatorClicks, locatorFills, keyPresses };
+  return { page, menu, locatorClicks, locatorFills, keyPresses, dispatchCalls };
 }
 
 /** Pulls the JSON-encoded selector back out of one of this file's own scripts. */
@@ -377,6 +425,115 @@ describe("a combobox suggestion is committed with the keyboard, not a click", ()
     // about; the keyboard selection itself never firing is.
     expect(keyPresses).not.toContain("ArrowDown");
     expect(keyPresses).not.toContain("Enter");
+  });
+});
+
+/**
+ * JOB-266 — SmartRecruiters' "Preliminary questions" screening step draws a
+ * "select one or more" question (its own examples: "Which, if any,
+ * location(s) are you not willing to work in?", "Please select your area of
+ * interest(s):") as an `aria-multiselectable="true"` listbox, a different
+ * WAI-ARIA pattern from the single-select listbox every other test in this
+ * file exercises. Live verification against AbbVie's screening step (see the
+ * JOB-266 PR description) showed neither `Enter`, `Space`, `Locator.click()`,
+ * nor a coordinate click on the option's own painted box — nor Stagehand's
+ * own vision-guided `act()` — ever reached this widget's own toggle handler.
+ * `dispatchOptionEvents` sends the fuller pointer/mouse/keyboard sequence a
+ * real interaction produces, so this branch never steers a keyboard highlight
+ * onto the option (no `ArrowDown`) and never calls `Locator.click()` either.
+ */
+describe("JOB-266: SmartRecruiters' aria-multiselectable listbox commits via dispatchOptionEvents", () => {
+  it("dispatches to the option directly, without steering a keyboard highlight, for an aria-multiselectable listbox on a SmartRecruiters page", async () => {
+    const { page, keyPresses, locatorClicks, dispatchCalls } = fakePage(
+      {
+        texts: ["Open to all locations"],
+        selectors: ["#opt-0"],
+        count: 1,
+        expanded: true,
+        multiselectable: true,
+      },
+      {
+        url: "https://jobs.smartrecruiters.com/oneclick-ui/company/AbbVie/publication/ad7a31de-e00b-405f-8354-523ec83fa620/screening?dcr_ci=AbbVie",
+      }
+    );
+
+    const outcome = await applyFieldValue(
+      page as never,
+      field({
+        label: "Which, if any, location(s) are you not willing to work in?",
+        selector: "#loc-input",
+        options: ["Open to all locations"],
+        optionsKnown: true,
+      }),
+      "Open to all locations"
+    );
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("Open to all locations");
+    expect(dispatchCalls).toEqual(["#opt-0"]);
+    expect(locatorClicks["#opt-0"]).toBeUndefined();
+    expect(keyPresses).not.toContain("Enter");
+    expect(keyPresses).not.toContain("Space");
+    expect(keyPresses).not.toContain("ArrowDown");
+  });
+
+  it("still commits by keyboard for a SmartRecruiters listbox that is not aria-multiselectable", async () => {
+    // A single-select SmartRecruiters dropdown ("What is your current degree
+    // major or area of focus?" is one) must not change shape from this
+    // ticket — only the `aria-multiselectable` listbox does.
+    const { page, keyPresses, dispatchCalls } = fakePage(
+      {
+        texts: ["Computer Science"],
+        selectors: ["#opt-0"],
+        count: 1,
+        expanded: true,
+        multiselectable: false,
+      },
+      { url: "https://jobs.smartrecruiters.com/oneclick-ui/company/AbbVie/publication/abc/screening?dcr_ci=AbbVie" }
+    );
+
+    await applyFieldValue(
+      page as never,
+      field({
+        label: "What is your current degree major or area of focus?",
+        selector: "#major-input",
+        options: ["Computer Science"],
+        optionsKnown: true,
+      }),
+      "Computer Science"
+    );
+
+    expect(keyPresses).toContain("Enter");
+    expect(dispatchCalls).toEqual([]);
+  });
+
+  it("still commits by keyboard for an aria-multiselectable listbox on a non-SmartRecruiters board", async () => {
+    // The ticket's own non-goal: this branch must not change behaviour on any
+    // other solver, even one whose menu happens to also be multiselectable.
+    const { page, keyPresses, dispatchCalls } = fakePage(
+      {
+        texts: ["Remote"],
+        selectors: ["#opt-0"],
+        count: 1,
+        expanded: true,
+        multiselectable: true,
+      },
+      { url: "https://boards.greenhouse.io/example/jobs/1" }
+    );
+
+    await applyFieldValue(
+      page as never,
+      field({
+        label: "Preferred work locations",
+        selector: "#pref-input",
+        options: ["Remote"],
+        optionsKnown: true,
+      }),
+      "Remote"
+    );
+
+    expect(keyPresses).toContain("Enter");
+    expect(dispatchCalls).toEqual([]);
   });
 });
 
