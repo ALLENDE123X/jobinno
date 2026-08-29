@@ -37,10 +37,14 @@ import {
   currentCityWithResumeFallback,
   isAttestationField,
   isSmartRecruitersPostalCodeCombobox,
+  isOngoingRole,
   resolveAdditionalAnswer,
   resolveDecision,
   fallbackRefusalReason,
   CONFIRM_EMAIL_RE,
+  CURRENT_ROLE_CHECKBOX_RE,
+  END_DATE_FIELD_RE,
+  EXPERIENCE_SECTION_HEADING_RE,
   LEGAL_ATTESTATION_RE,
   type NeedsInputItem,
 } from "@/lib/fill-application-form";
@@ -1573,6 +1577,131 @@ describe("buildFactCatalog minimumAge fact", () => {
     // attestation, so isAttestationField must return false for it. The model is
     // allowed to use the `minimumAge` fact to answer it via inferOrAsk.
     expect(isAttestationField("Are you at least 18 years old?")).toBe(false);
+  });
+});
+
+// ── JOB-270: SmartRecruiters OneClick Experience section autofill ───────────
+//
+// The batch of 2026 08 29 lost three SR submits to the same message: "the
+// Experience section still needs at least one entry." `fillRepeatingSections`
+// already hands a mounted entry's fields through the ordinary decide-then-apply
+// path, but that path had only one joined `work0.dates` fact to cite for
+// whatever separate Start Date / End Date controls the widget renders, and
+// nothing at all backed a "currently work here" checkbox. These prove the two
+// pieces `buildFactCatalog` now supplies: a start/end date split per entry, and
+// an `isCurrent` fact that never asks a real date field to hold the word
+// "Present".
+describe("JOB-270: buildFactCatalog splits a work entry's dates for repeating sections", () => {
+  it("keeps the joined work0.dates fact and adds separate start/end facts for a role that ended", () => {
+    // PROFILE's most recent entry, Northwind, ran Jun 2024 to Sep 2024.
+    const catalog = facts();
+    expect(catalog.get("work0.dates")?.value).toBe("Jun 2024 to Sep 2024");
+    expect(catalog.get("work0.startDate")?.value).toBe("Jun 2024");
+    expect(catalog.get("work0.endDate")?.value).toBe("Sep 2024");
+    expect(catalog.get("work0.isCurrent")?.value).toBe("No");
+  });
+
+  it("never exposes a work0.endDate fact for a role the resume shows as still ongoing", () => {
+    // A form's End Date control is built to hold a real date. Citing a fact
+    // that reads "Present" would type that word into it — the exact failure
+    // mode this ticket exists to close.
+    const ongoing = buildFactCatalog(
+      {
+        ...PROFILE,
+        workHistory: [
+          { company: "Now Inc", title: "Engineer", startDate: "Jun 2025", endDate: "Present", summary: "" },
+        ],
+      },
+      ANSWERS,
+      {}
+    );
+    const catalog = new Map(ongoing.map((f) => [f.key, f]));
+    expect(catalog.get("work0.startDate")?.value).toBe("Jun 2025");
+    expect(catalog.has("work0.endDate")).toBe(false);
+    expect(catalog.get("work0.isCurrent")?.value).toBe("Yes");
+  });
+
+  it("also treats a blank end date as still ongoing", () => {
+    const ongoing = buildFactCatalog(
+      {
+        ...PROFILE,
+        workHistory: [
+          { company: "Now Inc", title: "Engineer", startDate: "Jun 2025", endDate: null, summary: "" },
+        ],
+      },
+      ANSWERS,
+      {}
+    );
+    const catalog = new Map(ongoing.map((f) => [f.key, f]));
+    expect(catalog.has("work0.endDate")).toBe(false);
+    expect(catalog.get("work0.isCurrent")?.value).toBe("Yes");
+  });
+
+  it("adds no work0.* facts at all when the resume carries no work history", () => {
+    // The non-goal this ticket names explicitly: no work history on the resume
+    // means the Experience section falls through to the ordinary
+    // unanswerable_required escalation rather than anything being invented.
+    const empty = buildFactCatalog({ ...PROFILE, workHistory: [] }, ANSWERS, {});
+    const catalog = new Map(empty.map((f) => [f.key, f]));
+    expect(catalog.has("work0.isCurrent")).toBe(false);
+    expect(catalog.has("work0.startDate")).toBe(false);
+    expect(catalog.has("work0.endDate")).toBe(false);
+  });
+});
+
+describe("JOB-270: isOngoingRole", () => {
+  it("reads the resume's own vocabulary for a role that has not ended", () => {
+    for (const value of ["Present", "present", "Current", "Now", "Ongoing"]) {
+      expect(isOngoingRole(value)).toBe(true);
+    }
+  });
+
+  it("reads null and blank the same way a resume with no end date printed would", () => {
+    expect(isOngoingRole(null)).toBe(true);
+    expect(isOngoingRole(undefined)).toBe(true);
+    expect(isOngoingRole("  ")).toBe(true);
+  });
+
+  it("does not mistake an actual end date for one of its own words", () => {
+    for (const value of ["Sep 2024", "December 2023", "2022"]) {
+      expect(isOngoingRole(value)).toBe(false);
+    }
+  });
+});
+
+describe("JOB-270: the Experience section's own field-recognition patterns", () => {
+  it("EXPERIENCE_SECTION_HEADING_RE matches the Experience section and not Education", () => {
+    expect(EXPERIENCE_SECTION_HEADING_RE.test("Experience")).toBe(true);
+    expect(EXPERIENCE_SECTION_HEADING_RE.test("Experience *")).toBe(true);
+    expect(EXPERIENCE_SECTION_HEADING_RE.test("Work Experience")).toBe(true);
+    expect(EXPERIENCE_SECTION_HEADING_RE.test("Education")).toBe(false);
+    expect(EXPERIENCE_SECTION_HEADING_RE.test("Education *")).toBe(false);
+  });
+
+  it("CURRENT_ROLE_CHECKBOX_RE matches the wordings a board plausibly renders", () => {
+    for (const label of [
+      "I currently work here",
+      "Currently work here",
+      "I am still working here",
+      "Current position",
+      "Current role",
+      "Currently employed here",
+    ]) {
+      expect(CURRENT_ROLE_CHECKBOX_RE.test(label)).toBe(true);
+    }
+  });
+
+  it("does not mistake an unrelated label for the current-role checkbox", () => {
+    for (const label of ["Company", "Job title", "Description", "Start date", "End date"]) {
+      expect(CURRENT_ROLE_CHECKBOX_RE.test(label)).toBe(false);
+    }
+  });
+
+  it("END_DATE_FIELD_RE matches End Date and does not match Start Date", () => {
+    expect(END_DATE_FIELD_RE.test("End Date")).toBe(true);
+    expect(END_DATE_FIELD_RE.test("End date *")).toBe(true);
+    expect(END_DATE_FIELD_RE.test("Start Date")).toBe(false);
+    expect(END_DATE_FIELD_RE.test("Description")).toBe(false);
   });
 });
 
