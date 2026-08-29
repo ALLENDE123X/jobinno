@@ -773,6 +773,112 @@ describe("a location search whose suggestions all contain the query", () => {
 });
 
 /**
+ * JOB-271. Read verbatim off Bertelsmann's live SmartRecruiters posting on
+ * 2026-08-29: typing the candidate's own ZIP "94107" (San Francisco)
+ * returned one match apiece in Vietnam, Mexico, Lithuania and Germany
+ * alongside two in the United States — the plain city and a neighborhood
+ * inside it. Every suggestion here starts with the postal code itself, so
+ * `pick`'s leading-segment rule — built for a city field, where it does most
+ * of the narrowing — passes all six, and the whole burden of separating them
+ * falls on `contextTerms` and, for the two US ones, on `localityTerm`.
+ */
+const POSTAL_CODE_SUGGESTIONS = [
+  "94107, San Francisco, CA, USA",
+  "94107, Cái Khế, Cần Thơ, VNM",
+  "94107, Huatusco, Veracruz de Ignacio de la Llave, MEX",
+  "94107, Klaipėda, Klaipėdos apskritis, LTU",
+  "94107, Untergriesbach, Bayern, DEU",
+  "94107, Bayview, San Francisco, CA, USA",
+];
+
+describe("JOB-271: a SmartRecruiters postal code combobox with country-ambiguous suggestions", () => {
+  const postalCodeField = () =>
+    field({
+      label: "Postal Code",
+      selector: '[id="candidate-postal-code"]',
+      options: [],
+      optionsKnown: false,
+    });
+
+  it("narrows to the country attested, then to the city attested", async () => {
+    const { page } = searchMenu(POSTAL_CODE_SUGGESTIONS);
+
+    const outcome = await applyFieldValue(page as never, postalCodeField(), "94107", {
+      allowContains: true,
+      contextTerms: ["United States|USA|US|U.S."],
+      localityTerm: "San Francisco",
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("94107, San Francisco, CA, USA");
+  });
+
+  it("refuses to guess between the two US matches with no locality term", async () => {
+    // The country term alone narrows seven candidates to two — the plain
+    // city and the neighborhood inside it — and both survive on the
+    // leading-segment rule, since every option here starts with the same
+    // postal code. Without a locality to break that tie the field is left
+    // unresolved, exactly as any other genuine ambiguity is, rather than
+    // guessing between them.
+    const { page } = searchMenu(POSTAL_CODE_SUGGESTIONS);
+
+    const outcome = await applyFieldValue(page as never, postalCodeField(), "94107", {
+      allowContains: true,
+      contextTerms: ["United States|USA|US|U.S."],
+    });
+
+    expect(outcome.ok).toBe(false);
+  });
+
+  it("never lets the locality term pick a neighborhood over the city it sits inside", async () => {
+    // Both surviving US suggestions contain "San Francisco" as a substring,
+    // which is exactly why a plain `contextTerms` entry cannot separate
+    // them — see `localityTerm`'s own header. Listed in the opposite order
+    // from `POSTAL_CODE_SUGGESTIONS` so a pass here cannot be explained by
+    // this always preferring whichever option came first.
+    const { page } = searchMenu([
+      "94107, Bayview, San Francisco, CA, USA",
+      "94107, San Francisco, CA, USA",
+    ]);
+
+    const outcome = await applyFieldValue(page as never, postalCodeField(), "94107", {
+      allowContains: true,
+      contextTerms: ["United States|USA|US|U.S."],
+      localityTerm: "San Francisco",
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("94107, San Francisco, CA, USA");
+  });
+
+  it("still refuses when the locality term matches none of the survivors", async () => {
+    const { page } = searchMenu(POSTAL_CODE_SUGGESTIONS);
+
+    const outcome = await applyFieldValue(page as never, postalCodeField(), "94107", {
+      allowContains: true,
+      contextTerms: ["United States|USA|US|U.S."],
+      localityTerm: "Oakland",
+    });
+
+    expect(outcome.ok).toBe(false);
+  });
+
+  it("never lets the locality term introduce an answer with no country context", async () => {
+    // `localityTerm` only ever narrows what `contextTerms` already found —
+    // see its own header — so with no country term at all this stays a
+    // refusal even though a locality term is given.
+    const { page } = searchMenu(POSTAL_CODE_SUGGESTIONS);
+
+    const outcome = await applyFieldValue(page as never, postalCodeField(), "94107", {
+      allowContains: true,
+      localityTerm: "San Francisco",
+    });
+
+    expect(outcome.ok).toBe(false);
+  });
+});
+
+/**
  * JOB-047 — the repeating-subform predicates and the guard on the one new click
  * this module learned.
  *

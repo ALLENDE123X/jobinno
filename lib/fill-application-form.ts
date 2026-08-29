@@ -5064,6 +5064,49 @@ export function countryContextTermsWithResumeFallback(
   return guessedCountry === undefined ? [] : countryContextTerms(guessedCountry);
 }
 
+/**
+ * JOB-271. The candidate's own city, attested first and resume second — the
+ * same fallback order `countryContextTermsWithResumeFallback` uses for
+ * country, and for the same reason: `currentCity` is a question intake
+ * accepts as optional, and `resumeLocation`'s leading comma segment ("San
+ * Francisco, California, United States") is the same city a person would
+ * have typed in had it been asked. Used only by `chooseFromMenuOnce`'s
+ * `localityTerm`, the SmartRecruiters postal code combobox's second tie
+ * break — see the caller below and that parameter's own header for what it
+ * narrows and why the country term alone cannot.
+ */
+export function currentCityWithResumeFallback(
+  currentCity: string | undefined,
+  resumeLocation: string | undefined
+): string {
+  const attested = (currentCity ?? "").trim();
+  if (attested !== "") return attested;
+  const segments = (resumeLocation ?? "")
+    .split(",")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment !== "");
+  return segments[0] ?? "";
+}
+
+/**
+ * JOB-271. A SmartRecruiters postal code / ZIP code field whose menu is an
+ * async search rather than a fixed list — the shape the Bertelsmann
+ * disambiguation problem lives on. Scoped three ways, matching this
+ * ticket's own non goals: the page has to be SmartRecruiters (`ats`, the
+ * same string `EEO_DECLINE_FABRICATION_ATS` compares against), the DOM
+ * itself has to have declared this control a combobox (`field.kind`, set by
+ * `enumerateFormFields`'s own role based classification, never by this
+ * label match), and the label has to name a postal code or a ZIP code. A
+ * plain text postal code input is untouched: it never carries `kind ===
+ * "combobox"` to begin with, so this is false for it and the field is
+ * filled exactly as it always was.
+ */
+const SR_POSTAL_CODE_LABEL_RE = /\b(postal|zip|post)\s*code\b/i;
+
+export function isSmartRecruitersPostalCodeCombobox(ats: string | undefined, field: EnumeratedField): boolean {
+  return ats === "smartrecruiters" && field.kind === "combobox" && SR_POSTAL_CODE_LABEL_RE.test(field.label);
+}
+
 /** Whether `needle` appears in `haystack` delimited by non-word characters. */
 function containsAtWordBoundary(haystack: string, needle: string): boolean {
   if (needle === "") return false;
@@ -6604,6 +6647,22 @@ async function fillRemainingFields(
         state.applicationAnswers.currentCountry,
         factsByKey.get("resumeLocation")?.value
       ),
+      // JOB-271. The SmartRecruiters postal code combobox's own second tie
+      // break, on top of the country context term above rather than instead
+      // of it: `countryContextTermsWithResumeFallback` narrows Bertelsmann's
+      // seven candidates for "94107" down to two US ones, and this is what
+      // picks between them. See `isSmartRecruitersPostalCodeCombobox` and
+      // `chooseFromMenuOnce`'s `localityTerm` for the rest of the reasoning.
+      // Empty (and so a no-op — see that parameter's header) for every field
+      // this is not true of.
+      ...(isSmartRecruitersPostalCodeCombobox(state.ats, field)
+        ? {
+            localityTerm: currentCityWithResumeFallback(
+              state.applicationAnswers.currentCity,
+              factsByKey.get("resumeLocation")?.value
+            ),
+          }
+        : {}),
     });
 
     if (outcome.ok) {
