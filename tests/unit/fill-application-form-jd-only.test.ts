@@ -126,4 +126,19 @@ describe("deriveBreezyApplyUrl", () => {
       "https://acme.breezy.hr/p/abc123/apply?ref=simplify"
     );
   });
+
+  // N2 (JOB-261 red team). A hash fragment was silently dropped: the original
+  // implementation built the /apply URL from `origin + path + search`, never
+  // reading `url.hash` at all. Untested until now.
+  it("keeps a hash fragment on the /apply URL rather than dropping it", () => {
+    expect(deriveBreezyApplyUrl("https://acme.breezy.hr/p/abc123#section")).toBe(
+      "https://acme.breezy.hr/p/abc123/apply#section"
+    );
+  });
+
+  it("keeps both a query string and a hash fragment, in URL order", () => {
+    expect(deriveBreezyApplyUrl("https://acme.breezy.hr/p/abc123?ref=simplify#section")).toBe(
+      "https://acme.breezy.hr/p/abc123/apply?ref=simplify#section"
+    );
+  });
 });

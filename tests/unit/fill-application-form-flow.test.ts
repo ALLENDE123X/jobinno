@@ -131,9 +131,30 @@ const h = vi.hoisted(() => {
     /** Every URL `page.goto` was asked to visit, in order. */
     gotoUrls: [] as string[],
     /**
+     * N1 (JOB-261 red team). Where `goto` most recently sent the browser,
+     * tracked so `page.url()` can answer honestly instead of always reporting
+     * `applyUrl` no matter how many navigations happened. Read by `page.url()`
+     * whenever `landedUrl` is unset — see there.
+     */
+    currentUrl: APPLY_URL,
+    /**
+     * N1. Per call number (1-based, matching `gotoUrls`'s own indexing) where
+     * that specific `goto` call actually lands, when it is not the URL it was
+     * asked to visit. This is what lets a test say "the third `goto` call
+     * silently redirects" without also redirecting the first `goto` to the
+     * same URL, which a redirect keyed on the URL string alone could not tell
+     * apart — the B1 fix test needs exactly that: the restoration `goto` back
+     * to the job description page must be able to land somewhere the earlier,
+     * legitimate navigation to that same URL did not.
+     */
+    gotoLandsAt: {} as Record<number, string>,
+    /**
      * Where the browser really is, which is not the same question as what the
-     * row says. Null means it went where it was sent; a string is a redirect the
-     * board answered the navigation with, or a page a click led to.
+     * row says. Null means it went where `goto` (or `gotoLandsAt`) sent it; a
+     * string is a redirect that applies from the moment it is set onward,
+     * regardless of any later `goto` call — the escape hatch every test before
+     * N1 already relied on, and still does, for a redirect that is not tied to
+     * one specific navigation.
      */
     landedUrl: null as string | null,
     /** Set `landedUrl` to this the first time anything is typed into the form. */
@@ -230,6 +251,8 @@ const h = vi.hoisted(() => {
     state.ats = "greenhouse";
     state.applyIntentButtonVisible = false;
     state.gotoUrls = [];
+    state.currentUrl = APPLY_URL;
+    state.gotoLandsAt = {};
     state.landedUrl = null;
     state.moveOnFirstType = null;
     state.fileInputs = 0;
@@ -358,16 +381,25 @@ const h = vi.hoisted(() => {
 
   const page = {
     goto: async (url: string) => {
-      // Recorded only — never changes where `page.url()` reports the browser
-      // to be. The JOB-261 tests that care where the browser really ended up
-      // (`landedUrl`/`moveOnFirstType`) still set that explicitly, the same
-      // way every other redirect test in this file already does.
       state.gotoUrls.push(url);
+      // N1 (JOB-261 red team). Where this specific navigation actually lands:
+      // the URL it was sent to, unless `gotoLandsAt` scripts a redirect for
+      // this call number. `page.url()` reads `currentUrl` below, so — with
+      // `landedUrl` unset — a test written to catch B1 can tell a `goto` that
+      // stayed on the page it targeted apart from one that silently landed
+      // somewhere else, which is exactly what the real bug needed a test to
+      // see and could not before this.
+      state.currentUrl = state.gotoLandsAt[state.gotoUrls.length] ?? url;
       return undefined;
     },
-    // Where the browser is, not where it was sent. `goto` follows redirects, so
-    // these are two different strings whenever `landedUrl` is set.
-    url: async () => state.landedUrl ?? state.applyUrl,
+    // Where the browser is, not where it was sent. `landedUrl` is the older,
+    // sticky override every redirect test before N1 already used — set once
+    // and true from that point on regardless of any later `goto` — and it
+    // still takes priority. Unset, this now follows the most recent `goto`
+    // call (`currentUrl`) instead of always answering `applyUrl`, which is
+    // what N1 found: a mock that could never distinguish "restored
+    // successfully" from "restoration silently redirected".
+    url: async () => state.landedUrl ?? state.currentUrl,
     title: async () => "Careers at Example",
     /**
      * Resolves as soon as it is asked, the way the real one does on a page that
@@ -1520,6 +1552,15 @@ describe("a job description page on SR or Breezy that the reader called formless
       ? { selector: "xpath=/html[1]/body[1]/main[1]/a[1]", description, replayed: false }
       : h.manualEntryOnly(instruction);
 
+  /** Same shape as the "redirects the browser somewhere else" block's own. */
+  const skipRows = () =>
+    h.state.writes
+      .filter((write) => write.table === "skip_log" && write.op === "insert")
+      .map(
+        (write) =>
+          write.values as { reason: string; ats: string; job_id: string; raw_context: { message: string } }
+      );
+
   it("SmartRecruiters: clicks through the DOM's own Apply control and reaches the form", async () => {
     h.state.ats = "smartrecruiters";
     h.state.applyUrl = "https://jobs.smartrecruiters.com/example/744000145339679";
@@ -1581,9 +1622,12 @@ describe("a job description page on SR or Breezy that the reader called formless
     h.state.signalsOverride = (call) => {
       // Calls 1 through 3 are the JD page (the initial read plus the two
       // empty-handed rereads); call 4 is the /apply attempt, which this
-      // listing does not actually have — still the JD shape. Call 5 is what
-      // the fallback click led to.
-      if (call <= 4) return { applicationFormPresent: false, applyControlPresent: false };
+      // listing does not actually have — still the JD shape. Call 5 is the B1
+      // fix's re-read of the restored job description page, still the JD
+      // shape (a real restoration back to the listing this run started at,
+      // confirmed rather than assumed). Call 6 is what the fallback click
+      // led to.
+      if (call <= 5) return { applicationFormPresent: false, applyControlPresent: false };
       h.state.domHasForm = true;
       return {};
     };
@@ -1602,6 +1646,80 @@ describe("a job description page on SR or Breezy that the reader called formless
     );
     expect(suffixIndex).toBeGreaterThanOrEqual(0);
     expect(backIndex).toBeGreaterThan(suffixIndex);
+  });
+
+  // ── B1 (JOB-261 red team) ───────────────────────────────────────────────
+  // The restoration `goto` back to the job description page, after a failed
+  // `/apply` attempt, is a navigation like any other — a `goto` that throws
+  // nothing is not proof of where the browser landed. Both tests below give
+  // that `goto` an off-screen redirect the fixture never tells `goto` about
+  // directly, the same way a real board's redirect would not announce itself,
+  // and check that the guards catch it before the click loop ever gets a
+  // stale, unverified `signals` object to act on.
+
+  it("Breezy: a restoration goto that silently lands off the board is caught before the click loop", async () => {
+    h.state.ats = "breezy";
+    h.state.applyUrl = "https://example.breezy.hr/p/79e583d55a8f-software-engineer";
+    h.state.applyIntentButtonVisible = true;
+    h.state.domHasForm = false;
+    h.state.resolve = applyStartResolve("the Apply Now button");
+    h.state.signalsOverride = () => ({ applicationFormPresent: false, applyControlPresent: false });
+    // Goto #1 is the initial navigation, #2 is the /apply attempt, and #3 is
+    // the restoration `goto` back to the job description page — the one this
+    // test redirects. Keyed by call number rather than by URL: #1 targets the
+    // very same string and must land normally, which is exactly what a
+    // redirect keyed on the URL alone could not tell apart.
+    h.state.gotoLandsAt = { 3: "https://attacker.example/apply/42" };
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("blocked_apply_url");
+    expect(result.blockedReason).toContain("attacker.example");
+
+    // The assertion this test exists for: nothing reached the page the
+    // browser actually landed on. Before the fix, the click loop ran against
+    // whatever `session.page` showed, using stale `signals` that still
+    // described the job description page from before this redirect.
+    expect(h.state.events.filter((event) => event.startsWith("typed into"))).toEqual([]);
+    expect(h.state.resumeAttachments).toBe(0);
+    expect(skipRows()).toHaveLength(1);
+    expect(skipRows()[0]!.reason).toBe("blocked_redirect");
+    expect(skipRows()[0]!.ats).toBe("breezy");
+  });
+
+  it("Breezy: a captcha on the restored job description page is caught before the click loop", async () => {
+    h.state.ats = "breezy";
+    h.state.applyUrl = "https://example.breezy.hr/p/79e583d55a8f-software-engineer";
+    h.state.applyIntentButtonVisible = true;
+    h.state.domHasForm = false;
+    h.state.resolve = applyStartResolve("the Apply Now button");
+    h.state.signalsOverride = (call) => {
+      // Call 5 is the B1 fix's own re-read of the restored job description
+      // page — see the "falls back to clicking Apply" test above for why it
+      // is call 5 and not call 4. Scripting a captcha there, and nowhere
+      // else, proves `assertNoCaptcha` runs against a fresh read of exactly
+      // that page rather than against the pre-attempt `signals` this
+      // function used to hand back unread.
+      if (call === 5) {
+        return {
+          applicationFormPresent: false,
+          applyControlPresent: false,
+          captchaPresent: true,
+          captchaEvidence: "reCAPTCHA challenge on the restored listing",
+        };
+      }
+      return { applicationFormPresent: false, applyControlPresent: false };
+    };
+
+    const result = await run();
+
+    expect(result.status).toBe("form_fill_blocked");
+    expect(result.blockedReason).toContain("captcha_present");
+    expect(result.blockedReason).toContain("reCAPTCHA challenge on the restored listing");
+    expect(h.state.events.filter((event) => event.startsWith("typed into"))).toEqual([]);
+    expect(skipRows()).toHaveLength(1);
+    expect(skipRows()[0]!.reason).toBe("captcha");
   });
 
   it("does not touch any board outside SR and Breezy, even with the same DOM evidence", async () => {
