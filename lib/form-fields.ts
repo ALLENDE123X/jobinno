@@ -3433,7 +3433,33 @@ async function readElementText(page: Page, selector: string): Promise<string> {
  * this shape could plausibly be listening for in one pass rather than
  * guessing at a single one. See the JOB-266 PR description for the live
  * verification history.
+ *
+ * NOTE: this sends click, the native `.click()` activation behaviour, Enter,
+ * and Space in sequence, all in one call. On a widget that toggles per
+ * activation rather than committing on the first one, that sequence could
+ * net cancel (select, then deselect, then reselect) instead of landing in a
+ * single committed state. This is currently inert because no mechanism this
+ * file has tried causes any observable state change on the target widget at
+ * all, so the net cancel risk has never actually been exercised. See
+ * JOB-266.
+ *
+ * NEXT INVESTIGATOR: the `PointerEvent`s below are constructed without
+ * `pointerType`, `pointerId`, or `isPrimary`, so they default to `""`,
+ * `0`/unset, and `false`. Some Lit based widgets gate their handlers on
+ * `event.pointerType === "mouse"` or `event.isPrimary === true`, which would
+ * make a synthetic `PointerEvent` silently no op even though
+ * `dispatchEvent()` reports success. Try adding explicit
+ * `pointerType: "mouse"`, `pointerId: 1`, `isPrimary: true` to `opts` before
+ * ruling out the pointer events entirely.
+ *
+ * NOT CONFIRMED WORKING. Live testing against AbbVie's SmartRecruiters
+ * screening question left the control reading empty after this dispatch
+ * too. Shipped anyway because it is provably zero cost when it does not
+ * help (the existing mechanisms still run first and this is additive), and
+ * the exploration record above narrows what the next attempt should try.
+ * See JOB-266.
  */
+// NOT CONFIRMED WORKING, see JOB-266.
 async function dispatchOptionEvents(page: Page, selector: string): Promise<void> {
   const script = `(() => {
     const sel = ${jsLiteral(selector)};
