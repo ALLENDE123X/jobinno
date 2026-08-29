@@ -34,7 +34,9 @@ import {
   blockedForAnswers,
   buildFactCatalog,
   countryContextTermsWithResumeFallback,
+  currentCityWithResumeFallback,
   isAttestationField,
+  isSmartRecruitersPostalCodeCombobox,
   resolveAdditionalAnswer,
   resolveDecision,
   fallbackRefusalReason,
@@ -484,6 +486,79 @@ describe("an ordinary required field is answered rather than escalated", () => {
     it("returns nothing when neither the intake nor the resume names a country", () => {
       expect(countryContextTermsWithResumeFallback(undefined, undefined)).toEqual([]);
       expect(countryContextTermsWithResumeFallback("", "")).toEqual([]);
+    });
+  });
+
+  describe("JOB-271: the SmartRecruiters postal code combobox's locality term", () => {
+    // `currentCityWithResumeFallback` is `countryContextTermsWithResumeFallback`'s
+    // city twin, same fallback order and same reason: `currentCity` is a
+    // question intake accepts as optional, and the resume's own printed
+    // location carries the same city a person would have typed in had it
+    // been asked.
+    it("prefers the attested city and never reads the resume when one was given", () => {
+      expect(
+        currentCityWithResumeFallback("Oakland", "San Francisco, California, United States")
+      ).toBe("Oakland");
+    });
+
+    it("falls back to the resume's own leading segment when nothing was attested", () => {
+      expect(
+        currentCityWithResumeFallback(undefined, "San Francisco, California, United States")
+      ).toBe("San Francisco");
+    });
+
+    it("returns empty when neither the intake nor the resume names a city", () => {
+      expect(currentCityWithResumeFallback(undefined, undefined)).toBe("");
+      expect(currentCityWithResumeFallback("", "")).toBe("");
+    });
+
+    // `isSmartRecruitersPostalCodeCombobox` gates the whole fix to the one
+    // field it exists for: a SmartRecruiters, DOM confirmed combobox whose
+    // label names a postal or ZIP code. Every other board, every other
+    // field kind and every other label falls through untouched, matching
+    // this ticket's own non goals.
+    it("is true only for a SmartRecruiters postal code combobox", () => {
+      expect(
+        isSmartRecruitersPostalCodeCombobox(
+          "smartrecruiters",
+          field({ label: "Postal Code", kind: "combobox" })
+        )
+      ).toBe(true);
+      expect(
+        isSmartRecruitersPostalCodeCombobox(
+          "smartrecruiters",
+          field({ label: "ZIP/Postal Code", kind: "combobox" })
+        )
+      ).toBe(true);
+    });
+
+    it("is false on any other board", () => {
+      expect(
+        isSmartRecruitersPostalCodeCombobox(
+          "greenhouse",
+          field({ label: "Postal Code", kind: "combobox" })
+        )
+      ).toBe(false);
+    });
+
+    it("is false for a plain text postal code input, never widening past a combobox", () => {
+      // JOB-271's own non goal: the postal code TYPED into the field never
+      // changes, and a plain text input is not the field this fixes.
+      expect(
+        isSmartRecruitersPostalCodeCombobox(
+          "smartrecruiters",
+          field({ label: "Postal Code", kind: "text" })
+        )
+      ).toBe(false);
+    });
+
+    it("is false for a SmartRecruiters combobox that is not a postal or ZIP code field", () => {
+      expect(
+        isSmartRecruitersPostalCodeCombobox(
+          "smartrecruiters",
+          field({ label: "Location (City)", kind: "combobox" })
+        )
+      ).toBe(false);
     });
   });
 

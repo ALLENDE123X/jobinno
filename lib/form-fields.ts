@@ -3885,7 +3885,8 @@ async function chooseFromMenu(
   value: string,
   allowContains: boolean,
   allowFreeText: boolean,
-  contextTerms: readonly string[] = []
+  contextTerms: readonly string[] = [],
+  localityTerm?: string
 ): Promise<ApplyOutcome> {
   // Choosing an option is idempotent — the same option chosen twice is the same
   // form — so one retry is free, and it is worth having: on a live Greenhouse
@@ -3899,7 +3900,8 @@ async function chooseFromMenu(
     value,
     allowContains,
     allowFreeText,
-    contextTerms
+    contextTerms,
+    localityTerm
   );
   if (!outcome.ok && outcome.readBack === "") {
     await closeMenu(page);
@@ -3910,7 +3912,8 @@ async function chooseFromMenu(
       value,
       allowContains,
       allowFreeText,
-      contextTerms
+      contextTerms,
+      localityTerm
     );
   }
   return outcome;
@@ -3959,9 +3962,33 @@ async function chooseFromMenuOnce(
   value: string,
   allowContains: boolean,
   allowFreeText: boolean,
-  contextTerms: readonly string[] = []
+  contextTerms: readonly string[] = [],
+  /**
+   * JOB-271. A second, positional tie break for the one case
+   * `contextTerms`'s AND-of-substrings cannot resolve: a SmartRecruiters
+   * postal code combobox where the typed ZIP is shared by several countries
+   * AND, within the country the candidate attested, by more than one place.
+   * Bertelsmann's own 94107 example: `countryContextTerms` narrows seven
+   * candidates to two — "94107, San Francisco, CA, USA" and "94107,
+   * Bayview, San Francisco, CA, USA" — and stops there, because both
+   * options contain the substring "San Francisco" and `contextTerms`
+   * has no way to prefer one over the other.
+   *
+   * `localityTerm`, when given, only ever narrows a set `contextTerms`
+   * already narrowed, and only by a stricter test: the option's own comma
+   * segment immediately after the postal code has to equal it exactly,
+   * not merely contain it. That is true for "San Francisco, CA, USA"
+   * (segment "San Francisco") and false for "Bayview, San Francisco, CA,
+   * USA" (segment "Bayview"), which is exactly the distinction a bare
+   * substring test cannot draw. Passed by exactly one caller — the
+   * SmartRecruiters postal code field in `fill-application-form.ts` — so
+   * every other combobox on every other board narrows exactly as it did
+   * before this ticket.
+   */
+  localityTerm?: string
 ): Promise<ApplyOutcome> {
   const wanted = normalizeText(value);
+  const locality = normalizeText(localityTerm ?? "");
   /**
    * The attested terms, each already split into the spellings that count as it.
    *
@@ -4011,7 +4038,23 @@ async function chooseFromMenuOnce(
           spellings.some((spelling) => containsAtWordBoundary(entry.text, spelling))
         )
     );
-    return narrowed.length === 1 ? (narrowed[0]?.index ?? -1) : -1;
+    if (narrowed.length === 1) return narrowed[0]?.index ?? -1;
+    // JOB-271. `contextTerms` alone left more than one survivor — see
+    // `localityTerm`'s own header above. Requires `terms.length > 0` on top
+    // of a locality to try, so this is always a *second* tie break on an
+    // attested country and never a lone one: with no context term at all
+    // `terms.every` above is vacuously true for every leading-segment match,
+    // and a locality term alone narrowing an unrelated menu is exactly the
+    // "one context term is a real fact backing this, but a country and a
+    // city are two independently attested facts" distinction `contextTerms`
+    // was built to preserve — see JOB-047's own header on this function.
+    if (narrowed.length > 1 && terms.length > 0 && locality !== "") {
+      const byLocality = narrowed.filter(
+        (entry) => normalizeText((entry.text.split(",")[1] ?? "").trim()) === locality
+      );
+      if (byLocality.length === 1) return byLocality[0]?.index ?? -1;
+    }
+    return -1;
   };
 
   let menu: OpenMenu = NO_MENU;
@@ -4414,6 +4457,12 @@ export async function applyFieldValue(
      * that matches nothing changes no outcome.
      */
     contextTerms?: readonly string[];
+    /**
+     * JOB-271. Passed only for the SmartRecruiters postal code combobox —
+     * see `chooseFromMenuOnce`'s own `localityTerm` for what this narrows
+     * and why `contextTerms` alone cannot.
+     */
+    localityTerm?: string;
   } = {}
 ): Promise<ApplyOutcome> {
   switch (field.kind) {
@@ -4430,7 +4479,8 @@ export async function applyFieldValue(
         value,
         options.allowContains === true,
         options.allowFreeText === true,
-        options.contextTerms ?? []
+        options.contextTerms ?? [],
+        options.localityTerm
       );
     case "radio":
       return await chooseRadio(page, field, value);
