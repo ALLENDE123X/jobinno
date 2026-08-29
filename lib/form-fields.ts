@@ -3644,6 +3644,43 @@ async function chooseFromMenu(
   return outcome;
 }
 
+/**
+ * JOB-246. Whether `needle` appears in `haystack` bounded by non-word
+ * characters on both sides, rather than anywhere at all.
+ *
+ * `chooseFromMenuOnce`'s own tie-break used to test a context term with plain
+ * `.includes()`, which is exactly wrong for the short country abbreviations
+ * `countryContextTerms` writes: the term "us" is a real substring of "San
+ * Francisco, **Agusan** del Sur, Philippines", so a candidate typed with no
+ * attested country and a resume reading "United States" still had that
+ * suggestion survive the tie-break alongside the correct one — two survivors,
+ * which `chooseFromMenuOnce` correctly refuses to choose between. Verified
+ * live against Freeform's Location (City) field on 2026 08 28: providing the
+ * attested country term alone did not fix the field, because "us" kept
+ * matching Agusan del Sur too, until this boundary check went in.
+ *
+ * A private copy of `fill-application-form.ts`'s `containsAtWordBoundary`
+ * rather than a shared import: that module already imports from this one, so
+ * the reverse import would be circular, and the function itself is small
+ * enough that keeping two copies in sync costs less than restructuring the
+ * module boundary to avoid it.
+ */
+function containsAtWordBoundary(haystack: string, needle: string): boolean {
+  if (needle === "") return false;
+  let from = 0;
+  for (;;) {
+    const at = haystack.indexOf(needle, from);
+    if (at === -1) return false;
+    const before = at === 0 ? "" : haystack[at - 1]!;
+    const afterAt = at + needle.length;
+    const after = afterAt >= haystack.length ? "" : haystack[afterAt]!;
+    const boundedLeft = before === "" || !/[a-z0-9]/i.test(before);
+    const boundedRight = after === "" || !/[a-z0-9]/i.test(after);
+    if (boundedLeft && boundedRight) return true;
+    from = at + 1;
+  }
+}
+
 async function chooseFromMenuOnce(
   page: Page,
   field: EnumeratedField,
@@ -3698,7 +3735,9 @@ async function chooseFromMenuOnce(
     const narrowed = matches.filter(
       (entry) =>
         normalizeText(entry.text.split(",")[0] ?? "") === wanted &&
-        terms.every((spellings) => spellings.some((spelling) => entry.text.includes(spelling)))
+        terms.every((spellings) =>
+          spellings.some((spelling) => containsAtWordBoundary(entry.text, spelling))
+        )
     );
     return narrowed.length === 1 ? (narrowed[0]?.index ?? -1) : -1;
   };

@@ -218,3 +218,88 @@ describe("applyWithReadBackTolerance — issue #172 regression cases", () => {
     expect(outcome.typedValue).toBe("US Dollar ($)");
   });
 });
+
+/**
+ * Issue #260: the CapTech shape above (issue #172) was already caught by the
+ * generic symbol-and-whitespace fold, because neither side of that mismatch
+ * carried a country code. The night of 2026 08 28, six of ten SmartRecruiters
+ * submits blocked on a shape the generic fold does not reach: the pipeline
+ * typed a phone number with a leading "+1", SmartRecruiters' OneClick UI
+ * widget re-rendered it as ten space-separated digits with no country code,
+ * and the generic check never drops a leading "+1"/"1" — only
+ * `normalizeForComparison`'s dedicated "phone" branch does that, and it was
+ * never reached from the general pass a duplicate or uncorroborated
+ * phone-labeled field falls into.
+ *
+ * Scoped twice over, both pinned here: the field's label has to say "phone",
+ * and the page has to be a SmartRecruiters host. Neither alone is enough —
+ * the same country-code mismatch on a non-SmartRecruiters board must still
+ * block, per the ticket's own non-goal.
+ */
+describe("applyWithReadBackTolerance — issue #260 SmartRecruiters phone regression", () => {
+  const smartRecruitersPage = () =>
+    ({ url: vi.fn().mockResolvedValue("https://jobs.smartrecruiters.com/oneclick-ui/company/AbbVie/publication/abc123") }) as never;
+  const otherBoardPage = () =>
+    ({ url: vi.fn().mockResolvedValue("https://jobs.lever.co/example/abc123") }) as never;
+
+  it("accepts a dropped country code on a SmartRecruiters phone field", async () => {
+    applyFieldValueMock.mockResolvedValue({
+      ok: false,
+      readBack: "404 444 6018",
+      detail: 'the control now reads "404 444 6018", which is not what was typed',
+    });
+    const outcome = await applyWithReadBackTolerance(
+      smartRecruitersPage(),
+      fieldOf("text", "Phone number"),
+      "+14044446018",
+      {}
+    );
+    expect(outcome.ok).toBe(true);
+    expect(outcome.readBack).toBe("404 444 6018");
+  });
+
+  it("still blocks the same country-code mismatch off SmartRecruiters", async () => {
+    applyFieldValueMock.mockResolvedValue({
+      ok: false,
+      readBack: "404 444 6018",
+      detail: 'the control now reads "404 444 6018", which is not what was typed',
+    });
+    const outcome = await applyWithReadBackTolerance(
+      otherBoardPage(),
+      fieldOf("text", "Phone number"),
+      "+14044446018",
+      {}
+    );
+    expect(outcome.ok).toBe(false);
+  });
+
+  it("still blocks a SmartRecruiters field that is not labeled as a phone", async () => {
+    applyFieldValueMock.mockResolvedValue({
+      ok: false,
+      readBack: "404 444 6018",
+      detail: 'the control now reads "404 444 6018", which is not what was typed',
+    });
+    const outcome = await applyWithReadBackTolerance(
+      smartRecruitersPage(),
+      fieldOf("text", "Emergency contact number"),
+      "+14044446018",
+      {}
+    );
+    expect(outcome.ok).toBe(false);
+  });
+
+  it("still catches a genuinely different phone number on SmartRecruiters", async () => {
+    applyFieldValueMock.mockResolvedValue({
+      ok: false,
+      readBack: "404 444 9999",
+      detail: 'the control now reads "404 444 9999", which is not what was typed',
+    });
+    const outcome = await applyWithReadBackTolerance(
+      smartRecruitersPage(),
+      fieldOf("text", "Phone number"),
+      "+14044446018",
+      {}
+    );
+    expect(outcome.ok).toBe(false);
+  });
+});
