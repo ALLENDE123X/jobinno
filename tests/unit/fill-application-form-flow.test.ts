@@ -61,6 +61,50 @@ const h = vi.hoisted(() => {
   };
 
   /**
+   * JOB-270. One required repeating section as `enumerateRepeatingSections`
+   * reports it. Mirrors `RepeatingSection` in `lib/form-fields.ts`.
+   */
+  type RawRepeatingSection = {
+    heading: string;
+    addSelector: string;
+    containerSelector: string;
+    message: string;
+  };
+
+  /** One entry of `resolveCandidateProfile`'s own `workHistory`. */
+  type WorkHistoryEntry = {
+    company: string;
+    title: string;
+    startDate: string | null;
+    endDate: string | null;
+    summary: string;
+  };
+
+  // ── JOB-270: the SmartRecruiters Experience widget's own selectors ────────
+  //
+  // Opaque strings rather than real CSS or XPath, since nothing here ever
+  // resolves them against a DOM — `page.evaluate` below answers by which
+  // in-page function's source text the call carries, and `page.locator`
+  // answers by which of these strings it was given. `EXPERIENCE_ADD_SELECTOR`
+  // is the one the fixture's own `click()` handler treats specially: pressing
+  // it is what "mounts" `state.experienceFields` into `formControls()`.
+  const EXPERIENCE_ADD_SELECTOR = "section-experience-add";
+  const EXPERIENCE_CONTAINER_SELECTOR = "section-experience-container";
+  const EXPERIENCE_COMPANY_SELECTOR = "section-experience-company";
+  const EXPERIENCE_TITLE_SELECTOR = "section-experience-title";
+  const EXPERIENCE_START_SELECTOR = "section-experience-start";
+  const EXPERIENCE_END_SELECTOR = "section-experience-end";
+  const EXPERIENCE_CHECKBOX_SELECTOR = "section-experience-current-checkbox";
+
+  /** The one required repeating section every JOB-270 test mounts. */
+  const EXPERIENCE_SECTION: RawRepeatingSection = {
+    heading: "Experience",
+    addSelector: EXPERIENCE_ADD_SELECTOR,
+    containerSelector: EXPERIENCE_CONTAINER_SELECTOR,
+    message: "Please provide at least one work experience entry",
+  };
+
+  /**
    * A real Greenhouse embed URL rather than an invented careers page, because
    * `loadApplicationState` now refuses to open a listing whose host does not
    * belong to the board it came from. See `lib/apply-url-guard.ts`.
@@ -230,6 +274,30 @@ const h = vi.hoisted(() => {
     fieldReadBacksAfterAct: {} as Record<string, string>,
     /** Every instruction the unknown-field fallback handed `act()`, in order. */
     fallbackActs: [] as string[],
+
+    // ── JOB-270: SmartRecruiters Experience section autofill ────────────────
+    /** What `enumerateRepeatingSections` reports. Empty means the form has none. */
+    repeatingSections: [] as RawRepeatingSection[],
+    /**
+     * The fields the Experience entry mounts once its `Add` control is
+     * pressed. Not on the form at all until `experienceEntryAdded` is set —
+     * see `formControls()` — the same way a real board's subform does not
+     * exist in the DOM before the click.
+     */
+    experienceFields: [] as FormControl[],
+    /** Flipped by the fixture's own `click()` handler — see `page.locator`. */
+    experienceEntryAdded: false,
+    /**
+     * Flipped once `pressCommitEntry`'s own lookup has run, which in this
+     * fixture is the same moment every field this entry is going to get has
+     * already been applied. A real board collapses a committed entry into a
+     * summary card and takes its fields off the page; this is this fixture's
+     * version of that, and it is what keeps the ordinary pass that runs after
+     * `fillRepeatingSections` from reading the same fields a second time.
+     */
+    experienceEntryCommitted: false,
+    /** What `resolveCandidateProfile` reports as the person's `workHistory`. */
+    workHistory: [] as WorkHistoryEntry[],
   };
 
   const reset = (): void => {
@@ -272,6 +340,11 @@ const h = vi.hoisted(() => {
     state.fieldReadBacks = {};
     state.fieldReadBacksAfterAct = {};
     state.fallbackActs = [];
+    state.repeatingSections = [];
+    state.experienceFields = [];
+    state.experienceEntryAdded = false;
+    state.experienceEntryCommitted = false;
+    state.workHistory = [];
   };
 
   /**
@@ -336,12 +409,42 @@ const h = vi.hoisted(() => {
     optionsKnown: false,
   });
 
+  /**
+   * JOB-270. The fields the SmartRecruiters Experience widget's own entry
+   * mounts, once its `Add` control is pressed — Company, Job Title, Start Date
+   * and End Date, plus (when `checkboxLabel` is given) the "currently work
+   * here" checkbox beside End Date. Company/Job Title/Start Date are left
+   * optional: nothing in this suite decides them (`decideFieldAnswers` is
+   * mocked to answer nothing at all — see below), and marking them required
+   * would just add unrelated escalations to `result.needsInput` that have
+   * nothing to do with what these tests are about. End Date stays required,
+   * which is what lets a test tell "handled deterministically" apart from
+   * "silently skipped" apart from "escalated".
+   */
+  const experienceEntryFields = (checkboxLabel: string | null): FormControl[] => [
+    { ...unanswered("Company", "text", EXPERIENCE_COMPANY_SELECTOR), required: false },
+    { ...unanswered("Job Title", "text", EXPERIENCE_TITLE_SELECTOR), required: false },
+    { ...unanswered("Start Date", "text", EXPERIENCE_START_SELECTOR), required: false },
+    unanswered("End Date", "text", EXPERIENCE_END_SELECTOR),
+    ...(checkboxLabel === null
+      ? []
+      : [{ ...unanswered(checkboxLabel, "checkbox", EXPERIENCE_CHECKBOX_SELECTOR), required: false }]),
+  ];
+
   /** A self hosted careers page: no ids anywhere, so every selector is an XPath. */
   const formControls = (): FormControl[] => (!state.domHasForm ? [] : [
     control("First Name", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[1]/input[1]"),
     control("Last Name", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[2]/input[1]"),
     control("Email", "text", "xpath=/html[1]/body[1]/main[1]/form[1]/div[3]/input[1]"),
     ...state.extraControls,
+    // JOB-270. Not on the page until `Add` is pressed, and off it again once
+    // the entry is committed — see `experienceEntryCommitted` and the
+    // `click()` handler on `page.locator` below. A field that stayed visible
+    // here forever would have the ordinary pass that runs after
+    // `fillRepeatingSections` read and re-decide the very fields that
+    // function already handled, which no real board's DOM would offer it a
+    // second time.
+    ...(state.experienceEntryAdded && !state.experienceEntryCommitted ? state.experienceFields : []),
     ...(state.manualEntryClicked
       ? [
           control(
@@ -411,6 +514,12 @@ const h = vi.hoisted(() => {
       state.events.push("waited for the page to have content");
       return true;
     },
+    // JOB-270. `pressCommitEntry` waits between its own re-reads of the
+    // commit control, and closes any open menu first with a keypress. Neither
+    // is worth a real delay or a real DOM here — there is no menu and no
+    // timer this fixture cares about — so both resolve at once.
+    waitForTimeout: async () => undefined,
+    keyPress: async () => undefined,
     evaluate: async (script: unknown) => {
       const source = String(script);
       if (source.includes("passwordFields")) return readFloor();
@@ -419,6 +528,35 @@ const h = vi.hoisted(() => {
       // the page.
       if (source.includes("findVisibleApplyIntentControlInPage")) {
         return state.applyIntentButtonVisible;
+      }
+      // JOB-270. `enumerateRepeatingSections`'s own in-page scan, told apart
+      // the same way: by the name of the function serialised into the script.
+      // What it reports is exactly what a test scripted onto
+      // `state.repeatingSections` — nothing here re-derives it from a DOM,
+      // because there is no DOM, only the fixture's own idea of what one
+      // would have reported.
+      if (source.includes("enumerateRepeatingSectionsInPage")) {
+        return state.repeatingSections;
+      }
+      // JOB-270. `pressCommitEntry`'s own lookup for a control that commits
+      // the entry. Every test in this file gives the Experience widget no
+      // such control — SmartRecruiters does not always have a separate Save
+      // for every board's widget, and the entries this suite cares about
+      // commit as they are typed — so this always reports none found. That is
+      // also the cue this fixture uses to say the entry has been committed:
+      // by the time anything asks for a commit control, every field this
+      // entry is going to get has already been applied — see
+      // `experienceEntryCommitted` and `formControls()` above.
+      if (source.includes("findCommitControlInPage")) {
+        state.experienceEntryCommitted = true;
+        return { selector: "", containerFound: true, considered: [] };
+      }
+      // JOB-270. `pressGuarded`'s own re-read of a control right before it
+      // presses it — reached only for the Experience section's `Add` control
+      // in this suite, since the commit lookup above never hands back a
+      // selector for `pressGuarded` to be called on.
+      if (source.includes("describePressableInPage")) {
+        return { found: true, submitish: false, words: "Add" };
       }
       // Issue #100. `readFieldValue`'s script is the only one that asks a
       // control whether it is checked, which is what identifies it here. The
@@ -437,11 +575,35 @@ const h = vi.hoisted(() => {
       return state.descriptor;
     },
     screenshot: async () => new Uint8Array([1, 2, 3]),
-    locator: () => ({
+    locator: (selector: string) => ({
       inputValue: async () => state.lastTyped,
       setInputFiles: async () => {
         state.resumeAttachments += 1;
         state.events.push("uploaded the resume");
+      },
+      // JOB-270. `fillText` and `setCheckbox` in `lib/form-fields.ts` act
+      // through a real `Locator` rather than through `typeInto`, which is
+      // mocked separately above and is what every other control in this file
+      // goes through. `fill`/`isChecked`/`click` are new precisely because no
+      // test before this ticket ever drove that path — the "unknown-field
+      // fallback" tests below reach `act()` instead. Keyed by selector into
+      // the same `fieldReadBacks` table the checkbox branch of `evaluate`
+      // above already reads, so a fill or a click here is visible to the very
+      // next read-back, exactly as a real page would be.
+      fill: async (value: string) => {
+        state.fieldReadBacks[selector] = value;
+      },
+      isChecked: async () => state.fieldReadBacks[selector] === "checked",
+      click: async () => {
+        // The Experience section's own `Add` control gets a different click
+        // effect from an ordinary checkbox: it mounts the entry's fields
+        // rather than toggling anything — see `formControls()` above.
+        if (selector === EXPERIENCE_ADD_SELECTOR) {
+          state.experienceEntryAdded = true;
+          state.events.push("pressed the experience section's add control");
+          return;
+        }
+        state.fieldReadBacks[selector] = state.fieldReadBacks[selector] === "checked" ? "" : "checked";
       },
     }),
   };
@@ -504,6 +666,9 @@ const h = vi.hoisted(() => {
     JOB_APPLICATION_ID,
     CANDIDATE_ID,
     JOB_ID,
+    // JOB-270
+    EXPERIENCE_SECTION,
+    experienceEntryFields,
   };
 });
 
@@ -635,7 +800,11 @@ vi.mock("@/lib/resume-parser", () => ({
 // or out of a fresh parse. Which of the two happened is exercised in
 // `tests/unit/stored-candidate-parse.test.ts`, against the real module.
 vi.mock("@/lib/candidate-documents", () => ({
-  resolveCandidateProfile: async () => PARSED_PROFILE,
+  // JOB-270. `workHistory` comes from `h.state` rather than from
+  // `PARSED_PROFILE` directly, so a test can put a still-ongoing role on the
+  // resume `buildFactCatalog` reads without every other test in this file
+  // suddenly acquiring one too — `reset()` puts it back to `[]`.
+  resolveCandidateProfile: async () => ({ ...PARSED_PROFILE, workHistory: h.state.workHistory }),
 }));
 
 vi.mock("@/lib/stagehand-session", () => ({
@@ -1863,5 +2032,112 @@ describe("what the unknown-field fallback leaves behind", () => {
       (entry) => entry.field === "keep me posted about other roles" && entry.outcome === "mismatch"
     );
     expect(tick?.detail).toContain("nothing chose to tick it");
+  });
+});
+
+// ───────────────────────────────────
+// JOB-270 — SmartRecruiters Experience section autofill, end to end
+// ───────────────────────────────────
+//
+// The red-team review on this PR's first round found all eleven original
+// tests were pure-function/regex tests against `isOngoingRole`,
+// `CURRENT_ROLE_CHECKBOX_RE` and `buildFactCatalog` — none of them drove
+// `fillRepeatingSections` itself, so nothing here actually proved the block
+// was gated to SmartRecruiters or that a board it does not recognize
+// escalates End Date rather than dropping it. These three do, through the
+// same `fillApplicationForm` entry point every other test in this file uses,
+// with a resume whose most recent role carries no end date.
+describe("JOB-270: the SmartRecruiters Experience section's current-role handling", () => {
+  const ONGOING_ROLE = {
+    company: "Acme Robotics",
+    title: "Software Engineering Intern",
+    startDate: "Jun 2025",
+    endDate: "Present",
+    summary: "Built things.",
+  };
+
+  beforeEach(() => {
+    h.state.workHistory = [ONGOING_ROLE];
+    h.state.repeatingSections = [h.EXPERIENCE_SECTION];
+  });
+
+  it("on a SmartRecruiters page, ticks the matching checkbox and leaves End Date skipped rather than escalated", async () => {
+    h.state.ats = "smartrecruiters";
+    h.state.applyUrl = "https://jobs.smartrecruiters.com/example/744000145339679";
+    h.state.experienceFields = h.experienceEntryFields("I currently work here");
+
+    const result = await run();
+
+    const checkbox = result.fields.find((entry) => entry.field === "i currently work here");
+    expect(checkbox?.outcome).toBe("filled");
+    expect(checkbox?.intended).toBe("Yes");
+    expect(checkbox?.detail).toContain("work0.isCurrent");
+
+    const endDate = result.fields.find((entry) => entry.field === "end date");
+    expect(endDate?.outcome).toBe("skipped");
+    expect(endDate?.detail).toContain("still ongoing");
+
+    // Skipped deterministically and reported as such, not silently dropped: no
+    // escalation was ever raised for it.
+    expect(result.needsInput.some((item) => item.fieldLabel.includes("End Date"))).toBe(false);
+
+    // Nothing else on the form was left open, so the run reaches the ordinary
+    // success state rather than stopping for input.
+    expect(result.status).toBe("form_filled");
+  });
+
+  it("on a SmartRecruiters page, escalates End Date instead of silently dropping it when no matching checkbox is found", async () => {
+    // MAJOR #2 from the red-team review. The board's own checkbox is on the
+    // page but worded in a way `CURRENT_ROLE_CHECKBOX_RE` does not recognize
+    // — from `fillRepeatingSections`'s own point of view that is
+    // indistinguishable from there being no checkbox there at all, since both
+    // leave `fresh.find(...)` at `undefined`. Before this fix, End Date was
+    // marked handled and silently skipped regardless of whether a checkbox
+    // was ever actually found; the fix moves that marking inside the
+    // "checkbox was found" branch, so a board like this one falls through to
+    // the ordinary decide-then-apply path instead.
+    h.state.ats = "smartrecruiters";
+    h.state.applyUrl = "https://jobs.smartrecruiters.com/example/744000145339679";
+    h.state.experienceFields = h.experienceEntryFields("Ongoing employment here");
+
+    const result = await run();
+
+    // No checkbox was ticked — there was nothing recognizable to tick.
+    expect(
+      result.fields.some((entry) => entry.outcome === "filled" && entry.intended === "Yes")
+    ).toBe(false);
+
+    // End Date is not silently abandoned: it went through the ordinary
+    // decide-then-apply path like any other required field nothing here could
+    // answer, and that path escalates rather than dropping it.
+    const endDate = result.fields.find((entry) => entry.field === "end date");
+    expect(endDate?.outcome).toBe("needs-input");
+    expect(endDate?.detail).not.toContain("still ongoing");
+    expect(result.needsInput.some((item) => item.fieldLabel.includes("End Date"))).toBe(true);
+  });
+
+  it("is inert on a non-SmartRecruiters board, even with the same heading, checkbox and ongoing role", async () => {
+    // BLOCKING #1 from the red-team review. `h.state.applyUrl` is left at the
+    // file's default Greenhouse URL (`h.APPLY_URL`, restored by the top-level
+    // `beforeEach`'s own `h.reset()` above), so `isSmartRecruitersPage` reads
+    // false and the whole JOB-270 block must never run —
+    // `EXPERIENCE_SECTION_HEADING_RE` alone would
+    // still match this section's "Experience" heading, and the checkbox on
+    // the page would still match `CURRENT_ROLE_CHECKBOX_RE` if anything here
+    // looked at it, so gating on the board is the only thing standing between
+    // this test passing and every other ATS's own "Experience" section being
+    // ticked on the candidate's behalf.
+    h.state.experienceFields = h.experienceEntryFields("I currently work here");
+
+    const result = await run();
+
+    // Nothing this block would have produced shows up anywhere in the report.
+    expect(result.fields.some((entry) => entry.detail.includes("work0.isCurrent"))).toBe(false);
+    expect(result.fields.some((entry) => entry.detail.includes("still ongoing"))).toBe(false);
+
+    // End Date instead follows the ordinary path, exactly as it does on a
+    // SmartRecruiters board with no recognizable checkbox at all.
+    const endDate = result.fields.find((entry) => entry.field === "end date");
+    expect(endDate?.outcome).toBe("needs-input");
   });
 });

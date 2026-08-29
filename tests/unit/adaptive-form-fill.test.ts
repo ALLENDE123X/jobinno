@@ -1667,6 +1667,14 @@ describe("JOB-270: isOngoingRole", () => {
       expect(isOngoingRole(value)).toBe(false);
     }
   });
+
+  // MINOR from the JOB-270 red-team review: a resume's own dash or "N/A" in
+  // place of an end date reads as ongoing too, the same as a blank cell would.
+  it("reads a bare dash or N/A the same way a blank end date would", () => {
+    for (const value of ["-", "N/A", "n/a", "N/a"]) {
+      expect(isOngoingRole(value)).toBe(true);
+    }
+  });
 });
 
 describe("JOB-270: the Experience section's own field-recognition patterns", () => {
@@ -1694,6 +1702,31 @@ describe("JOB-270: the Experience section's own field-recognition patterns", () 
   it("does not mistake an unrelated label for the current-role checkbox", () => {
     for (const label of ["Company", "Job title", "Description", "Start date", "End date"]) {
       expect(CURRENT_ROLE_CHECKBOX_RE.test(label)).toBe(false);
+    }
+  });
+
+  // MAJOR from the JOB-270 red-team review: the first version matched bare
+  // "currently work(ing)" or "still work(ing)" anywhere in a label, which also
+  // matched four unrelated questions a form plausibly asks that have nothing
+  // to do with this widget's own "still working here" checkbox. All four were
+  // being ticked "Yes" as though the candidate had said their most recent role
+  // was ongoing, which they never said anything about.
+  it("does not mistake an unrelated question that merely contains \"currently working\" for the checkbox", () => {
+    for (const label of [
+      "Are you currently working at another job?",
+      "Are you currently working for a competitor?",
+      "Do you currently work for the company you are applying to?",
+      "Are you currently working towards a degree?",
+    ]) {
+      expect(CURRENT_ROLE_CHECKBOX_RE.test(label)).toBe(false);
+    }
+  });
+
+  // The same review found wordings the first version missed entirely, because
+  // "still" only ever paired with "work" and never with "employed".
+  it("matches \"still employed\", with or without \"here\" following it", () => {
+    for (const label of ["I am still employed here", "I am still employed", "Still employed"]) {
+      expect(CURRENT_ROLE_CHECKBOX_RE.test(label)).toBe(true);
     }
   });
 

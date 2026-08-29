@@ -4392,16 +4392,16 @@ function joinDates(start: string | null, end: string | null): string | null {
 }
 
 /**
- * JOB-270. A work entry with no real end date: blank, or the resume's own
- * "Present"/"Current"/"Now"/"Ongoing". `totalYearsOfExperience` below applies
- * the same test to the same set of strings for its own count; kept as a
- * separate function rather than shared so a change to one's rounding
+ * JOB-270. A work entry with no real end date: blank, a bare "-" or "N/A", or
+ * the resume's own "Present"/"Current"/"Now"/"Ongoing". `totalYearsOfExperience`
+ * below applies the same test to the same set of strings for its own count;
+ * kept as a separate function rather than shared so a change to one's rounding
  * behaviour can never silently change what `buildFactCatalog` states about a
  * still-ongoing role.
  */
 export function isOngoingRole(endDate: string | null | undefined): boolean {
   const text = (endDate ?? "").trim();
-  return text === "" || /^(present|current|now|ongoing)$/i.test(text);
+  return text === "" || text === "-" || /^(present|current|now|ongoing|n\/a)$/i.test(text);
 }
 
 /**
@@ -6000,13 +6000,28 @@ export const EXPERIENCE_SECTION_HEADING_RE = /\bexperience\b/i;
 /**
  * JOB-270. The "I currently work here" checkbox SmartRecruiters' OneClick UI
  * Experience widget shows beside the End Date field, worded some variant of
- * "currently work(ing) here" or "current position/role/job". Matched against a
- * checkbox field's own label so a still-ongoing role is stated by ticking the
- * board's own control rather than by typing "Present" into a field built to
- * hold a real date.
+ * "currently work(ing) here", "still employed (here)" or "current
+ * position/role/job". Matched against a checkbox field's own label so a
+ * still-ongoing role is stated by ticking the board's own control rather than
+ * by typing "Present" into a field built to hold a real date.
+ *
+ * ── Rewritten after review on this PR ───────────────────────────────────────
+ * The first version matched bare "currently work(ing)" or "still work(ing)"
+ * anywhere in a label, which also matched "Are you currently working at
+ * another job?", "Are you currently working for a competitor?", "Do you
+ * currently work for the company you are applying to?" and "Are you currently
+ * working towards a degree?" — four questions this widget's own checkbox never
+ * asks, and every one of them would have been ticked "Yes" as though the
+ * candidate had said their most recent role was ongoing. This version requires
+ * the verb to be anchored to the role itself — "here", "at/in this
+ * company/job/position/role" — or to be one of the fixed phrases a checkbox
+ * actually uses for its own label: "current position/role/job", "present job"
+ * or "still employed" on its own. It also picks up two wordings the first
+ * version missed because "still" only ever paired with "work": "I am still
+ * employed here" and "I am still employed" with no "here" at all.
  */
 export const CURRENT_ROLE_CHECKBOX_RE =
-  /\b(i\s+)?(currently|still)\s+work(ing)?(\s+here)?\b|\bcurrent(ly)?\s+(position|role|job|employ\w*)\b/i;
+  /\b(currently|still)\s+(work(ing)?|employed)\s+(here|at\s+this\s+(?:company|job|position|role)|in\s+this\s+(?:position|role))\b|\bcurrent(?:ly)?\s+(?:position|role|job)\b|\bpresent\s+job\b|\bstill\s+employed\b/i;
 
 /** JOB-270. The Experience entry's End Date field, by its own label. */
 export const END_DATE_FIELD_RE = /\bend\s*date\b/i;
@@ -6051,6 +6066,14 @@ export const END_DATE_FIELD_RE = /\bend\s*date\b/i;
  * none of the `work0.*` facts, so this block never fires and the section
  * falls through to the ordinary escalation every other unbacked required
  * section already gets.
+ *
+ * Gated on `isSmartRecruitersPage`, strictly, in addition to the heading and
+ * fact checks above: `EXPERIENCE_SECTION_HEADING_RE` is a plain
+ * `/\bexperience\b/i` and would just as happily match "Experience" or "Work
+ * Experience" on a Greenhouse or Lever form. This ticket is scoped to
+ * SmartRecruiters' own OneClick UI widget and every other board is a named
+ * non-goal, so the board check is what actually keeps this block inert
+ * everywhere else rather than the heading regex alone.
  */
 async function fillRepeatingSections(
   session: BrowserSession,
@@ -6126,11 +6149,22 @@ async function fillRepeatingSections(
       // removed from `fresh` before that path ever sees them — see this
       // function's own header for why an End Date field is never handed a
       // guessed value. Keys land here only for the section whose heading is
-      // actually "Experience" and only when the resume's most recent role has
-      // no end date, so an education entry's own dates, and a work entry that
-      // did end, are both untouched by this block.
+      // actually "Experience", only on a SmartRecruiters page (this ticket is
+      // scoped there and nowhere else — `EXPERIENCE_SECTION_HEADING_RE` alone
+      // would also match "Experience" on a Greenhouse or Lever form, which is
+      // not this ticket's board), and only when the resume's most recent role
+      // has no end date, so an education entry's own dates, and a work entry
+      // that did end, are both untouched by this block. And End Date is only
+      // ever marked handled once a checkbox was actually found to tick in its
+      // place — a board whose wording this system does not recognize gets no
+      // silent substitute and End Date falls through to the ordinary
+      // decide-then-apply path below, which escalates it like any other
+      // required field nothing here could answer.
       const currentRoleHandled = new Set<string>();
-      if (EXPERIENCE_SECTION_HEADING_RE.test(section.heading)) {
+      if (
+        EXPERIENCE_SECTION_HEADING_RE.test(section.heading) &&
+        (await isSmartRecruitersPage(session.page))
+      ) {
         const isCurrentRole = factsByKey.get("work0.isCurrent")?.value === "Yes";
         if (isCurrentRole) {
           const checkbox = fresh.find(
@@ -6176,21 +6210,30 @@ async function fillRepeatingSections(
                 );
               }
             }
-          }
-          const endDate = fresh.find(
-            (field) => field.kind !== "checkbox" && END_DATE_FIELD_RE.test(field.label)
-          );
-          if (endDate !== undefined) {
-            currentRoleHandled.add(endDate.key);
-            outcomes.push({
-              field: endDate.key,
-              intended: null,
-              outcome: "skipped",
-              detail:
-                `${section.heading} entry — left blank: the candidate's most recent role has ` +
-                `no end date on their resume (still ongoing), so nothing is typed into a field ` +
-                `built to hold a real date`,
-            });
+            // Only reached once a checkbox to tick was actually found. A board
+            // whose wording `CURRENT_ROLE_CHECKBOX_RE` does not recognize gets
+            // no checkbox ticked at all, and previously left End Date silently
+            // unfilled regardless — a required field abandoned with no
+            // escalation, which read as this system having handled a role it
+            // never actually stated anything about. End Date now stays out of
+            // `currentRoleHandled` in that case and falls to the ordinary
+            // decide-then-apply path below, which escalates it exactly as it
+            // would any other required field nothing here can answer.
+            const endDate = fresh.find(
+              (field) => field.kind !== "checkbox" && END_DATE_FIELD_RE.test(field.label)
+            );
+            if (endDate !== undefined) {
+              currentRoleHandled.add(endDate.key);
+              outcomes.push({
+                field: endDate.key,
+                intended: null,
+                outcome: "skipped",
+                detail:
+                  `${section.heading} entry — left blank: the candidate's most recent role has ` +
+                  `no end date on their resume (still ongoing), so nothing is typed into a field ` +
+                  `built to hold a real date`,
+              });
+            }
           }
         }
       }
