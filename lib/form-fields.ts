@@ -326,7 +326,12 @@ function enumerateFieldsInPage(
   // Threading them keeps one definition shared with `readFieldValue`, which is
   // the whole point — see `SELECTED_VALUE_SELECTOR`.
   SELECTED_VALUE_SEL: string,
-  VALUE_MIRROR_SEL: string
+  VALUE_MIRROR_SEL: string,
+  // JOB-272. Whether the page this runs against is a Breezy listing, decided by
+  // `enumerateFormFields` (which has `page.url()`) rather than here (which does
+  // not, and cannot import `matchAtsHost` into a serialised function anyway).
+  // See `questionBlockText`'s Breezy-scoped skip below for what this gates.
+  isBreezyHost: boolean
 ): RawField[] {
   const out: RawField[] = [];
   let handleCount = 0;
@@ -823,12 +828,48 @@ function enumerateFieldsInPage(
       (node.matches(WIDGET_CHROME) || node.querySelector(WIDGET_CHROME) !== null) &&
       !holdsFormControl(node);
 
+    /**
+     * JOB-272. Breezy's own read-only currency readout, not a caption for
+     * anything.
+     *
+     * When an employer's Breezy form offers exactly one currency, its "Desired
+     * Salary" section draws `<span ng-if="currencies.length === 1">US Dollar
+     * ($)</span>` as a static readout immediately before the actual salary
+     * amount `<input>` — there is no `<select>` here at all, because there is
+     * nothing to choose between. That span is not a form control (`nodes`
+     * above never harvests a bare `<span>`), but it IS the amount input's
+     * nearest previous sibling with visible text, so unmodified this function
+     * reported the amount field's caption as "US Dollar ($)" instead of the
+     * real "Desired Salary" heading one sibling further back. A downstream
+     * decision layer reading a field literally captioned "US Dollar ($)"
+     * reasonably answered "USD" — a currency code, not a salary number — and
+     * Breezy's `ng-change="stripNonNumeric()"` on that input stripped every
+     * character of it, leaving the control empty. Live-verified 2026 08 29
+     * against BlueTread's Frontend Software Engineer listing
+     * (bluetread.breezy.hr): the currency readout, not any dropdown widget
+     * refusing to commit, was the entire failure.
+     *
+     * Skipped rather than stopped at, exactly like `isWidgetChrome` above: the
+     * real caption is further back and still belongs to this control. Scoped
+     * to Breezy by `isBreezyHost` (computed in `enumerateFormFields` off
+     * `matchAtsHost`, the same table JOB-260 and JOB-266 use) so no other
+     * board's labelling changes — the `ng-if` attribute name and its
+     * "currencies.length" value are AngularJS-specific to Breezy's own
+     * template and would not coincidentally appear elsewhere, but the host
+     * check keeps this auditable against the same pattern those tickets
+     * established rather than relying on that alone.
+     */
+    const isBreezyCurrencyReadout = (node: Element): boolean =>
+      isBreezyHost &&
+      node.tagName.toLowerCase() === "span" &&
+      (node.getAttribute("ng-if") ?? "").includes("currencies.length");
+
     let node: Element | null = element;
     for (let depth = 0; node !== null && depth < 5; depth++) {
       let sibling: Element | null = node.previousElementSibling;
       while (sibling !== null) {
         if (holdsFormControl(sibling)) return "";
-        if (!isWidgetChrome(sibling)) {
+        if (!isWidgetChrome(sibling) && !isBreezyCurrencyReadout(sibling)) {
           const text = clean(visibleText(sibling));
           if (text !== "") return text;
         }
@@ -1596,6 +1637,27 @@ const KINDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * JOB-272. True when the page currently open is a Breezy listing.
+ *
+ * A twin of `isSmartRecruitersPage` further down this file (added by JOB-266
+ * for the same reason: a fix scoped to this one board only). Both read off
+ * `page.url()` through the same `matchAtsHost` table in `lib/ats-boards.ts`,
+ * so they can never disagree about what counts as a Breezy page. Computed
+ * here rather than inside `enumerateFieldsInPage` because that function is
+ * serialised with `toString()` into a page that has never imported
+ * `matchAtsHost` — see the parameter comment on `isBreezyHost` there.
+ */
+async function isBreezyPage(page: Page): Promise<boolean> {
+  try {
+    const current = await page.url();
+    const hostname = new URL(String(current)).hostname;
+    return matchAtsHost(hostname)?.ats === "breezy";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Every control on the page, with a stable key per field.
  *
  * Never throws: a page this cannot read is reported as having no fields, and the
@@ -1605,11 +1667,13 @@ const KINDS: ReadonlySet<string> = new Set([
 export async function enumerateFormFields(page: Page): Promise<EnumeratedField[]> {
   let raw: RawField[];
   try {
+    const isBreezyHost = await isBreezyPage(page);
     const result = await page.evaluate(
       inPageExpression(
         enumerateFieldsInPage,
         `${MAX_FIELDS}, ${MAX_OPTIONS_REPORTED}, ${jsLiteral(FIELD_HANDLE_ATTR)}, ` +
-          `${jsLiteral(SELECTED_VALUE_SELECTOR)}, ${jsLiteral(VALUE_MIRROR_SELECTOR)}`
+          `${jsLiteral(SELECTED_VALUE_SELECTOR)}, ${jsLiteral(VALUE_MIRROR_SELECTOR)}, ` +
+          `${isBreezyHost}`
       )
     );
     const failure = inPageError(result);
