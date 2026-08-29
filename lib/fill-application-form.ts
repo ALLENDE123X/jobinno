@@ -4726,6 +4726,44 @@ function countryContextTerms(currentCountry: string | undefined): string[] {
   return ["United States|USA|US|U.S."];
 }
 
+/**
+ * JOB-246. `countryContextTerms` needs an attested country to break a tied
+ * city search, and `currentCountry` is a question `intake-cli.ts` accepts as
+ * optional — nothing requires a candidate to have answered it separately,
+ * and the founder's own profile never has. Freeform's Location (City) field
+ * went unresolved on a live 2026 08 28 run for exactly that reason:
+ * `chooseFromMenuOnce` correctly narrowed "San Francisco" to three qualified
+ * candidates spelling the same city in three different countries, found no
+ * attested country to break the tie with, and correctly refused to guess —
+ * the right call with no evidence at all. But the candidate's resume already
+ * carries the evidence nobody asked for a second time: `buildFactCatalog`
+ * already writes the parsed header line ("San Francisco, California, United
+ * States") as the `resumeLocation` fact, and its last comma separated
+ * segment is the same country a person would have typed into the intake
+ * form had `currentCountry` been asked.
+ *
+ * This can only ever narrow a menu `chooseFromMenuOnce` already found, and
+ * that function still requires an exact, qualified, single surviving match
+ * before it commits anything — see its own header and `matchOption`'s. A
+ * wrong guess at the country here cannot make it choose the wrong option: at
+ * most it turns a legitimate escalation into a resolved, verified answer
+ * when exactly one offered option agrees with it, and leaves the escalation
+ * exactly as it was otherwise.
+ */
+export function countryContextTermsWithResumeFallback(
+  currentCountry: string | undefined,
+  resumeLocation: string | undefined
+): string[] {
+  const attested = countryContextTerms(currentCountry);
+  if (attested.length > 0) return attested;
+  const segments = (resumeLocation ?? "")
+    .split(",")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment !== "");
+  const guessedCountry = segments[segments.length - 1];
+  return guessedCountry === undefined ? [] : countryContextTerms(guessedCountry);
+}
+
 /** Whether `needle` appears in `haystack` delimited by non-word characters. */
 function containsAtWordBoundary(haystack: string, needle: string): boolean {
   if (needle === "") return false;
@@ -5714,9 +5752,16 @@ async function fillRepeatingSections(
             SCHOOL_FACT_KEY_RE.test(decision?.sourceFact ?? ""),
           // JOB-051's tie break, on the same footing as the ordinary pass: the
           // country the candidate attested, used only to choose between
-          // suggestions that already contain the value.
+          // suggestions that already contain the value. JOB-246 falls back to
+          // the resume's own location when nothing was attested — see
+          // `countryContextTermsWithResumeFallback`.
           ...(OPTION_KINDS.has(field.kind)
-            ? { contextTerms: countryContextTerms(state.applicationAnswers.currentCountry) }
+            ? {
+                contextTerms: countryContextTermsWithResumeFallback(
+                  state.applicationAnswers.currentCountry,
+                  factsByKey.get("resumeLocation")?.value
+                ),
+              }
             : {}),
         });
 
@@ -6155,9 +6200,16 @@ async function fillRemainingFields(
       // JOB-051's tie break for a search control whose options only exist once
       // it has been typed into. Without it "San Francisco" comes back as eight
       // San Franciscos, `chooseFromMenu` correctly refuses to guess between
-      // them, and the required City field stays empty.
+      // them, and the required City field stays empty. JOB-246: falls back to
+      // the resume's own location when `currentCountry` was never attested —
+      // see `countryContextTermsWithResumeFallback`.
       ...(OPTION_KINDS.has(field.kind)
-        ? { contextTerms: countryContextTerms(state.applicationAnswers.currentCountry) }
+        ? {
+            contextTerms: countryContextTermsWithResumeFallback(
+              state.applicationAnswers.currentCountry,
+              factsByKey.get("resumeLocation")?.value
+            ),
+          }
         : {}),
       // JOB-044. Scoped to school-shaped comboboxes by label AND by the fact
       // key that backed `value`, same double gate as the resolution that
@@ -6174,8 +6226,11 @@ async function fillRemainingFields(
       // be resolved from what they attested rather than by taking the first
       // suggestion. `chooseFromMenu` uses it only to break a tie between
       // options that already contain `value`, so it can never introduce an
-      // answer of its own.
-      contextTerms: countryContextTerms(state.applicationAnswers.currentCountry),
+      // answer of its own. JOB-246: same resume fallback as above.
+      contextTerms: countryContextTermsWithResumeFallback(
+        state.applicationAnswers.currentCountry,
+        factsByKey.get("resumeLocation")?.value
+      ),
     });
 
     if (outcome.ok) {
