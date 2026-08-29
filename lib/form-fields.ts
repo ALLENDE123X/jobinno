@@ -43,6 +43,7 @@
  */
 
 import { type Page } from "@browserbasehq/stagehand";
+import { matchAtsHost } from "@/lib/ats-boards";
 
 /** What a control is, as far as filling it in is concerned. */
 export type FormFieldKind =
@@ -1630,6 +1631,19 @@ type OpenMenu = {
   focused: number;
   /** The highlighted option's own text, so a caller can see what Enter would commit. */
   focusedText: string;
+  /**
+   * Whether the listbox holding these options declares `aria-multiselectable`.
+   *
+   * JOB-266. Every other reading in this type is about *which* option is
+   * highlighted; this one is about what committing it takes. A single-select
+   * listbox's `Enter` both highlights-confirms and closes in one press, which
+   * is the convention every other call site in this file was built against.
+   * SmartRecruiters' `aria-multiselectable="true"` listbox answers to neither
+   * `Enter` nor `Space` — see `chooseFromMenuOnce`'s SmartRecruiters-scoped
+   * branch, the only place this is read, and `dispatchOptionEvents`, which it
+   * calls instead of pressing a key.
+   */
+  multiselectable: boolean;
 };
 
 const NO_MENU: OpenMenu = {
@@ -1639,6 +1653,7 @@ const NO_MENU: OpenMenu = {
   expanded: false,
   focused: -1,
   focusedText: "",
+  multiselectable: false,
 };
 
 /**
@@ -1985,6 +2000,28 @@ function readOpenMenuInPage(
   }
 
   /**
+   * JOB-266. Whether the listbox these options live in declares itself
+   * `aria-multiselectable`, read off the nearest `[role="listbox"]` ancestor
+   * of the first option rather than off any one of the search paths above —
+   * `named` can arrive from three different walks (the control's own
+   * `aria-controls`/`aria-owns`, a climb from the control, or a
+   * document-wide sweep) and the listbox is the one node all three agree an
+   * option sits inside, so reading it here covers every path with one check
+   * instead of three.
+   */
+  let multiselectable = false;
+  {
+    let node: Element | null = named.length > 0 ? parentOf(named[0] as Element) : null;
+    for (let depth = 0; node !== null && depth < 8; depth++) {
+      if ((node.getAttribute("role") ?? "").toLowerCase() === "listbox") {
+        multiselectable = node.getAttribute("aria-multiselectable") === "true";
+        break;
+      }
+      node = parentOf(node);
+    }
+  }
+
+  /**
    * Which option the widget itself considers highlighted — the one its own
    * `Enter` would commit.
    *
@@ -2127,6 +2164,7 @@ function readOpenMenuInPage(
     // measured would make every such option unconfirmable and therefore
     // unchoosable.
     focusedText: focused === -1 ? "" : deepText(named[focused] as Element),
+    multiselectable,
   };
 }
 
@@ -2158,6 +2196,7 @@ async function readOpenMenu(
       expanded: result.expanded === true,
       focused: typeof result.focused === "number" ? result.focused : -1,
       focusedText: typeof result.focusedText === "string" ? result.focusedText : "",
+      multiselectable: result.multiselectable === true,
     };
   } catch {
     return NO_MENU;
@@ -3376,6 +3415,101 @@ async function readElementText(page: Page, selector: string): Promise<string> {
   }
 }
 
+/**
+ * JOB-266. Commits a SmartRecruiters `aria-multiselectable` listbox option by
+ * dispatching the full pointer/mouse/keyboard event sequence a real
+ * interaction produces (focus, pointerdown, mousedown, pointerup, mouseup,
+ * click, the native `.click()` activation behaviour, and an Enter and a
+ * Space keydown/keyup pair) directly at the deepest `[role="option"]`
+ * descendant of `selector` — in one `evaluate` round trip, so there is no
+ * gap between finding the element and interacting with it for a re-render to
+ * land in.
+ *
+ * Every other commit mechanism this file knows how to send — a bare `Enter`,
+ * a bare `Space`, `Locator.click()` on the option's own light-DOM wrapper,
+ * and a coordinate click on the painted row's own box — was tried live
+ * against AbbVie's "location(s) not willing to work in" question and left
+ * the control reading empty every time, so this sends everything a widget of
+ * this shape could plausibly be listening for in one pass rather than
+ * guessing at a single one. See the JOB-266 PR description for the live
+ * verification history.
+ *
+ * NOTE: this sends click, the native `.click()` activation behaviour, Enter,
+ * and Space in sequence, all in one call. On a widget that toggles per
+ * activation rather than committing on the first one, that sequence could
+ * net cancel (select, then deselect, then reselect) instead of landing in a
+ * single committed state. This is currently inert because no mechanism this
+ * file has tried causes any observable state change on the target widget at
+ * all, so the net cancel risk has never actually been exercised. See
+ * JOB-266.
+ *
+ * NEXT INVESTIGATOR: the `PointerEvent`s below are constructed without
+ * `pointerType`, `pointerId`, or `isPrimary`, so they default to `""`,
+ * `0`/unset, and `false`. Some Lit based widgets gate their handlers on
+ * `event.pointerType === "mouse"` or `event.isPrimary === true`, which would
+ * make a synthetic `PointerEvent` silently no op even though
+ * `dispatchEvent()` reports success. Try adding explicit
+ * `pointerType: "mouse"`, `pointerId: 1`, `isPrimary: true` to `opts` before
+ * ruling out the pointer events entirely.
+ *
+ * NOT CONFIRMED WORKING. Live testing against AbbVie's SmartRecruiters
+ * screening question left the control reading empty after this dispatch
+ * too. Shipped anyway because it is provably zero cost when it does not
+ * help (the existing mechanisms still run first and this is additive), and
+ * the exploration record above narrows what the next attempt should try.
+ * See JOB-266.
+ */
+// NOT CONFIRMED WORKING, see JOB-266.
+async function dispatchOptionEvents(page: Page, selector: string): Promise<void> {
+  const script = `(() => {
+    const sel = ${jsLiteral(selector)};
+    const el = ${RESOLVE_IN_PAGE_SRC}(sel);
+    if (!el) return;
+    let deepest = null;
+    let budget = 200;
+    const stack = [el];
+    const seen = new Set();
+    while (stack.length && budget-- > 0) {
+      const node = stack.pop();
+      if (!node || seen.has(node)) continue;
+      seen.add(node);
+      if ((node.getAttribute && node.getAttribute("role")) === "option") deepest = node;
+      let kids = [];
+      try { kids = Array.from(node.children || []); } catch { kids = []; }
+      const inner = node.shadowRoot;
+      if (inner) { try { kids = kids.concat(Array.from(inner.children || [])); } catch {} }
+      for (const kid of kids) stack.push(kid);
+    }
+    const target = deepest || el;
+    const rect = target.getBoundingClientRect();
+    const cx = rect.x + rect.width / 2;
+    const cy = rect.y + rect.height / 2;
+    const opts = { bubbles: true, cancelable: true, composed: true, clientX: cx, clientY: cy, view: window, button: 0 };
+    try { if (target.focus) target.focus(); } catch (e) {}
+    try {
+      target.dispatchEvent(new PointerEvent("pointerdown", opts));
+      target.dispatchEvent(new MouseEvent("mousedown", opts));
+      target.dispatchEvent(new PointerEvent("pointerup", opts));
+      target.dispatchEvent(new MouseEvent("mouseup", opts));
+      target.dispatchEvent(new MouseEvent("click", opts));
+      if (target.click) target.click();
+      const keyOpts = { bubbles: true, cancelable: true, composed: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 };
+      target.dispatchEvent(new KeyboardEvent("keydown", keyOpts));
+      target.dispatchEvent(new KeyboardEvent("keyup", keyOpts));
+      const spaceOpts = { bubbles: true, cancelable: true, composed: true, key: " ", code: "Space", keyCode: 32, which: 32 };
+      target.dispatchEvent(new KeyboardEvent("keydown", spaceOpts));
+      target.dispatchEvent(new KeyboardEvent("keyup", spaceOpts));
+    } catch (e) {}
+  })()`;
+  try {
+    await page.evaluate(script);
+  } catch {
+    // The read-back this feeds into is what decides success or failure; a
+    // dispatch that could not even run reads back exactly like one that ran
+    // and changed nothing.
+  }
+}
+
 /** `checked` for a radio group means "one of its radios is checked". */
 async function readRadioGroupValue(page: Page, field: EnumeratedField): Promise<string> {
   for (const [index, selector] of field.optionSelectors.entries()) {
@@ -3607,6 +3741,30 @@ async function selectNative(page: Page, field: EnumeratedField, value: string): 
  * has more evidence, not a guard that now guesses. Nothing here invents a
  * location: every term compared came from the candidate's own intake.
  */
+
+/**
+ * JOB-266. True when the page currently open is a SmartRecruiters listing.
+ *
+ * A local twin of `isSmartRecruitersPage` in `lib/fill-application-form.ts`
+ * (added by JOB-260 for the same reason: a phone-field read-back tolerance
+ * scoped to this one board), rather than an import of it. `fill-application-
+ * form.ts` already imports from this file, so the other direction would be a
+ * circular import; JOB-246 hit the identical shape of problem with
+ * `containsAtWordBoundary` and duplicated rather than restructured for it, and
+ * this follows that precedent. Both twins read off `page.url()` through the
+ * same `matchAtsHost` table in `lib/ats-boards.ts`, so they can never disagree
+ * about what counts as a SmartRecruiters page.
+ */
+async function isSmartRecruitersPage(page: Page): Promise<boolean> {
+  try {
+    const current = await page.url();
+    const hostname = new URL(String(current)).hostname;
+    return matchAtsHost(hostname)?.ats === "smartrecruiters";
+  } catch {
+    return false;
+  }
+}
+
 async function chooseFromMenu(
   page: Page,
   field: EnumeratedField,
@@ -3922,54 +4080,100 @@ async function chooseFromMenuOnce(
     };
   }
 
-  // JOB-044. Committed by keyboard rather than by clicking `optionSelector`.
-  // Video review of a real skipped application (Greenhouse's "Location"
-  // combobox) showed the agent typing a city, a suggestion appearing, the
-  // click on it not registering, and the raw unmatched text left sitting in
-  // the field — a mouse click dispatches at the element's centroid over CDP
-  // with no confirmation it landed on the widget's own hit target, and a
-  // freshly re-rendered suggestion list is exactly where that gap shows up.
-  // The `stillReads` check just above already proves the option at `index`
-  // is still the one this chose; walking there by arrow key uses that same
-  // index against the widget's own list order instead of a screen position,
-  // which is what a real keyboard user does and what this control was built
-  // to answer to.
+  // ── JOB-266 ──────────────────────────────────────────────────────────────
+  // SmartRecruiters' "Preliminary questions" screening step draws its "select
+  // one or more" questions ("Which, if any, location(s) are you not willing
+  // to work in?", "Please select your area of interest(s):", "Select your
+  // desired work locations in the U.S.:", "In what country/countries are you
+  // currently authorized to work?") as `[role="listbox"
+  // aria-multiselectable="true"]`, holding `<spl-select-option>` rows whose
+  // committed answer is rendered as a tag in a sibling `<spl-tags-list>`, not
+  // as the single-value caption `readFieldValue`'s combobox branch already
+  // knows how to find.
   //
-  // How far to walk is asked of the widget rather than assumed from the ARIA
-  // pattern — see `highlightOption`, which is where the off-by-one that chose
-  // the option after the right one on every Greenhouse dropdown was fixed.
+  // Six commit mechanisms were tried live against AbbVie's "location(s) not
+  // willing to work in" question and every one of them left the control
+  // reading empty: a bare `Enter`, a bare `Space` (the WAI ARIA convention
+  // for toggling a multiselect listbox row), `Locator.click()` on the
+  // resolved `optionSelector` element, a coordinate click on the deepest
+  // `[role="option"]` node's own painted box, `dispatchOptionEvents` below
+  // (the full pointer, mouse, and keyboard sequence), and that same dispatch
+  // followed by a `Tab` press on the search input on the theory the widget
+  // commits on blur. A live read of the widget's own internal Lit state
+  // (`__value`, `__tags`, `__selectedOptionsDictionary` on the custom
+  // element, none of it reflected to an HTML attribute) confirmed this is
+  // not a read back gap either: the internal state genuinely never changes
+  // under any of the six. See the JOB-266 PR description for the full
+  // verification history, including a rerun against a second employer on a
+  // freshly created Browserbase context that reproduced the same failure
+  // with no captcha in play, which rules out the repeated live testing
+  // itself as the explanation.
   //
-  // Failing closed on `focusElement` itself, rather than firing the arrow keys
-  // regardless: an `ArrowDown`/`Enter` sequence goes to whatever element the
-  // page happens to have focused, and with nothing focused (or focus left on
-  // the wrong control) that is exactly the "click didn't register" failure
-  // mode this whole keyboard path exists to avoid, just relocated one step
-  // earlier and left unreported.
-  const focused = await focusElement(page, field.selector);
-  if (!focused) {
-    await closeMenu(page);
-    return {
-      ok: false,
-      readBack: "",
-      detail: "could not focus the control before selecting the option with the keyboard",
-    };
-  }
+  // `dispatchOptionEvents` ships anyway, as the most thorough of the six
+  // rather than the simplest: it is a strict superset of every other
+  // mechanism tried, it is unreachable from every other board and from
+  // SmartRecruiters' own single-select dropdowns, and it leaves a documented
+  // starting point for whoever picks this back up rather than nothing at
+  // all. It is not a confirmed fix.
+  //
+  // Scoped twice, so no other board's commit changes shape from this ticket:
+  // the open menu has to declare itself `aria-multiselectable`, and the page
+  // has to be a SmartRecruiters host. Every other listbox on every other
+  // board — including SmartRecruiters' own single-select dropdowns — still
+  // commits by keyboard, exactly as it did before this ticket.
   let blindWalk = false;
-  try {
-    const walk = await highlightOption(page, field, index, chosen);
-    blindWalk = walk.blind;
-    if (!walk.ok) {
+  if (menu.multiselectable && (await isSmartRecruitersPage(page))) {
+    await dispatchOptionEvents(page, optionSelector);
+  } else {
+    // JOB-044. Committed by keyboard rather than by clicking `optionSelector`.
+    // Video review of a real skipped application (Greenhouse's "Location"
+    // combobox) showed the agent typing a city, a suggestion appearing, the
+    // click on it not registering, and the raw unmatched text left sitting in
+    // the field — a mouse click dispatches at the element's centroid over CDP
+    // with no confirmation it landed on the widget's own hit target, and a
+    // freshly re-rendered suggestion list is exactly where that gap shows up.
+    // The `stillReads` check just above already proves the option at `index`
+    // is still the one this chose; walking there by arrow key uses that same
+    // index against the widget's own list order instead of a screen position,
+    // which is what a real keyboard user does and what this control was built
+    // to answer to.
+    //
+    // How far to walk is asked of the widget rather than assumed from the
+    // ARIA pattern — see `highlightOption`, which is where the off-by-one
+    // that chose the option after the right one on every Greenhouse dropdown
+    // was fixed.
+    //
+    // Failing closed on `focusElement` itself, rather than firing the arrow
+    // keys regardless: an `ArrowDown`/`Enter` sequence goes to whatever
+    // element the page happens to have focused, and with nothing focused (or
+    // focus left on the wrong control) that is exactly the "click didn't
+    // register" failure mode this whole keyboard path exists to avoid, just
+    // relocated one step earlier and left unreported.
+    const focused = await focusElement(page, field.selector);
+    if (!focused) {
       await closeMenu(page);
-      return { ok: false, readBack: await readFieldValue(page, field), detail: walk.detail };
+      return {
+        ok: false,
+        readBack: "",
+        detail: "could not focus the control before selecting the option with the keyboard",
+      };
     }
-    await page.keyPress("Enter");
-  } catch (err) {
-    await closeMenu(page);
-    return {
-      ok: false,
-      readBack: "",
-      detail: `could not select the option with the keyboard: ${err instanceof Error ? err.message : String(err)}`,
-    };
+    try {
+      const walk = await highlightOption(page, field, index, chosen);
+      blindWalk = walk.blind;
+      if (!walk.ok) {
+        await closeMenu(page);
+        return { ok: false, readBack: await readFieldValue(page, field), detail: walk.detail };
+      }
+      await page.keyPress("Enter");
+    } catch (err) {
+      await closeMenu(page);
+      return {
+        ok: false,
+        readBack: "",
+        detail: `could not select the option with the keyboard: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
   }
 
   // A widget that re-renders its selection asynchronously reads empty for a
