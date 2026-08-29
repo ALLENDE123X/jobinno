@@ -2566,6 +2566,265 @@ async function rereadWhileTheFormCouldStillAppear(
   return { signals, rereads };
 }
 
+// ───────────────────────────────────
+// JOB-261: SR + Breezy job-description pages the reader missed
+// ───────────────────────────────────
+//
+// Three real rows the night this ticket was opened — Renesas Electronics on
+// SmartRecruiters, and Sports Reference and VetsEZ Dallas on Breezy — all
+// terminated at `form_fill_blocked` having landed on the listing's job
+// description page rather than its application form. Each one had a working
+// Apply control sitting on screen (SmartRecruiters' own "I'm Interested" for
+// Renesas; Breezy's ordinary "Apply" for the other two), and the page reader
+// judged `applyControlPresent: false` on every one of them, so the click loop
+// in `reachApplicationForm` broke on its first line without trying anything.
+//
+// This is the same kind of fix `domSaysForm` already is a few hundred lines up
+// this file: a judgement call the model got wrong, corroborated against a fact
+// the DOM can answer for itself. It is scoped to the two boards the incident
+// happened on and the ticket asks for, deliberately, rather than generalised
+// to every board's Apply control — see the ticket for why.
+
+/** The two boards this detection runs for, and no others. */
+const JD_ONLY_DETECTION_ATS: ReadonlySet<string> = new Set(["smartrecruiters", "breezy"]);
+
+/**
+ * Whether a read looks like a job description page rather than an application
+ * form or anything on the way to one — the shape every one of the three
+ * incident rows shared. Exported for the unit test that pins it against the
+ * exact numbers those rows' skip_log messages recorded.
+ */
+export function isJdOnlyPageShape(signals: FormSignals): boolean {
+  return (
+    !signals.applicationFormPresent &&
+    signals.passwordFieldCount === 0 &&
+    signals.fileInputCount === 0 &&
+    signals.domCoreSlots.length === 0
+  );
+}
+
+/**
+ * `page.evaluate`'s in-page half of {@link pageHasVisibleApplyIntentControl}.
+ *
+ * Matched against a control's own trimmed, whitespace-collapsed text, and
+ * bounded to a short label so this cannot match a paragraph that merely
+ * mentions applying somewhere in its copy. The wording covers both boards
+ * this ticket is scoped to — SmartRecruiters' listing page says "I'm
+ * Interested" rather than "Apply" anywhere on it (JOB-036), and Breezy's
+ * ordinary listing says "Apply".
+ *
+ * JOB-052 style, shadow-root aware, the same as `pageShowsFileNameInPage`
+ * above and `STRUCTURAL_FLOOR_SCRIPT`: `document.querySelectorAll` stops at a
+ * shadow boundary, and SmartRecruiters' `oneclick-ui` page is exactly the
+ * board this override exists for. A flat query against the light document
+ * alone undercounts to zero on that page the same way the structural floor
+ * once did, which would make this check corroborate nothing on the one board
+ * it most needs to.
+ *
+ * The visibility test rejects `visibility: hidden`, `display: none` and
+ * `opacity: 0` in addition to the bounding box check: a box can be nonzero
+ * for a control that is not actually painted, and this only exists to
+ * corroborate a control a person could really see and click.
+ *
+ * A plain function declaration, not a closure over anything in this module:
+ * `inPageExpression` ships it into the page by calling `.toString()` on it, so
+ * everything the check needs — including this regex — has to be declared
+ * inside it.
+ */
+function findVisibleApplyIntentControlInPage(): boolean {
+  const RE =
+    /(^|\b)(apply(\s+(now|for this job|for this position|today))?|i\s*'?\s*m\s+interested|i\s+am\s+interested)(\b|$)/i;
+  const SELECTOR = 'a, button, [role="button"], input[type="submit"], input[type="button"]';
+
+  function isVisiblyPainted(el: Element): boolean {
+    const box = el.getBoundingClientRect();
+    if (box.width <= 0 || box.height <= 0) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    if (parseFloat(style.opacity) === 0) return false;
+    return true;
+  }
+
+  function matchesApplyIntent(el: Element): boolean {
+    const raw =
+      el.tagName === "INPUT" ? (el as HTMLInputElement).value || "" : el.textContent || "";
+    const text = raw.replace(/\s+/g, " ").trim();
+    if (text === "" || text.length > 60 || !RE.test(text)) return false;
+    return isVisiblyPainted(el);
+  }
+
+  const seen = new Set<Document | ShadowRoot>();
+  const stack: (Document | ShadowRoot)[] = [document];
+  let budget = 6000;
+  while (stack.length > 0 && budget > 0) {
+    const root = stack.pop();
+    if (root === undefined || seen.has(root)) continue;
+    seen.add(root);
+    let matches: Element[];
+    let all: Element[];
+    try {
+      matches = Array.from(root.querySelectorAll(SELECTOR));
+      all = Array.from(root.querySelectorAll("*"));
+    } catch {
+      continue;
+    }
+    for (const el of matches) {
+      if (budget-- <= 0) break;
+      if (matchesApplyIntent(el)) return true;
+    }
+    for (const el of all) {
+      if (budget-- <= 0) break;
+      const inner = (el as HTMLElement).shadowRoot;
+      if (inner !== null && inner !== undefined) stack.push(inner);
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether the page has a visible, clickable control reading as an Apply-intent
+ * control, asked of the DOM directly rather than of a model.
+ *
+ * This is the corroboration `isJdOnlyPageShape` needs before treating a page
+ * the reader called formless as one this run should try to click through:
+ * without it, every genuinely form-free page on these two boards — a closed
+ * requisition, an off-board redirect — would be handed the same override.
+ * Never throws; an unreadable page has no control this can find either way.
+ *
+ * Exported for the unit test that runs `findVisibleApplyIntentControlInPage`'s
+ * real, serialised script against a jsdom document — including one with a real
+ * shadow root attached, the case this module's other DOM scans already cover
+ * (see `pageShowsFileNameInPage` and `STRUCTURAL_FLOOR_SCRIPT` above) — rather
+ * than only through the flow test's `page.evaluate` stub, which cannot tell a
+ * shadow-root-aware scan apart from a flat one.
+ */
+export async function pageHasVisibleApplyIntentControl(page: Page): Promise<boolean> {
+  try {
+    const raw = await page.evaluate(inPageExpression(findVisibleApplyIntentControlInPage, ""));
+    if (inPageError(raw) !== null) return false;
+    return raw === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Breezy's own convention for where a listing's application form lives: the
+ * job description page is `.../p/<slug>` and the form is `.../p/<slug>/apply`.
+ * The four Breezy submits that already worked the same night this ticket was
+ * opened (Bitdeer, Bear Robotics, Sentinel Blue, Computer Information
+ * Concepts) all resolved to exactly this shape before form-fill — this
+ * generalises that working path rather than inventing a new one.
+ *
+ * `null` when the URL cannot be parsed, or already ends in `/apply`, in which
+ * case there is nothing this can add over just clicking through.
+ *
+ * Exported for the unit test that pins the exact suffix against a real Breezy
+ * listing URL.
+ */
+export function deriveBreezyApplyUrl(rawUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  const trimmedPath = url.pathname.replace(/\/+$/, "");
+  if (/\/apply$/i.test(trimmedPath)) return null;
+  return `${url.origin}${trimmedPath}/apply${url.search}${url.hash}`;
+}
+
+/**
+ * Tries Breezy's `/apply` URL convention once, before falling back to a click.
+ *
+ * Never throws for a suffix that simply fails to produce a form: a 404, or a
+ * listing that does not follow the convention, is not itself a reason to stop
+ * the run when the ordinary click path in `reachApplicationForm` has not been
+ * tried yet. It does still throw through the three guards every navigation in
+ * this module answers to — the apply-URL board check, the captcha check and
+ * the already-submitted check — because a page landed on this way is exactly
+ * as capable of failing those as one reached any other way, and silently
+ * swallowing one of them here would be the same mistake this ticket is fixing,
+ * just moved one function over.
+ *
+ * That includes the restoration `goto` on the fallback branch. A `goto` that
+ * throws nothing is not proof of where it landed — it is a navigation like
+ * the /apply attempt just above it, and the caller's click loop is about to
+ * act on whatever `session.page` shows next. Trusting the pre-navigation
+ * `signals` there, unread and unguarded, is the exact mistake this whole
+ * function exists to fix, just moved to its own last few lines instead of
+ * caught by them. So the restoration branch always re-reads and re-runs all
+ * three guards against wherever the browser actually is afterward, success or
+ * failure, rather than handing back a stale object that was true of a page
+ * this call is done looking at.
+ *
+ * Returns the signals to continue with, and how many page reads it cost:
+ * the freshly read `/apply` page on success, or a freshly re-read job
+ * description page — confirmed, not assumed, to still be a safe one — when
+ * the suffix did not pan out.
+ */
+async function tryBreezyApplySuffix(
+  session: BrowserSession,
+  state: ApplicationState,
+  signals: FormSignals
+): Promise<{ signals: FormSignals; reads: number }> {
+  const candidateUrl = deriveBreezyApplyUrl(signals.url);
+  if (candidateUrl === null) return { signals, reads: 0 };
+
+  console.log(`${LOG} JOB-261: breezy job description page, trying ${candidateUrl}`);
+  try {
+    await session.page.goto(candidateUrl, { timeout: NAVIGATION_TIMEOUT_MS });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `${LOG} JOB-261: navigating to ${candidateUrl} failed (${reason}); falling back to a click`
+    );
+    return { signals, reads: 0 };
+  }
+
+  const afterAppend = await readFormSignals(session);
+  await assertStillOnTheBoard(
+    session,
+    state,
+    "after appending /apply to a Breezy job description page"
+  );
+  assertNoCaptcha(afterAppend, "the appended /apply page");
+  assertNotAlreadySubmitted(afterAppend, "the appended /apply page");
+
+  if (afterAppend.applicationFormPresent || afterAppend.applyControlPresent) {
+    return { signals: afterAppend, reads: 1 };
+  }
+
+  console.warn(
+    `${LOG} JOB-261: ${candidateUrl} did not read as an application form; returning to ` +
+      `"${signals.url}" to try clicking Apply instead`
+  );
+  try {
+    await session.page.goto(signals.url, { timeout: NAVIGATION_TIMEOUT_MS });
+  } catch {
+    // Best effort: if the job description page cannot be reopened, the guards
+    // below still have to run against whatever `session.page` actually shows
+    // now — a failed `goto` is not a guarantee that the browser stayed on the
+    // /apply attempt page already checked above, so skipping the re-read here
+    // would reintroduce the exact bug this function exists to close.
+  }
+
+  // B1. Re-read and re-guard, unconditionally, rather than returning the
+  // `signals` this function was handed: those describe the job description
+  // page as it was *before* the /apply attempt, and everything that has
+  // happened to `session.page` since then — the /apply navigation, and this
+  // restoration `goto` — is unverified until it is read again.
+  const restored = await readFormSignals(session);
+  await assertStillOnTheBoard(
+    session,
+    state,
+    "after returning from the /apply attempt to the job description page"
+  );
+  assertNoCaptcha(restored, "the restored job description page");
+  assertNotAlreadySubmitted(restored, "the restored job description page");
+  return { signals: restored, reads: 2 };
+}
+
 async function reachApplicationForm(
   session: BrowserSession,
   state: ApplicationState,
@@ -2633,6 +2892,45 @@ async function reachApplicationForm(
     signals = await signIn(session, state, signals);
     assertNoCaptcha(signals, "the page after signing in");
     assertNotAlreadySubmitted(signals, "the page after signing in");
+  }
+
+  // JOB-261. SR + Breezy only: a job description page the reader called
+  // formless, with no apply control it recognised either, corroborated
+  // against a real Apply-intent control the DOM can see. See the header
+  // above `isJdOnlyPageShape` for why this stops at the two boards it does.
+  if (
+    JD_ONLY_DETECTION_ATS.has(state.ats) &&
+    !signals.applicationFormPresent &&
+    !signals.applyControlPresent &&
+    isJdOnlyPageShape(signals)
+  ) {
+    const domFoundApplyButton = await pageHasVisibleApplyIntentControl(session.page);
+    if (domFoundApplyButton) {
+      console.log(
+        `${LOG} JOB-261: "${signals.url}" reads as a job description page with an Apply ` +
+          `control the page reader missed`
+      );
+      if (state.ats === "breezy") {
+        // All three guards already ran inside `tryBreezyApplySuffix`, against
+        // whatever the `/apply` suffix led to, and — on the branch that falls
+        // back to the job description page — against a fresh read of wherever
+        // the restoration `goto` actually landed. There is nothing left to
+        // check again here; see B1 in JOB-261's review for why the restoration
+        // branch re-reads and re-guards rather than trusting the pre-attempt
+        // `signals` it started with.
+        const attempted = await tryBreezyApplySuffix(session, state, signals);
+        signals = attempted.signals;
+        pageReads += attempted.reads;
+      }
+      // Whichever board this is, corroborate the apply control itself so the
+      // click loop below gets a fair shot at it. The control it actually
+      // clicks is still resolved fresh from the live page by `clickControl`,
+      // never from this flag — this only decides whether that loop runs at
+      // all, which is exactly what the reader got wrong on all three rows.
+      if (!signals.applicationFormPresent) {
+        signals = { ...signals, applyControlPresent: true };
+      }
+    }
   }
 
   for (let round = 0; round < APPLY_CLICK_ROUNDS; round++) {
