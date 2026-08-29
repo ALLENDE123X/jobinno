@@ -69,9 +69,17 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-/** A `Page` whose `evaluate` runs the serialised script against this jsdom. */
-function domPage(): Page {
+/**
+ * A `Page` whose `evaluate` runs the serialised script against this jsdom.
+ *
+ * JOB-272. `url` defaults to a Greenhouse address — `enumerateFormFields`
+ * reads it through `isBreezyPage`, the same `matchAtsHost` table the real
+ * board guard uses, so every existing test in this file, none of which set
+ * this, keeps exercising a non-Breezy page exactly as before.
+ */
+function domPage(url = "https://boards.greenhouse.io/example/jobs/1"): Page {
   return {
+    url: async () => url,
     evaluate: async (script: string) => eval(script),
     locator: (selector: string) => ({
       selectOption: async (values: string[]) => {
@@ -1346,5 +1354,63 @@ describe("SmartRecruiters education dropdown: the option after the chosen one", 
 
     expect(outcome.ok).toBe(true);
     expect(outcome.readBack).toBe("Bachelors Degree");
+  });
+});
+
+/**
+ * JOB-272 — Breezy's read-only currency readout ("US Dollar ($)") is not a
+ * caption for the salary amount input that follows it.
+ *
+ * Fixture is a stripped-down copy of the real BlueTread listing
+ * (bluetread.breezy.hr/p/3f44f3012d23-frontend-software-engineer/apply): a
+ * "Desired Salary" heading, a static `<span ng-if="currencies.length === 1">`
+ * readout (no `<select>` at all — this employer offers only one currency),
+ * the salary amount `<input name="cSalary">`, and the salary-period
+ * `<select>`. Before this fix, `questionBlockText`'s nearest-preceding-
+ * sibling walk stopped at the currency readout and reported the amount
+ * field's label as "US Dollar ($)" — a field a downstream decision layer
+ * could reasonably answer "USD" into, which Breezy's own
+ * `ng-change="stripNonNumeric()"` then strips to nothing.
+ */
+function breezySalarySection(): string {
+  return `
+    <div class="desired-salary">
+      <h3><span class="polygot">Desired Salary</span><span title="Required" class="required">*</span></h3>
+      <span ng-if="currencies.length === 1" class="ng-binding ng-scope ng-animate">US Dollar ($)</span>
+      <input name="cSalary" ng-model="candidate.salary.salary" type="text"
+        ng-change="stripNonNumeric()" placeholder="Desired Salary"
+        class="salary-number polygot" required="required">
+      <select ng-model="candidate.salary.period" class="salary-details" required="required">
+        <option value="hourly">Hourly</option>
+        <option value="weekly">Weekly</option>
+        <option value="monthly">Monthly</option>
+        <option value="yearly">Yearly</option>
+      </select>
+    </div>`;
+}
+
+describe("Breezy's currency readout is skipped as a caption (JOB-272)", () => {
+  it("reads the salary amount input's label off the heading, not the currency readout", async () => {
+    document.body.innerHTML = breezySalarySection();
+
+    const fields = await enumerateFormFields(domPage("https://bluetread.breezy.hr/p/abc/apply"));
+    // The amount input is the fixture's only "text" kind field — the salary
+    // period control right after it is a `<select>`.
+    const amount = fields.find((f) => f.kind === "text");
+
+    expect(amount?.label).toBe("Desired Salary");
+    expect(amount?.label).not.toContain("US Dollar");
+  });
+
+  it("leaves a non-Breezy host's identical markup exactly as it read before this ticket", async () => {
+    // Same fixture, a Greenhouse URL — the scope this ticket must not touch.
+    // `questionBlockText` should still stop at the currency readout here, the
+    // same as every board this fix was never meant to change.
+    document.body.innerHTML = breezySalarySection();
+
+    const fields = await enumerateFormFields(domPage());
+    const amount = fields.find((f) => f.kind === "text");
+
+    expect(amount?.label).toBe("US Dollar ($)");
   });
 });
