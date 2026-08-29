@@ -43,6 +43,8 @@ import {
   ADD_ENTRY_CONTROL_RE,
   AT_LEAST_ONE_ENTRY_RE,
   COMMIT_ENTRY_CONTROL_RE,
+  findDeclineAnalogOption,
+  findDeclineOption,
   type EnumeratedField,
   type RepeatingSection,
 } from "@/lib/form-fields";
@@ -795,5 +797,46 @@ describe("the guard on pressing a repeating section's controls", () => {
     expect(outcome.ok).toBe(false);
     expect(outcome.detail).toContain("could submit the application");
     expect(clicked).toEqual([]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+/**
+ * JOB-262. `findDeclineAnalogOption` is the pure lookup half of the
+ * SmartRecruiters and Breezy EEO decline carve out — the ats gate and the
+ * "only after `findDeclineOption` came back null" rule both live in
+ * `resolveDecision` (see `tests/unit/adaptive-form-fill.test.ts`), so this
+ * file only has to prove the wider pattern itself finds what it should and
+ * nothing more.
+ */
+describe("findDeclineAnalogOption, the widened EEO decline lookup", () => {
+  it("finds an \"N/A\" option DECLINE_OPTION_RE does not recognise", () => {
+    const options = ["Hispanic or Latino", "White", "Black or African American", "N/A"];
+    expect(findDeclineOption(options)).toBeNull();
+    expect(findDeclineAnalogOption(options)).toBe("N/A");
+  });
+
+  it("finds a \"Not Applicable\" option the same way", () => {
+    const options = ["Male", "Female", "Non-binary", "Not Applicable"];
+    expect(findDeclineOption(options)).toBeNull();
+    expect(findDeclineAnalogOption(options)).toBe("Not Applicable");
+  });
+
+  it("still finds an explicitly labelled decline option, unchanged", () => {
+    const options = ["Male", "Female", "Decline to self identify"];
+    expect(findDeclineAnalogOption(options)).toBe("Decline to self identify");
+  });
+
+  it("finds nothing when every option is a substantive identity claim", () => {
+    // The VetsEZ Tampa Cloud Integration shape: a plain Yes/No offers nothing
+    // honest adjacent at all, and the widened pattern must not invent one.
+    expect(findDeclineAnalogOption(["Yes", "No"])).toBeNull();
+    expect(findDeclineAnalogOption(["Male", "Female", "Non-binary"])).toBeNull();
+  });
+
+  it("does not match \"N/A\" or \"not applicable\" as a substring of an unrelated option", () => {
+    // Guards against the widened pattern over-matching a word boundary. A
+    // country or state list is exactly where a stray match would be costly.
+    expect(findDeclineAnalogOption(["Nevada"])).toBeNull();
   });
 });

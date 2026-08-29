@@ -401,13 +401,23 @@ export type ResolvedAnswer = {
  * ladder, so a post hoc audit can tell which categories got fabricated across
  * many submissions and what the model actually chose. Column names are
  * snake_case because they are stored as jsonb keys and read back by SQL.
+ *
+ * `"fabricated_eeo_decline"` is JOB-262's addition. It is written only for
+ * the SmartRecruiters and Breezy carve out on `resolveDecision`'s EEO branch
+ * in `lib/fill-application-form.ts`, when a required self identification
+ * question offered no option `DECLINE_OPTION_RE` recognised but did offer one
+ * the wider `EEO_DECLINE_ANALOG_RE` does (an "N/A" or "Not applicable"
+ * choice). It is kept apart from `"llm_fabrication"` and `"sane_default"`
+ * on purpose: no model ever sees this field and no free text is ever
+ * written, only an option the form itself offered, so a later audit should
+ * be able to tell the two mechanisms apart at a glance.
  */
 export type AnswerProvenanceEntry = {
   field_key: string;
   field_label: string;
   question_text: string;
   answered_value: string;
-  source: "llm_fabrication" | "sane_default";
+  source: "llm_fabrication" | "sane_default" | "fabricated_eeo_decline";
   model_confidence?: number;
 };
 
@@ -432,6 +442,29 @@ export function answerProvenanceEntry(input: {
     ...(source === "llm_fabrication" && typeof input.resolution.confidence === "number"
       ? { model_confidence: input.resolution.confidence }
       : {}),
+  };
+}
+
+/**
+ * JOB-262. Builds one `"fabricated_eeo_decline"` provenance entry directly
+ * from the field and the option chosen for it, rather than from a
+ * `ResolvedAnswer`. There is no `ResolvedAnswer` to build one from here: this
+ * path never calls the fabrication rung, never sees a model, and never has a
+ * confidence score. It only ever picks an option the form itself already
+ * offered, so the entry records that option and nothing else.
+ */
+export function fabricatedEeoDeclineProvenanceEntry(input: {
+  fieldKey: string;
+  fieldLabel: string;
+  questionText: string;
+  chosenOption: string;
+}): AnswerProvenanceEntry {
+  return {
+    field_key: input.fieldKey.slice(0, 300),
+    field_label: input.fieldLabel.slice(0, 300),
+    question_text: input.questionText.slice(0, 500),
+    answered_value: input.chosenOption.slice(0, 2_000),
+    source: "fabricated_eeo_decline",
   };
 }
 

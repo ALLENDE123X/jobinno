@@ -239,6 +239,42 @@ export function findDeclineOption(options: readonly string[]): string | null {
   return options.find((option) => DECLINE_OPTION_RE.test(option)) ?? null;
 }
 
+/**
+ * JOB-262. A wider set of decline shaped phrasings than `DECLINE_OPTION_RE`
+ * matches, for the narrow SmartRecruiters and Breezy carve out described on
+ * `resolveDecision`'s EEO branch in `fill-application-form.ts`.
+ *
+ * Adds "N/A" and "not applicable", the two honest adjacent phrasings a real
+ * Bosch Group and Wabtec Engineering form on SmartRecruiters, and a real
+ * VetsEZ Tampa Cloud Integration form on Breezy, each offered on a required
+ * self identification question on 2026 08 28 without offering anything
+ * `DECLINE_OPTION_RE` recognises. Neither phrase states a demographic
+ * identity; both report that the candidate is not making a claim, which is
+ * the same statement "prefer not to answer" makes in different words.
+ *
+ * Deliberately additive rather than a change to `DECLINE_OPTION_RE` itself.
+ * That pattern also gates the legal attestation ladder (`declineOrAsk`) and
+ * every other board's demographic questions, and widening it there was never
+ * asked for and was never verified against a real form on those boards.
+ */
+export const EEO_DECLINE_ANALOG_RE = new RegExp(
+  `${DECLINE_OPTION_RE.source}|\\bn/a\\b|\\bnot\\s+applicable\\b`,
+  "i"
+);
+
+/**
+ * The option in `options` that functions as a decline under the wider
+ * JOB-262 pattern above, or null.
+ *
+ * Never a decision on its own about whether picking it is allowed. The `ats`
+ * gate and the "only when the option itself is decline shaped" rule both
+ * live in `resolveDecision`, so this stays a pure lookup, the same shape as
+ * `findDeclineOption`.
+ */
+export function findDeclineAnalogOption(options: readonly string[]): string | null {
+  return options.find((option) => EEO_DECLINE_ANALOG_RE.test(option)) ?? null;
+}
+
 // ───────────────────────────────────
 // Perception — the DOM, and only the DOM
 // ───────────────────────────────────
