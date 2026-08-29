@@ -256,9 +256,23 @@ export function findDeclineOption(options: readonly string[]): string | null {
  * That pattern also gates the legal attestation ladder (`declineOrAsk`) and
  * every other board's demographic questions, and widening it there was never
  * asked for and was never verified against a real form on those boards.
+ *
+ * The two new alternatives are anchored to the whole (trimmed) option with
+ * `^` and `$`, not left as a bare word boundary match. A red team review of
+ * this PR reproduced a compound option, "Not Applicable — I am not a
+ * protected veteran", the exact OFCCP style phrasing a real Workday derived
+ * veteran or disability question uses: "N/A" or "Not Applicable" prepended
+ * to a full sentence that itself asserts a demographic identity. A bare
+ * `\bnot\s+applicable\b` matches that whole string as a substring and
+ * `.find()` then returns the entire sentence, including the identity claim,
+ * to be typed into the form and recorded in `answer_provenance` verbatim —
+ * exactly the fabrication this ticket exists to prevent. Anchoring each new
+ * alternative to the full option (`\s*` absorbing incidental whitespace)
+ * means the phrase has to be the whole answer, not merely present in it, so
+ * a compound option like that one falls through to `null` instead.
  */
 export const EEO_DECLINE_ANALOG_RE = new RegExp(
-  `${DECLINE_OPTION_RE.source}|\\bn/a\\b|\\bnot\\s+applicable\\b`,
+  `${DECLINE_OPTION_RE.source}|^\\s*n/a\\s*$|^\\s*not\\s+applicable\\s*$`,
   "i"
 );
 

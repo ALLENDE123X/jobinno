@@ -907,10 +907,34 @@ export const applications = pgTable(
      * we keep about an application, not an answer the person gives about
      * themselves.
      *
-     * EEO answers never appear here by construction: demographic fields are
-     * never fabricated and never defaulted (HARD STOP #10), so they can only
-     * ever be declined from the control's own option set, which the existing
-     * outcome report already records.
+     * EEO answers were originally meant to never appear here by construction:
+     * demographic fields are never fabricated and never defaulted (HARD STOP
+     * #10), so the intent was that they could only ever be declined from the
+     * control's own option set, recorded by the existing outcome report and
+     * nowhere else.
+     *
+     * ── JOB-262's narrow, named exception ─────────────────────────────────
+     *
+     * A real SmartRecruiters and Breezy form can require a self identification
+     * answer while offering no option `findDeclineOption` recognises, only an
+     * "N/A" or "Not Applicable" choice (see `EEO_DECLINE_ANALOG_RE` in
+     * `lib/form-fields.ts`). Leaving the field blank fails a required control
+     * and stops the run; picking that option is a true decline in different
+     * words, never a demographic claim. `resolveDecision` in
+     * `lib/fill-application-form.ts` picks it, and a `source:
+     * "fabricated_eeo_decline"` row is written here so an audit can see which
+     * runs used this carve out and what option was actually on the page.
+     *
+     * This is safe under HARD STOP #10 because no model ever sees the field
+     * and no free text is ever written: `chosenOption` is always one of the
+     * options the form itself rendered, verified by
+     * `findDeclineAnalogOption` to be anchored to the whole option text, not
+     * a substring match that could smuggle a compound option like "Not
+     * Applicable — I am not a protected veteran" through as if it were a
+     * plain decline. The invariant this comment used to state literally
+     * ("EEO answers never appear here") now holds in the narrower form that
+     * matters: no demographic identity is ever fabricated, defaulted, or
+     * transmitted, only ever a decline the form itself offered.
      */
     answerProvenance: jsonb("answer_provenance"),
     createdAt: timestamp("created_at", { withTimezone: true })

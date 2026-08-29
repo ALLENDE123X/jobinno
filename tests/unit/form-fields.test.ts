@@ -839,4 +839,34 @@ describe("findDeclineAnalogOption, the widened EEO decline lookup", () => {
     // country or state list is exactly where a stray match would be costly.
     expect(findDeclineAnalogOption(["Nevada"])).toBeNull();
   });
+
+  it("does not select a demographic identity claim disguised behind an \"N/A\" or \"Not Applicable\" prefix", () => {
+    // Red team finding: a real OFCCP style Workday derived veteran or
+    // disability question phrases its negative option as a full sentence,
+    // and "N/A" or "Not Applicable" is commonly prepended to it. Before the
+    // fix, the bare word boundary alternatives matched this as a substring
+    // and `.find()` returned the whole sentence, an identity claim, to be
+    // typed into the form and written to `answer_provenance` verbatim.
+    const options = [
+      "I am a protected veteran",
+      "Not Applicable — I am not a protected veteran",
+    ];
+    expect(findDeclineAnalogOption(options)).toBeNull();
+
+    const disabilityOptions = [
+      "Yes, I have a disability",
+      "No, I do not have a disability",
+      "N/A — I choose to self identify as having no disability",
+    ];
+    expect(findDeclineAnalogOption(disabilityOptions)).toBeNull();
+  });
+
+  it("still matches a bare \"N/A\" or \"Not Applicable\" option, including with incidental whitespace", () => {
+    // The anchoring fix above must not regress the safe cases it exists to
+    // protect: the exact phrasings real SmartRecruiters and Breezy forms use.
+    expect(findDeclineAnalogOption(["N/A"])).toBe("N/A");
+    expect(findDeclineAnalogOption(["Not Applicable"])).toBe("Not Applicable");
+    expect(findDeclineAnalogOption(["N/A "])).toBe("N/A ");
+    expect(findDeclineAnalogOption([" Not Applicable"])).toBe(" Not Applicable");
+  });
 });
