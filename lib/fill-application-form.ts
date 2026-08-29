@@ -236,6 +236,7 @@ import {
   enumerateFormFields,
   enumerateRepeatingSections,
   findDeclineOption,
+  findDeclineAnalogOption,
   pressAddEntry,
   pressCommitEntry,
   sectionStillUnsatisfied,
@@ -263,6 +264,7 @@ import {
   sameStoredAnswers,
   withStoredAnswers,
   answerProvenanceEntry,
+  fabricatedEeoDeclineProvenanceEntry,
   resolveAnswer,
   type AnswerProvenanceEntry,
   type StoredAnswer,
@@ -4798,7 +4800,22 @@ function booleanAnswer(text: string): boolean | null {
 
 /** What the policy decided to do with one field, once every check has run. */
 type Resolution =
-  | { kind: "apply"; value: string; declined: boolean; note: string }
+  | {
+      kind: "apply";
+      value: string;
+      declined: boolean;
+      note: string;
+      /**
+       * JOB-262. True only for the SmartRecruiters and Breezy carve out: a
+       * required self identification question offered no option
+       * `DECLINE_OPTION_RE` recognises, but did offer one the wider
+       * `EEO_DECLINE_ANALOG_RE` does. The caller uses this to write a
+       * `"fabricated_eeo_decline"` row to `applications.answer_provenance`
+       * so an audit can tell this apart from an ordinary, explicitly labelled
+       * decline. Absent (or false) on every other `apply` resolution.
+       */
+      fabricatedDecline?: boolean;
+    }
   | { kind: "generate"; note: string }
   | { kind: "ask"; question: string; why: string }
   | { kind: "skip"; why: string };
@@ -5003,6 +5020,14 @@ function asksAQuestion(label: string): boolean {
 }
 
 /**
+ * JOB-262. The only two boards the widened EEO decline analog carve out
+ * applies to, matching `state.ats` (`jobs.ats`) verbatim — see
+ * `lib/ats-boards.ts` for where those exact strings come from. Ticket scope
+ * was explicit: SmartRecruiters and Breezy only, nothing else touched.
+ */
+const EEO_DECLINE_FABRICATION_ATS = new Set(["smartrecruiters", "breezy"]);
+
+/**
  * The answering policy, enforced.
  *
  * `decideFieldAnswers` states the same rules to the model in English; this
@@ -5027,11 +5052,28 @@ function asksAQuestion(label: string): boolean {
  * all, whether a degree abbreviation spelled differently from a dropdown, a
  * date field with no matching fact key, or a question about office preference,
  * ended the application. It ended 18 of 21 of them on 2026 08 20.
+ *
+ * ── JOB-262: the SmartRecruiters and Breezy decline carve out ─────────────
+ * `ats` is `state.ats` (`jobs.ats`), threaded through so the demographic
+ * branch below can tell which board it is looking at. It changes exactly one
+ * thing, and only for `EEO_DECLINE_FABRICATION_ATS`: when a required
+ * self-identification question offers no option `DECLINE_OPTION_RE`
+ * recognises, the wider `EEO_DECLINE_ANALOG_RE` (adds "N/A" and "not
+ * applicable") gets a second look at the same options before the question is
+ * escalated. Everything else about the branch is unchanged, on every board:
+ * an optional question is still skipped, a question with a real decline
+ * option is still answered by it, and a question where every offered choice
+ * is a substantive identity claim still escalates. See
+ * `feedback_pipeline_may_fabricate_form_answers` (memory, 2026-08-26) for the
+ * product decision this narrows, and HARD STOP 10 in CLAUDE.md for the line
+ * this never crosses: nothing here ever asserts an identity, it only ever
+ * picks an option the form itself already offered.
  */
 export function resolveDecision(
   field: EnumeratedField,
   decision: FieldDecision | undefined,
-  facts: ReadonlyMap<string, CandidateFact>
+  facts: ReadonlyMap<string, CandidateFact>,
+  ats?: string
 ): Resolution {
   // Where a failed check goes. Bound once, at the top, so that no branch below
   // can accidentally keep the old unconditional stop: every `refuse` in this
@@ -5080,6 +5122,25 @@ export function resolveDecision(
           "a required self-identification question, answered by declining to self-identify — " +
           "the only truthful answer available without asserting a demographic identity",
       };
+    }
+    // JOB-262. Scoped to `EEO_DECLINE_FABRICATION_ATS` and to a form whose
+    // options were actually read, so a page this system never opened a menu
+    // on cannot silently be treated as offering nothing but identity claims.
+    if (ats !== undefined && EEO_DECLINE_FABRICATION_ATS.has(ats) && field.optionsKnown) {
+      const analog = findDeclineAnalogOption(field.options);
+      if (analog !== null) {
+        return {
+          kind: "apply",
+          value: analog,
+          declined: true,
+          fabricatedDecline: true,
+          note:
+            "a required self-identification question offering no explicitly labelled decline " +
+            `option, answered by selecting "${analog}" — the closest honest-adjacent choice ` +
+            "the form itself offers, chosen instead of inventing a demographic identity for a " +
+            "real person",
+        };
+      }
     }
     return askAbout(
       field,
@@ -5697,6 +5758,11 @@ async function fillRepeatingSections(
 
       for (const field of fresh) {
         const decision = byKey.get(field.key);
+        // JOB-262's `ats` parameter is deliberately NOT passed here. A
+        // repeating work/education entry has no self-identification field to
+        // begin with, and this function's own header already promises it
+        // "deliberately never fabricates" — that stays true rather than
+        // gaining a silent exception nothing here would ever exercise.
         const resolution = resolveDecision(field, decision, factsByKey);
 
         // Nothing in a work or education entry is a prose question, so a
@@ -6126,11 +6192,18 @@ async function fillRemainingFields(
   });
   const byKey = new Map(decisions.map((decision) => [decision.fieldKey, decision]));
 
+  // JOB-262. Filled only by the SmartRecruiters and Breezy EEO decline analog
+  // carve out below, and merged into this function's own `answerProvenance`
+  // at the very end alongside the JOB-170 fabrication rung's entries and the
+  // repeating-sections pass's (always empty). Declared here, ahead of Step 6,
+  // because that is the only place `resolution.fabricatedDecline` is ever set.
+  const fabricatedDeclineProvenance: AnswerProvenanceEntry[] = [];
+
   // ── Step 6: policy, then action, then read-back ──────────────────────────
   let generated = 0;
   for (const field of undecided) {
     const decision = byKey.get(field.key);
-    const resolution = resolveDecision(field, decision, factsByKey);
+    const resolution = resolveDecision(field, decision, factsByKey, state.ats);
 
     if (resolution.kind === "skip") {
       record(field, "skipped", null, `left blank — ${resolution.why}`);
@@ -6144,6 +6217,7 @@ async function fillRemainingFields(
     let value: string;
     let note: string;
     let declined = false;
+    let fabricatedDecline = false;
 
     if (resolution.kind === "generate") {
       if (generated >= MAX_GENERATED_ANSWERS) {
@@ -6186,6 +6260,7 @@ async function fillRemainingFields(
       value = resolution.value;
       note = resolution.note;
       declined = resolution.declined;
+      fabricatedDecline = resolution.fabricatedDecline === true;
     }
 
     await humanizedSleep(
@@ -6236,6 +6311,19 @@ async function fillRemainingFields(
     if (outcome.ok) {
       record(field, declined ? "declined" : "filled", outcome.typedValue, `${note}; ${outcome.detail}`, outcome.readBack);
       console.log(`${LOG} ${field.label}: ${declined ? "declined to answer" : "filled"} + verified`);
+      // JOB-262. Logged only once the option has actually landed on the form
+      // and read back correctly — the same "provenance follows a verified
+      // apply" rule the JOB-170 fabrication rung follows below.
+      if (fabricatedDecline) {
+        fabricatedDeclineProvenance.push(
+          fabricatedEeoDeclineProvenanceEntry({
+            fieldKey: field.key,
+            fieldLabel: field.label,
+            questionText: field.label,
+            chosenOption: outcome.typedValue,
+          })
+        );
+      }
       continue;
     }
     if (outcome.readBack !== "") {
@@ -6680,7 +6768,11 @@ async function fillRemainingFields(
   return {
     outcomes,
     needsInput: [...afterFabrication, ...repeatingNeedsInput],
-    answerProvenance: [...repeating.answerProvenance, ...answerProvenance],
+    answerProvenance: [
+      ...repeating.answerProvenance,
+      ...fabricatedDeclineProvenance,
+      ...answerProvenance,
+    ],
   };
 }
 

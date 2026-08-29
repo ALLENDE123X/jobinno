@@ -240,6 +240,56 @@ export function findDeclineOption(options: readonly string[]): string | null {
   return options.find((option) => DECLINE_OPTION_RE.test(option)) ?? null;
 }
 
+/**
+ * JOB-262. A wider set of decline shaped phrasings than `DECLINE_OPTION_RE`
+ * matches, for the narrow SmartRecruiters and Breezy carve out described on
+ * `resolveDecision`'s EEO branch in `fill-application-form.ts`.
+ *
+ * Adds "N/A" and "not applicable", the two honest adjacent phrasings a real
+ * Bosch Group and Wabtec Engineering form on SmartRecruiters, and a real
+ * VetsEZ Tampa Cloud Integration form on Breezy, each offered on a required
+ * self identification question on 2026 08 28 without offering anything
+ * `DECLINE_OPTION_RE` recognises. Neither phrase states a demographic
+ * identity; both report that the candidate is not making a claim, which is
+ * the same statement "prefer not to answer" makes in different words.
+ *
+ * Deliberately additive rather than a change to `DECLINE_OPTION_RE` itself.
+ * That pattern also gates the legal attestation ladder (`declineOrAsk`) and
+ * every other board's demographic questions, and widening it there was never
+ * asked for and was never verified against a real form on those boards.
+ *
+ * The two new alternatives are anchored to the whole (trimmed) option with
+ * `^` and `$`, not left as a bare word boundary match. A red team review of
+ * this PR reproduced a compound option, "Not Applicable — I am not a
+ * protected veteran", the exact OFCCP style phrasing a real Workday derived
+ * veteran or disability question uses: "N/A" or "Not Applicable" prepended
+ * to a full sentence that itself asserts a demographic identity. A bare
+ * `\bnot\s+applicable\b` matches that whole string as a substring and
+ * `.find()` then returns the entire sentence, including the identity claim,
+ * to be typed into the form and recorded in `answer_provenance` verbatim —
+ * exactly the fabrication this ticket exists to prevent. Anchoring each new
+ * alternative to the full option (`\s*` absorbing incidental whitespace)
+ * means the phrase has to be the whole answer, not merely present in it, so
+ * a compound option like that one falls through to `null` instead.
+ */
+export const EEO_DECLINE_ANALOG_RE = new RegExp(
+  `${DECLINE_OPTION_RE.source}|^\\s*n/a\\s*$|^\\s*not\\s+applicable\\s*$`,
+  "i"
+);
+
+/**
+ * The option in `options` that functions as a decline under the wider
+ * JOB-262 pattern above, or null.
+ *
+ * Never a decision on its own about whether picking it is allowed. The `ats`
+ * gate and the "only when the option itself is decline shaped" rule both
+ * live in `resolveDecision`, so this stays a pure lookup, the same shape as
+ * `findDeclineOption`.
+ */
+export function findDeclineAnalogOption(options: readonly string[]): string | null {
+  return options.find((option) => EEO_DECLINE_ANALOG_RE.test(option)) ?? null;
+}
+
 // ───────────────────────────────────
 // Perception — the DOM, and only the DOM
 // ───────────────────────────────────

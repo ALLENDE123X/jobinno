@@ -1858,6 +1858,143 @@ describe("a veteran status question is caught whatever a board calls it", () => 
 
 // ═══════════════════════════════════════════════════════════════════════════
 /**
+ * JOB-262: SmartRecruiters and Breezy only, and only when the form itself
+ * offers something honest adjacent. The fixtures are the three rows from the
+ * 2026 08 28 live verify pass that stopped at `needs_attestation`:
+ *
+ *  · Bosch Group (SR) and Wabtec Engineering (SR) — a demographic select that
+ *    offered "N/A" but nothing `DECLINE_OPTION_RE` recognised.
+ *  · VetsEZ Tampa Cloud Integration (Breezy) — "Are you a veteran of any
+ *    branch of the United States Armed Forces", a plain Yes/No with no
+ *    honest adjacent option at all, which stays escalated on purpose.
+ */
+describe("JOB-262: the SmartRecruiters and Breezy EEO decline analog carve out", () => {
+  it("selects \"N/A\" on SmartRecruiters when nothing DECLINE_OPTION_RE recognises is offered", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Race/Ethnicity",
+        kind: "select",
+        options: ["Hispanic or Latino", "White", "Black or African American", "N/A"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "race/ethnicity", decision: "infer", value: "White", why: "best guess" }),
+      facts(),
+      "smartrecruiters"
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("N/A");
+      expect(resolution.declined).toBe(true);
+      expect(resolution.fabricatedDecline).toBe(true);
+    }
+  });
+
+  it("selects \"Not Applicable\" on Breezy the same way", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Gender Identity",
+        kind: "select",
+        options: ["Male", "Female", "Non-binary", "Not Applicable"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "gender identity", decision: "infer", value: "Male", why: "best guess" }),
+      facts(),
+      "breezy"
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Not Applicable");
+      expect(resolution.fabricatedDecline).toBe(true);
+    }
+  });
+
+  it("still escalates a veteran question with no honest adjacent option at all, ats or not", () => {
+    // The VetsEZ Tampa Cloud Integration case: a plain Yes/No leaves nothing
+    // for the widened pattern to find either, so the fabrication path never
+    // engages and `needs_attestation` behaviour is preserved.
+    const resolution = resolveDecision(
+      field({
+        label: "Are you a veteran of any branch of the United States Armed Forces?",
+        kind: "radio",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "veteran", decision: "infer", value: "No", why: "best guess" }),
+      facts(),
+      "breezy"
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+
+  it("does not widen the decline search on any other board", () => {
+    // Same options as the Bosch fixture above, but no ats — or an ats outside
+    // the ticket's scope — must still stop the run rather than picking "N/A".
+    // This is the boundary the ticket's non-goals list by name: Ashby, Lever,
+    // Workable, Greenhouse, Recruitee, BambooHR and JazzHR are all untouched.
+    for (const ats of [undefined, "ashby", "greenhouse", "lever", "workable"]) {
+      const resolution = resolveDecision(
+        field({
+          label: "Race/Ethnicity",
+          kind: "select",
+          options: ["Hispanic or Latino", "White", "Black or African American", "N/A"],
+          optionsKnown: true,
+          required: true,
+        }),
+        decision({ fieldKey: "race/ethnicity", decision: "infer", value: "White", why: "best guess" }),
+        facts(),
+        ats
+      );
+      expect(resolution.kind).toBe("ask");
+    }
+  });
+
+  it("still prefers an explicitly labelled decline option over the widened search", () => {
+    // A real decline option, even on an ats in the carve out, is answered by
+    // `findDeclineOption` exactly as before — the widened search only ever
+    // runs once that has already come back null.
+    const resolution = resolveDecision(
+      field({
+        label: "Gender",
+        kind: "select",
+        options: ["Male", "Female", "Decline to self identify"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "gender", decision: "infer", value: "Male", why: "best guess" }),
+      facts(),
+      "smartrecruiters"
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Decline to self identify");
+      expect(resolution.fabricatedDecline).toBeUndefined();
+    }
+  });
+
+  it("never widens the search when the form's options could not be read", () => {
+    // `optionsKnown: false` means this system never actually saw what the
+    // control offers, so it must never be treated as though it offered "N/A".
+    const resolution = resolveDecision(
+      field({
+        label: "Disability Status",
+        kind: "select",
+        options: [],
+        optionsKnown: false,
+        required: true,
+      }),
+      decision({ fieldKey: "disability status", decision: "infer", value: "No", why: "best guess" }),
+      facts(),
+      "smartrecruiters"
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+/**
  * JOB-101: the intake answers that were blocking real applications, and the
  * jurisdiction rule that closes issue #108.
  *
