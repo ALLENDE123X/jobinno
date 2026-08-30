@@ -500,6 +500,100 @@ describe("SRScreeningDropdownAdapter.commit", () => {
   });
 
   /**
+   * JOB-293 MINOR-1. If a caller ever passes an outer wrapper selector
+   * that contains more than one combobox (say an `.sr-field-group` that
+   * groups two sibling screening questions), the prior descendant
+   * fallback in `widgetResolverSource` returned the first match from
+   * `querySelector` and `commit` happily dispatched events on the wrong
+   * widget while reporting `committed`. The new rule requires the
+   * descendant search to find exactly one widget: on ambiguity the
+   * resolver returns null and `commit` reports `adapter_failed` so the
+   * caller can rely on the visible click path alone.
+   *
+   * This case exercises an outer wrapper naming two sibling comboboxes
+   * with their own hidden `<select>` mirrors and asserts:
+   *
+   *   - The commit result is `adapter_failed` with a reason that names
+   *     the resolution problem.
+   *   - Neither combobox received any `input` or `change` event.
+   *   - Neither hidden `<select>` had its value written.
+   *
+   * No current caller passes such a wrapper (see `selectDropdown` in
+   * `lib/agent/tools.ts`), so this is a guard for future callers rather
+   * than a bug that fires today.
+   */
+  it("ambiguous wrapper with two combobox children returns adapter_failed and touches nothing", async () => {
+    document.body.innerHTML = `
+      <form>
+        <div class="sr-field-group" id="ambiguous-wrapper">
+          <div class="sr-field">
+            <div id="qA" role="combobox" aria-haspopup="listbox">
+              <ul role="listbox">
+                <li role="option" data-value="yes">Yes</li>
+              </ul>
+            </div>
+            <select id="qA-hidden" name="qA_hidden" style="display:none">
+              <option value="">--</option>
+              <option value="yes">Yes</option>
+            </select>
+          </div>
+          <div class="sr-field">
+            <div id="qB" role="combobox" aria-haspopup="listbox">
+              <ul role="listbox">
+                <li role="option" data-value="yes">Yes</li>
+              </ul>
+            </div>
+            <select id="qB-hidden" name="qB_hidden" style="display:none">
+              <option value="">--</option>
+              <option value="yes">Yes</option>
+            </select>
+          </div>
+        </div>
+      </form>
+    `;
+
+    const events: Array<{ type: string; targetId: string }> = [];
+    const capture = (event: Event): void => {
+      const target = event.target as HTMLElement | null;
+      events.push({ type: event.type, targetId: target?.id ?? "" });
+    };
+    document.addEventListener("input", capture, true);
+    document.addEventListener("change", capture, true);
+
+    const adapter = new SRScreeningDropdownAdapter();
+    const result = await adapter.commit(
+      fakePage(SR_URL),
+      "#ambiguous-wrapper",
+      "Yes"
+    );
+
+    document.removeEventListener("input", capture, true);
+    document.removeEventListener("change", capture, true);
+
+    expect(result.status).toBe("adapter_failed");
+    expect(result.adapterName).toBe("SRScreeningDropdownAdapter");
+    expect(result.detail).toContain("no unique widget");
+
+    // Neither sibling combobox saw an event and neither hidden select
+    // was written; the wrapper itself must not have been treated as a
+    // widget either.
+    const widgetEvents = events.filter(
+      (e) =>
+        e.targetId === "qA" ||
+        e.targetId === "qB" ||
+        e.targetId === "qA-hidden" ||
+        e.targetId === "qB-hidden" ||
+        e.targetId === "ambiguous-wrapper"
+    );
+    expect(widgetEvents).toEqual([]);
+
+    const qAHidden = document.querySelector<HTMLSelectElement>("#qA-hidden");
+    const qBHidden = document.querySelector<HTMLSelectElement>("#qB-hidden");
+    expect(qAHidden?.value).toBe("");
+    expect(qBHidden?.value).toBe("");
+  });
+
+  /**
    * The option (a) fallback: when no `.sr-field` or `[data-field]`
    * wraps the widget, the scope collapses to the widget's direct
    * parent's direct children only. A hidden input two ancestor levels
