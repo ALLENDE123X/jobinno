@@ -187,6 +187,28 @@ describe("AgentSnapshotSchema", () => {
       })
     ).toThrow();
   });
+
+  it("rejects two fields sharing the same ref", () => {
+    // Two producers emitting one ref used to fold into a single entry by
+    // the Map in `buildDiffSnapshot`, dropping the loser from every diff.
+    // JOB-287 closes that at the schema boundary.
+    const result = AgentSnapshotSchema.safeParse({
+      url: "https://example.test",
+      title: "Apply",
+      fields: [
+        validField,
+        { ...validField, label: "Work email", value: "work@example.test" },
+      ],
+      sections: [],
+      capturedAt: 0,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((i) => i.message)).toContain(
+        "AgentSnapshot fields must have unique refs"
+      );
+    }
+  });
 });
 
 describe("AgentSnapshotDiffSchema", () => {
@@ -205,11 +227,14 @@ describe("AgentSnapshotDiffSchema", () => {
   });
 
   it("accepts a fully populated diff with all three field level moves", () => {
+    // The refs across `added`, `removed`, and `updated` must be disjoint
+    // (and likewise the section refs), which the JOB-287 uniqueness refine
+    // enforces; each move below names its own field and section.
     expect(() =>
       AgentSnapshotDiffSchema.parse({
         url: "https://example.test/apply",
         title: "Apply",
-        added: [validField],
+        added: [{ ...validField, ref: "field_added" }],
         removed: ["field_removed"],
         updated: [
           {
@@ -219,7 +244,7 @@ describe("AgentSnapshotDiffSchema", () => {
           },
         ],
         sections: {
-          added: [validSection],
+          added: [{ ...validSection, ref: "section_added" }],
           removed: ["section_removed"],
           changed: [{ ...validSection, hash: "1111111111111111" }],
         },
@@ -250,5 +275,87 @@ describe("AgentSnapshotDiffSchema", () => {
         capturedAt: 2,
       })
     ).toThrow();
+  });
+
+  it("rejects two added entries sharing the same ref", () => {
+    const result = AgentSnapshotDiffSchema.safeParse({
+      url: "https://example.test/apply",
+      title: "Apply",
+      added: [validField, { ...validField, label: "Work email" }],
+      removed: [],
+      updated: [],
+      sections: { added: [], removed: [], changed: [] },
+      capturedAt: 2,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((i) => i.message)).toContain(
+        "diff field refs must be unique across added, removed, and updated"
+      );
+    }
+  });
+
+  it("rejects the same ref appearing in both added and updated", () => {
+    // A field cannot be added and updated in the same diff; a builder or
+    // hand rolled diff that says so is contradicting itself.
+    const result = AgentSnapshotDiffSchema.safeParse({
+      url: "https://example.test/apply",
+      title: "Apply",
+      added: [validField],
+      removed: [],
+      updated: [
+        {
+          ref: validField.ref,
+          before: { ...validField, value: null },
+          after: validField,
+        },
+      ],
+      sections: { added: [], removed: [], changed: [] },
+      capturedAt: 2,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((i) => i.message)).toContain(
+        "diff field refs must be unique across added, removed, and updated"
+      );
+    }
+  });
+
+  it("rejects the same ref appearing in both added and removed", () => {
+    const result = AgentSnapshotDiffSchema.safeParse({
+      url: "https://example.test/apply",
+      title: "Apply",
+      added: [validField],
+      removed: [validField.ref],
+      updated: [],
+      sections: { added: [], removed: [], changed: [] },
+      capturedAt: 2,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects duplicate refs across sections.added", () => {
+    const result = AgentSnapshotDiffSchema.safeParse({
+      url: "https://example.test/apply",
+      title: "Apply",
+      added: [],
+      removed: [],
+      updated: [],
+      sections: {
+        added: [
+          validSection,
+          { ...validSection, label: "Education", hash: "2222222222222222" },
+        ],
+        removed: [],
+        changed: [],
+      },
+      capturedAt: 2,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((i) => i.message)).toContain(
+        "diff section refs must be unique across sections.added, sections.removed, and sections.changed"
+      );
+    }
   });
 });

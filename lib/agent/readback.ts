@@ -21,13 +21,17 @@
 
 import { createHash } from "node:crypto";
 
-import type {
-  AgentSnapshot,
-  AgentSnapshotDiff,
-  FieldKind,
-  FieldNode,
-  FieldValidationState,
-  SectionHandle,
+import type { ZodIssue } from "zod";
+
+import {
+  AgentSnapshotDiffSchema,
+  AgentSnapshotSchema,
+  type AgentSnapshot,
+  type AgentSnapshotDiff,
+  type FieldKind,
+  type FieldNode,
+  type FieldValidationState,
+  type SectionHandle,
 } from "@/lib/agent/snapshot-types";
 
 /**
@@ -377,7 +381,17 @@ export async function buildFullSnapshot(
   page: AgentSnapshotSource,
   options: SnapshotOptions = {}
 ): Promise<AgentSnapshot> {
-  const snapshot = await captureSnapshot(page, options);
+  // The capture builds a value typed as `AgentSnapshot`, but nothing parses
+  // it through `AgentSnapshotSchema` on the way out. Without the parse the
+  // schema refinements never fire and a producer bug (two fields sharing a
+  // ref) rides through to the Map dedup in `buildDiffSnapshot`, dropping a
+  // field from every diff. Parse here so such a bug surfaces as an error
+  // naming the builder, ahead of the byte budget check that measures a
+  // snapshot that is already known to be well formed.
+  const snapshot = assertSnapshotValid(
+    "buildFullSnapshot",
+    await captureSnapshot(page, options)
+  );
   const limit = options.maxBytes ?? SNAPSHOT_MAX_BYTES;
   enforceByteBudget(JSON.stringify(snapshot), limit);
   return snapshot;
@@ -429,6 +443,55 @@ function enforceByteBudget(serialized: string, limit: number): void {
 }
 
 /**
+ * Format one Zod issue for an error message: the failing path (or `(root)`
+ * for a refine that is not scoped to a single field) followed by the
+ * issue's own message, so a producer debugging a rejected snapshot does not
+ * need to run the parse again to find where it failed.
+ */
+function describeZodIssue(issue: ZodIssue): string {
+  const path = issue.path.length > 0 ? issue.path.join(".") : "(root)";
+  return `${path}: ${issue.message}`;
+}
+
+/**
+ * Parse a full snapshot through `AgentSnapshotSchema`. Nothing wired the
+ * schema in at the build boundary before JOB-287, so the sectionRef and
+ * ref uniqueness refinements never fired at runtime and a producer bug
+ * could ride through to the Map dedup in `buildDiffSnapshot` silently.
+ * Rejects with a message naming the builder so the agent loop can tell a
+ * producer bug apart from a budget failure.
+ */
+function assertSnapshotValid(
+  label: string,
+  snapshot: AgentSnapshot
+): AgentSnapshot {
+  const parsed = AgentSnapshotSchema.safeParse(snapshot);
+  if (parsed.success) return parsed.data;
+  throw new Error(
+    `${label} produced an AgentSnapshot rejected by AgentSnapshotSchema ` +
+      `(${parsed.error.issues.map(describeZodIssue).join("; ")})`
+  );
+}
+
+/**
+ * Parse a diff through `AgentSnapshotDiffSchema`, mirroring
+ * `assertSnapshotValid` for the diff shape so a hand built diff that
+ * contradicts itself (a ref in two of `added`, `removed`, and `updated`)
+ * fails here rather than confusing the agent loop.
+ */
+function assertDiffValid(
+  label: string,
+  diff: AgentSnapshotDiff
+): AgentSnapshotDiff {
+  const parsed = AgentSnapshotDiffSchema.safeParse(diff);
+  if (parsed.success) return parsed.data;
+  throw new Error(
+    `${label} produced an AgentSnapshotDiff rejected by AgentSnapshotDiffSchema ` +
+      `(${parsed.error.issues.map(describeZodIssue).join("; ")})`
+  );
+}
+
+/**
  * Deep equality on the fields that matter to the diff. Compares the shape
  * a caller would actually look at, not the whole object, so a change in
  * `optionSetHash` alone (options list rewritten but no value change) does
@@ -472,7 +535,10 @@ export async function buildDiffSnapshot(
   page: AgentSnapshotSource,
   options: SnapshotOptions = {}
 ): Promise<AgentSnapshotDiff> {
-  const current = await captureSnapshot(page, options);
+  const current = assertSnapshotValid(
+    "buildDiffSnapshot",
+    await captureSnapshot(page, options)
+  );
 
   const prevByRef = new Map(prev.fields.map((f) => [f.ref, f]));
   const currByRef = new Map(current.fields.map((f) => [f.ref, f]));
@@ -528,7 +594,8 @@ export async function buildDiffSnapshot(
     capturedAt: current.capturedAt,
   };
 
+  const validated = assertDiffValid("buildDiffSnapshot", diff);
   const limit = options.maxBytes ?? SNAPSHOT_MAX_BYTES;
-  enforceByteBudget(JSON.stringify(diff), limit);
-  return diff;
+  enforceByteBudget(JSON.stringify(validated), limit);
+  return validated;
 }
