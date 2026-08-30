@@ -4105,6 +4105,26 @@ export function buildFactCatalog(
     add(`work${index}.title`, `${where}: job title${from}`, entry.title);
     add(`work${index}.dates`, `${where}: dates${from}`, joinDates(entry.startDate, entry.endDate));
     add(`work${index}.summary`, `${where}: what they did${from}`, entry.summary);
+    // JOB-270. Kept apart from the joined `work${index}.dates` above so a form
+    // with separate Start Date / End Date controls — SmartRecruiters' OneClick
+    // UI Experience widget among them — has one fact per control to cite,
+    // rather than a decision call splitting one joined string across two
+    // fields. A still-ongoing role's end date is never exposed this way: the
+    // resume's own "Present" is not a date a form field should hold, and
+    // `work${index}.isCurrent` is what backs the widget's own "I currently
+    // work here" checkbox instead — see `fillRepeatingSections`.
+    const ongoing = isOngoingRole(entry.endDate);
+    add(`work${index}.startDate`, `${where}: start date${from}`, entry.startDate);
+    if (!ongoing) {
+      add(`work${index}.endDate`, `${where}: end date${from}`, entry.endDate);
+    }
+    if (entry.startDate !== null || entry.endDate !== null) {
+      add(
+        `work${index}.isCurrent`,
+        `${where}: currently employed here${from}`,
+        ongoing ? "Yes" : "No"
+      );
+    }
   });
   const experience = totalYearsOfExperience(profile.workHistory);
   if (experience !== null) {
@@ -4358,6 +4378,19 @@ function joinDates(start: string | null, end: string | null): string | null {
   if (from === "") return to;
   if (to === "") return from;
   return `${from} to ${to}`;
+}
+
+/**
+ * JOB-270. A work entry with no real end date: blank, a bare "-" or "N/A", or
+ * the resume's own "Present"/"Current"/"Now"/"Ongoing". `totalYearsOfExperience`
+ * below applies the same test to the same set of strings for its own count;
+ * kept as a separate function rather than shared so a change to one's rounding
+ * behaviour can never silently change what `buildFactCatalog` states about a
+ * still-ongoing role.
+ */
+export function isOngoingRole(endDate: string | null | undefined): boolean {
+  const text = (endDate ?? "").trim();
+  return text === "" || text === "-" || /^(present|current|now|ongoing|n\/a)$/i.test(text);
 }
 
 /**
@@ -5945,6 +5978,44 @@ async function awaitStableForm(session: BrowserSession): Promise<void> {
 }
 
 /**
+ * JOB-270. Which repeating section is the work-history one, by its own
+ * heading. "Experience" and "Education" are the two SmartRecruiters shows
+ * through this same widget, and only the first is backed by
+ * `profile.workHistory` — the deterministic current-role handling below must
+ * never run against an education entry's own graduation date.
+ */
+export const EXPERIENCE_SECTION_HEADING_RE = /\bexperience\b/i;
+
+/**
+ * JOB-270. The "I currently work here" checkbox SmartRecruiters' OneClick UI
+ * Experience widget shows beside the End Date field, worded some variant of
+ * "currently work(ing) here", "still employed (here)" or "current
+ * position/role/job". Matched against a checkbox field's own label so a
+ * still-ongoing role is stated by ticking the board's own control rather than
+ * by typing "Present" into a field built to hold a real date.
+ *
+ * ── Rewritten after review on this PR ───────────────────────────────────────
+ * The first version matched bare "currently work(ing)" or "still work(ing)"
+ * anywhere in a label, which also matched "Are you currently working at
+ * another job?", "Are you currently working for a competitor?", "Do you
+ * currently work for the company you are applying to?" and "Are you currently
+ * working towards a degree?" — four questions this widget's own checkbox never
+ * asks, and every one of them would have been ticked "Yes" as though the
+ * candidate had said their most recent role was ongoing. This version requires
+ * the verb to be anchored to the role itself — "here", "at/in this
+ * company/job/position/role" — or to be one of the fixed phrases a checkbox
+ * actually uses for its own label: "current position/role/job", "present job"
+ * or "still employed" on its own. It also picks up two wordings the first
+ * version missed because "still" only ever paired with "work": "I am still
+ * employed here" and "I am still employed" with no "here" at all.
+ */
+export const CURRENT_ROLE_CHECKBOX_RE =
+  /\b(currently|still)\s+(work(ing)?|employed)\s+(here|at\s+this\s+(?:company|job|position|role)|in\s+this\s+(?:position|role))\b|\bcurrent(?:ly)?\s+(?:position|role|job)\b|\bpresent\s+job\b|\bstill\s+employed\b/i;
+
+/** JOB-270. The Experience entry's End Date field, by its own label. */
+export const END_DATE_FIELD_RE = /\bend\s*date\b/i;
+
+/**
  * Fills the required repeating sections a form opens with, one entry each.
  *
  * ── Why this exists ─────────────────────────────────────────────────────────
@@ -5967,6 +6038,31 @@ async function awaitStableForm(session: BrowserSession): Promise<void> {
  * so a model can tell an education entry's dates from a work entry's, and that
  * label travels as data in a typed field of a tool-free call, exactly as every
  * other form label already does.
+ *
+ * ── JOB-270: the Experience section's own current-role handling ────────────
+ * `buildFactCatalog` now carries `work0.startDate`, `work0.endDate` (present
+ * only for a role that has actually ended) and `work0.isCurrent` alongside the
+ * existing `work0.employer` / `work0.title` / `work0.summary`, so the ordinary
+ * decide-then-apply path above already fills Company, Job Title, Start Date
+ * and Description from the candidate's own most recent job. What it cannot
+ * safely do is a still-ongoing role's End Date: the resume records that as
+ * "Present", and typing "Present" into a real date widget is not a smaller
+ * version of typing the actual date, it is a wrong value on a real
+ * application. So before any of that runs, this function ticks the section's
+ * own "currently work here" checkbox when the resume says the role is
+ * ongoing, and leaves End Date untouched rather than guessing at it — see the
+ * block below the mount log. A resume with no work history at all supplies
+ * none of the `work0.*` facts, so this block never fires and the section
+ * falls through to the ordinary escalation every other unbacked required
+ * section already gets.
+ *
+ * Gated on `isSmartRecruitersPage`, strictly, in addition to the heading and
+ * fact checks above: `EXPERIENCE_SECTION_HEADING_RE` is a plain
+ * `/\bexperience\b/i` and would just as happily match "Experience" or "Work
+ * Experience" on a Greenhouse or Lever form. This ticket is scoped to
+ * SmartRecruiters' own OneClick UI widget and every other board is a named
+ * non-goal, so the board check is what actually keeps this block inert
+ * everywhere else rather than the heading regex alone.
  */
 async function fillRepeatingSections(
   session: BrowserSession,
@@ -6026,9 +6122,115 @@ async function fillRepeatingSections(
           fresh.map((f) => `${f.label}${f.required ? "*" : ""}`).join(", ")
       );
 
+      const escalate = (field: EnumeratedField, question: string, why: string): void => {
+        needsInput.push({
+          key: field.key,
+          fieldLabel: `${section.heading}: ${field.label}`,
+          question,
+          why,
+          required: field.required,
+          kind: field.kind,
+          ...(field.optionsKnown && field.options.length > 0 ? { options: field.options } : {}),
+        });
+      };
+
+      // JOB-270. Handled outside the ordinary decide-then-apply path below, and
+      // removed from `fresh` before that path ever sees them — see this
+      // function's own header for why an End Date field is never handed a
+      // guessed value. Keys land here only for the section whose heading is
+      // actually "Experience", only on a SmartRecruiters page (this ticket is
+      // scoped there and nowhere else — `EXPERIENCE_SECTION_HEADING_RE` alone
+      // would also match "Experience" on a Greenhouse or Lever form, which is
+      // not this ticket's board), and only when the resume's most recent role
+      // has no end date, so an education entry's own dates, and a work entry
+      // that did end, are both untouched by this block. And End Date is only
+      // ever marked handled once a checkbox was actually found to tick in its
+      // place — a board whose wording this system does not recognize gets no
+      // silent substitute and End Date falls through to the ordinary
+      // decide-then-apply path below, which escalates it like any other
+      // required field nothing here could answer.
+      const currentRoleHandled = new Set<string>();
+      if (
+        EXPERIENCE_SECTION_HEADING_RE.test(section.heading) &&
+        (await isSmartRecruitersPage(session.page))
+      ) {
+        const isCurrentRole = factsByKey.get("work0.isCurrent")?.value === "Yes";
+        if (isCurrentRole) {
+          const checkbox = fresh.find(
+            (field) => field.kind === "checkbox" && CURRENT_ROLE_CHECKBOX_RE.test(field.label)
+          );
+          if (checkbox !== undefined) {
+            await humanizedSleep(
+              "field_jitter",
+              HUMANIZE_TIMINGS.fieldJitterMs[0],
+              HUMANIZE_TIMINGS.fieldJitterMs[1]
+            );
+            const ticked = await applyWithReadBackTolerance(session.page, checkbox, "Yes");
+            currentRoleHandled.add(checkbox.key);
+            if (ticked.ok) {
+              outcomes.push({
+                field: checkbox.key,
+                intended: "Yes",
+                outcome: "filled",
+                detail:
+                  `${section.heading} entry — ticked from the stored fact "work0.isCurrent": ` +
+                  `${ticked.detail}`,
+                readBack: ticked.readBack,
+              });
+              console.log(`${LOG} ${section.heading}: ${checkbox.label} ticked (current role)`);
+            } else {
+              outcomes.push({
+                field: checkbox.key,
+                intended: null,
+                outcome: checkbox.required ? "needs-input" : "skipped",
+                detail:
+                  `${section.heading} entry — could not tick "${checkbox.label}" for a role ` +
+                  `with no end date on the resume: ${ticked.detail}`,
+              });
+              // Same rule as every other field this function fills: only a
+              // control the form itself marks required is worth stopping the
+              // candidate for.
+              if (checkbox.required) {
+                escalate(
+                  checkbox,
+                  `The "${section.heading}" section has a "${checkbox.label}" checkbox for a ` +
+                    `role the resume shows with no end date. Should it be checked?`,
+                  `could not tick the checkbox — ${ticked.detail}`
+                );
+              }
+            }
+            // Only reached once a checkbox to tick was actually found. A board
+            // whose wording `CURRENT_ROLE_CHECKBOX_RE` does not recognize gets
+            // no checkbox ticked at all, and previously left End Date silently
+            // unfilled regardless — a required field abandoned with no
+            // escalation, which read as this system having handled a role it
+            // never actually stated anything about. End Date now stays out of
+            // `currentRoleHandled` in that case and falls to the ordinary
+            // decide-then-apply path below, which escalates it exactly as it
+            // would any other required field nothing here can answer.
+            const endDate = fresh.find(
+              (field) => field.kind !== "checkbox" && END_DATE_FIELD_RE.test(field.label)
+            );
+            if (endDate !== undefined) {
+              currentRoleHandled.add(endDate.key);
+              outcomes.push({
+                field: endDate.key,
+                intended: null,
+                outcome: "skipped",
+                detail:
+                  `${section.heading} entry — left blank: the candidate's most recent role has ` +
+                  `no end date on their resume (still ongoing), so nothing is typed into a field ` +
+                  `built to hold a real date`,
+              });
+            }
+          }
+        }
+      }
+
       // Same as step 4 of the ordinary pass: open the dropdowns that stand
       // between this and a satisfied section, so the decision sees real wording.
       for (const field of fresh) {
+        if (currentRoleHandled.has(field.key)) continue;
         if (!field.required) continue;
         if (!OPTION_KINDS.has(field.kind) || field.optionsKnown) continue;
         const harvested = await harvestOptions(session.page, field);
@@ -6041,16 +6243,18 @@ async function fillRepeatingSections(
       // something. They repeat verbatim between the two sections, and a
       // decision call that cannot tell an education entry's dates from a work
       // entry's is being asked an unanswerable question.
-      const decidable: DecidableField[] = fresh.map((field) => ({
-        key: field.key,
-        label: `${section.heading}: ${field.label}`,
-        kind: field.kind,
-        required: field.required,
-        options: field.options,
-        optionsKnown: field.optionsKnown,
-        optionsTruncated: field.optionsTruncated,
-        helpText: field.helpText,
-      }));
+      const decidable: DecidableField[] = fresh
+        .filter((field) => !currentRoleHandled.has(field.key))
+        .map((field) => ({
+          key: field.key,
+          label: `${section.heading}: ${field.label}`,
+          kind: field.kind,
+          required: field.required,
+          options: field.options,
+          optionsKnown: field.optionsKnown,
+          optionsTruncated: field.optionsTruncated,
+          helpText: field.helpText,
+        }));
 
       let decisions: FieldDecision[];
       try {
@@ -6074,19 +6278,8 @@ async function fillRepeatingSections(
       }
       const byKey = new Map(decisions.map((decision) => [decision.fieldKey, decision]));
 
-      const escalate = (field: EnumeratedField, question: string, why: string): void => {
-        needsInput.push({
-          key: field.key,
-          fieldLabel: `${section.heading}: ${field.label}`,
-          question,
-          why,
-          required: field.required,
-          kind: field.kind,
-          ...(field.optionsKnown && field.options.length > 0 ? { options: field.options } : {}),
-        });
-      };
-
       for (const field of fresh) {
+        if (currentRoleHandled.has(field.key)) continue;
         const decision = byKey.get(field.key);
         // JOB-262's `ats` parameter is deliberately NOT passed here. A
         // repeating work/education entry has no self-identification field to
