@@ -55,7 +55,7 @@ export async function buildFactCatalog(userId: string): Promise<FactCatalog> {
  * Resolves a dotted `path` against a `FactCatalog` and returns the entry when
  * one exists. Kept as a small helper here rather than inlined into `tools.ts`
  * so the exclusion list wrapper can be tested in isolation with a mock
- * resolver. The scaffold implementation is a plain linear scan — sub ticket B
+ * resolver. The scaffold implementation is a plain linear scan. Sub ticket B
  * may replace it with an indexed lookup once the catalog is large enough for
  * that to matter.
  */

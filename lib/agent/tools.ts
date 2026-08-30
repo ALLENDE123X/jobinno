@@ -155,15 +155,57 @@ export class ExcludedFieldError extends Error {
 }
 
 /**
+ * Sentinel returned by `resolveIntakeFactValue` when the dotted path does not
+ * resolve against the current run's fact catalog. A distinct symbol rather
+ * than `undefined` so that a fact whose stored value is literally `undefined`
+ * (or `null`) is not confused with an unresolvable path. Callers that only
+ * care about existence check `value !== UNRESOLVED_INTAKE_FACT`; callers that
+ * care about equality (the exclusion list wrapper) can then compare the
+ * resolved value against the input value directly.
+ */
+export const UNRESOLVED_INTAKE_FACT: unique symbol = Symbol(
+  "UNRESOLVED_INTAKE_FACT"
+);
+
+export type ResolvedIntakeFactValue =
+  | string
+  | number
+  | boolean
+  | null
+  | typeof UNRESOLVED_INTAKE_FACT;
+
+/**
  * The context passed into every tool handler. Kept as an interface so tests
  * can supply a minimal fake without importing the whole run wiring.
  */
 export interface ToolContext {
   /**
-   * Returns true when the given dotted path resolves against the current
-   * run's fact catalog. False when it does not, or when the path is null.
+   * Returns the value the given dotted path resolves to against the current
+   * run's fact catalog. Returns `UNRESOLVED_INTAKE_FACT` when the path does
+   * not resolve, or when the path is null. Returning the underlying value
+   * rather than a plain boolean is what lets the exclusion list wrapper
+   * enforce value equality, not just path existence: a call may not fill
+   * `Previous Employer` with "Some Other Company" by quoting a real
+   * `resume.experience[0].employer` path whose value is "Acme Corp".
    */
-  resolveIntakeFactPath: (path: string | null | undefined) => boolean;
+  resolveIntakeFactValue: (
+    path: string | null | undefined
+  ) => ResolvedIntakeFactValue;
+}
+
+/**
+ * Normalizes a value for equality comparison against the intake catalog.
+ * Strings are trimmed. Numbers and booleans are coerced to their canonical
+ * string form. Null becomes the empty string. Kept small and deliberate so
+ * the equality check is auditable on the diff and does not accidentally
+ * coerce an unrelated value class into matching.
+ */
+function normalizeForEquality(
+  value: string | number | boolean | null
+): string {
+  if (value === null) return "";
+  if (typeof value === "string") return value.trim();
+  return String(value);
 }
 
 /**
@@ -173,26 +215,45 @@ export interface ToolContext {
  *   - `intakeFactPath` is a resolvable path in the fact catalog whenever
  *     `sourceHint === "intake"`, regardless of label. A hint that claims a
  *     source without pointing at one is a bug, not a value.
+ *   - The value on the call matches the value the path resolves to (after a
+ *     small normalization step). This is what closes the gap CodeRabbit
+ *     flagged at r3888875177: a call may not launder a fabricated value by
+ *     quoting any valid catalog path, since the path check alone proves only
+ *     that the path exists, not that the value the agent is writing came
+ *     from it. HARD STOP 9 fails if the wrapper accepts a mismatched value.
  *   - For labels that read as background check critical, only
- *     `sourceHint === "intake"` with a resolvable `intakeFactPath` is
- *     accepted. Everything else throws.
+ *     `sourceHint === "intake"` with a resolvable, value matching
+ *     `intakeFactPath` is accepted. Everything else throws.
  */
 export function assertSetFieldValueAllowed(
   input: SetFieldValueInput,
   ctx: ToolContext
 ): void {
   if (input.sourceHint === "intake") {
-    if (
-      input.intakeFactPath == null ||
-      !ctx.resolveIntakeFactPath(input.intakeFactPath)
-    ) {
+    if (input.intakeFactPath == null) {
       throw new ExcludedFieldError(
         `setFieldValue for "${input.label}" declared sourceHint=intake but ` +
-          `its intakeFactPath ${
-            input.intakeFactPath == null
-              ? "was not supplied"
-              : `"${input.intakeFactPath}" does not resolve against the fact catalog`
-          }.`
+          `its intakeFactPath was not supplied.`
+      );
+    }
+    const resolved = ctx.resolveIntakeFactValue(input.intakeFactPath);
+    if (resolved === UNRESOLVED_INTAKE_FACT) {
+      throw new ExcludedFieldError(
+        `setFieldValue for "${input.label}" declared sourceHint=intake but ` +
+          `its intakeFactPath "${input.intakeFactPath}" does not resolve ` +
+          `against the fact catalog.`
+      );
+    }
+    if (
+      normalizeForEquality(resolved) !== normalizeForEquality(input.value)
+    ) {
+      throw new ExcludedFieldError(
+        `setFieldValue for "${input.label}" declared sourceHint=intake and ` +
+          `intakeFactPath "${input.intakeFactPath}", but the value on the ` +
+          `call did not match the value the path resolves to. The path check ` +
+          `alone proves only that the path exists, not that the value the ` +
+          `agent is writing came from it, so a mismatch is treated as a ` +
+          `fabricated fact under HARD STOP 9.`
       );
     }
   }
@@ -205,17 +266,9 @@ export function assertSetFieldValueAllowed(
         `may only be filled from intake. Received sourceHint=${input.sourceHint}.`
     );
   }
-  if (
-    input.intakeFactPath == null ||
-    !ctx.resolveIntakeFactPath(input.intakeFactPath)
-  ) {
-    throw new ExcludedFieldError(
-      `setFieldValue for "${input.label}" is background check critical and ` +
-        `requires a resolvable intakeFactPath. Received ${
-          input.intakeFactPath == null ? "null" : `"${input.intakeFactPath}"`
-        }, which does not resolve against the fact catalog.`
-    );
-  }
+  // At this point the intake branch above has already verified the path
+  // resolves and the value matches, so no further check is required for
+  // background check critical labels beyond the sourceHint gate.
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────

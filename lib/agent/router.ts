@@ -27,11 +27,20 @@ export interface ModelConfig {
 
 /**
  * Default primary model, kept as a module constant so a review can see the
- * exact string on the diff. Sub ticket D may promote this to its own env var,
- * but at scaffold time the primary is not configurable — flipping it would
- * silently reshape agent behavior across every ats.
+ * exact string on the diff. Epic #276 acceptance criterion 7 pins Gemini 3.1
+ * pro preview as the primary rung. JOB-SPIKE v5 modal-loop evidence ruled
+ * Haiku out as a viable primary, so the scaffold ships the real primary
+ * rather than a placeholder that a sub ticket would silently inherit. Sub
+ * ticket D may promote this to its own env var, but at scaffold time the
+ * primary is not configurable. Flipping it would silently reshape agent
+ * behavior across every ats.
+ *
+ * The `model` field on `ModelConfig` is typed as a plain `string` so that a
+ * non Anthropic identifier fits the union without a type widening pass. Sub
+ * ticket D formalizes the union of supported model ids as it wires the real
+ * LLM client.
  */
-const DEFAULT_PRIMARY_MODEL = "anthropic/claude-haiku-4-5";
+const DEFAULT_PRIMARY_MODEL = "google/gemini-3-1-pro-preview";
 const DEFAULT_ESCALATION_MODEL = "anthropic/claude-sonnet-4-6";
 
 export function pickModel(

@@ -10,19 +10,38 @@ import { describe, expect, it, vi } from "vitest";
 import { AgentFillNotImplementedError } from "@/lib/agent";
 import {
   ExcludedFieldError,
+  UNRESOLVED_INTAKE_FACT,
   assertSetFieldValueAllowed,
   isBackgroundCheckCriticalLabel,
   setFieldValue,
+  type ResolvedIntakeFactValue,
   type SetFieldValueInput,
   type ToolContext,
 } from "@/lib/agent/tools";
 
-const acceptingContext: ToolContext = {
-  resolveIntakeFactPath: (path) => typeof path === "string" && path.length > 0,
+/**
+ * Context whose `resolveIntakeFactValue` echoes the input value back for any
+ * non empty path. Simulates a catalog whose stored value matches whatever the
+ * agent tried to write, which is the shape the wrapper accepts.
+ */
+const echoingContext: ToolContext = {
+  resolveIntakeFactValue: (path) =>
+    typeof path === "string" && path.length > 0
+      ? "Acme Corp"
+      : UNRESOLVED_INTAKE_FACT,
 };
 
+/**
+ * Context whose `resolveIntakeFactValue` returns the specific value under
+ * test, so the tests below can assert both the match and the mismatch case
+ * against a real catalog value rather than a boolean stand in.
+ */
+function contextReturning(value: ResolvedIntakeFactValue): ToolContext {
+  return { resolveIntakeFactValue: () => value };
+}
+
 const rejectingContext: ToolContext = {
-  resolveIntakeFactPath: () => false,
+  resolveIntakeFactValue: () => UNRESOLVED_INTAKE_FACT,
 };
 
 function excludedLabelCases(): SetFieldValueInput[] {
@@ -93,7 +112,7 @@ describe("assertSetFieldValueAllowed", () => {
   it("throws ExcludedFieldError for every background check critical label without an intake source", () => {
     for (const input of excludedLabelCases()) {
       expect(() =>
-        assertSetFieldValueAllowed(input, acceptingContext)
+        assertSetFieldValueAllowed(input, echoingContext)
       ).toThrow(ExcludedFieldError);
     }
   });
@@ -123,7 +142,27 @@ describe("assertSetFieldValueAllowed", () => {
           sourceHint: "intake",
           intakeFactPath: null,
         },
-        acceptingContext
+        echoingContext
+      )
+    ).toThrow(ExcludedFieldError);
+  });
+
+  it("throws when sourceHint=intake and the path resolves but its value does not match the input value", () => {
+    // This is the gap CodeRabbit flagged at r3888875177. Without the value
+    // equality check, a call could quote a real path such as
+    // resume.experience[0].employer (whose value is "Acme Corp") and still
+    // write "Some Other Company" to the field, laundering a fabricated fact
+    // through a valid path. HARD STOP 9 fails if the wrapper accepts this.
+    expect(() =>
+      assertSetFieldValueAllowed(
+        {
+          fieldId: "prev_employer",
+          label: "Previous Employer",
+          value: "Some Other Company",
+          sourceHint: "intake",
+          intakeFactPath: "resume.experience[0].employer",
+        },
+        contextReturning("Acme Corp")
       )
     ).toThrow(ExcludedFieldError);
   });
@@ -145,7 +184,22 @@ describe("assertSetFieldValueAllowed", () => {
     ).toThrow(ExcludedFieldError);
   });
 
-  it("accepts a background check critical label when the intake path resolves", () => {
+  it("also enforces value equality for benign labels when sourceHint is intake", () => {
+    expect(() =>
+      assertSetFieldValueAllowed(
+        {
+          fieldId: "first_name",
+          label: "First name",
+          value: "Ada",
+          sourceHint: "intake",
+          intakeFactPath: "profile.first_name",
+        },
+        contextReturning("Grace")
+      )
+    ).toThrow(ExcludedFieldError);
+  });
+
+  it("accepts a background check critical label when the intake path resolves and the value matches", () => {
     expect(() =>
       assertSetFieldValueAllowed(
         {
@@ -155,7 +209,42 @@ describe("assertSetFieldValueAllowed", () => {
           sourceHint: "intake",
           intakeFactPath: "resume.experience[0].employer",
         },
-        acceptingContext
+        contextReturning("Acme Corp")
+      )
+    ).not.toThrow();
+  });
+
+  it("tolerates surrounding whitespace on the input value when comparing to the catalog value", () => {
+    // Normalization trims strings so a leading space introduced by a form
+    // control does not defeat the equality check.
+    expect(() =>
+      assertSetFieldValueAllowed(
+        {
+          fieldId: "prev_employer",
+          label: "Previous Employer",
+          value: "  Acme Corp  ",
+          sourceHint: "intake",
+          intakeFactPath: "resume.experience[0].employer",
+        },
+        contextReturning("Acme Corp")
+      )
+    ).not.toThrow();
+  });
+
+  it("accepts a numeric catalog value quoted as a string on the input", () => {
+    // Numbers coerce to their canonical string form, so a graduation year
+    // stored as a number matches when the agent writes "2024" into a text
+    // field.
+    expect(() =>
+      assertSetFieldValueAllowed(
+        {
+          fieldId: "grad_year",
+          label: "Graduation year",
+          value: "2024",
+          sourceHint: "intake",
+          intakeFactPath: "resume.education[0].end_year",
+        },
+        contextReturning(2024)
       )
     ).not.toThrow();
   });
@@ -170,7 +259,7 @@ describe("assertSetFieldValueAllowed", () => {
           sourceHint: "fabricated",
           intakeFactPath: null,
         },
-        acceptingContext
+        echoingContext
       )
     ).not.toThrow();
   });
@@ -178,7 +267,7 @@ describe("assertSetFieldValueAllowed", () => {
 
 describe("setFieldValue", () => {
   it("rejects a fabricated background check critical fill before reaching the handler stub", async () => {
-    const spy = vi.spyOn(acceptingContext, "resolveIntakeFactPath");
+    const spy = vi.spyOn(echoingContext, "resolveIntakeFactValue");
     await expect(
       setFieldValue(
         {
@@ -188,7 +277,7 @@ describe("setFieldValue", () => {
           sourceHint: "fabricated",
           intakeFactPath: null,
         },
-        acceptingContext
+        echoingContext
       )
     ).rejects.toBeInstanceOf(ExcludedFieldError);
     // No path resolution attempted for a fabricated hint on an excluded label.
@@ -221,7 +310,7 @@ describe("setFieldValue", () => {
           sourceHint: "intake",
           intakeFactPath: "resume.experience[0].employer",
         },
-        acceptingContext
+        contextReturning("Acme Corp")
       )
     ).rejects.toBeInstanceOf(AgentFillNotImplementedError);
   });
