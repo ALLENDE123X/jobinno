@@ -354,10 +354,156 @@ describe("SRScreeningDropdownAdapter.commit", () => {
   });
 
   /**
-   * The option (a) fallback: when no `.sr-field`, `[data-field]`, or
-   * `<fieldset>` wraps the widget, the scope collapses to the widget's
-   * direct parent's direct children only. A hidden input two ancestor
-   * levels up must not be scooped in.
+   * JOB-281 round two MAJOR-1. A caller that passes a descendant
+   * selector (a class on a non widget child, or a role=option row
+   * inside the listbox) must still see events dispatched on the
+   * widget itself, not on the descendant, so any delegated handler
+   * listening for `event.target === widget` receives them. The
+   * hidden `<select>` sibling of the widget must still be committed
+   * even though the raw selector lands elsewhere.
+   */
+  it("descendant selector still fires events on the widget with .sr-field wrapper", async () => {
+    mountSrScreeningFixture();
+    const events: Array<{ type: string; targetId: string; tag: string; className: string }> = [];
+    const capture = (event: Event): void => {
+      const target = event.target as HTMLElement | null;
+      events.push({
+        type: event.type,
+        targetId: target?.id ?? "",
+        tag: target?.tagName ?? "",
+        className: target?.className ?? "",
+      });
+    };
+    document.addEventListener("input", capture, true);
+    document.addEventListener("change", capture, true);
+
+    // Selector points at the label span inside the widget (a non widget
+    // descendant). commitScript must walk up to the combobox before
+    // dispatching, so the visible event lands on #q1, not on the span.
+    const adapter = new SRScreeningDropdownAdapter();
+    const result = await adapter.commit(fakePage(SR_URL), ".sr-field__label", "Yes");
+
+    document.removeEventListener("input", capture, true);
+    document.removeEventListener("change", capture, true);
+
+    expect(result.status).toBe("committed");
+
+    // The widget (id=q1) received both events; the descendant span
+    // did NOT, because commitScript resolved the widget from the
+    // descendant before dispatching.
+    const widgetEvents = events.filter((e) => e.targetId === "q1");
+    const labelEvents = events.filter((e) => e.className === "sr-field__label");
+    expect(widgetEvents.map((e) => e.type)).toEqual(["input", "change"]);
+    expect(labelEvents).toEqual([]);
+
+    // The hidden `<select>` sibling of the widget was still committed.
+    const hidden = document.querySelector<HTMLSelectElement>("#q1-hidden");
+    expect(hidden?.value).toBe("yes");
+    const hiddenEvents = events.filter((e) => e.targetId === "q1-hidden");
+    expect(hiddenEvents.map((e) => e.type)).toEqual(["input", "change"]);
+  });
+
+  /**
+   * JOB-281 round two MAJOR-1, fallback branch. Without an .sr-field
+   * or [data-field] wrapper the sibling scope must anchor at the
+   * WIDGET's parent (not the descendant's parent), so a hidden
+   * `<select>` sibling of the widget is still reached and unrelated
+   * hidden inputs elsewhere are not.
+   */
+  it("descendant selector anchors fallback scope at the widget's parent", async () => {
+    document.body.innerHTML = `
+      <form>
+        <input id="csrf" type="hidden" name="csrf_token" value="ORIGINAL_CSRF_TOKEN" />
+        <div id="row">
+          <div id="q1" role="combobox" aria-haspopup="listbox">
+            <span id="q1-label" class="widget-label">Label</span>
+            <ul role="listbox">
+              <li role="option" data-value="yes">Yes</li>
+            </ul>
+          </div>
+          <select id="q1-hidden" name="q1_hidden" style="display:none">
+            <option value="">--</option>
+            <option value="yes">Yes</option>
+          </select>
+        </div>
+      </form>
+    `;
+
+    // Selector names the label span (a non widget descendant of the
+    // combobox). Without widget resolution the fallback anchor would
+    // be `#q1` (the span's parent) and its only children are the span
+    // and the `<ul>`, so `#q1-hidden` would be missed. With widget
+    // resolution the anchor becomes `#q1` the combobox, whose parent
+    // `#row` has `#q1-hidden` as a direct child.
+    const adapter = new SRScreeningDropdownAdapter();
+    const result = await adapter.commit(fakePage(SR_URL), "#q1-label", "Yes");
+
+    expect(result.status).toBe("committed");
+
+    const hidden = document.querySelector<HTMLSelectElement>("#q1-hidden");
+    expect(hidden?.value).toBe("yes");
+
+    const csrf = document.querySelector<HTMLInputElement>("#csrf");
+    expect(csrf?.value).toBe("ORIGINAL_CSRF_TOKEN");
+  });
+
+  /**
+   * JOB-281 round two MINOR-1. A form level `<fieldset>` that groups
+   * a CSRF token, the widget, its hidden mirror, and another
+   * question's hidden mirror. With `fieldset` in the semantic scope
+   * list (the round one shape), `closest('fieldset')` would land on
+   * this form level wrapper and the descendant query would return
+   * every hidden control including the CSRF token and the sibling
+   * question's mirror. Round two dropped `fieldset` from the list,
+   * which forces the fallback branch to the widget's direct parent's
+   * children only.
+   */
+  it("commit does not treat a form level fieldset as a per question scope", async () => {
+    document.body.innerHTML = `
+      <form>
+        <fieldset id="form-level-set">
+          <input id="csrf" type="hidden" name="csrf_token" value="ORIGINAL_CSRF_TOKEN" />
+          <div id="q1-row">
+            <div id="q1" role="combobox" aria-haspopup="listbox">
+              <ul role="listbox">
+                <li role="option" data-value="yes">Yes</li>
+              </ul>
+            </div>
+            <select id="q1-hidden" name="q1_hidden" style="display:none">
+              <option value="">--</option>
+              <option value="yes">Yes</option>
+            </select>
+          </div>
+          <select id="q2-hidden" name="q2_hidden" style="display:none">
+            <option value="">--</option>
+            <option value="yes">Yes</option>
+          </select>
+        </fieldset>
+      </form>
+    `;
+
+    const adapter = new SRScreeningDropdownAdapter();
+    const result = await adapter.commit(fakePage(SR_URL), "#q1", "Yes");
+
+    expect(result.status).toBe("committed");
+
+    // q1-hidden is a direct sibling of q1 inside #q1-row and is committed.
+    const q1Hidden = document.querySelector<HTMLSelectElement>("#q1-hidden");
+    expect(q1Hidden?.value).toBe("yes");
+
+    // The CSRF token and the sibling question's hidden mirror both live
+    // higher up in the same `<fieldset>` and must NOT be touched.
+    const csrf = document.querySelector<HTMLInputElement>("#csrf");
+    expect(csrf?.value).toBe("ORIGINAL_CSRF_TOKEN");
+    const q2Hidden = document.querySelector<HTMLSelectElement>("#q2-hidden");
+    expect(q2Hidden?.value).toBe("");
+  });
+
+  /**
+   * The option (a) fallback: when no `.sr-field` or `[data-field]`
+   * wraps the widget, the scope collapses to the widget's direct
+   * parent's direct children only. A hidden input two ancestor levels
+   * up must not be scooped in.
    */
   it("fallback scope stays at the widget's direct parent's children", async () => {
     document.body.innerHTML = `

@@ -186,6 +186,44 @@ function jsLiteral(value: string): string {
 }
 
 /**
+ * JS source that defines the in page `resolveWidget(start)` helper. Given
+ * an arbitrary starting element, walks up the ancestor chain (up to 6
+ * levels) and returns the nearest `[role=combobox]` or `[role=listbox]`
+ * ancestor, or the start element itself if it already has that role.
+ * Falls back to a descendant search when neither the start element nor
+ * any ancestor is a widget, which handles selectors that name an outer
+ * wrapper. Returns null when no widget is found.
+ *
+ * Shared source that both `matchScript` and `commitScript` inline into
+ * their IIFEs, so a caller that passes a descendant selector like
+ * `#q1-listbox` or a `.sr-field__label` class inside the widget resolves
+ * to the SAME widget in both places. Without this parity (JOB-281 round
+ * two red team MAJOR-1), `matches` would accept the widget while
+ * `commit` would fire `input` / `change` on the descendant, and any
+ * delegated handler that listens for `event.target === widget` would
+ * never see the event; the fallback sibling scope would also be
+ * anchored at the descendant's parent rather than at the widget's, so a
+ * hidden `<select>` a level up from the descendant could be missed.
+ */
+function widgetResolverSource(): string {
+  return `
+    const resolveWidget = (start) => {
+      let scope = start;
+      for (let depth = 0; depth < 6 && scope; depth++) {
+        const r = scope.getAttribute && scope.getAttribute("role");
+        if (r === "combobox" || r === "listbox") return scope;
+        scope = scope.parentElement;
+      }
+      if (start && start.querySelector) {
+        const nested = start.querySelector('[role="combobox"], [role="listbox"]');
+        if (nested) return nested;
+      }
+      return null;
+    };
+  `;
+}
+
+/**
  * The in page IIFE the SR adapter's `matches` runs. Returns true when the
  * resolved element:
  *
@@ -209,20 +247,11 @@ function jsLiteral(value: string): string {
 function matchScript(fieldSelector: string): string {
   return `(() => {
     try {
+      ${widgetResolverSource()}
       const sel = ${jsLiteral(fieldSelector)};
       const el = document.querySelector(sel);
       if (!el) return false;
-      let scope = el;
-      let widget = null;
-      for (let depth = 0; depth < 6 && scope; depth++) {
-        const role = scope.getAttribute && scope.getAttribute("role");
-        if (role === "combobox" || role === "listbox") { widget = scope; break; }
-        scope = scope.parentElement;
-      }
-      if (!widget) {
-        const nested = el.querySelector('[role="combobox"], [role="listbox"]');
-        if (nested) widget = nested;
-      }
+      const widget = resolveWidget(el);
       if (!widget) return false;
       const options = widget.querySelectorAll('[role="option"]');
       if (options.length === 0) return false;
@@ -258,7 +287,29 @@ function matchScript(fieldSelector: string): string {
  * itself. Returns a JSON serialisable record of what fired so the outer
  * function can put it in the `detail` field of the `CommitResult`.
  *
- * Scoping strategy, per the JOB-281 red team BLOCKING finding:
+ * Widget resolution parity, per the JOB-281 round two red team MAJOR-1
+ * finding: the raw element `document.querySelector(sel)` returns is not
+ * always the widget itself. When the caller (currently sub ticket E, the
+ * `selectDropdown` wiring in `lib/agent/tools.ts`) passes a selector that
+ * points at a descendant like `#q1-listbox`, `.sr-field__label`, or a
+ * `[role=option]` inside the widget, the raw element is that descendant.
+ * The prior revision used the raw element as both the visible control
+ * target AND the anchor for the fallback sibling scope, which meant:
+ *
+ *   - Delegated handlers listening for `event.target === widget` never
+ *     saw the `input` / `change` this script dispatched, because the
+ *     event fired on the descendant.
+ *   - The fallback sibling scope was anchored at the descendant's parent,
+ *     so a hidden `<select>` a level up from the descendant could be
+ *     missed entirely.
+ *
+ * The fix resolves the widget the same way `matchScript` does (see
+ * `widgetResolverSource`) and uses that widget as both the visible
+ * control target and the fallback sibling anchor. When no widget is
+ * found, the raw element still serves as anchor, which preserves the
+ * prior behavior for callers that happen to pass a non widget selector.
+ *
+ * Scoping strategy, per the JOB-281 round one red team BLOCKING finding:
  *
  *   Prior revision walked up 6 ancestor levels calling
  *   `querySelectorAll("select" | "input[type=hidden]")` at each level. Once
@@ -270,11 +321,19 @@ function matchScript(fieldSelector: string): string {
  *
  * The fix scopes the search two ways, in order of preference:
  *
- *   (b) Semantic field group: `el.closest('[data-field], .sr-field,
- *       fieldset')`. When the widget lives inside a wrapper the form
- *       author explicitly marked as one field, that wrapper is the scope.
- *       This is the case on the SR screening pages the adapter targets
- *       (`.sr-field` wraps each question and its hidden native control).
+ *   (b) Semantic field group: `anchor.closest('[data-field], .sr-field')`.
+ *       When the widget lives inside a wrapper the form author explicitly
+ *       marked as one field, that wrapper is the scope. This is the case
+ *       on the SR screening pages the adapter targets (`.sr-field` wraps
+ *       each question and its hidden native control). `<fieldset>` was in
+ *       this list in the round one fix but was removed in round two
+ *       (MINOR-1): a `<fieldset>` in real HTML commonly groups many
+ *       questions plus form level controls (CSRF, hidden mirrors for
+ *       sibling questions), so treating it as a per question wrapper
+ *       reopens the exact shape of the original BLOCKING bug on any form
+ *       that uses `<fieldset>` at form root rather than per question.
+ *       `.sr-field` and `[data-field]` are explicit per question markers
+ *       and are safe.
  *   (a) Fallback: the widget's DIRECT parent's DIRECT children only. No
  *       ancestor walk, no descendant queries, no querySelectorAll of any
  *       ancestor subtree. Just the immediate siblings of the widget.
@@ -300,22 +359,33 @@ function matchScript(fieldSelector: string): string {
  */
 function commitScript(fieldSelector: string, optionValue: string): string {
   return `(() => {
+    ${widgetResolverSource()}
     const sel = ${jsLiteral(fieldSelector)};
     const target = ${jsLiteral(optionValue)};
     const el = document.querySelector(sel);
     if (!el) {
       return { ok: false, reason: "selector did not resolve", fired: [] };
     }
-    const controls = [el];
-    const seen = new Set([el]);
+    // Round two MAJOR-1: resolve the widget with the same rule matchScript
+    // uses, so a descendant selector (for example an id on the listbox or
+    // a class on a label inside the widget) still fires events on the
+    // widget and still anchors the fallback sibling scope at the widget's
+    // parent rather than the descendant's. When no widget is found the
+    // raw element is the anchor, which preserves the prior behavior for
+    // non widget callers.
+    const widget = resolveWidget(el);
+    const anchor = widget || el;
+    const controls = [anchor];
+    const seen = new Set([anchor]);
 
     // Option (b): a semantic field group wrapper is the preferred scope.
-    // The CSS selector list is the one the field group could plausibly be
-    // marked with; extend it in this one place if a future ATS is added.
-    const fieldGroup = (el.closest && el.closest('[data-field], .sr-field, fieldset')) || null;
+    // Kept intentionally narrow to explicit per question markers; see the
+    // block comment above for why fieldset is deliberately absent from
+    // the CSS list.
+    const fieldGroup = (anchor.closest && anchor.closest('[data-field], .sr-field')) || null;
 
     const acceptControl = (node) => {
-      if (!node || node === el || seen.has(node)) return;
+      if (!node || node === anchor || seen.has(node)) return;
       const tag = node.tagName || "";
       const isSelect = tag === "SELECT";
       const isHiddenInput = tag === "INPUT" && (node.getAttribute && node.getAttribute("type") === "hidden");
@@ -353,7 +423,7 @@ function commitScript(fieldSelector: string, optionValue: string): string {
       // Option (a) fallback: the widget's direct parent's direct children.
       // No descendant query, no ancestor walk. Only the widget's
       // immediate siblings can enter the control set.
-      const parent = el.parentElement;
+      const parent = anchor.parentElement;
       if (parent) {
         const kids = parent.children;
         for (let i = 0; i < kids.length; i++) acceptControl(kids[i]);
