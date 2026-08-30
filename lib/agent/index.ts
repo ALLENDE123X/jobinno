@@ -47,6 +47,28 @@ export type {
 } from "@/lib/agent/readback";
 
 /**
+ * JOB-280 (sub ticket C): the deterministic prefill pass. Re-exported so
+ * sub tickets D..H can `import { deterministicPrefill } from "@/lib/agent"`
+ * without knowing the module layout. See `lib/agent/prefill.ts` for the
+ * cost model and the HARD STOP 9 exclusion guard the walker enforces.
+ */
+export {
+  classifyPrefillSlot,
+  deterministicPrefill,
+  isExcludedLabel,
+} from "@/lib/agent/prefill";
+export type {
+  FilledField,
+  PrefillError,
+  PrefillOptions,
+  PrefillPage,
+  PrefillReport,
+  PrefillSkipReason,
+  PrefillSlot,
+  SkippedField,
+} from "@/lib/agent/prefill";
+
+/**
  * Return type of `runAgentFill`. Kept as an alias of `SubmitApplicationResult`
  * so the pipeline can treat the agent path and the legacy path
  * interchangeably. The alias exists as its own name so sub tickets can widen
@@ -96,13 +118,23 @@ export function shouldUseAgentFillForAts(
  * the Stagehand agent loop, and returns the same shape `submitApplication`
  * returns. For now it throws so the pipeline fails loudly the first time an
  * operator flips the flag on for an ats before the implementation ships.
+ *
+ * JOB-280 (sub ticket C) shape note. Once sub ticket E lands the Browserbase
+ * session and sub ticket B lands the fact catalog builder, this function
+ * runs `deterministicPrefill(page, catalog)` on the opened page as its
+ * first step (before the agent loop takes a turn) and threads the returned
+ * `PrefillReport` into the trace log sub ticket F wires. The wiring is
+ * intentionally staged rather than done here today: prefill needs both a
+ * real `PrefillPage` and a non stub catalog to actually run, and both are
+ * strict blockers on tickets that have not merged yet.
  */
 export async function runAgentFill(
   input: SubmitApplicationInput
 ): Promise<AgentFillResult> {
   // Reference the argument so eslint does not flag it while the body is a
-  // stub; sub tickets B..H open a Browserbase session on `input` and hand
-  // it to the agent loop.
+  // stub; sub tickets B..H open a Browserbase session on `input`, build a
+  // fact catalog for `input.userId`, hand both to `deterministicPrefill`,
+  // and then hand the same page to the agent loop.
   void input;
   throw new AgentFillNotImplementedError("runAgentFill");
 }

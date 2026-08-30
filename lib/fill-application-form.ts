@@ -218,6 +218,7 @@ import {
 } from "@/lib/form-action-cache";
 import { resolveCandidateProfile } from "@/lib/candidate-documents";
 import { humanizedSleep, HUMANIZE_TIMINGS } from "@/lib/humanized-delays";
+import { FIELD_KEYWORDS, type FieldKey } from "@/lib/label-map";
 import {
   decideFieldAnswers,
   generateCoverLetter,
@@ -1464,22 +1465,14 @@ async function readControlValue(page: Page, selector: string): Promise<string | 
  * They double as a *conflict* table: a control whose own labelling matches a
  * different field's pattern and not this one is refused outright, which is what
  * stops the classic failure of a correct-looking observation landing one box off.
+ *
+ * JOB-280 (sub ticket C of #276) hoisted the constant into `lib/label-map.ts`
+ * so the agent path's deterministic prefill pass can read the same regexes
+ * without duplicating them. The re-export here keeps the legacy public API
+ * unchanged; every downstream import in tests and in this file continues to
+ * name `FIELD_KEYWORDS` from `@/lib/fill-application-form`.
  */
-export const FIELD_KEYWORDS = {
-  firstName: /first[\s_-]*name|given[\s_-]*name|\bfname\b/i,
-  lastName: /last[\s_-]*name|\bsurname\b|family[\s_-]*name|\blname\b/i,
-  fullName: /(full|your|applicant)[\s_-]*name|^\s*name\b/i,
-  email: /e-?mail/i,
-  confirmEmail: /confirm[\s_-]*(?:your[\s_-]*)?e-?mail|re-?enter[\s_-]*e-?mail|repeat[\s_-]*e-?mail|verify[\s_-]*e-?mail/i,
-  city: /\bcity\b|\bcurrent[\s_-]*(?:city|location)\b/i,
-  phone: /phone|mobile|telephone|\btel\b/i,
-  linkedin: /linked-?in/i,
-  website: /website|portfolio|personal[\s_-]*(site|url|page)|\bgithub\b/i,
-  coverLetter: /cover[\s_-]*letter/i,
-  resume: /resum|\bcv\b|curriculum/i,
-} as const;
-
-type FieldKey = keyof typeof FIELD_KEYWORDS;
+export { FIELD_KEYWORDS } from "@/lib/label-map";
 
 /** Input types that are never a free-text field, whatever a model called them. */
 const NON_TEXT_INPUT_TYPES = new Set([
