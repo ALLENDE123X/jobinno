@@ -168,13 +168,15 @@ const EXCLUDED_LABEL_PATTERNS: readonly RegExp[] = [
   /\b(?:month|year)\s*(?:started|ended|of\s+(?:start|end))\b/i,
   /\b(?:school|university|college|institution)\b/i,
   /\b(?:degree|qualification|major|field\s+of\s+study|discipline)\b/i,
-  // Country of citizenship, country of birth, state of birth and the like.
-  // The plain `\bcountry\b` and `\bstate\b` patterns for the applicant's
-  // current address would otherwise happily match these, and prefill would
-  // write the current country or state into a legally distinct field. See
-  // the module header for why HARD STOP 9 makes this a refusal rather than
-  // a best effort guess.
-  /\b(?:citizenship|nationality|birthplace)\b|\b(?:country|state)\s+of\s+(?:birth|origin)\b/i,
+  // Country of citizenship, country of birth, state of birth and the like,
+  // in both the "country of birth" order and the reversed "birth country"
+  // / "native country" / "nation of birth" shapes real forms use. The plain
+  // `\bcountry\b` and `\bstate\b` patterns for the applicant's current
+  // address would otherwise happily match every one of these, and prefill
+  // would write the current country or state into a legally distinct field.
+  // See the module header for why HARD STOP 9 makes this a refusal rather
+  // than a best effort guess.
+  /\b(?:citizenship|nationality|birthplace)\b|\b(?:country|state|nation)\s+of\s+(?:birth|origin)\b|\b(?:birth|origin|native)\s+(?:country|state|nation)\b/i,
 ];
 
 /**
@@ -266,9 +268,10 @@ export function classifyPrefillSlot(label: string): PrefillSlot | null {
   // `PREFILL_SLOT_ORDER` because the agent loop handles the copy explicitly
   // (some boards validate the pair by typing sequence rather than pasting),
   // so the classifier has to reject the label up front. Without this
-  // pre-filter the walker would classify a "Confirm email" control to
-  // `email` and paste the address a second time, nullifying the whole
-  // reason `confirmEmail` was left off the include list.
+  // check that runs before the slot scan, the walker would classify a
+  // "Confirm email" control to `email` and paste the address a second
+  // time, nullifying the whole reason `confirmEmail` was left off the
+  // include list.
   if (FIELD_KEYWORDS.confirmEmail.test(text)) return null;
   for (const slot of PREFILL_SLOT_ORDER) {
     if (isFieldKey(slot)) {

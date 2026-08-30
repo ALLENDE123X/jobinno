@@ -163,7 +163,7 @@ describe("classifyPrefillSlot", () => {
 
   it("returns null for a 'Confirm email' style label so the walker never re fills it as `email`", () => {
     // The plain `email` regex would match the "email" substring inside
-    // "Confirm email"; the classifier's pre-filter has to reject it so
+    // "Confirm email"; the classifier's up front check has to reject it so
     // prefill's deliberate exclusion of `confirmEmail` from
     // `PREFILL_SLOT_ORDER` actually holds on the page.
     expect(classifyPrefillSlot("Confirm email")).toBeNull();
@@ -206,6 +206,23 @@ describe("isExcludedLabel", () => {
     expect(isExcludedLabel("State of origin")).toBe(true);
     expect(isExcludedLabel("Birthplace")).toBe(true);
     expect(isExcludedLabel("Nationality")).toBe(true);
+  });
+
+  it("refuses reversed birth / origin / native labels the round 3 red team flagged", () => {
+    // Round 3 regression. The original exclusion regex anchored on
+    // "country" / "state" appearing first ("Country of birth"), so the
+    // reversed shapes real forms use ("Birth country", "Native country",
+    // "Nation of birth") slipped through the guard and re routed to
+    // `currentCountry` / `currentState`. HARD STOP 9 makes each of these a
+    // refusal too, since the field a "Birth country" box collects is a
+    // legally distinct fact from the applicant's current residence.
+    expect(isExcludedLabel("Birth country")).toBe(true);
+    expect(isExcludedLabel("Birth state")).toBe(true);
+    expect(isExcludedLabel("Birth nation")).toBe(true);
+    expect(isExcludedLabel("Native country")).toBe(true);
+    expect(isExcludedLabel("Native state")).toBe(true);
+    expect(isExcludedLabel("Origin country")).toBe(true);
+    expect(isExcludedLabel("Nation of birth")).toBe(true);
   });
 });
 
@@ -297,7 +314,7 @@ describe("deterministicPrefill", () => {
     // regex matched the "email" substring inside "Confirm email", the
     // walker classified it as `email`, and the module's stated reason for
     // excluding `confirmEmail` from `PREFILL_SLOT_ORDER` was silently
-    // nullified. The classifier's pre-filter must return null so the
+    // nullified. The classifier's up front check must return null so the
     // walker skips with `no_label_match` and never writes to the ref.
     const tree: RawAccessibilityNode = {
       role: "form",
@@ -322,7 +339,7 @@ describe("deterministicPrefill", () => {
     // Confirm email is never written to.
     expect(page.calls.some((c) => c.ref === "field_email_confirm")).toBe(false);
     // And the report records the skip with the "no label match" reason,
-    // since the classifier's pre-filter rejects the label before any
+    // since the classifier's up front check rejects the label before any
     // pattern in `PREFILL_SLOT_ORDER` runs.
     const skip = report.skipped.find((s) => s.ref === "field_email_confirm");
     expect(skip?.reason).toBe("no_label_match");
@@ -394,6 +411,71 @@ describe("deterministicPrefill", () => {
     ]) {
       const skip = report.skipped.find((s) => s.ref === ref);
       expect(skip?.reason, ref).toBe("excluded_label");
+      expect(page.calls.some((c) => c.ref === ref), ref).toBe(false);
+    }
+  });
+
+  it("refuses to fill reversed 'Birth country' / 'Birth state' / 'Native country' labels with the applicant's current address", async () => {
+    // Round 3 regression. The exclusion regex was anchored on the
+    // "country of birth" order and let the reversed shapes real forms use
+    // through: "Birth country" hit `\bcountry\b` and prefill wrote
+    // `profile.current_country` into the box, the same HARD STOP 9 break
+    // the round 1 red team caught, just on a different label shape.
+    const tree: RawAccessibilityNode = {
+      role: "form",
+      name: "Application",
+      ref: "form_root",
+      children: [
+        { role: "textbox", name: "City", required: false, ref: "field_city" },
+        {
+          role: "textbox",
+          name: "Birth country",
+          required: false,
+          ref: "field_birth_country",
+        },
+        {
+          role: "textbox",
+          name: "Birth state",
+          required: false,
+          ref: "field_birth_state",
+        },
+        {
+          role: "textbox",
+          name: "Native country",
+          required: false,
+          ref: "field_native_country",
+        },
+        {
+          role: "textbox",
+          name: "Nation of birth",
+          required: false,
+          ref: "field_nation_of_birth",
+        },
+      ],
+    };
+    const page = pageFromTree(
+      "https://example.test/apply/reversed-birth-labels",
+      "Apply",
+      tree
+    );
+    const report = await deterministicPrefill(page, buildCatalog());
+    // The applicant's plain city still fills.
+    expect(report.filled.find((f) => f.ref === "field_city")?.value).toBe(
+      "San Francisco"
+    );
+    // Every reversed birth / native / nation field is skipped as
+    // `excluded_label`, and none of them is written to.
+    for (const ref of [
+      "field_birth_country",
+      "field_birth_state",
+      "field_native_country",
+      "field_nation_of_birth",
+    ]) {
+      const skip = report.skipped.find((s) => s.ref === ref);
+      expect(skip?.reason, ref).toBe("excluded_label");
+      // The walker records the slot the classifier would have reached, so
+      // the trace shows the guard refused an ambiguous field rather than a
+      // clearly out of scope one; the guard firing at all is what matters.
       expect(page.calls.some((c) => c.ref === ref), ref).toBe(false);
     }
   });
