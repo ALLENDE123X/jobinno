@@ -14,7 +14,7 @@
  * "same corpus reaches two answers" test in `tests/unit/form-action-cache`
  * exists to prevent. Lifting the constant here keeps one source of truth.
  *
- * Semantics preserved. The regexes below are byte-for-byte the ones the
+ * Semantics preserved. The regexes below are, character by character, the ones the
  * legacy path shipped with; the extraction is a hoist, not a rewrite. The
  * legacy behavior test named in `tests/unit/adaptive-form-fill.test.ts`
  * exercises `FIELD_KEYWORDS` transitively and still passes on this branch.

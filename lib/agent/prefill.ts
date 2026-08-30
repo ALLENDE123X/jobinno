@@ -27,6 +27,17 @@
  * refuses to write to a control whose label reads as one of those, even
  * when the label also happens to name an identity slot. The exclusion is
  * defensive; the include list never lists those slots to begin with.
+ *
+ * A second class of exclusion the guard carries is the citizenship,
+ * nationality, country of birth and state of birth family. Those labels
+ * naively match the `\bcountry\b` and `\bstate\b` patterns for the
+ * applicant's current address, but the values they collect are legally
+ * distinct facts (work authorization forms in particular treat country of
+ * citizenship and country of birth as separate answers from country of
+ * residence). Writing `profile.current_country` into a "Country of
+ * citizenship" box would forge a legally material attestation, so the
+ * guard rejects every label that names one of those senses before the
+ * classifier ever runs.
  */
 
 import { buildFullSnapshot } from "@/lib/agent/readback";
@@ -157,6 +168,13 @@ const EXCLUDED_LABEL_PATTERNS: readonly RegExp[] = [
   /\b(?:month|year)\s*(?:started|ended|of\s+(?:start|end))\b/i,
   /\b(?:school|university|college|institution)\b/i,
   /\b(?:degree|qualification|major|field\s+of\s+study|discipline)\b/i,
+  // Country of citizenship, country of birth, state of birth and the like.
+  // The plain `\bcountry\b` and `\bstate\b` patterns for the applicant's
+  // current address would otherwise happily match these, and prefill would
+  // write the current country or state into a legally distinct field. See
+  // the module header for why HARD STOP 9 makes this a refusal rather than
+  // a best effort guess.
+  /\b(?:citizenship|nationality|birthplace)\b|\b(?:country|state)\s+of\s+(?:birth|origin)\b/i,
 ];
 
 /**
@@ -179,7 +197,7 @@ export interface FilledField {
   label: string;
   slot: PrefillSlot;
   factPath: string;
-  /** The value the prefill wrote. Stored so the trace can cross reference the fill against the fact catalog without re-running the resolver. */
+  /** The value the prefill wrote. Stored so the trace can cross reference the fill against the fact catalog without running the resolver a second time. */
   value: string;
 }
 
@@ -242,6 +260,16 @@ export interface PrefillOptions {
 export function classifyPrefillSlot(label: string): PrefillSlot | null {
   const text = String(label ?? "").trim();
   if (text === "") return null;
+  // "Confirm email" reads to a human as an email box, and the plain
+  // `\be-?mail\b` regex for the `email` slot happily matches the "email"
+  // substring inside it. Prefill deliberately excludes `confirmEmail` from
+  // `PREFILL_SLOT_ORDER` because the agent loop handles the copy explicitly
+  // (some boards validate the pair by typing sequence rather than pasting),
+  // so the classifier has to reject the label up front. Without this
+  // pre-filter the walker would classify a "Confirm email" control to
+  // `email` and paste the address a second time, nullifying the whole
+  // reason `confirmEmail` was left off the include list.
+  if (FIELD_KEYWORDS.confirmEmail.test(text)) return null;
   for (const slot of PREFILL_SLOT_ORDER) {
     if (isFieldKey(slot)) {
       if (FIELD_KEYWORDS[slot].test(text)) return slot;
@@ -272,17 +300,31 @@ export function isExcludedLabel(label: string): boolean {
  * empty string value. Falls through the ordered list in
  * `FACT_PATHS_FOR_SLOT` so a fact catalog written in either the legacy
  * shape or sub ticket B's shape resolves the same slot to the same value.
+ *
+ * Returns a discriminated union so the walker can distinguish three cases
+ * that the trace log wants to keep separate: `found` writes the value,
+ * `empty` records that the catalog knew about the slot but held only a
+ * blank answer (a chance to prompt intake for the missing text), and
+ * `missing` records that no path resolved to any entry at all (a chance to
+ * revisit whether the slot's fact paths cover the shapes the fact catalog
+ * builder is actually producing).
  */
-function resolveSlotValue(
-  slot: PrefillSlot,
-  catalog: FactCatalog
-): { path: string; value: string } | null {
+type SlotResolution =
+  | { status: "found"; path: string; value: string }
+  | { status: "empty"; path: string }
+  | { status: "missing" };
+
+function resolveSlotValue(slot: PrefillSlot, catalog: FactCatalog): SlotResolution {
+  let firstEmptyPath: string | null = null;
   for (const path of FACT_PATHS_FOR_SLOT[slot]) {
     const entry = resolveFactPath(catalog, path);
+    if (entry === undefined) continue;
     const stringValue = coerceFactValue(entry);
-    if (stringValue !== null) return { path, value: stringValue };
+    if (stringValue !== null) return { status: "found", path, value: stringValue };
+    if (firstEmptyPath === null) firstEmptyPath = path;
   }
-  return null;
+  if (firstEmptyPath !== null) return { status: "empty", path: firstEmptyPath };
+  return { status: "missing" };
 }
 
 function coerceFactValue(entry: FactEntry | undefined): string | null {
@@ -351,8 +393,12 @@ export async function deterministicPrefill(
     }
 
     const resolved = resolveSlotValue(slot, catalog);
-    if (resolved === null) {
+    if (resolved.status === "missing") {
       skipped.push({ ref: field.ref, label, reason: "no_fact_for_slot", slot });
+      continue;
+    }
+    if (resolved.status === "empty") {
+      skipped.push({ ref: field.ref, label, reason: "empty_fact_value", slot });
       continue;
     }
 

@@ -160,6 +160,18 @@ describe("classifyPrefillSlot", () => {
     expect(classifyPrefillSlot("")).toBeNull();
     expect(classifyPrefillSlot("Cover letter")).toBeNull();
   });
+
+  it("returns null for a 'Confirm email' style label so the walker never re fills it as `email`", () => {
+    // The plain `email` regex would match the "email" substring inside
+    // "Confirm email"; the classifier's pre-filter has to reject it so
+    // prefill's deliberate exclusion of `confirmEmail` from
+    // `PREFILL_SLOT_ORDER` actually holds on the page.
+    expect(classifyPrefillSlot("Confirm email")).toBeNull();
+    expect(classifyPrefillSlot("Confirm your email")).toBeNull();
+    expect(classifyPrefillSlot("Re-enter email")).toBeNull();
+    expect(classifyPrefillSlot("Repeat email address")).toBeNull();
+    expect(classifyPrefillSlot("Verify email")).toBeNull();
+  });
 });
 
 describe("isExcludedLabel", () => {
@@ -178,6 +190,22 @@ describe("isExcludedLabel", () => {
     expect(isExcludedLabel("First name")).toBe(false);
     expect(isExcludedLabel("City")).toBe(false);
     expect(isExcludedLabel("Postal code")).toBe(false);
+  });
+
+  it("refuses citizenship, nationality, country of birth and state of birth labels", () => {
+    // These labels naively match the `\bcountry\b` and `\bstate\b`
+    // patterns for the applicant's current address, but they collect
+    // legally distinct facts. HARD STOP 9 makes the guard reject them
+    // before the classifier can route them to `currentCountry` /
+    // `currentState`.
+    expect(isExcludedLabel("Country of citizenship")).toBe(true);
+    expect(isExcludedLabel("Country of nationality")).toBe(true);
+    expect(isExcludedLabel("Country of birth")).toBe(true);
+    expect(isExcludedLabel("Country of origin")).toBe(true);
+    expect(isExcludedLabel("State of birth")).toBe(true);
+    expect(isExcludedLabel("State of origin")).toBe(true);
+    expect(isExcludedLabel("Birthplace")).toBe(true);
+    expect(isExcludedLabel("Nationality")).toBe(true);
   });
 });
 
@@ -264,6 +292,112 @@ describe("deterministicPrefill", () => {
     expect(callRefs.has("field_degree")).toBe(false);
   });
 
+  it("refuses to fill a 'Confirm email' box even when the classifier would have written the same address", async () => {
+    // Regression for the MAJOR from the JOB-280 red team: the plain `email`
+    // regex matched the "email" substring inside "Confirm email", the
+    // walker classified it as `email`, and the module's stated reason for
+    // excluding `confirmEmail` from `PREFILL_SLOT_ORDER` was silently
+    // nullified. The classifier's pre-filter must return null so the
+    // walker skips with `no_label_match` and never writes to the ref.
+    const tree: RawAccessibilityNode = {
+      role: "form",
+      name: "Application",
+      ref: "form_root",
+      children: [
+        { role: "textbox", name: "Email address", required: true, ref: "field_email" },
+        {
+          role: "textbox",
+          name: "Confirm email",
+          required: true,
+          ref: "field_email_confirm",
+        },
+      ],
+    };
+    const page = pageFromTree("https://example.test/apply/confirm-email", "Apply", tree);
+    const report = await deterministicPrefill(page, buildCatalog());
+    // Primary email still fills.
+    expect(report.filled.find((f) => f.ref === "field_email")?.value).toBe(
+      "ada@example.test"
+    );
+    // Confirm email is never written to.
+    expect(page.calls.some((c) => c.ref === "field_email_confirm")).toBe(false);
+    // And the report records the skip with the "no label match" reason,
+    // since the classifier's pre-filter rejects the label before any
+    // pattern in `PREFILL_SLOT_ORDER` runs.
+    const skip = report.skipped.find((s) => s.ref === "field_email_confirm");
+    expect(skip?.reason).toBe("no_label_match");
+    expect(skip?.slot).toBeNull();
+  });
+
+  it("refuses to fill 'Country of citizenship' and 'State of birth' with the applicant's current address", async () => {
+    // Regression for the MAJOR from the JOB-280 red team: the plain
+    // `\bcountry\b` and `\bstate\b` patterns for the applicant's current
+    // address happily matched these labels, and prefill wrote
+    // `profile.current_country` and `profile.current_state` into legally
+    // distinct fields. HARD STOP 9 makes that a refusal, not a best guess.
+    const tree: RawAccessibilityNode = {
+      role: "form",
+      name: "Application",
+      ref: "form_root",
+      children: [
+        { role: "textbox", name: "City", required: false, ref: "field_city" },
+        {
+          role: "textbox",
+          name: "Country of citizenship",
+          required: false,
+          ref: "field_country_citizen",
+        },
+        {
+          role: "textbox",
+          name: "Country of birth",
+          required: false,
+          ref: "field_country_birth",
+        },
+        {
+          role: "textbox",
+          name: "Country of nationality",
+          required: false,
+          ref: "field_country_nat",
+        },
+        {
+          role: "textbox",
+          name: "State of birth",
+          required: false,
+          ref: "field_state_birth",
+        },
+        {
+          role: "textbox",
+          name: "Birthplace",
+          required: false,
+          ref: "field_birthplace",
+        },
+      ],
+    };
+    const page = pageFromTree(
+      "https://example.test/apply/legally-distinct",
+      "Apply",
+      tree
+    );
+    const report = await deterministicPrefill(page, buildCatalog());
+    // The applicant's plain city still fills.
+    expect(report.filled.find((f) => f.ref === "field_city")?.value).toBe(
+      "San Francisco"
+    );
+    // Every legally distinct country / state / birthplace field is skipped
+    // as `excluded_label`, and none of them is written to.
+    for (const ref of [
+      "field_country_citizen",
+      "field_country_birth",
+      "field_country_nat",
+      "field_state_birth",
+      "field_birthplace",
+    ]) {
+      const skip = report.skipped.find((s) => s.ref === ref);
+      expect(skip?.reason, ref).toBe("excluded_label");
+      expect(page.calls.some((c) => c.ref === ref), ref).toBe(false);
+    }
+  });
+
   it("skips a field whose slot has no fact catalog entry", async () => {
     // Seed a catalog that is missing the phone number.
     const page = pageFromTree(
@@ -280,6 +414,37 @@ describe("deterministicPrefill", () => {
     const phone = report.skipped.find((s) => s.ref === "field_phone");
     expect(phone?.reason).toBe("no_fact_for_slot");
     expect(phone?.slot).toBe("phone");
+  });
+
+  it("emits `empty_fact_value` when the fact catalog knows the slot but holds a blank answer", async () => {
+    // Regression for the MINOR from the JOB-280 red team: the
+    // `empty_fact_value` reason was in the closed union but nothing emitted
+    // it, since `resolveSlotValue` collapsed a blank entry into the same
+    // return shape as a missing one. Splitting the two lets the trace log
+    // distinguish "the person did not answer the intake question" (a
+    // chance to prompt intake for the answer) from "no fact catalog path
+    // for this slot resolved at all" (a chance to revisit the path list).
+    const page = pageFromTree(
+      "https://example.test/apply/sr-1",
+      "Apply",
+      srIdentityFixture()
+    );
+    const catalogWithBlankPhone: FactCatalog = {
+      userId: "user-fixture",
+      entries: [
+        { path: "profile.first_name", label: "profile.first_name", value: "Ada", source: "profile" },
+        { path: "profile.last_name", label: "profile.last_name", value: "Lovelace", source: "profile" },
+        { path: "profile.email", label: "profile.email", value: "ada@example.test", source: "profile" },
+        // Phone: catalog holds the path but the answer is a whitespace only string.
+        { path: "profile.phone", label: "profile.phone", value: "   ", source: "profile" },
+      ],
+    };
+    const report = await deterministicPrefill(page, catalogWithBlankPhone);
+    const phone = report.skipped.find((s) => s.ref === "field_phone");
+    expect(phone?.reason).toBe("empty_fact_value");
+    expect(phone?.slot).toBe("phone");
+    // Phone was not written to the page.
+    expect(page.calls.some((c) => c.ref === "field_phone")).toBe(false);
   });
 
   it("skips a field the page already carries the same value on", async () => {

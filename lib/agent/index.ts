@@ -47,7 +47,7 @@ export type {
 } from "@/lib/agent/readback";
 
 /**
- * JOB-280 (sub ticket C): the deterministic prefill pass. Re-exported so
+ * JOB-280 (sub ticket C): the deterministic prefill pass. Exported a second time so
  * sub tickets D..H can `import { deterministicPrefill } from "@/lib/agent"`
  * without knowing the module layout. See `lib/agent/prefill.ts` for the
  * cost model and the HARD STOP 9 exclusion guard the walker enforces.

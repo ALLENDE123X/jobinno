@@ -1468,7 +1468,7 @@ async function readControlValue(page: Page, selector: string): Promise<string | 
  *
  * JOB-280 (sub ticket C of #276) hoisted the constant into `lib/label-map.ts`
  * so the agent path's deterministic prefill pass can read the same regexes
- * without duplicating them. The re-export here keeps the legacy public API
+ * without duplicating them. Exporting the constant a second time here keeps the legacy public API
  * unchanged; every downstream import in tests and in this file continues to
  * name `FIELD_KEYWORDS` from `@/lib/fill-application-form`.
  */
