@@ -46,8 +46,16 @@ export type EscalationSignal = "complex-widget" | "modal-heavy";
 /** The single value a router call needs about the current attempt. */
 export interface ModelSelectionContext {
   /**
-   * How many prior iterations already ran on the primary rung. Zero means
-   * "give me the primary"; any positive value means "move to the fallback".
+   * How many prior primary tier attempts failed with an escalation signal (a
+   * tool returning a `complex-widget` or `modal-heavy` failure hint). Zero
+   * means "give me the primary rung"; any positive value means "the primary
+   * rung already tried and hit a signal, move to the fallback". Successful
+   * primary turns do NOT bump this: a Gemini turn that completes a tool call
+   * without escalation stays on Gemini for the next turn. Only failure
+   * signals, surfaced via `ModelSelectionContext.hint` on the next call,
+   * cause `retry` to advance. The bump itself lives in `runAgentLoop`
+   * alongside the tool outcome inspection, see the pointer near the
+   * `retry = 1` assignment inside the tool loop.
    */
   retry: number;
   /**
@@ -528,6 +536,10 @@ export async function runAgentLoop(
     for (const toolCall of response.toolCalls) {
       const outcome = await opts.runTool(toolCall);
       outcomes.push({ call: toolCall, outcome });
+      // Invariant lives in both places: only a failed tool outcome carrying an
+      // escalation signal advances `retry`. See the doc block on
+      // `ModelSelectionContext.retry` for why a successful primary turn stays
+      // on the primary rung instead of handing off on every iteration.
       if (!outcome.ok && outcome.signal) {
         retry = 1;
         hint = outcome.signal;
