@@ -108,6 +108,7 @@ import {
   releaseApplicationSlot,
   reserveApplicationSlot,
 } from "@/lib/application-quota";
+import { dispatchApplicationFill } from "@/lib/agent";
 import { claimApplicationRow, recordSkipQuietly } from "@/lib/application-records";
 import { APPLICATION_STATUS } from "@/lib/application-status";
 import { FormFillBlockedError } from "@/lib/fill-application-form";
@@ -886,18 +887,28 @@ export const applyToJob = inngest.createFunction(
     // See correction 2 in the header: `submitApplication` fills the form via
     // `fillApplicationFormRetainingSession` and submits in that same session.
     // Splitting this in two would fill a form in a browser that is then closed.
+    //
+    // JOB-277. The call goes through `dispatchApplicationFill` so that a run
+    // whose `ats` is on the `USE_AGENT_FILL_ATS` allowlist takes the agent
+    // path from `lib/agent/` instead. Both flags default to off in
+    // `.env.example`, so with no operator change this remains the exact same
+    // `submitApplication(input)` call it was before.
     const fillAndSubmit = () =>
       step.run("fill-and-submit-application", async () => {
         try {
-          const result = await submitApplication({
-            jobApplicationId: applicationId,
-            requiresCoverLetter: claim.requiresCoverLetter,
-            // Deliberately not passed. ACT-008's `preflight` reads
-            // `jobs.description` off the row it already loads, which keeps up to
-            // 8KB of scraped job text out of this run's durable step state. The
-            // claim step drops it for the same reason.
-            ...(additionalAnswers === undefined ? {} : { additionalAnswers }),
-          });
+          const result = await dispatchApplicationFill(
+            {
+              jobApplicationId: applicationId,
+              requiresCoverLetter: claim.requiresCoverLetter,
+              // Deliberately not passed. ACT-008's `preflight` reads
+              // `jobs.description` off the row it already loads, which keeps up to
+              // 8KB of scraped job text out of this run's durable step state. The
+              // claim step drops it for the same reason.
+              ...(additionalAnswers === undefined ? {} : { additionalAnswers }),
+            },
+            claim.ats,
+            { legacy: submitApplication }
+          );
           // Trimmed for the same reason as the claim: the full result nests
           // ACT-007's entire field-by-field report and the parsed resume profile —
           // a candidate's real personal data, which has no business being copied
