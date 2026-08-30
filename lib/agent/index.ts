@@ -19,6 +19,34 @@ import type {
 } from "@/lib/submit-application";
 
 /**
+ * JOB-279 (sub ticket B): the snapshot type shapes and pure builders that
+ * the eventual agent loop threads through every turn. Re-exported from the
+ * package entry point so sub tickets C..H can `import { ... } from
+ * "@/lib/agent"` without having to know which sibling file each name
+ * originally lives in. The runtime behavior is still stubbed here (see
+ * `runAgentFill` below); this only wires the shape.
+ */
+export type {
+  AgentSnapshot,
+  AgentSnapshotDiff,
+  FieldKind,
+  FieldNode,
+  FieldValidationState,
+  SectionHandle,
+} from "@/lib/agent/snapshot-types";
+export {
+  buildDiffSnapshot,
+  buildFullSnapshot,
+  SNAPSHOT_MAX_BYTES,
+  SnapshotBudgetExceededError,
+} from "@/lib/agent/readback";
+export type {
+  AgentSnapshotSource,
+  RawAccessibilityNode,
+  SnapshotOptions,
+} from "@/lib/agent/readback";
+
+/**
  * Return type of `runAgentFill`. Kept as an alias of `SubmitApplicationResult`
  * so the pipeline can treat the agent path and the legacy path
  * interchangeably. The alias exists as its own name so sub tickets can widen
