@@ -33,19 +33,24 @@ import { z } from "zod";
  * Workday emit custom roles the parser cannot map cleanly, and the agent is
  * still allowed to try to fill them from the label. Dropping them from the
  * snapshot would hide a required field.
+ *
+ * The set is deliberately narrow to what the parser can actually emit today.
+ * `textarea`, `multiselect`, and `file` are not in it: the raw a11y node the
+ * parser reads carries no `multiline`, `multiple`, or input `type` attribute
+ * the walk could switch on, so a textarea collapses to `text` and a file
+ * input to `unknown` at parse time. Adding those kinds without a producer to
+ * emit them would lock the shape in this sub ticket and force a rework in
+ * sub ticket E; sub ticket E can grow the set when it grows the parser.
  */
 export const FieldKindSchema = z.enum([
   "text",
-  "textarea",
   "email",
   "url",
   "tel",
   "number",
   "select",
-  "multiselect",
   "checkbox",
   "radio",
-  "file",
   "date",
   "button",
   "section",
@@ -118,13 +123,29 @@ export type SectionHandle = z.infer<typeof SectionHandleSchema>;
  * again for the same page unless the loop asks for one explicitly (for
  * example after a hard navigation the diff cannot reconcile against).
  */
-export const AgentSnapshotSchema = z.object({
-  url: z.string().min(1),
-  title: z.string(),
-  fields: z.array(FieldNodeSchema),
-  sections: z.array(SectionHandleSchema),
-  capturedAt: z.number().int().nonnegative(),
-});
+export const AgentSnapshotSchema = z
+  .object({
+    url: z.string().min(1),
+    title: z.string(),
+    fields: z.array(FieldNodeSchema),
+    sections: z.array(SectionHandleSchema),
+    capturedAt: z.number().int().nonnegative(),
+  })
+  // Cross check every `sectionRef` against the sections list, so a
+  // snapshot whose fields point at a section that is not in `sections[]`
+  // fails at the parse boundary rather than deep in the agent loop.
+  .refine(
+    (snap) => {
+      const sectionRefs = new Set(snap.sections.map((s) => s.ref));
+      for (const field of snap.fields) {
+        if (field.sectionRef !== null && !sectionRefs.has(field.sectionRef)) {
+          return false;
+        }
+      }
+      return true;
+    },
+    { message: "every field.sectionRef must reference a section in sections[]" }
+  );
 export type AgentSnapshot = z.infer<typeof AgentSnapshotSchema>;
 
 /**
@@ -152,11 +173,19 @@ export const AgentSnapshotDiffSchema = z.object({
   added: z.array(FieldNodeSchema),
   removed: z.array(z.string().min(1)),
   updated: z.array(
-    z.object({
-      ref: z.string().min(1),
-      before: FieldNodeSchema,
-      after: FieldNodeSchema,
-    })
+    z
+      .object({
+        ref: z.string().min(1),
+        before: FieldNodeSchema,
+        after: FieldNodeSchema,
+      })
+      // A no op update (`before` structurally equal to `after`) has no
+      // meaning to the agent and is filtered out by the builder. Enforce
+      // the same rule at the schema boundary so a hand rolled diff cannot
+      // slip a stale entry past it either.
+      .refine((u) => JSON.stringify(u.before) !== JSON.stringify(u.after), {
+        message: "updated entries must have a structurally different before and after",
+      })
   ),
   sections: z.object({
     added: z.array(SectionHandleSchema),

@@ -38,16 +38,13 @@ describe("FieldKindSchema", () => {
   it("accepts every kind the parser can emit", () => {
     for (const kind of [
       "text",
-      "textarea",
       "email",
       "url",
       "tel",
       "number",
       "select",
-      "multiselect",
       "checkbox",
       "radio",
-      "file",
       "date",
       "button",
       "section",
@@ -60,6 +57,17 @@ describe("FieldKindSchema", () => {
 
   it("rejects strings outside the closed set", () => {
     expect(() => FieldKindSchema.parse("banner")).toThrow();
+  });
+
+  it("rejects kinds the parser cannot emit today", () => {
+    // `textarea`, `multiselect`, and `file` were removed from the closed
+    // set in the JOB-279 iteration on PR #286: the walk had no attribute
+    // to distinguish them from `text`, `select`, and `unknown`, so leaving
+    // them in would lock a shape no producer emits. Sub ticket E grows the
+    // set when it grows the parser.
+    for (const kind of ["textarea", "multiselect", "file"]) {
+      expect(() => FieldKindSchema.parse(kind)).toThrow();
+    }
   });
 });
 
@@ -164,6 +172,21 @@ describe("AgentSnapshotSchema", () => {
       })
     ).toThrow();
   });
+
+  it("rejects a field whose sectionRef names a section not in sections[]", () => {
+    // A field pointing at a section that no `sections[]` entry names would
+    // deserialize fine before the JOB-279 iteration on PR #286; the parse
+    // boundary now catches it.
+    expect(() =>
+      AgentSnapshotSchema.parse({
+        url: "https://example.test",
+        title: "Apply",
+        fields: [{ ...validField, sectionRef: "section_missing" }],
+        sections: [],
+        capturedAt: 0,
+      })
+    ).toThrow();
+  });
 });
 
 describe("AgentSnapshotDiffSchema", () => {
@@ -203,5 +226,29 @@ describe("AgentSnapshotDiffSchema", () => {
         capturedAt: 2,
       })
     ).not.toThrow();
+  });
+
+  it("rejects an updated entry whose before and after are structurally equal", () => {
+    // The builder filters no op updates via `fieldValueEqual`, but the
+    // schema itself accepted an entry with equal before and after before
+    // the JOB-279 iteration on PR #286. A hand rolled diff can no longer
+    // slip a stale entry past the parse boundary.
+    expect(() =>
+      AgentSnapshotDiffSchema.parse({
+        url: "https://example.test/apply",
+        title: "Apply",
+        added: [],
+        removed: [],
+        updated: [
+          {
+            ref: validField.ref,
+            before: validField,
+            after: validField,
+          },
+        ],
+        sections: { added: [], removed: [], changed: [] },
+        capturedAt: 2,
+      })
+    ).toThrow();
   });
 });

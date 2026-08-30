@@ -144,16 +144,20 @@ const ROLE_TO_FIELD_KIND: ReadonlyMap<string, FieldKind> = new Map<
 
 /**
  * Refine a `textbox` node to a more specific text kind when the label hints
- * at one. Deliberately conservative: only labels that read as unambiguously
- * one specific input type map through here, so a plain "Address" text field
- * stays `text` rather than being misclassified.
+ * at one. Deliberately conservative and word bounded: unanchored substring
+ * matches misclassified real labels ("Candidate name" landed as `date` via
+ * `/date/`, "Automobile insurance" as `tel` via `/mobile/`, "Hyperlink" as
+ * `url` via `/link/`), which one layer up would let the agent write a
+ * fabricated ISO date into a name field. Every phrase below is anchored
+ * with `\b` so only whole words match, and each matched vocabulary is
+ * narrow enough to stay honest about what the label actually is.
  */
 function refineTextKind(label: string, defaultKind: FieldKind): FieldKind {
   const lower = label.toLowerCase();
-  if (/email/.test(lower)) return "email";
-  if (/phone|mobile|telephone/.test(lower)) return "tel";
-  if (/\burl\b|website|link/.test(lower)) return "url";
-  if (/date|birthday|birthdate|dob/.test(lower)) return "date";
+  if (/\b(e[- ]?mail|email)\b/.test(lower)) return "email";
+  if (/\b(phone|mobile|telephone|cell)\b/.test(lower)) return "tel";
+  if (/\b(url|website|homepage)\b/.test(lower)) return "url";
+  if (/\b(date|birthday|birthdate|dob)\b/.test(lower)) return "date";
   return defaultKind;
 }
 
@@ -215,24 +219,79 @@ interface WalkOutput {
 }
 
 /**
- * Depth first walk over the raw tree. Emits a `FieldNode` for every field
- * shaped node, and a `SectionHandle` for every section/modal container.
- * Static text nodes are dropped at walk time so the byte budget check
- * further down does not have to reason about them.
+ * Strip the mutable state (`value`, `invalid`, `required`) off a raw a11y
+ * subtree so that a section's hash captures only its static shape. The
+ * previous version hashed the raw subtree, which folded every descendant's
+ * typed value into the section fingerprint, so typing one character into
+ * any field flipped every ancestor section's hash and pushed the region
+ * back into `sections.changed`. That defeats the whole point of hashing:
+ * the loop's read of `sections.changed` was supposed to prove a region did
+ * not change without re-sending it, and it was proving the opposite. This
+ * helper keeps the structural shape the loop reasons about (roles, labels,
+ * options list, ref, and child layout) and drops the fields that a fill or
+ * a validation flip would move.
  */
-function walk(
+function staticSubtreeForHash(node: RawAccessibilityNode): unknown {
+  return {
+    role: node.role,
+    name: node.name,
+    ref: node.ref,
+    options: node.options,
+    children: (node.children ?? []).map(staticSubtreeForHash),
+  };
+}
+
+/**
+ * Compute the ref a child should carry, using the child's own `ref` if the
+ * a11y layer gave it one and otherwise synthesizing a per-parent, per
+ * (role, label) index. The synthesized shape is `synth_<parentRef>_<role>
+ * _<labelHash>_<index>`, which keeps two properties the previous
+ * monotonic counter did not:
+ *
+ *  - A refless node mounting or unmounting elsewhere in the tree does not
+ *    renumber unrelated nodes. Only the (parent, role, label) sibling
+ *    group that gains or loses a node sees an index shift, and even then
+ *    only for that exact group.
+ *  - Two refless children of different parents cannot collide, because
+ *    `parentRef` is baked into the id.
+ *
+ * The label goes through a 8 char hash so a very long or noisy label does
+ * not blow up the ref length, and so a label containing special chars does
+ * not need escaping. The parent's ref is used verbatim (already
+ * constrained by whatever bounded the parent's own ref).
+ */
+function resolveRef(
   node: RawAccessibilityNode,
+  parentRef: string,
+  counts: Map<string, number>
+): string {
+  if (node.ref && node.ref.length > 0) return node.ref;
+  const label = (node.name ?? "").trim();
+  const key = `${node.role}::${label}`;
+  const idx = counts.get(key) ?? 0;
+  counts.set(key, idx + 1);
+  const labelHash = label.length > 0 ? hashRegion(label).slice(0, 8) : "unlabeled";
+  return `synth_${parentRef}_${node.role}_${labelHash}_${idx}`;
+}
+
+/**
+ * Walk one node (given its parent computed ref) and recurse into children
+ * using a fresh per parent counts map, so refless siblings only compete
+ * for indices among their own (role, label) group in their own parent.
+ */
+function walkNode(
+  node: RawAccessibilityNode,
+  ref: string,
   parentSectionRef: string | null,
-  synthIdCounter: { next: number },
   out: WalkOutput
 ): void {
   const role = node.role;
   if (STATIC_ROLES_TO_DROP.has(role)) {
     // Walk children even for a dropped node: a heading can wrap a form
-    // section on some boards and the interesting bits sit under it.
-    (node.children ?? []).forEach((child) =>
-      walk(child, parentSectionRef, synthIdCounter, out)
-    );
+    // section on some boards and the interesting bits sit under it. The
+    // dropped node's ref is still used as their parent context so that a
+    // shift elsewhere in the tree stays local.
+    walkChildren(node.children ?? [], ref, parentSectionRef, out);
     return;
   }
 
@@ -241,17 +300,19 @@ function walk(
   const kind: FieldKind =
     mappedKind === "text" ? refineTextKind(label, mappedKind) : mappedKind;
 
-  const ref =
-    node.ref && node.ref.length > 0
-      ? node.ref
-      : `synth_${role}_${synthIdCounter.next++}`;
-
   if (kind === "section" || kind === "modal") {
     // A section is represented once by a `FieldNode` (so the loop can address
     // it by ref) and once as a `SectionHandle` in the hashed region list
     // (so a diff can prove the region did not change without re-sending it).
+    // The hash covers only the static subtree shape: see
+    // `staticSubtreeForHash` for why descendant `value` and `invalid` are
+    // stripped before hashing.
     const sectionHash = hashRegion(
-      JSON.stringify({ role, label, children: node.children ?? [] })
+      JSON.stringify({
+        role,
+        label,
+        children: (node.children ?? []).map(staticSubtreeForHash),
+      })
     );
     out.fields.push({
       ref,
@@ -264,9 +325,7 @@ function walk(
       optionSetHash: null,
     });
     out.sections.push({ ref, label, hash: sectionHash });
-    (node.children ?? []).forEach((child) =>
-      walk(child, ref, synthIdCounter, out)
-    );
+    walkChildren(node.children ?? [], ref, ref, out);
     return;
   }
 
@@ -288,9 +347,20 @@ function walk(
     optionSetHash,
   });
 
-  (node.children ?? []).forEach((child) =>
-    walk(child, parentSectionRef, synthIdCounter, out)
-  );
+  walkChildren(node.children ?? [], ref, parentSectionRef, out);
+}
+
+function walkChildren(
+  children: RawAccessibilityNode[],
+  parentRef: string,
+  parentSectionRef: string | null,
+  out: WalkOutput
+): void {
+  const counts = new Map<string, number>();
+  for (const child of children) {
+    const childRef = resolveRef(child, parentRef, counts);
+    walkNode(child, childRef, parentSectionRef, out);
+  }
 }
 
 /**
@@ -307,8 +377,25 @@ export async function buildFullSnapshot(
   page: AgentSnapshotSource,
   options: SnapshotOptions = {}
 ): Promise<AgentSnapshot> {
-  const now = options.now ?? Date.now;
+  const snapshot = await captureSnapshot(page, options);
   const limit = options.maxBytes ?? SNAPSHOT_MAX_BYTES;
+  enforceByteBudget(JSON.stringify(snapshot), limit);
+  return snapshot;
+}
+
+/**
+ * Capture a snapshot without checking the byte budget. Used by
+ * `buildDiffSnapshot`, where the intermediate full snapshot is a compute
+ * step that never ships, so applying the full snapshot budget to it would
+ * throw on the exact pages the diff exists to shrink (SR OneClick,
+ * Workday, JOB-SPIKE v9's Bertelsmann run). The diff itself is measured
+ * against the budget one layer up.
+ */
+async function captureSnapshot(
+  page: AgentSnapshotSource,
+  options: SnapshotOptions
+): Promise<AgentSnapshot> {
+  const now = options.now ?? Date.now;
 
   const [url, title, tree] = await Promise.all([
     Promise.resolve(page.url()),
@@ -317,23 +404,28 @@ export async function buildFullSnapshot(
   ]);
 
   const out: WalkOutput = { fields: [], sections: [] };
-  walk(tree, null, { next: 0 }, out);
+  const rootRef = resolveRef(tree, "root", new Map());
+  walkNode(tree, rootRef, null, out);
 
-  const snapshot: AgentSnapshot = {
+  return {
     url,
     title,
     fields: out.fields,
     sections: out.sections,
-    capturedAt: now(),
+    // `capturedAt` is `z.number().int().nonnegative()` on the canonical
+    // schema. A caller wiring `performance.now()` in as `options.now`
+    // would otherwise produce a fractional value the schema rejects at
+    // any downstream boundary; truncate at the assignment site so the
+    // guarantee is local to this file rather than a caller convention.
+    capturedAt: Math.trunc(now()),
   };
+}
 
-  const serialized = JSON.stringify(snapshot);
+function enforceByteBudget(serialized: string, limit: number): void {
   const byteLength = Buffer.byteLength(serialized, "utf8");
   if (byteLength > limit) {
     throw new SnapshotBudgetExceededError(byteLength, limit);
   }
-
-  return snapshot;
 }
 
 /**
@@ -366,18 +458,21 @@ function fieldValueEqual(a: FieldNode, b: FieldNode): boolean {
  * page. The diff is what the loop sends the LLM on every turn after the
  * first; it typically weighs in at a few hundred bytes even on Workday.
  *
- * Implementation: capture a fresh full snapshot (still bounded by the byte
- * budget), then walk both field lists by ref. This deliberately does not
- * try to be clever about detecting reflow: a ref moving between sections
- * shows up as an updated field with a new `sectionRef`, which is exactly
- * what the agent needs to know.
+ * Implementation: capture a fresh full snapshot without applying the byte
+ * budget to it (that intermediate never ships and applying the full
+ * snapshot budget to it would throw on the exact pages the diff exists to
+ * shrink), diff both field lists by ref, then enforce the budget against
+ * the serialized diff payload itself. This deliberately does not try to
+ * be clever about detecting reflow: a ref moving between sections shows
+ * up as an updated field with a new `sectionRef`, which is exactly what
+ * the agent needs to know.
  */
 export async function buildDiffSnapshot(
   prev: AgentSnapshot,
   page: AgentSnapshotSource,
   options: SnapshotOptions = {}
 ): Promise<AgentSnapshotDiff> {
-  const current = await buildFullSnapshot(page, options);
+  const current = await captureSnapshot(page, options);
 
   const prevByRef = new Map(prev.fields.map((f) => [f.ref, f]));
   const currByRef = new Map(current.fields.map((f) => [f.ref, f]));
@@ -419,7 +514,7 @@ export async function buildDiffSnapshot(
     if (!currSectionByRef.has(ref)) sectionsRemoved.push(ref);
   }
 
-  return {
+  const diff: AgentSnapshotDiff = {
     url: current.url,
     title: current.title,
     added,
@@ -432,4 +527,8 @@ export async function buildDiffSnapshot(
     },
     capturedAt: current.capturedAt,
   };
+
+  const limit = options.maxBytes ?? SNAPSHOT_MAX_BYTES;
+  enforceByteBudget(JSON.stringify(diff), limit);
+  return diff;
 }

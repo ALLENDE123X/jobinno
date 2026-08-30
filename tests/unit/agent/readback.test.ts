@@ -246,6 +246,14 @@ describe("buildDiffSnapshot", () => {
     expect(diff.updated[0].before.value).toBeNull();
     expect(diff.updated[0].after.value).toBe("person@example.test");
     expect(diff.capturedAt).toBe(20);
+    // Regression: before the JOB-279 iteration on PR #286, the section
+    // hash folded in every descendant `value`, so typing into one field
+    // flipped every ancestor section's hash and pushed those sections
+    // back into `sections.changed`. The hash now covers only the static
+    // subtree shape, so a value change does not flap the section list.
+    expect(diff.sections.added).toHaveLength(0);
+    expect(diff.sections.removed).toHaveLength(0);
+    expect(diff.sections.changed).toHaveLength(0);
   });
 
   it("returns added for a new modal and removed for a closed picker", async () => {
@@ -323,6 +331,106 @@ describe("buildDiffSnapshot", () => {
     // the diff turn to turn. The section walk still hashes the region, so
     // an interested caller can find the change through `diff.sections.changed`.
     expect(diff.updated.find((u) => u.ref === "field_country")).toBeUndefined();
+  });
+
+  it("mounting a refless node earlier does not renumber unrelated refless siblings", async () => {
+    // Regression for B3 in the PR #286 red team pass: the previous synth
+    // formula used one monotonic counter for the whole walk, so a refless
+    // node mounting earlier in the tree shifted every later synthesized
+    // ref by one. That surfaced as spurious `added` + `removed` pairs for
+    // fields that had not changed, inflating the exact payload the diff
+    // exists to shrink. Under the per parent (role, label) index scheme
+    // the fix installs, only the sibling group that actually gained a
+    // node sees an index change.
+    const before: RawAccessibilityNode = {
+      role: "form",
+      name: "Application",
+      ref: "form_root",
+      children: [
+        {
+          role: "textbox",
+          name: "Free response A",
+          required: false,
+          // no ref: forces the synth path
+        },
+        {
+          role: "textbox",
+          name: "Free response B",
+          required: false,
+          // no ref: forces the synth path
+        },
+      ],
+    };
+    const page1 = pageFromTree("https://example.test/apply/sr-1", "Apply", before);
+    const prev = await buildFullSnapshot(page1);
+    const beforeRefs = prev.fields
+      .filter((f) => f.label.startsWith("Free response"))
+      .map((f) => f.ref);
+    expect(beforeRefs).toHaveLength(2);
+
+    // Insert a refless button earlier in the same parent. Under the old
+    // monotonic counter this would renumber the two textboxes; under the
+    // per (role, label) index scheme, only the (button, ...) sibling
+    // group gets a fresh index, and the two textboxes keep their refs.
+    const after: RawAccessibilityNode = {
+      role: "form",
+      name: "Application",
+      ref: "form_root",
+      children: [
+        {
+          role: "button",
+          name: "Click me",
+          // no ref: this is the newly mounted refless node
+        },
+        ...(before.children ?? []),
+      ],
+    };
+    const page2 = pageFromTree("https://example.test/apply/sr-1", "Apply", after);
+    const diff = await buildDiffSnapshot(prev, page2);
+
+    // The two textboxes must not appear as either `added` or `removed`;
+    // that is the exact failure mode of the old formula.
+    const addedLabels = diff.added.map((f) => f.label);
+    expect(addedLabels).not.toContain("Free response A");
+    expect(addedLabels).not.toContain("Free response B");
+    // The `removed` list carries synth refs, so assert by looking up the
+    // previous ref set instead of matching against labels.
+    for (const ref of beforeRefs) {
+      expect(diff.removed).not.toContain(ref);
+    }
+    // The refless button legitimately appears as added, and there is no
+    // corresponding removal to pair it with.
+    expect(diff.added.some((f) => f.label === "Click me")).toBe(true);
+    expect(diff.updated).toHaveLength(0);
+  });
+
+  it("does not misclassify plain word labels as date, tel, or url", async () => {
+    // Regression for M1 in the PR #286 red team pass: the previous
+    // refine regexes were unanchored substrings, so labels like
+    // "Candidate name" landed as `date`, "Automobile insurance" as
+    // `tel`, and "Hyperlink" as `url`. Word boundaries pin each match
+    // to whole vocabulary.
+    const tree: RawAccessibilityNode = {
+      role: "form",
+      name: "Regressions",
+      ref: "form_regressions",
+      children: [
+        { role: "textbox", name: "Candidate name", ref: "field_candidate_name" },
+        { role: "textbox", name: "Mandate reference", ref: "field_mandate_reference" },
+        { role: "textbox", name: "Update your profile", ref: "field_update_profile" },
+        { role: "textbox", name: "Hyperlink description", ref: "field_hyperlink" },
+        { role: "textbox", name: "Automobile insurance", ref: "field_automobile" },
+      ],
+    };
+    const page = pageFromTree("https://example.test/regress", "Regress", tree);
+    const snapshot = await buildFullSnapshot(page);
+    const kindOf = (ref: string) =>
+      snapshot.fields.find((f) => f.ref === ref)?.kind;
+    expect(kindOf("field_candidate_name")).toBe("text");
+    expect(kindOf("field_mandate_reference")).toBe("text");
+    expect(kindOf("field_update_profile")).toBe("text");
+    expect(kindOf("field_hyperlink")).toBe("text");
+    expect(kindOf("field_automobile")).toBe("text");
   });
 
   it("surfaces a section hash change through sections.changed", async () => {
