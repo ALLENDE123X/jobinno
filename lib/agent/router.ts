@@ -58,11 +58,54 @@ export interface ModelSelectionContext {
   hint?: EscalationSignal;
 }
 
+/**
+ * The provider families the loop treats separately. The value is derived from
+ * the picked model at `pickModel` time so the loop routes on the config itself
+ * rather than by string sniffing the model id, which used to fail on operator
+ * overrides that named the model without a provider prefix or with a routing
+ * host in front of it. Anthropic is the only value that unlocks the caching
+ * shape today; every other family falls into `other` so a new provider name
+ * lands in the legacy path by default instead of silently claiming Anthropic
+ * caching semantics it does not support.
+ */
+export type ModelProvider = "anthropic" | "google" | "other";
+
 export interface ModelConfig {
   /** Model identifier the caller passes into the LLM client. */
   model: string;
   /** Which rung of the ladder this call is on. */
   tier: "primary" | "escalation";
+  /**
+   * The provider family the loop routes on. Set by `pickModel` from the
+   * resolved model id so the caller does not have to reparse strings to know
+   * which shape of messages the model expects. Anthropic is the one value
+   * that unlocks the cached message shape today.
+   */
+  provider: ModelProvider;
+}
+
+/**
+ * Derives the provider family from a resolved model id. The classification is
+ * substring based so the router accepts every shape an operator or a routing
+ * layer might realistically supply for the same model: bare slugs
+ * (`claude-sonnet-4-6`, matching Anthropic's own SDK docs), family prefixed
+ * slugs (`anthropic/claude-sonnet-4-6`), and router prefixed slugs
+ * (`openrouter/anthropic/claude-sonnet-4-6`). All three route to the Anthropic
+ * caching path, so an operator override never bypasses the ticket's primary
+ * cost lever by choosing a different string spelling of the same model.
+ */
+function inferProvider(model: string): ModelProvider {
+  const lowered = model.toLowerCase();
+  if (
+    lowered.includes("anthropic/") ||
+    lowered.includes("claude-")
+  ) {
+    return "anthropic";
+  }
+  if (lowered.includes("google/") || lowered.includes("gemini")) {
+    return "google";
+  }
+  return "other";
 }
 
 /**
@@ -86,11 +129,17 @@ const DEFAULT_PRIMARY_MODEL = "google/gemini-3-1-pro-preview";
 const DEFAULT_ESCALATION_MODEL = "anthropic/claude-sonnet-4-6";
 
 /**
- * The Haiku identifier the router must never resolve to. Kept as a named
- * constant so the defensive guard reads clearly and so a future change to a
- * model id trips the guard rather than silently passing a Haiku string.
+ * Case insensitive substring pattern the router must never accept in a model
+ * identifier. Named so the defensive guard reads clearly and so a future
+ * change to a model id trips the guard rather than silently passing a Haiku
+ * string. A substring match on the model family word rather than an exact id
+ * check catches every dated and aliased variant Anthropic ever ships, since
+ * Anthropic themselves route ids like `claude-haiku-4-5-20261001` and
+ * `claude-haiku-4-5-latest` alongside the bare family id: the exact match this
+ * guard used to do would let those variants pass, which is exactly the
+ * scenario the guard exists to catch.
  */
-const FORBIDDEN_HAIKU_MODEL = "anthropic/claude-haiku-4-5";
+const FORBIDDEN_HAIKU_PATTERN = /haiku/i;
 
 /**
  * Boundary guard on the router: the router must never hand the loop a Haiku
@@ -99,13 +148,15 @@ const FORBIDDEN_HAIKU_MODEL = "anthropic/claude-haiku-4-5";
  * but `USE_AGENT_ESCALATION_MODEL` is an operator controlled env var and is
  * the one path a future misconfiguration could push a Haiku id through. Fail
  * loud at the boundary rather than let the loop silently run on a model the
- * spike proved unusable.
+ * spike proved unusable. The check is case insensitive substring, not exact
+ * equality, so dated ids like `claude-haiku-4-5-20261001` and aliases like
+ * `claude-haiku-4-5-latest` are refused the same way the bare id is.
  */
 function assertNotHaiku(model: string): string {
-  if (model === FORBIDDEN_HAIKU_MODEL) {
+  if (FORBIDDEN_HAIKU_PATTERN.test(model)) {
     throw new Error(
-      `Refusing to route to ${FORBIDDEN_HAIKU_MODEL}: JOB-SPIKE v5 modal ` +
-        `loop evidence showed Haiku is not viable at any tier.`
+      `Refusing to route to ${model}: JOB-SPIKE v5 modal loop evidence ` +
+        `showed Haiku is not viable at any tier.`
     );
   }
   return model;
@@ -127,18 +178,21 @@ export function pickModel(
   context: ModelSelectionContext,
   env: Record<string, string | undefined> = process.env
 ): ModelConfig {
-  const shouldEscalate =
-    context.retry > 0 ||
-    context.hint === "complex-widget" ||
-    context.hint === "modal-heavy";
+  // `hint !== undefined` rather than an explicit member enumeration so a
+  // future EscalationSignal added to the union is honored automatically. The
+  // set is a closed union at the type level so any value that reaches here is
+  // already a known signal.
+  const shouldEscalate = context.retry > 0 || context.hint !== undefined;
 
   if (!shouldEscalate) {
-    return { model: assertNotHaiku(DEFAULT_PRIMARY_MODEL), tier: "primary" };
+    const model = assertNotHaiku(DEFAULT_PRIMARY_MODEL);
+    return { model, tier: "primary", provider: inferProvider(model) };
   }
 
   const override = (env.USE_AGENT_ESCALATION_MODEL ?? "").trim();
-  const model = override.length > 0 ? override : DEFAULT_ESCALATION_MODEL;
-  return { model: assertNotHaiku(model), tier: "escalation" };
+  const resolved = override.length > 0 ? override : DEFAULT_ESCALATION_MODEL;
+  const model = assertNotHaiku(resolved);
+  return { model, tier: "escalation", provider: inferProvider(model) };
 }
 
 /** One text block in the Anthropic system prompt array. */
@@ -148,9 +202,15 @@ export interface AnthropicMessageTextBlock {
   cache_control?: { type: "ephemeral" };
 }
 
-/** One per turn user message in the Anthropic messages array. */
+/**
+ * One per turn message in the Anthropic messages array. Kept wide enough to
+ * hold both roles the API accepts, so a later ticket that starts feeding the
+ * model its own prior text back on multi turn runs does not have to widen the
+ * type first. Only `user` turns are emitted today; the `assistant` value sits
+ * here waiting for sub ticket B or D to start using it.
+ */
 export interface AnthropicTurnMessage {
-  role: "user";
+  role: "user" | "assistant";
   content: string;
 }
 
@@ -329,19 +389,23 @@ function readPositiveInt(
 /**
  * Builds the text a completed turn contributes to the running transcript the
  * next model call sees. Kept small and boring: the assistant reply plus a
- * one line summary per tool outcome. Sub tickets B and D may replace this
- * with a richer serialization once the real tool handlers exist.
+ * one line summary per tool outcome, tagged with the tool name and id so a
+ * turn that ran more than one tool produces distinguishable summaries rather
+ * than a run of identical "Tool completed." lines the next model call cannot
+ * tell apart. Sub tickets B and D may replace this with a richer
+ * serialization once the real tool handlers exist.
  */
 function buildUserTurn(
   response: AgentModelResponse,
-  outcomes: AgentToolOutcome[]
+  outcomes: Array<{ call: AgentToolCall; outcome: AgentToolOutcome }>
 ): string {
   const parts: string[] = [];
   if (response.text) parts.push(response.text);
-  for (const outcome of outcomes) {
-    const summary = outcome.ok
-      ? "Tool completed."
-      : `Tool reported ${outcome.signal ?? "an error"}.`;
+  for (const entry of outcomes) {
+    const label = `${entry.call.name} (${entry.call.id})`;
+    const summary = entry.outcome.ok
+      ? `Tool ${label} completed.`
+      : `Tool ${label} reported ${entry.outcome.signal ?? "an error"}.`;
     parts.push(summary);
   }
   return parts.join(" ");
@@ -405,38 +469,63 @@ export async function runAgentLoop(
     }
 
     const config = pickModel({ retry, hint }, env);
-    const messages: AgentMessages = config.model.startsWith("anthropic/")
-      ? buildAnthropicMessagesWithCaching(systemPrompt, factCatalog, priorMessages)
-      : {
-          kind: "legacy",
-          system: `${systemPrompt}\n\nFact catalog:\n${factCatalog}`,
-          messages: priorMessages,
-        };
+    // Route on the resolved provider rather than a `startsWith("anthropic/")`
+    // sniff on the model id. The sniff used to miss operator overrides that
+    // named the model without the provider prefix (matching Anthropic's own
+    // SDK docs, which use bare slugs like `claude-sonnet-4-6`) or with a
+    // routing host in front of it (like `openrouter/anthropic/...`), and both
+    // shapes would silently fall through to the Legacy path and skip the
+    // ephemeral cache markers. `config.provider` is set by `pickModel` from
+    // the resolved id, so every spelling of the same Anthropic model routes
+    // to the caching helper.
+    const messages: AgentMessages =
+      config.provider === "anthropic"
+        ? buildAnthropicMessagesWithCaching(
+            systemPrompt,
+            factCatalog,
+            priorMessages
+          )
+        : {
+            kind: "legacy",
+            system: `${systemPrompt}\n\nFact catalog:\n${factCatalog}`,
+            // Copy rather than share the live buffer: the injected model
+            // function is opaque to the loop, and letting it mutate the
+            // loop's own transcript would corrupt every later turn.
+            messages: [...priorMessages],
+          };
 
     const response = await opts.modelCall(config, messages);
     step += 1;
     totalCostCents += response.costCents;
 
-    if (totalCostCents >= maxCostCents) {
-      throw new AgentBudgetExceededError({
-        reason: "max-cost",
-        steps: step,
-        costCents: totalCostCents,
-      });
-    }
-
-    const outcomes: AgentToolOutcome[] = [];
+    const outcomes: Array<{ call: AgentToolCall; outcome: AgentToolOutcome }> =
+      [];
     for (const toolCall of response.toolCalls) {
       const outcome = await opts.runTool(toolCall);
-      outcomes.push(outcome);
+      outcomes.push({ call: toolCall, outcome });
       if (!outcome.ok && outcome.signal) {
         retry = 1;
         hint = outcome.signal;
       }
     }
 
+    // Cost cap is checked AFTER the terminal return so a turn that produces
+    // the final answer on the same call that crosses the cap returns the
+    // answer instead of throwing it away. The strict `>` boundary means the
+    // exact spent value hitting the cap ends the run cleanly rather than
+    // aborting the next iteration a run that already finished never would
+    // have made. Reversed from the earlier `>=` check that fired before the
+    // terminal return and discarded a run's finished text.
     if (response.toolCalls.length === 0) {
       return { turns: step, finalText: response.text };
+    }
+
+    if (totalCostCents > maxCostCents) {
+      throw new AgentBudgetExceededError({
+        reason: "max-cost",
+        steps: step,
+        costCents: totalCostCents,
+      });
     }
 
     priorMessages.push(buildUserTurn(response, outcomes));
