@@ -20,6 +20,17 @@
 import { z } from "zod";
 
 import { AgentFillNotImplementedError } from "@/lib/agent";
+import {
+  commitFrameworkState,
+  type CommitResult,
+} from "@/lib/agent/widget-adapters";
+
+/**
+ * JOB-281 re export: downstream call sites already import tool related
+ * types out of this file; keeping the `CommitResult` name reachable here
+ * means adding the adapter path did not fork the import surface.
+ */
+export type { CommitResult } from "@/lib/agent/widget-adapters";
 
 /**
  * Where the value on a `setFieldValue` call came from.
@@ -191,6 +202,15 @@ export interface ToolContext {
   resolveIntakeFactValue: (
     path: string | null | undefined
   ) => ResolvedIntakeFactValue;
+  /**
+   * JOB-281: the Stagehand page handle when a real browser is attached.
+   * Typed as `unknown` because the scaffold does not import Stagehand at
+   * this layer; sub ticket E narrows this to the real `Page` type where
+   * the tool wiring lives. Optional so tests that only exercise the
+   * exclusion list or the routing keep working with the minimal fake
+   * context they already build.
+   */
+  page?: unknown;
 }
 
 /**
@@ -286,11 +306,35 @@ export async function setFieldValue(
   throw new AgentFillNotImplementedError("setFieldValue");
 }
 
+/**
+ * JOB-281: `selectDropdown` now consults the widget adapter registry when a
+ * page handle is present on the tool context, so the framework state
+ * commit for SR screening dropdowns ships ahead of sub ticket E's visible
+ * click implementation. Order once E lands:
+ *
+ *   1. Sub ticket E performs the existing visible `[role=option]` click
+ *      and reads back the widget's textContent to prove the picker
+ *      accepted the choice.
+ *   2. This handler then invokes `commitFrameworkState`, which dispatches
+ *      the framework state events on any adapter that matches the widget.
+ *   3. The returned `CommitResult` names the adapter that fired (or that
+ *      none matched) so the run trace can prove which path did the work.
+ *
+ * Until sub ticket E lands, step 1 is absent and this handler exercises
+ * only the adapter path when a page is supplied. When no page is on the
+ * context, the handler preserves the pre E scaffold behavior and throws
+ * `AgentFillNotImplementedError`, which is the shape the routing tests
+ * already assert against.
+ */
 export async function selectDropdown(
-  input: SelectDropdownInput
-): Promise<void> {
-  SelectDropdownInputSchema.parse(input);
-  throw new AgentFillNotImplementedError("selectDropdown");
+  input: SelectDropdownInput,
+  ctx: ToolContext
+): Promise<CommitResult> {
+  const parsed = SelectDropdownInputSchema.parse(input);
+  if (ctx.page === undefined || ctx.page === null) {
+    throw new AgentFillNotImplementedError("selectDropdown");
+  }
+  return commitFrameworkState(ctx.page, parsed.fieldId, parsed.optionValue);
 }
 
 export async function toggleCheckbox(
