@@ -16,10 +16,20 @@
  * react select, a Lit component, or vanilla, so any framework specific claim
  * here would be a fabrication. Instead the adapter dispatches synthetic
  * `input` then `change` (both bubbling and composed) on the visible widget
- * AND on any sibling hidden form control it can find by walking up the
- * widget's ancestor chain. Whichever of the two paths the framework listens
- * on gets the event; the other path is a cheap extra dispatch that no
- * observed handler cares about.
+ * AND on any sibling hidden form control it can find inside the widget's
+ * own field group. Whichever of the two paths the framework listens on gets
+ * the event; the other path is a cheap extra dispatch that no observed
+ * handler cares about.
+ *
+ * The scope of the hidden control search is deliberately narrow. The first
+ * revision walked up the widget's ancestor chain calling `querySelectorAll`
+ * on every ancestor up to 6 levels; the JOB-281 red team pointed out that
+ * once the walk reached the surrounding `<form>` the query returned every
+ * hidden input and every `<select>` in the form, so the commit was
+ * silently overwriting sibling screening dropdowns and CSRF tokens. The
+ * current commit script instead scopes to `closest('[data-field], .sr-
+ * field, fieldset')` with a fallback to the widget's direct parent's
+ * direct children only; see `commitScript` below for the exact rules.
  *
  * What this module deliberately does NOT do:
  *
@@ -118,40 +128,83 @@ async function readPageUrl(page: PageLike): Promise<string> {
 }
 
 /**
- * True when the URL looks like a SmartRecruiters candidate facing page.
- * Kept as a substring test rather than a URL parse because the same host
- * pattern appears under `jobs.smartrecruiters.com`, `careers.<company>.
- * smartrecruiters.com`, and the internal `apply.smartrecruiters.com`
- * variants, and a substring match covers all three without a hard coded
- * list of host aliases.
+ * True when the URL is served from a `smartrecruiters.com` host or one of its
+ * subdomains (`jobs.smartrecruiters.com`, `careers.<company>.smartrecruiters
+ * .com`, `apply.smartrecruiters.com`, and any other subdomain the ATS uses).
+ *
+ * Uses `URL.hostname` with a trailing dot boundary rather than a `String
+ * .includes` on the raw URL, because the substring form false positives on a
+ * path or query string that happens to contain the phrase, for example
+ * `https://evil.example/redirect?to=smartrecruiters.com`. The parse also
+ * discards ports, credentials, fragments, and the rest of the URL noise, so
+ * only the host contributes to the decision.
  */
 function isSmartRecruitersUrl(url: string): boolean {
-  return url.toLowerCase().includes("smartrecruiters.com");
+  if (!url) return false;
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return host === "smartrecruiters.com" || host.endsWith(".smartrecruiters.com");
 }
 
 /**
  * Escapes a string for safe embedding in the JS source we hand to
- * `page.evaluate`. Backslash first, then single and double quotes, then
- * backticks, then the newline and carriage return pair. Kept local rather
- * than reused from `lib/form-fields.ts`'s helpers so this module has no
- * dependency edge back into the ported code.
+ * `page.evaluate` as a double quoted literal. The set covered:
+ *
+ *   - Backslash, which has to run first so later replacements do not double
+ *     escape their own inserts.
+ *   - The double quote that closes the literal.
+ *   - Newline (`\n`) and carriage return (`\r`), which terminate a string
+ *     literal in JS source.
+ *   - U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR). These are
+ *     valid in JS string values but are illegal inside a string literal in
+ *     JS source; leaving one raw turns the injected script into a parse
+ *     error. See ECMA-262 12.9.4 for the exact rule.
+ *
+ * Single quotes and backticks do not need escaping because the wrapper this
+ * function returns is a double quoted literal; they are ordinary characters
+ * inside that literal. Kept local rather than reused from
+ * `lib/form-fields.ts`'s helpers so this module has no dependency edge back
+ * into the ported code.
  */
 function jsLiteral(value: string): string {
   const escaped = value
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
     .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r");
+    .replace(/\r/g, "\\r")
+    // U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) are
+    // valid inside a JS string VALUE but illegal inside a JS string
+    // LITERAL in source. Written as \uXXXX inside the regex literal so
+    // the source of this file never carries the raw code points.
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
   return `"${escaped}"`;
 }
 
 /**
  * The in page IIFE the SR adapter's `matches` runs. Returns true when the
- * resolved element (or an ancestor) declares `role="combobox"` or
- * `role="listbox"` and has at least one `role="option"` descendant, which
- * is the structural fingerprint every SR screening dropdown observed in
- * the spike had in common. Kept structural rather than tied to a class
- * name so a class rename by SR does not silently break the adapter.
+ * resolved element:
+ *
+ *   1. Sits inside (or is itself) an ARIA combobox / listbox widget that
+ *      exposes at least one `role="option"` descendant. That covers the
+ *      structural fingerprint every SR screening dropdown observed in the
+ *      spike had in common.
+ *   2. Additionally lives inside an `.sr-field` wrapper (or names an
+ *      `aria-labelledby` target that itself carries the SR screening label
+ *      class). SR's country picker, state picker, autocomplete, and share
+ *      widget all satisfy condition 1 on a SR host; without condition 2 the
+ *      adapter would fire on those too, which is exactly the false positive
+ *      surface the red team flagged. `.sr-field` is what SR wraps every
+ *      screening question in on the observed fixtures; if a future recon
+ *      finds a tighter discriminator this predicate can narrow further
+ *      without touching the callers.
+ *
+ * Kept structural rather than tied to a specific label string so a copy
+ * change by SR does not silently break the adapter.
  */
 function matchScript(fieldSelector: string): string {
   return `(() => {
@@ -172,7 +225,26 @@ function matchScript(fieldSelector: string): string {
       }
       if (!widget) return false;
       const options = widget.querySelectorAll('[role="option"]');
-      return options.length > 0;
+      if (options.length === 0) return false;
+      // Screening question discriminator: an .sr-field wrapper anywhere up
+      // the ancestor chain of the widget, OR an aria-labelledby target
+      // that itself sits inside a .sr-field. Without this the adapter
+      // matches every combobox on smartrecruiters.com (country picker,
+      // state picker, autocomplete, share widget).
+      const inSrField = widget.closest && widget.closest(".sr-field") !== null;
+      let labelInSrField = false;
+      const labelledBy = widget.getAttribute && widget.getAttribute("aria-labelledby");
+      if (labelledBy) {
+        for (const id of labelledBy.split(/\\s+/)) {
+          if (!id) continue;
+          const labelEl = document.getElementById(id);
+          if (labelEl && labelEl.closest && labelEl.closest(".sr-field")) {
+            labelInSrField = true;
+            break;
+          }
+        }
+      }
+      return inSrField || labelInSrField;
     } catch (e) {
       return false;
     }
@@ -180,13 +252,51 @@ function matchScript(fieldSelector: string): string {
 }
 
 /**
- * The in page IIFE the SR adapter's `commit` runs. Walks up the widget's
- * ancestor chain a bounded number of steps looking for hidden form
- * controls (a `<select>` sibling, or an `<input type="hidden">`), sets
- * their value when it can, then dispatches `input` then `change` on every
- * control it collected AND on the visible widget itself. Returns a JSON
- * serialisable record of what fired so the outer function can put it in
- * the `detail` field of the `CommitResult`.
+ * The in page IIFE the SR adapter's `commit` runs. Scopes the hidden form
+ * control search to the widget's own field group and dispatches `input`
+ * then `change` on every control it collected AND on the visible widget
+ * itself. Returns a JSON serialisable record of what fired so the outer
+ * function can put it in the `detail` field of the `CommitResult`.
+ *
+ * Scoping strategy, per the JOB-281 red team BLOCKING finding:
+ *
+ *   Prior revision walked up 6 ancestor levels calling
+ *   `querySelectorAll("select" | "input[type=hidden]")` at each level. Once
+ *   the walk reached the surrounding `<form>`, those queries returned
+ *   every hidden input and every `<select>` in the whole form, and the
+ *   loop unconditionally wrote the target value into every hidden input it
+ *   collected. That silently overwrote CSRF tokens and answered sibling
+ *   screening dropdowns whose options happened to include the same text.
+ *
+ * The fix scopes the search two ways, in order of preference:
+ *
+ *   (b) Semantic field group: `el.closest('[data-field], .sr-field,
+ *       fieldset')`. When the widget lives inside a wrapper the form
+ *       author explicitly marked as one field, that wrapper is the scope.
+ *       This is the case on the SR screening pages the adapter targets
+ *       (`.sr-field` wraps each question and its hidden native control).
+ *   (a) Fallback: the widget's DIRECT parent's DIRECT children only. No
+ *       ancestor walk, no descendant queries, no querySelectorAll of any
+ *       ancestor subtree. Just the immediate siblings of the widget.
+ *
+ * Neither branch ever climbs to the surrounding form, so a hidden CSRF
+ * input or an unrelated screening dropdown elsewhere in the same form is
+ * never touched. If SR ships a screening question outside a `.sr-field`
+ * wrapper and the fallback path proves too narrow, the semantic list in
+ * (b) is the single place to widen.
+ *
+ * Note for a later ticket (M-3 in the red team report): direct
+ * `node.value = target` plus a native `Event(...)` dispatch is enough to
+ * wake plain listeners and Angular's `ngModelChange`, but React controlled
+ * inputs check their `_valueTracker` cache and skip `onChange` when the
+ * cached value equals the new one. If the orchestrator's live recon later
+ * reveals SR ships a react-select or another React controlled dropdown as
+ * the hidden control, the workaround is
+ * `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+ * .set.call(node, value)` (and the analogous descriptor for `<select>`)
+ * before the dispatch. Deliberately not shimmed here because a
+ * framework specific shim on a framework the recon has not yet confirmed
+ * would only add a maintenance burden.
  */
 function commitScript(fieldSelector: string, optionValue: string): string {
   return `(() => {
@@ -198,42 +308,58 @@ function commitScript(fieldSelector: string, optionValue: string): string {
     }
     const controls = [el];
     const seen = new Set([el]);
-    let scope = el;
-    for (let depth = 0; depth < 6 && scope; depth++) {
-      const hiddenSelectors = [
-        "select",
-        'input[type="hidden"]',
-      ];
-      for (const q of hiddenSelectors) {
-        const found = scope.querySelectorAll(q);
-        for (const node of found) {
-          if (seen.has(node)) continue;
-          seen.add(node);
-          controls.push(node);
-          try {
-            if (node.tagName === "SELECT" && node.options) {
-              const t = String(target).trim();
-              for (let i = 0; i < node.options.length; i++) {
-                const opt = node.options[i];
-                const text = (opt.text || "").trim();
-                const val = (opt.value || "").trim();
-                if (text === t || val === t) {
-                  node.value = opt.value;
-                  break;
-                }
-              }
-            } else if (node.type === "hidden") {
-              node.value = target;
+
+    // Option (b): a semantic field group wrapper is the preferred scope.
+    // The CSS selector list is the one the field group could plausibly be
+    // marked with; extend it in this one place if a future ATS is added.
+    const fieldGroup = (el.closest && el.closest('[data-field], .sr-field, fieldset')) || null;
+
+    const acceptControl = (node) => {
+      if (!node || node === el || seen.has(node)) return;
+      const tag = node.tagName || "";
+      const isSelect = tag === "SELECT";
+      const isHiddenInput = tag === "INPUT" && (node.getAttribute && node.getAttribute("type") === "hidden");
+      if (!isSelect && !isHiddenInput) return;
+      seen.add(node);
+      controls.push(node);
+      try {
+        if (isSelect && node.options) {
+          const t = String(target).trim();
+          for (let i = 0; i < node.options.length; i++) {
+            const opt = node.options[i];
+            const text = (opt.text || "").trim();
+            const val = (opt.value || "").trim();
+            if (text === t || val === t) {
+              node.value = opt.value;
+              break;
             }
-          } catch (e) {
-            // Assigning value on a detached or read only control is not the
-            // adapter's failure mode to fix; the event dispatch below still
-            // runs and the trace records what fired.
           }
+        } else if (isHiddenInput) {
+          node.value = target;
         }
+      } catch (e) {
+        // Assigning value on a detached or read only control is not the
+        // adapter's failure mode to fix; the event dispatch below still
+        // runs and the trace records what fired.
       }
-      scope = scope.parentElement;
+    };
+
+    if (fieldGroup) {
+      // Scope: the semantic wrapper only. Descendant query is safe here
+      // because the wrapper is bounded to one question.
+      const found = fieldGroup.querySelectorAll('select, input[type="hidden"]');
+      for (const node of found) acceptControl(node);
+    } else {
+      // Option (a) fallback: the widget's direct parent's direct children.
+      // No descendant query, no ancestor walk. Only the widget's
+      // immediate siblings can enter the control set.
+      const parent = el.parentElement;
+      if (parent) {
+        const kids = parent.children;
+        for (let i = 0; i < kids.length; i++) acceptControl(kids[i]);
+      }
     }
+
     const fired = [];
     for (const c of controls) {
       try {

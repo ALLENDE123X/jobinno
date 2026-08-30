@@ -84,6 +84,70 @@ function mountPlainSelectFixture(): void {
   `;
 }
 
+/**
+ * Two SR screening field groups plus a form level CSRF token. The
+ * commit-on-group-1 test asserts that no state on group 2 or on the CSRF
+ * token changes and that no `change` listener elsewhere in the form fires,
+ * which is the regression surface the JOB-281 red team BLOCKING finding
+ * called out.
+ */
+function mountTwoScreeningGroupsWithCsrfFixture(): void {
+  document.body.innerHTML = `
+    <form>
+      <input id="csrf" type="hidden" name="csrf_token" value="ORIGINAL_CSRF_TOKEN" />
+      <div class="sr-field" id="group1">
+        <div id="q1" role="combobox" aria-expanded="false" aria-haspopup="listbox">
+          <span class="sr-field__label">Question one</span>
+          <ul role="listbox" id="q1-listbox">
+            <li role="option" data-value="yes">Yes</li>
+            <li role="option" data-value="no">No</li>
+          </ul>
+        </div>
+        <select id="q1-hidden" name="q1_hidden" style="display:none">
+          <option value="">--</option>
+          <option value="yes">Yes</option>
+          <option value="no">No</option>
+        </select>
+      </div>
+      <div class="sr-field" id="group2">
+        <div id="q2" role="combobox" aria-expanded="false" aria-haspopup="listbox">
+          <span class="sr-field__label">Question two</span>
+          <ul role="listbox" id="q2-listbox">
+            <li role="option" data-value="yes">Yes</li>
+            <li role="option" data-value="no">No</li>
+          </ul>
+        </div>
+        <select id="q2-hidden" name="q2_hidden" style="display:none">
+          <option value="">--</option>
+          <option value="yes">Yes</option>
+          <option value="no">No</option>
+        </select>
+      </div>
+    </form>
+  `;
+}
+
+/**
+ * A SR combobox that is NOT wrapped in an `.sr-field` and does not name a
+ * labelled by target that is. Stands in for SR's country picker, state
+ * picker, autocomplete, and share widget - the false positive surface the
+ * M-1 finding flagged. The adapter must NOT match this.
+ */
+function mountSrNonScreeningComboboxFixture(): void {
+  document.body.innerHTML = `
+    <form>
+      <div class="autocomplete-widget">
+        <div id="country-picker" role="combobox" aria-expanded="false" aria-haspopup="listbox">
+          <ul role="listbox">
+            <li role="option" data-value="us">United States</li>
+            <li role="option" data-value="ca">Canada</li>
+          </ul>
+        </div>
+      </div>
+    </form>
+  `;
+}
+
 describe("SRScreeningDropdownAdapter.matches", () => {
   beforeEach(() => {
     document.body.innerHTML = "";
@@ -127,6 +191,38 @@ describe("SRScreeningDropdownAdapter.matches", () => {
     const adapter = new SRScreeningDropdownAdapter();
     const result = await adapter.matches({}, "#q1");
     expect(result).toBe(false);
+  });
+
+  it("returns false for an SR combobox that is not a screening question", async () => {
+    // JOB-281 M-1: without the .sr-field discriminator the adapter matches
+    // every combobox on a smartrecruiters.com host, including the country
+    // picker, state picker, autocomplete, and share widget. This case
+    // guards that the discriminator is enforced.
+    mountSrNonScreeningComboboxFixture();
+    const adapter = new SRScreeningDropdownAdapter();
+    const result = await adapter.matches(fakePage(SR_URL), "#country-picker");
+    expect(result).toBe(false);
+  });
+
+  it("rejects a lookalike host on a path that mentions smartrecruiters.com", async () => {
+    // JOB-281 N-1: substring match false positives on
+    // https://evil.example/redirect?to=smartrecruiters.com. The hostname
+    // parse must reject this.
+    mountSrScreeningFixture();
+    const adapter = new SRScreeningDropdownAdapter();
+    const spoofUrl = "https://evil.example/redirect?to=smartrecruiters.com";
+    const result = await adapter.matches(fakePage(spoofUrl), "#q1");
+    expect(result).toBe(false);
+  });
+
+  it("accepts a company subdomain of smartrecruiters.com", async () => {
+    mountSrScreeningFixture();
+    const adapter = new SRScreeningDropdownAdapter();
+    const result = await adapter.matches(
+      fakePage("https://careers.acme.smartrecruiters.com/apply/12345"),
+      "#q1"
+    );
+    expect(result).toBe(true);
   });
 });
 
@@ -195,6 +291,116 @@ describe("SRScreeningDropdownAdapter.commit", () => {
     const result = await adapter.commit(fakeThrowingPage(SR_URL), "#q1", "Yes");
     expect(result.status).toBe("adapter_failed");
     expect(result.detail).toBe("boom");
+  });
+
+  /**
+   * JOB-281 M-2. U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH
+   * SEPARATOR) are valid inside a JS string value but illegal inside a JS
+   * string literal in source. If `jsLiteral` did not escape them, the
+   * injected script would fail to parse and the adapter would return
+   * `adapter_failed`. This case asserts the escape lets the commit run.
+   */
+  it("commit does not throw when the option value contains U+2028 or U+2029", async () => {
+    mountSrScreeningFixture();
+    const target = `Yes extra line`;
+    const adapter = new SRScreeningDropdownAdapter();
+    const result = await adapter.commit(fakePage(SR_URL), "#q1", target);
+    // No option matches, but the script itself has to run without a
+    // parse error. `ok: true` is what tells us the escape worked.
+    expect(result.status).toBe("committed");
+  });
+
+  /**
+   * The JOB-281 red team BLOCKING regression. The prior ancestor walk
+   * reached the surrounding `<form>` and its `querySelectorAll` at that
+   * level returned every hidden input and every `<select>` in the form,
+   * so calling commit on group 1 clobbered the CSRF token AND silently
+   * answered group 2. This case pins the fix in place.
+   */
+  it("commit on group 1 does not touch group 2 or the CSRF token", async () => {
+    mountTwoScreeningGroupsWithCsrfFixture();
+
+    const changeSpy: Array<{ type: string; targetId: string }> = [];
+    const capture = (event: Event): void => {
+      const target = event.target as HTMLElement | null;
+      changeSpy.push({ type: event.type, targetId: target?.id ?? "" });
+    };
+    document.addEventListener("input", capture, true);
+    document.addEventListener("change", capture, true);
+
+    const adapter = new SRScreeningDropdownAdapter();
+    const result = await adapter.commit(fakePage(SR_URL), "#q1", "Yes");
+
+    document.removeEventListener("input", capture, true);
+    document.removeEventListener("change", capture, true);
+
+    expect(result.status).toBe("committed");
+
+    const csrf = document.querySelector<HTMLInputElement>("#csrf");
+    expect(csrf?.value).toBe("ORIGINAL_CSRF_TOKEN");
+
+    const q1Hidden = document.querySelector<HTMLSelectElement>("#q1-hidden");
+    expect(q1Hidden?.value).toBe("yes");
+
+    // The critical assertions: group 2's hidden select is untouched, and
+    // no change or input event has fired on it or on the CSRF input.
+    const q2Hidden = document.querySelector<HTMLSelectElement>("#q2-hidden");
+    expect(q2Hidden?.value).toBe("");
+
+    const foreignEvents = changeSpy.filter(
+      (e) => e.targetId === "q2-hidden" || e.targetId === "csrf" || e.targetId === "q2"
+    );
+    expect(foreignEvents).toEqual([]);
+  });
+
+  /**
+   * The option (a) fallback: when no `.sr-field`, `[data-field]`, or
+   * `<fieldset>` wraps the widget, the scope collapses to the widget's
+   * direct parent's direct children only. A hidden input two ancestor
+   * levels up must not be scooped in.
+   */
+  it("fallback scope stays at the widget's direct parent's children", async () => {
+    document.body.innerHTML = `
+      <form>
+        <input id="csrf" type="hidden" name="csrf_token" value="ORIGINAL_CSRF_TOKEN" />
+        <div id="wrapper">
+          <div id="row">
+            <div id="q1" role="combobox" aria-haspopup="listbox" aria-labelledby="lbl">
+              <ul role="listbox">
+                <li role="option" data-value="yes">Yes</li>
+              </ul>
+            </div>
+            <select id="q1-hidden" name="q1_hidden" style="display:none">
+              <option value="">--</option>
+              <option value="yes">Yes</option>
+            </select>
+          </div>
+          <input id="unrelated-hidden" type="hidden" value="LEAVE_ME_ALONE" />
+        </div>
+      </form>
+    `;
+
+    const commitScriptResult = await new SRScreeningDropdownAdapter().commit(
+      fakePage(SR_URL),
+      "#q1",
+      "Yes"
+    );
+    // The .sr-field discriminator is not present, so `matches` would say
+    // false; but `commit` never consults `matches` (that is the registry's
+    // job), so this case reaches the commit path and exercises the option
+    // (a) fallback directly. That is what we want to pin.
+    expect(commitScriptResult.status).toBe("committed");
+
+    // q1-hidden is a direct sibling of q1 inside #row and must be committed.
+    const q1Hidden = document.querySelector<HTMLSelectElement>("#q1-hidden");
+    expect(q1Hidden?.value).toBe("yes");
+
+    // csrf and #unrelated-hidden are not direct siblings of #q1; they must
+    // not be touched.
+    const csrf = document.querySelector<HTMLInputElement>("#csrf");
+    expect(csrf?.value).toBe("ORIGINAL_CSRF_TOKEN");
+    const unrelated = document.querySelector<HTMLInputElement>("#unrelated-hidden");
+    expect(unrelated?.value).toBe("LEAVE_ME_ALONE");
   });
 });
 
