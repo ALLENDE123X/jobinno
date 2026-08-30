@@ -72,6 +72,7 @@ import {
   CHECKOUT_PATH,
   CHECKOUT_PLAN_PARAM,
 } from "@/lib/billing/plans";
+import { LANDING_PLANS } from "@/lib/pricing";
 import { createServerClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 import {
@@ -82,58 +83,13 @@ import {
 import { WAITLIST_GATE_ACTIVE } from "@/lib/waitlist-gate";
 
 /**
- * The two paid plans are the real ones. Do not adjust a number here without the
- * matching change wherever billing reads them once JOB-010 lands.
+ * The two paid plans are the real ones. The catalog itself is in
+ * `lib/pricing.ts`, so the landing page and the dashboard's upgrade cards
+ * (`app/dashboard/upgrade-cards.tsx`, JOB-284) render the same numbers and
+ * the same copy without either surface owning the source of truth. Do not
+ * adjust a number by editing the render here; edit `LANDING_PLANS`.
  */
-const PLANS = [
-  {
-    // `slug` is what the checkout route is handed. The two paid ones match the
-    // `plan_tier` enum and the catalog in `lib/billing/plans.ts`; `free` is not
-    // sold and has no Stripe price behind it.
-    slug: "free",
-    name: "Free",
-    price: "$0",
-    cadence: "to try it",
-    allowance: "3 applications, total",
-    features: [
-      "3 applications, once",
-      "Every supported ATS platform",
-      "Full log of what was submitted",
-    ],
-    cta: "Start free",
-    featured: false,
-  },
-  {
-    slug: "starter",
-    name: "Starter",
-    price: "$29",
-    cadence: "per month",
-    allowance: "150 applications every month",
-    features: [
-      "150 applications per month",
-      "Runs overnight, every night",
-      "Full log of what was submitted",
-      "Cancel whenever you want",
-    ],
-    cta: "Get Starter",
-    featured: true,
-  },
-  {
-    slug: "season_pass",
-    name: "Season Pass",
-    price: "$99",
-    cadence: "one time",
-    allowance: "500 applications, valid 6 months",
-    features: [
-      "500 applications",
-      "Valid for 6 months",
-      "Built for one recruiting season",
-      "No subscription to remember",
-    ],
-    cta: "Get the Season Pass",
-    featured: false,
-  },
-] as const;
+const PLANS = LANDING_PLANS;
 
 /**
  * The id the waitlist section carries, and where this page's calls to action

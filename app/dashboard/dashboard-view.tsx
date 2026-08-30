@@ -23,6 +23,7 @@ import { cn } from "@/lib/utils";
 
 import { FindJobsButton } from "./find-jobs-button";
 import { QuotaMeter } from "./quota-meter";
+import { UpgradeCards } from "./upgrade-cards";
 
 /** Pill colours per tone. The tone itself is never rendered. */
 const TONE_CLASSES: Record<StatusTone, string> = {
@@ -235,6 +236,12 @@ export function DashboardView({
             ))}
           </ul>
         )}
+
+        {/* JOB-284: pricing cards below the list so a person who has used
+            up their allowance has a path to pay without leaving the app.
+            The route on the other end owns the "already on this plan"
+            check, so both cards render regardless of the current plan. */}
+        <UpgradeCards />
       </main>
     </PageShell>
   );

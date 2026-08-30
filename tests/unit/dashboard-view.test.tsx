@@ -51,6 +51,16 @@ vi.mock("@/lib/supabase/client", () => ({
   }),
 }));
 
+// JOB-284 planted upgrade cards under the applications list. That component
+// renders two feature lists and two submit buttons that would otherwise show
+// up in `screen.queryByRole("list")` and count against `getByRole("button")`
+// queries here, breaking asserts that were about the applications list
+// itself. `tests/unit/dashboard/upgrade-cards.test.tsx` owns coverage of the
+// upgrade cards; this stub keeps the two suites focused on their own halves.
+vi.mock("@/app/dashboard/upgrade-cards", () => ({
+  UpgradeCards: () => null,
+}));
+
 const { DashboardView } = await import("@/app/dashboard/dashboard-view");
 const { toQuota } = await import("@/lib/dashboard/dashboard-data");
 const { APPLICATION_STATUS } = await import("@/lib/application-status");
