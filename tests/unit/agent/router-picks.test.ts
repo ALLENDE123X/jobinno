@@ -28,27 +28,29 @@ const HAIKU = "anthropic/claude-haiku-4-5";
 
 describe("pickModel", () => {
   it("retry zero with no hint returns the Gemini primary", () => {
-    const config = pickModel({ retry: 0 });
+    const config = pickModel({ retry: 0 }, {});
     expect(config.tier).toBe("primary");
     expect(config.model).toBe(GEMINI);
   });
 
   it("retry zero with the complex widget hint returns the Sonnet escalation", () => {
-    const config = pickModel({ retry: 0, hint: "complex-widget" });
+    const config = pickModel({ retry: 0, hint: "complex-widget" }, {});
     expect(config.tier).toBe("escalation");
     expect(config.model).toBe(SONNET);
   });
 
   it("retry zero with the modal heavy hint also escalates", () => {
-    const config = pickModel({ retry: 0, hint: "modal-heavy" });
+    const config = pickModel({ retry: 0, hint: "modal-heavy" }, {});
     expect(config.tier).toBe("escalation");
     expect(config.model).toBe(SONNET);
   });
 
   it("retry one returns the Sonnet escalation regardless of hint", () => {
-    expect(pickModel({ retry: 1 }).model).toBe(SONNET);
-    expect(pickModel({ retry: 1, hint: "complex-widget" }).model).toBe(SONNET);
-    expect(pickModel({ retry: 2, hint: undefined }).model).toBe(SONNET);
+    expect(pickModel({ retry: 1 }, {}).model).toBe(SONNET);
+    expect(pickModel({ retry: 1, hint: "complex-widget" }, {}).model).toBe(
+      SONNET
+    );
+    expect(pickModel({ retry: 2, hint: undefined }, {}).model).toBe(SONNET);
   });
 
   it("honors an operator escalation override through env", () => {
@@ -67,8 +69,8 @@ describe("pickModel", () => {
       pickModel({ retry: 1 }, { USE_AGENT_ESCALATION_MODEL: HAIKU })
     ).toThrow(/not viable/);
     // The plain primary and escalation paths also resolve away from Haiku.
-    const primary = pickModel({ retry: 0 }).model;
-    const escalation = pickModel({ retry: 1 }).model;
+    const primary = pickModel({ retry: 0 }, {}).model;
+    const escalation = pickModel({ retry: 1 }, {}).model;
     expect([primary, escalation]).not.toContain(HAIKU);
   });
 
@@ -118,7 +120,7 @@ describe("pickModel", () => {
       ).toBe("anthropic");
     }
     // Google prefixed and bare Gemini ids both classify as `google`.
-    expect(pickModel({ retry: 0 }).provider).toBe("google");
+    expect(pickModel({ retry: 0 }, {}).provider).toBe("google");
     // Any unrecognized family lands in `other` so a new provider name
     // routes to the legacy path by default rather than silently claiming
     // Anthropic caching semantics.
@@ -324,5 +326,49 @@ describe("runAgentLoop", () => {
       expect(error.reason).toBe("max-cost");
       expect(error.costCents).toBe(6);
     }
+  });
+
+  it("does not run any tool handler when a non terminal turn already crossed the cost cap", async () => {
+    // Regression for the earlier order that ran the tool loop first and only
+    // then checked the cost cap. Once sub tickets B and D land real
+    // Stagehand handlers, a run that has already blown its budget must not
+    // trigger any further browser side effects (form fills, form submits)
+    // before aborting. The invariant that `submitted` is terminal and can
+    // never be undone means an over budget submit tool call would be
+    // unrecoverable, so the loop has to fail closed at the budget boundary
+    // before dispatching the model's tool calls.
+    let toolInvocations = 0;
+    const runTool = async () => {
+      toolInvocations += 1;
+      return { ok: true };
+    };
+    const model = scriptedModel([
+      {
+        text: "Still working.",
+        costCents: 10,
+        toolCalls: [
+          { id: "t1", name: "readSnapshot", input: "{}" },
+          { id: "t2", name: "fillField", input: "{}" },
+        ],
+      },
+    ]);
+
+    const error = await runAgentLoop(undefined, "Facts", "Fill", {
+      modelCall: model.handler,
+      runTool,
+      env: { AGENT_MAX_COST_CENTS: "5" },
+    }).then(
+      () => new Error("expected the loop to reject"),
+      (e: unknown) => e
+    );
+
+    expect(error).toBeInstanceOf(AgentBudgetExceededError);
+    if (error instanceof AgentBudgetExceededError) {
+      expect(error.reason).toBe("max-cost");
+      expect(error.costCents).toBe(10);
+    }
+    // The load bearing assertion: not a single tool call fired even though
+    // the model returned two of them on the over budget turn.
+    expect(toolInvocations).toBe(0);
   });
 });

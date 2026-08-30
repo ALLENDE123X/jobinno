@@ -498,24 +498,19 @@ export async function runAgentLoop(
     step += 1;
     totalCostCents += response.costCents;
 
-    const outcomes: Array<{ call: AgentToolCall; outcome: AgentToolOutcome }> =
-      [];
-    for (const toolCall of response.toolCalls) {
-      const outcome = await opts.runTool(toolCall);
-      outcomes.push({ call: toolCall, outcome });
-      if (!outcome.ok && outcome.signal) {
-        retry = 1;
-        hint = outcome.signal;
-      }
-    }
-
-    // Cost cap is checked AFTER the terminal return so a turn that produces
-    // the final answer on the same call that crosses the cap returns the
-    // answer instead of throwing it away. The strict `>` boundary means the
-    // exact spent value hitting the cap ends the run cleanly rather than
-    // aborting the next iteration a run that already finished never would
-    // have made. Reversed from the earlier `>=` check that fired before the
-    // terminal return and discarded a run's finished text.
+    // Terminal return runs first so a turn that produces the final answer on
+    // the same call that crosses the cap returns the answer instead of
+    // throwing it away. Cost cap runs next, BEFORE any tool handlers execute,
+    // because a tool loop that fires after the cap has already been crossed
+    // can leak real side effects (form fills, form submits) past the budget
+    // the loop is meant to enforce. Once sub tickets B and D wire real
+    // Stagehand handlers in place of the stubs, an over budget submit tool
+    // call is unrecoverable under the invariant that `submitted` is terminal
+    // and can never be undone. The strict `>` boundary means the exact spent
+    // value hitting the cap ends the run cleanly rather than aborting the
+    // next iteration a run that already finished never would have made.
+    // Reversed from the earlier `>=` check that fired before the terminal
+    // return and discarded a run's finished text.
     if (response.toolCalls.length === 0) {
       return { turns: step, finalText: response.text };
     }
@@ -526,6 +521,17 @@ export async function runAgentLoop(
         steps: step,
         costCents: totalCostCents,
       });
+    }
+
+    const outcomes: Array<{ call: AgentToolCall; outcome: AgentToolOutcome }> =
+      [];
+    for (const toolCall of response.toolCalls) {
+      const outcome = await opts.runTool(toolCall);
+      outcomes.push({ call: toolCall, outcome });
+      if (!outcome.ok && outcome.signal) {
+        retry = 1;
+        hint = outcome.signal;
+      }
     }
 
     priorMessages.push(buildUserTurn(response, outcomes));
