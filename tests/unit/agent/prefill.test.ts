@@ -220,6 +220,184 @@ describe("classifyPrefillSlot", () => {
     }
   });
 
+  it("returns null for country and state labels whose positive signal is paired with a birth or citizenship qualifier", () => {
+    // Regression for the JOB-280 second red team, finding B1. The earlier
+    // draft's positive signal check accepted "Current country of
+    // citizenship" and "Home country of birth" as `currentCountry` because
+    // the positive signal fired without a paired negative check. The
+    // combined positive plus negative rule closes the hole architecturally.
+    const combined = [
+      "Current country of citizenship",
+      "Home country of birth",
+      "Home country of origin",
+      "Current country of birth",
+      "Mailing country of birth",
+      "Residence country of birth",
+      "Home country of nationality",
+      "Home state of birth",
+      "Home province of origin",
+      "Current state of birth",
+      "Mailing state of birth",
+      "Residence state of nationality",
+    ];
+    for (const label of combined) {
+      expect(classifyPrefillSlot(label), label).toBeNull();
+    }
+  });
+
+  it("returns null for postal code labels whose positive signal is paired with a birth or previous qualifier", () => {
+    // Regression for the JOB-280 second red team, finding B2. The earlier
+    // draft had no guard on `postalCode` at all, so an immigration or
+    // background check form asking for "Zip of birth" would attest the
+    // applicant's current zip. The shared negative qualifier catches these
+    // too.
+    const combined = [
+      "Zip of birth",
+      "Birth zip code",
+      "Postal code of previous residence",
+      "Zip code of birth",
+      "Home zip code of birth",
+      "Postal code of former residence",
+      "Zip of native country",
+    ];
+    for (const label of combined) {
+      expect(classifyPrefillSlot(label), label).toBeNull();
+    }
+  });
+
+  it("returns null for city labels whose positive signal is paired with a birth, native, or contact qualifier", () => {
+    // Regression for the JOB-280 second red team, finding M1. `city`
+    // classified for "City of birth", "Birth city", "Native city",
+    // "Emergency contact city" before the shared negative qualifier
+    // covered every identity slot.
+    const combined = [
+      "City of birth",
+      "Birth city",
+      "Native city",
+      "Emergency contact city",
+      "City of origin",
+      "Home city of birth",
+    ];
+    for (const label of combined) {
+      expect(classifyPrefillSlot(label), label).toBeNull();
+    }
+  });
+
+  it("returns null for name labels that describe someone other than the applicant", () => {
+    // Regression for the JOB-280 second red team, finding M1. Emergency
+    // contact / reference / manager / spouse / parent / guardian labels
+    // named their person's identity, not the applicant's.
+    const namesForOthers = [
+      "Emergency contact first name",
+      "Reference first name",
+      "Manager first name",
+      "Spouse first name",
+      "Parent last name",
+      "Guardian last name",
+      "Supervisor first name",
+      "Contact last name",
+      "Mother first name",
+      "Father last name",
+    ];
+    for (const label of namesForOthers) {
+      expect(classifyPrefillSlot(label), label).toBeNull();
+    }
+  });
+
+  it("returns null for phone labels that describe someone other than the applicant", () => {
+    // Regression for the JOB-280 second red team, finding M1.
+    const phonesForOthers = [
+      "Emergency phone",
+      "Reference phone",
+      "Spouse phone",
+      "Parent phone",
+      "Emergency contact phone",
+      "Manager phone",
+      "Guardian mobile",
+    ];
+    for (const label of phonesForOthers) {
+      expect(classifyPrefillSlot(label), label).toBeNull();
+    }
+  });
+
+  it("returns null for social labels that describe someone other than the applicant", () => {
+    // Regression for the JOB-280 second red team, finding M1.
+    const socialForOthers = [
+      "Manager LinkedIn",
+      "Reference website",
+      "Spouse LinkedIn",
+      "Emergency contact LinkedIn",
+      "Manager portfolio",
+      "Reference GitHub",
+    ];
+    for (const label of socialForOthers) {
+      expect(classifyPrefillSlot(label), label).toBeNull();
+    }
+  });
+
+  it("returns null for the suffix form of an email confirmation label", () => {
+    // Regression for the JOB-280 second red team, finding B3. The prefix
+    // form ("Confirm email") was caught by `FIELD_KEYWORDS.confirmEmail`
+    // already; the suffix form ("Email confirmation", "Email
+    // verification") ran through the plain `email` regex and silently
+    // classified as `email` before this fix.
+    expect(classifyPrefillSlot("Email confirmation")).toBeNull();
+    expect(classifyPrefillSlot("Email verification")).toBeNull();
+    expect(classifyPrefillSlot("email confirmation address")).toBeNull();
+    expect(classifyPrefillSlot("Email confirmation address")).toBeNull();
+    expect(classifyPrefillSlot("Email repeat")).toBeNull();
+    expect(classifyPrefillSlot("Email again")).toBeNull();
+  });
+
+  it("keeps classifying the positive labels every reader relies on", () => {
+    // Regression pin so a broader negative qualifier does not silently
+    // shrink the positive surface. Every label below has to still resolve
+    // to its own slot after the shared negative check runs.
+    const positives: Array<[string, PrefillSlot]> = [
+      ["Country", "currentCountry"],
+      ["Current country", "currentCountry"],
+      ["Country of residence", "currentCountry"],
+      ["Country you live in", "currentCountry"],
+      ["Country of residency", "currentCountry"],
+      ["State", "currentState"],
+      ["Current state", "currentState"],
+      ["State of residence", "currentState"],
+      ["Zip code", "postalCode"],
+      ["Postal code", "postalCode"],
+      ["Home zip", "postalCode"],
+      ["Email address", "email"],
+      ["Your email", "email"],
+      ["Email", "email"],
+      ["City", "city"],
+      ["Current city", "city"],
+      ["City of residence", "city"],
+      ["First name", "firstName"],
+      ["Your first name", "firstName"],
+      ["Given name", "firstName"],
+      ["Last name", "lastName"],
+      ["Phone", "phone"],
+      ["Mobile", "phone"],
+      ["LinkedIn URL", "linkedin"],
+      ["Personal website", "website"],
+    ];
+    // A few of the positives above overlap the negative qualifier when
+    // read with a broader eye (a bare "Country" is ambiguous but not
+    // negative). The classifier has to still resolve them, which is
+    // exactly the assertion here.
+    for (const [label, expected] of positives) {
+      const actual = classifyPrefillSlot(label);
+      // A bare "Country" or "State" falls through to null under the
+      // positive current location gate; the assertion for those splits
+      // into "either the expected slot or null" so the pin stays honest
+      // about the double gate rather than pretending the bare form fills.
+      if (label === "Country" || label === "State") {
+        expect(actual, label).toBeNull();
+      } else {
+        expect(actual, label).toBe(expected);
+      }
+    }
+  });
+
   it("returns null for labels no pattern matches", () => {
     expect(classifyPrefillSlot("How did you hear about us?")).toBeNull();
     expect(classifyPrefillSlot("")).toBeNull();
@@ -485,6 +663,197 @@ describe("deterministicPrefill", () => {
     }
   });
 
+  it("does not write the applicant's identity into any reference, emergency contact, spouse, parent, or guardian label", async () => {
+    // Regression for the JOB-280 second red team, finding M1. The
+    // classifier lets the walker skip these labels as `no_label_match`
+    // (never a fill) because the shared negative qualifier catches every
+    // "someone other than the applicant" word before any positive slot
+    // pattern runs. Verified end to end: no write reaches these refs.
+    const tree: RawAccessibilityNode = {
+      role: "form",
+      name: "Application",
+      ref: "form_root",
+      children: [
+        { role: "textbox", name: "City", required: false, ref: "field_city" },
+        {
+          role: "textbox",
+          name: "Emergency contact first name",
+          required: false,
+          ref: "field_emerg_first",
+        },
+        {
+          role: "textbox",
+          name: "Reference last name",
+          required: false,
+          ref: "field_ref_last",
+        },
+        {
+          role: "textbox",
+          name: "Spouse phone",
+          required: false,
+          ref: "field_spouse_phone",
+        },
+        {
+          role: "textbox",
+          name: "Manager LinkedIn",
+          required: false,
+          ref: "field_mgr_linkedin",
+        },
+        {
+          role: "textbox",
+          name: "Reference website",
+          required: false,
+          ref: "field_ref_site",
+        },
+        {
+          role: "textbox",
+          name: "Parent phone",
+          required: false,
+          ref: "field_parent_phone",
+        },
+        {
+          role: "textbox",
+          name: "Emergency contact city",
+          required: false,
+          ref: "field_emerg_city",
+        },
+        {
+          role: "textbox",
+          name: "Guardian last name",
+          required: false,
+          ref: "field_guardian_last",
+        },
+      ],
+    };
+    const page = pageFromTree(
+      "https://example.test/apply/other-parties",
+      "Apply",
+      tree
+    );
+    const report = await deterministicPrefill(page, buildCatalog());
+    // The applicant's plain city still fills.
+    expect(report.filled.find((f) => f.ref === "field_city")?.value).toBe(
+      "San Francisco"
+    );
+    // Every "someone else" label is skipped with `no_label_match`, null
+    // slot, and receives no write. HARD STOP 9 by construction.
+    for (const ref of [
+      "field_emerg_first",
+      "field_ref_last",
+      "field_spouse_phone",
+      "field_mgr_linkedin",
+      "field_ref_site",
+      "field_parent_phone",
+      "field_emerg_city",
+      "field_guardian_last",
+    ]) {
+      const skip = report.skipped.find((s) => s.ref === ref);
+      expect(skip?.reason, ref).toBe("no_label_match");
+      expect(skip?.slot, ref).toBeNull();
+      expect(page.calls.some((c) => c.ref === ref), ref).toBe(false);
+    }
+  });
+
+  it("does not write the current zip into any postal code label paired with a birth or previous qualifier", async () => {
+    // Regression for the JOB-280 second red team, finding B2. Immigration
+    // and background check forms ask for the postal code of birth or of a
+    // previous residence; the earlier draft had no guard on `postalCode`
+    // and would attest the applicant's current zip.
+    const tree: RawAccessibilityNode = {
+      role: "form",
+      name: "Application",
+      ref: "form_root",
+      children: [
+        { role: "textbox", name: "City", required: false, ref: "field_city" },
+        {
+          role: "textbox",
+          name: "Zip of birth",
+          required: false,
+          ref: "field_zip_birth",
+        },
+        {
+          role: "textbox",
+          name: "Birth zip code",
+          required: false,
+          ref: "field_birth_zip",
+        },
+        {
+          role: "textbox",
+          name: "Postal code of previous residence",
+          required: false,
+          ref: "field_postal_previous",
+        },
+        {
+          role: "textbox",
+          name: "Postal code of former residence",
+          required: false,
+          ref: "field_postal_former",
+        },
+      ],
+    };
+    const page = pageFromTree(
+      "https://example.test/apply/postal-legally-distinct",
+      "Apply",
+      tree
+    );
+    const report = await deterministicPrefill(page, buildCatalog());
+    expect(report.filled.find((f) => f.ref === "field_city")?.value).toBe(
+      "San Francisco"
+    );
+    for (const ref of [
+      "field_zip_birth",
+      "field_birth_zip",
+      "field_postal_previous",
+      "field_postal_former",
+    ]) {
+      const skip = report.skipped.find((s) => s.ref === ref);
+      expect(skip?.reason, ref).toBe("no_label_match");
+      expect(skip?.slot, ref).toBeNull();
+      expect(page.calls.some((c) => c.ref === ref), ref).toBe(false);
+    }
+  });
+
+  it("does not classify the suffix form of email confirmation as `email`", async () => {
+    // Regression for the JOB-280 second red team, finding B3. "Email
+    // confirmation" and "Email verification" ran through the plain `email`
+    // regex before this fix.
+    const tree: RawAccessibilityNode = {
+      role: "form",
+      name: "Application",
+      ref: "form_root",
+      children: [
+        { role: "textbox", name: "Email address", required: true, ref: "field_email" },
+        {
+          role: "textbox",
+          name: "Email confirmation",
+          required: true,
+          ref: "field_email_conf_suffix",
+        },
+        {
+          role: "textbox",
+          name: "Email verification",
+          required: true,
+          ref: "field_email_verif_suffix",
+        },
+      ],
+    };
+    const page = pageFromTree(
+      "https://example.test/apply/suffix-confirm",
+      "Apply",
+      tree
+    );
+    const report = await deterministicPrefill(page, buildCatalog());
+    expect(report.filled.find((f) => f.ref === "field_email")?.value).toBe(
+      "ada@example.test"
+    );
+    for (const ref of ["field_email_conf_suffix", "field_email_verif_suffix"]) {
+      const skip = report.skipped.find((s) => s.ref === ref);
+      expect(skip?.reason, ref).toBe("no_label_match");
+      expect(skip?.slot, ref).toBeNull();
+      expect(page.calls.some((c) => c.ref === ref), ref).toBe(false);
+    }
+  });
+
   it("does not write the current address into ambiguous bare address labels", async () => {
     const tree: RawAccessibilityNode = {
       role: "form",
@@ -655,6 +1024,78 @@ describe("deterministicPrefill", () => {
     const skipped = report.skipped.find((s) => s.ref === "field_first_name");
     expect(skipped?.reason).toBe("already_filled");
     expect(page.calls).toEqual([]);
+  });
+
+  it("never overwrites an existing non blank value even when it differs from the fact catalog", async () => {
+    // Regression for the JOB-280 second red team, finding B4. The earlier
+    // check gated on value equality, so a different non blank value
+    // (browser autofill, a prior turn, the applicant typing) was silently
+    // overwritten by the deterministic pass. Prefill is non destructive on
+    // any existing value now.
+    const tree: RawAccessibilityNode = {
+      role: "form",
+      name: "Application",
+      ref: "form_root",
+      children: [
+        {
+          role: "textbox",
+          name: "First name",
+          required: true,
+          ref: "field_first_name",
+          value: "Grace",
+        },
+        {
+          role: "textbox",
+          name: "Last name",
+          required: true,
+          ref: "field_last_name",
+          value: "Hopper",
+        },
+        {
+          role: "textbox",
+          name: "Email address",
+          required: true,
+          ref: "field_email",
+          // Empty string is the blank case: prefill still writes here.
+          value: "",
+        },
+        {
+          role: "textbox",
+          name: "Phone number",
+          required: false,
+          ref: "field_phone",
+          // Whitespace only counts as blank so prefill fills it.
+          value: "   ",
+        },
+      ],
+    };
+    const page = pageFromTree(
+      "https://example.test/apply/preserve-existing",
+      "Apply",
+      tree
+    );
+    const report = await deterministicPrefill(page, buildCatalog());
+
+    // First / last name were pre populated with different names and stay
+    // untouched. The report records `already_filled` for each, and the
+    // page never received a write for those refs.
+    const firstNameSkip = report.skipped.find((s) => s.ref === "field_first_name");
+    expect(firstNameSkip?.reason).toBe("already_filled");
+    expect(firstNameSkip?.slot).toBe("firstName");
+    const lastNameSkip = report.skipped.find((s) => s.ref === "field_last_name");
+    expect(lastNameSkip?.reason).toBe("already_filled");
+    expect(lastNameSkip?.slot).toBe("lastName");
+    expect(page.calls.some((c) => c.ref === "field_first_name")).toBe(false);
+    expect(page.calls.some((c) => c.ref === "field_last_name")).toBe(false);
+
+    // Email was empty and phone was whitespace only, so prefill still
+    // wrote to both. Both land on `filled` with the catalog values.
+    expect(report.filled.find((f) => f.ref === "field_email")?.value).toBe(
+      "ada@example.test"
+    );
+    expect(report.filled.find((f) => f.ref === "field_phone")?.value).toBe(
+      "+14155551212"
+    );
   });
 
   it("captures a per field write failure on the report and continues", async () => {

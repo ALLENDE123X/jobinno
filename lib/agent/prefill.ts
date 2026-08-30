@@ -32,18 +32,52 @@
  * tried to enumerate every legal shape for the current address while
  * rejecting every birth, citizenship, and nationality variant, and each
  * review round surfaced one more label the exclusion regex missed. That
- * enumeration is the wrong architecture, so `currentCountry`, `currentState`
- * and `postalCode` now classify differently. `currentCountry` and
- * `currentState` only classify when the label carries a positive current
- * location signal (one of current, residence, residing, live, address,
- * mailing, home, postal); a bare "Country" or "State" and every "Country of
- * birth", "Citizenship", "Native land", "Province of birth" shape return
- * `null` because none of them name a current location. This turns the risk
+ * enumeration is the wrong architecture; the classifier now works from the
+ * opposite direction. A label classifies to an identity slot only when it
+ * carries a positive signal that the slot names AND carries no negative
+ * qualifier that would name someone or something other than the applicant
+ * themselves. The two halves are independent conditions and both have to
+ * hold. Missing either one sends the label back to the walker as
+ * `no_label_match` so the agent decides later.
+ *
+ * The positive signal per slot: `firstName`, `lastName`, `email`, `phone`,
+ * `city`, `linkedin`, `website` all reuse the shared `FIELD_KEYWORDS` table
+ * that the DOM safety layer reads too, so both sides of the codebase agree
+ * on what a label means. `postalCode` reuses its own local regex that
+ * covers the postal, postcode, and zip vocabulary. `currentCountry` and
+ * `currentState` reuse their bare country / state regex AND additionally
+ * require a positive current location signal (one of current, residence,
+ * residing, live, address, mailing, home, postal) because a bare "Country"
+ * does not identify a current country the way "Country of residence" does.
+ *
+ * The negative qualifier: a single shared regex catches every phrase that
+ * turns an identity label into someone else's information. Birth / born /
+ * citizenship / nationality / origin / native / previous / former / prior /
+ * past all name a legally distinct answer (a country of birth is not the
+ * current country of residence, and HARD STOP 9 forbids attesting one as
+ * the other). Reference / emergency / spouse / partner / parent / guardian
+ * / mother / father / contact / manager / supervisor / boss all name a
+ * different person. When the negative qualifier fires, the label classifies
+ * to `null` regardless of the positive match: "Emergency contact first
+ * name" is not the applicant's first name, "Country of birth" is not their
+ * country, "Manager LinkedIn" is not their LinkedIn. This turns the risk
  * shape from "silently attest a wrong fact" into "let the agent decide
  * later", which aligns HARD STOP 9 by construction rather than by pattern
- * maintenance. `postalCode` is deliberately more permissive: any of `zip`,
- * `postal code`, `postcode`, or `postal` classifies, so a bare "Zip" still
- * fills.
+ * maintenance.
+ *
+ * The confirmEmail up front check catches both the prefix form
+ * (`FIELD_KEYWORDS.confirmEmail` matches "Confirm email", "Verify email")
+ * and the suffix form ("Email confirmation", "Email verification") that
+ * carry the confirmation word after the email token rather than before it.
+ * Both prevent a "Confirm email" or "Email confirmation" box from being
+ * silently filled as the primary email.
+ *
+ * The `already_filled` skip is deliberately non destructive: any pre
+ * existing non blank value on a control stays untouched, even when it
+ * differs from the fact catalog's value. Prefill runs at the top of a
+ * session before the agent loop; a value that arrived from browser
+ * autofill, a prior turn, or the person themselves belongs to the page
+ * already and is never overwritten by a deterministic pass.
  */
 
 import { buildFullSnapshot } from "@/lib/agent/readback";
@@ -87,12 +121,37 @@ export type PrefillSlot =
 /**
  * The positive current location signals that gate `currentCountry` and
  * `currentState`. A label has to name one of these to classify as a current
- * address slot, which is what makes a bare "Country" or a "Country of birth"
- * fall through to the agent instead of being filled. See the module header
- * for why this inverted guard replaces the closed PR's exclusion regex.
+ * address slot, which is what makes a bare "Country" fall through to the
+ * agent instead of being filled. See the module header for why this
+ * inverted guard replaces the closed PR's exclusion regex.
  */
 const POSITIVE_CURRENT_LOCATION =
-  /\b(?:current|residence|residing|live|address|mailing|home|postal)\b/i;
+  /\b(?:current|residence|residency|residing|live|address|mailing|home|postal)\b/i;
+
+/**
+ * The negative qualifier that rejects a label whatever slot its positive
+ * signal matched. Every word in this set names either a legally distinct
+ * answer (birth country versus current country, previous residence versus
+ * current residence) or a different person (reference, emergency contact,
+ * spouse, parent). See the module header for the full architectural
+ * argument. The list is shared across every slot so a new hole cannot open
+ * up on one slot without opening on the others.
+ */
+const NEGATIVE_QUALIFIER =
+  /\b(?:birth|born|citizen(?:ship)?|nationality|origin|native|previous|former|prior|past|reference|emergency|spouse|partner|parent|guardian|mother|father|contact|manager|supervisor|boss)\b/i;
+
+/**
+ * The suffix form of an email confirmation label. The shared
+ * `FIELD_KEYWORDS.confirmEmail` regex catches the prefix form ("Confirm
+ * email", "Verify email", "Re-enter email") because the confirmation word
+ * comes before "email" there. This regex covers the suffix form ("Email
+ * confirmation", "Email verification", "Email confirmation address") where
+ * the confirmation word follows the email token. Both prevent the primary
+ * email address from being typed into a control the board expects to
+ * validate against a manual retype.
+ */
+const EMAIL_CONFIRMATION_SUFFIX =
+  /\be-?mail\b[\s\S]*\b(?:confirm(?:ation)?|verify|verification|repeat|again)\b/i;
 
 /**
  * Address slot patterns the shared `FIELD_KEYWORDS` table does not carry.
@@ -101,8 +160,13 @@ const POSITIVE_CURRENT_LOCATION =
  * safety check silently. Kept local to prefill instead, matched with the
  * same shape (word bounded, case insensitive) so behavior stays predictable.
  *
- * `postalCode` is more permissive than the other two: it needs no positive
- * current location signal, so a bare "Zip" or "Postal code" still classifies.
+ * `postalCode` covers the postal, postcode, and zip vocabulary. A bare
+ * "Postal" alone does not classify; the shape reads as a mailing address
+ * fragment there rather than a code. `currentCountry` and `currentState`
+ * additionally require a positive current location signal (see
+ * `POSITIVE_CURRENT_LOCATION`) and every slot including `postalCode` is
+ * subject to the shared `NEGATIVE_QUALIFIER` reject inside
+ * `classifyPrefillSlot`.
  */
 const EXTRA_LABEL_PATTERNS: Record<
   Exclude<PrefillSlot, FieldKey>,
@@ -171,19 +235,22 @@ const PREFILL_KINDS: ReadonlySet<FieldNode["kind"]> = new Set([
 /**
  * The labels prefill refuses to write to, whatever slot they classify to.
  *
- * A "First name of your previous employer" input matches `firstName`'s
- * regex, and a bare `EXCLUDED_LABEL_PATTERNS` guard is what stops the
- * prefill from typing the candidate's own first name into it. The label
- * classes below are the ones HARD STOP 9 covers directly: employer
- * identity, employment dates, education institutions, and degree fields.
- * `PREFILL_SLOT_ORDER` never lists those slots to begin with, so the guard
- * is defensive rather than the primary line.
+ * The classes below are the ones the shared `NEGATIVE_QUALIFIER` does not
+ * catch: employer identity, employment dates, education institutions, and
+ * degree fields. `PREFILL_SLOT_ORDER` never lists those slots to begin
+ * with, so the guard is defensive rather than the primary line. The
+ * classifier already returns `null` for a "First name of your previous
+ * employer" label because "previous" is a negative qualifier, but the
+ * `employer` / `company` / `organization` half stays here so a "Company
+ * name" label still records `excluded_label` rather than the less specific
+ * `no_label_match` on the trace.
  *
- * This list deliberately does NOT enumerate birth, citizenship, or
- * nationality labels. Those no longer classify at all under the inverted
- * guard (`currentCountry` and `currentState` require a positive current
- * location signal), so they reach the walker as `no_label_match` and fall
- * through to the agent loop rather than being written.
+ * This list deliberately does NOT enumerate birth, citizenship,
+ * nationality, reference, emergency, spouse, parent, guardian, mother,
+ * father, contact, manager, supervisor, or boss labels. All of those are
+ * caught earlier by the shared `NEGATIVE_QUALIFIER` in
+ * `classifyPrefillSlot`, so they never reach a slot in the first place and
+ * the walker records them as `no_label_match`.
  */
 const EXCLUDED_LABEL_PATTERNS: readonly RegExp[] = [
   /\b(?:employer|company|organi[sz]ation)\b/i,
@@ -273,28 +340,45 @@ export interface PrefillOptions {
  * by accident. City resolves last of the address slots so a "City, State"
  * combined label prefers `currentState` over the plain city fallback.
  *
- * The inverted guard lives here: `currentCountry` and `currentState` only
- * classify when the label carries a positive current location signal (see
- * `POSITIVE_CURRENT_LOCATION`). A bare "Country", a "State / Province", and
- * every birth, citizenship, or nationality shape return `null` so the walker
- * records them as `no_label_match` and the agent loop decides later. This is
- * what aligns HARD STOP 9 by construction rather than by enumerating every
- * shape a form might use.
+ * The inverted guard lives here and applies to every identity slot without
+ * exception. A label classifies to a slot only when both halves hold: the
+ * slot's own positive signal matches, AND `NEGATIVE_QUALIFIER` does not.
+ * The negative qualifier catches every phrase that names a legally distinct
+ * fact ("Country of birth" is not the current country) or a different
+ * person ("Emergency contact first name" is not the applicant's first
+ * name). `currentCountry` and `currentState` layer an additional positive
+ * requirement on top: the label also has to carry a current location
+ * signal, since a bare "Country" does not point at a current country the
+ * way "Country of residence" does. See the module header for why this
+ * shape replaces the closed PR's enumerated exclusion regex.
+ *
+ * The confirmEmail up front check covers both the prefix form (the shared
+ * `FIELD_KEYWORDS.confirmEmail` regex catches "Confirm email", "Verify
+ * email", "Re-enter email") and the suffix form
+ * (`EMAIL_CONFIRMATION_SUFFIX` catches "Email confirmation", "Email
+ * verification"). Prefill deliberately excludes `confirmEmail` from
+ * `PREFILL_SLOT_ORDER` because the agent loop handles the copy explicitly
+ * (some boards validate the pair by typing sequence rather than pasting).
  */
 export function classifyPrefillSlot(label: string): PrefillSlot | null {
   const text = String(label ?? "").trim();
   if (text === "") return null;
-  // "Confirm email" reads to a human as an email box, and the plain
-  // `\be-?mail\b` regex for the `email` slot happily matches the "email"
-  // substring inside it. Prefill deliberately excludes `confirmEmail` from
-  // `PREFILL_SLOT_ORDER` because the agent loop handles the copy explicitly
-  // (some boards validate the pair by typing sequence rather than pasting),
-  // so the classifier has to reject the label up front. Without this
-  // check that runs before the slot scan, the walker would classify a
-  // "Confirm email" control to `email` and paste the address a second
-  // time, nullifying the whole reason `confirmEmail` was left off the
+  // Both forms of the email confirmation label reject before any positive
+  // pattern runs. Without this check the walker would classify a "Confirm
+  // email" or "Email confirmation" control to `email` and paste the address
+  // a second time, nullifying the reason `confirmEmail` was left off the
   // include list.
-  if (FIELD_KEYWORDS.confirmEmail.test(text)) return null;
+  if (
+    FIELD_KEYWORDS.confirmEmail.test(text) ||
+    EMAIL_CONFIRMATION_SUFFIX.test(text)
+  ) {
+    return null;
+  }
+  // The shared negative qualifier fires once, up front, so every slot
+  // inherits the same reject list. A hole cannot open on one slot without
+  // opening on every other slot, which is what makes the guard architectural
+  // rather than per pattern.
+  if (NEGATIVE_QUALIFIER.test(text)) return null;
   for (const slot of PREFILL_SLOT_ORDER) {
     if (isFieldKey(slot)) {
       if (FIELD_KEYWORDS[slot].test(text)) return slot;
@@ -322,9 +406,12 @@ function isFieldKey(slot: PrefillSlot): slot is Extract<PrefillSlot, FieldKey> {
  * caller (and the test suite) can assert the guard fires without having to
  * observe it through a full prefill walk.
  *
- * Only the employment, education, and degree classes fire here. Birth,
- * citizenship, and nationality labels are not listed because they no longer
- * classify at all; see `classifyPrefillSlot` and the module header.
+ * Only the employment, education, and degree classes fire here. Every
+ * other class the earlier draft enumerated (birth, citizenship,
+ * nationality, reference, emergency, spouse, parent, and so on) is caught
+ * earlier by the shared `NEGATIVE_QUALIFIER` in `classifyPrefillSlot`, so
+ * those labels no longer classify to a slot and the walker records them as
+ * `no_label_match` rather than `excluded_label`.
  */
 export function isExcludedLabel(label: string): boolean {
   const text = String(label ?? "").trim();
@@ -439,7 +526,13 @@ export async function deterministicPrefill(
       continue;
     }
 
-    if (field.value !== null && field.value.trim() === resolved.value.trim()) {
+    // Prefill is non destructive on every existing non blank value, not
+    // only on values that already match the fact catalog. A different
+    // string on the control means someone or something (browser autofill,
+    // an earlier turn, the applicant themselves) put it there and it
+    // belongs to the page already. Preserving it prevents the prefill pass
+    // from silently overwriting an answer the applicant would attest to.
+    if (field.value !== null && field.value.trim() !== "") {
       skipped.push({ ref: field.ref, label, reason: "already_filled", slot });
       continue;
     }

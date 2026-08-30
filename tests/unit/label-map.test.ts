@@ -16,7 +16,7 @@ import { FIELD_KEYWORDS as FIELD_KEYWORDS_LEGACY } from "@/lib/fill-application-
 import { FIELD_KEYWORDS, type FieldKey } from "@/lib/label-map";
 
 describe("FIELD_KEYWORDS", () => {
-  it("re-exports the same object reference from the legacy module", () => {
+  it("shares the same object reference with the legacy module", () => {
     // Identity, not deep equality: a second constant would be a duplicate
     // table, which is exactly what the hoist is meant to prevent.
     expect(FIELD_KEYWORDS_LEGACY).toBe(FIELD_KEYWORDS);
