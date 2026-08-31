@@ -35,7 +35,9 @@ import {
   judgeSubmission,
   readSettledConfirmation,
   waitForPostClickSettle,
+  waitForPostLandedDomSettle,
   type ConfirmationCapture,
+  type PostLandedDomSettle,
   type SettleBounds,
   type SettleWindow,
 } from "@/lib/submit-application";
@@ -434,5 +436,196 @@ describe("JOB-133: the payload that disagrees with itself now says so", () => {
     expect(describeStaleJudgement(null, SUCCESS.url)).toBe("");
     expect(describeStaleJudgement(CLICKED_AT, null)).toBe("");
     expect(describeStaleJudgement(null, null)).toBe("");
+  });
+});
+
+// ───────────────────────────────────
+// JOB-302. The URL lands before the view does
+// ───────────────────────────────────
+
+/** The Breezy form URL the submit click happens from in these cases. */
+const BREEZY_APPLY = "https://acme.breezy.hr/p/abc123/apply";
+
+/**
+ * Where Breezy's SPA router lands first, before Angular has swapped the view.
+ * The tab title already reads like a receipt; the DOM has not caught up.
+ */
+const BREEZY_LANDED: Look = {
+  url: "https://acme.breezy.hr/p/abc123/apply/submitted",
+  title: "Application submitted",
+};
+
+/**
+ * A small window for `waitForPostLandedDomSettle` in a test, standing in for
+ * the five second `POST_LANDED_DOM_SETTLE_BUDGET_MS` the pipeline uses. The
+ * loop under test is the same loop either way; the same argument as `FAST`
+ * applies, only this wait has its own budget instead of borrowing the URL
+ * wait's.
+ */
+const FAST_DOM: SettleBounds = { budgetMs: 300, pollMs: 50 };
+
+/** The smallest shape `enumerateFormFields` will keep and classify. */
+type RawField = { selector: string; label: string; kind: string };
+
+/**
+ * A page that reads the way Breezy's does during the SPA lag: the URL and the
+ * tab title have already landed on `/apply/submitted`, while the DOM is still
+ * whatever the script says it is. `fields` scripts whether the identity form
+ * is still in the DOM, and `bodyText` scripts what `innerText` shows. Both are
+ * served through the same `evaluate` the real page serves, so the whole of
+ * `waitForPostLandedDomSettle` runs against it untouched rather than against a
+ * stub of the wait.
+ */
+function breezyLaggedDom(opts: { fields: boolean; bodyText: string }): Page {
+  const identityFields: RawField[] = [
+    { selector: "#first_name", label: "First name", kind: "text" },
+    { selector: "#last_name", label: "Last name", kind: "text" },
+    { selector: "#email", label: "Email", kind: "text" },
+  ];
+  const page = {
+    url: () => Promise.resolve(BREEZY_LANDED.url),
+    title: () => Promise.resolve(BREEZY_LANDED.title),
+    evaluate: (expression: string | (() => unknown)) => {
+      // The page text script is the one with `innerText` in it; every other
+      // interpreter this page serves is the fields enumeration, which asks for
+      // a serialised function instead. This is the same way the helper's own
+      // two reads differ, so one fake page can answer both.
+      if (String(expression).includes("innerText")) {
+        return Promise.resolve(opts.bodyText);
+      }
+      return Promise.resolve(opts.fields ? identityFields : []);
+    },
+  } as unknown as Page;
+  return page;
+}
+
+describe("JOB-302: Breezy lands on the URL before it lands in the DOM", () => {
+  it("ends the wait the moment the form leaves the DOM, and the extract reads the confirmation", async () => {
+    // The swap is complete the moment the identity form is gone, so the DOM
+    // settle wait stops at the first look and the extract describes the page
+    // the board actually put there, which reads as a confirmation.
+    const page = breezyLaggedDom({ fields: false, bodyText: "" });
+    const session = { page } as unknown as BrowserSession;
+    let domSettle: PostLandedDomSettle | undefined;
+    const settled = await readSettledConfirmation(session, BREEZY_APPLY, "the submit click", {
+      read: () =>
+        Promise.resolve(
+          capture({
+            confirmationPresent: true,
+            confirmationText: "Application submitted!",
+            emailConfirmationPromised: true,
+            url: BREEZY_LANDED.url,
+            title: BREEZY_LANDED.title,
+          })
+        ),
+      bounds: FAST,
+      settleDomAfterLanded: async (p) => {
+        domSettle = await waitForPostLandedDomSettle(p, FAST_DOM);
+        return domSettle;
+      },
+    });
+    expect(domSettle?.exit).toBe("form-gone");
+    expect(settled.settle?.reads).toBe(1);
+    expect(judgeSubmission(settled, BREEZY_APPLY).submitted).toBe(true);
+  });
+
+  it("ends the wait the moment the page shows the board's own confirmation copy", async () => {
+    // The form is still on screen here; it is the confirmation wording that
+    // proves the swap has happened, and the phrase branch has to be the one
+    // that fires rather than waiting the window out.
+    const page = breezyLaggedDom({ fields: true, bodyText: "Thank you for applying. We'll be in touch." });
+    const session = { page } as unknown as BrowserSession;
+    let domSettle: PostLandedDomSettle | undefined;
+    const settled = await readSettledConfirmation(session, BREEZY_APPLY, "the submit click", {
+      read: () =>
+        Promise.resolve(
+          capture({
+            confirmationPresent: true,
+            confirmationText: "We'll be in touch",
+            url: BREEZY_LANDED.url,
+            title: BREEZY_LANDED.title,
+          })
+        ),
+      bounds: FAST,
+      settleDomAfterLanded: async (p) => {
+        domSettle = await waitForPostLandedDomSettle(p, FAST_DOM);
+        return domSettle;
+      },
+    });
+    expect(domSettle?.exit).toBe("phrase");
+    expect(settled.settle?.reads).toBe(1);
+    expect(judgeSubmission(settled, BREEZY_APPLY).submitted).toBe(true);
+  });
+
+  it("spends the whole window when neither signal arrives, and the stale form is still read as a failure", async () => {
+    // A board that rejected the application keeps its form and its silence, so
+    // neither DOM signal can ever fire. The real window is the five second
+    // `POST_LANDED_DOM_SETTLE_BUDGET_MS`; this runs the same loop against a
+    // three hundred millisecond one, and the wait has to spend all of it and
+    // still hand the reading to the extract uncoaxed. What the extract sees is
+    // the stale form with its validation error, which routes to the same
+    // `navigated-unconfirmed` failure the URL wait alone would have produced.
+    const page = breezyLaggedDom({ fields: true, bodyText: "Apply to Acme for the Software Engineer Intern role" });
+    const session = { page } as unknown as BrowserSession;
+    let domSettle: PostLandedDomSettle | undefined;
+    const settled = await readSettledConfirmation(session, BREEZY_APPLY, "the submit click", {
+      read: () =>
+        Promise.resolve(
+          capture({
+            applicationFormStillPresent: true,
+            identityFieldsPresent: true,
+            validationErrorsShown: true,
+            validationErrorText: "Please complete all required fields.",
+            url: BREEZY_LANDED.url,
+            title: BREEZY_LANDED.title,
+          })
+        ),
+      bounds: FAST,
+      settleDomAfterLanded: async (p) => {
+        domSettle = await waitForPostLandedDomSettle(p, FAST_DOM);
+        return domSettle;
+      },
+    });
+    expect(domSettle?.exit).toBe("budget");
+    expect(domSettle?.waitedMs).toBeGreaterThanOrEqual(FAST_DOM.budgetMs - FAST_DOM.pollMs);
+    const verdict = judgeSubmission(settled, BREEZY_APPLY);
+    expect(verdict.submitted).toBe(false);
+    expect(verdict.navigated).toBe(true);
+    expect(verdict.continuedToFurtherStep).toBe(false);
+  });
+
+  it("does not let the reachable /apply/submitted URL become proof on its own", async () => {
+    // The Phase 1 investigation confirmed `/apply/submitted` is reachable
+    // without an application behind it, so a page whose URL reads like a
+    // receipt still has to be read on its own terms. The form never leaves and
+    // the phrase never appears, the wait spends its whole window, and the
+    // failure the run would have filed without this ticket is exactly what is
+    // filed with it.
+    const page = breezyLaggedDom({ fields: true, bodyText: "Submit application" });
+    const session = { page } as unknown as BrowserSession;
+    let domSettle: PostLandedDomSettle | undefined;
+    const settled = await readSettledConfirmation(session, BREEZY_APPLY, "the submit click", {
+      read: () =>
+        Promise.resolve(
+          capture({
+            confirmationPresent: false,
+            applicationFormStillPresent: true,
+            identityFieldsPresent: true,
+            url: BREEZY_LANDED.url,
+            title: BREEZY_LANDED.title,
+          })
+        ),
+      bounds: FAST,
+      settleDomAfterLanded: async (p) => {
+        domSettle = await waitForPostLandedDomSettle(p, FAST_DOM);
+        return domSettle;
+      },
+    });
+    expect(domSettle?.exit).toBe("budget");
+    const verdict = judgeSubmission(settled, BREEZY_APPLY);
+    expect(verdict.submitted).toBe(false);
+    expect(verdict.navigated).toBe(true);
+    expect(verdict.evidence).toContain("confirmation page: false");
+    expect(verdict.evidence).toContain("form gone: false");
   });
 });
