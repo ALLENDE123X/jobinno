@@ -615,6 +615,33 @@ const SUBMIT_SETTLE_BOUNDS = Object.freeze({ budgetMs: 8_000, pollMs: 250 });
 
 export type SettleBounds = { budgetMs: number; pollMs: number };
 
+/**
+ * JOB-302. The window the landed page is given to replace its own form.
+ *
+ * These two numbers belong to the DOM settle wait and to no other wait: the
+ * URL wait above has its own `SUBMIT_SETTLE_BOUNDS`, and the two are
+ * deliberately independent. A Breezy application pushes `/apply/submitted` into
+ * the URL bar a moment before its Angular view finishes swapping, this window
+ * is what sits between those two moments, and a swap that an SPA renders near
+ * instantly takes a small fraction of it. Five seconds at a quarter second per
+ * poll is twenty looks, so this almost always ends at the first look and never
+ * shapes the reading when a board answers in place.
+ */
+export const POST_LANDED_DOM_SETTLE_BUDGET_MS = 5_000;
+export const POST_LANDED_DOM_SETTLE_POLL_MS = 250;
+
+/**
+ * JOB-302. The words a board puts on screen when it has taken the application.
+ *
+ * Read off `document.body.innerText` while the DOM settle wait runs. A phrase
+ * shown on the page means the swap has landed and the extract no longer needs
+ * to be the first reader. No stronger than the `/apply/submitted` URL by
+ * itself: either signal only decides when the page is read, never what the
+ * reading means, and whatever it finds is still judged exactly as it was.
+ */
+const CONFIRMATION_PHRASE_RE =
+  /thank you|application submitted|application received|we (have )?received|we'll be in touch|application has been submitted/i;
+
 /** What one wait for the board to stop moving actually did. */
 export type SettlePoll = {
   /** Wall clock spent waiting before the page was read, in milliseconds. */
@@ -708,6 +735,98 @@ async function urlNow(page: Page): Promise<string | null> {
   }
 }
 
+/** JOB-302. What one wait for the landed copy to replace the form did. */
+export type PostLandedDomSettle = {
+  /** Wall clock spent waiting before the page was read, in milliseconds. */
+  waitedMs: number;
+  /**
+   * Why the wait ended.
+   *
+   *   · `form-gone` the board's application form has left the DOM.
+   *   · `phrase`    the page already shows the board's own confirmation copy.
+   *   · `budget`    neither signal arrived; the extract is asked to look anyway.
+   */
+  exit: "form-gone" | "phrase" | "budget";
+};
+
+/**
+ * JOB-302. The ante-room between the URL landing and the page being read.
+ *
+ * ── What it is for ───────────────────────────────────────────────────────────
+ * Breezy is an Angular single page app. Its router writes `/apply/submitted`
+ * to the URL bar before the rendered view is swapped for the confirmation, so
+ * the moment `waitForPostClickSettle` reports the browser has landed, the form
+ * the extract is about to describe is usually still the old one. An LLM
+ * asked to describe that form answers "form present, no confirmation", and a
+ * real acceptance is filed as `submission_unconfirmed`.
+ *
+ * This wait sits on that gap and gives the swap time to finish. It ends early
+ * on either of the two things the swap is working toward, the identity form
+ * leaving the DOM or confirmation wording appearing in it, and otherwise spends
+ * the whole budget and lets the extract be the judge either way.
+ *
+ * ── Why the URL is not enough ────────────────────────────────────────────────
+ * The Phase 1 investigation for this ticket confirmed `/apply/submitted` is
+ * world accessible, so reaching that URL proves nothing about whether the
+ * employer received the application. This wait therefore never treats a landed
+ * URL as a confirmation; the two signals above are DOM facts, and a page that
+ * keeps its form and its silence is left alone for the whole window.
+ *
+ * ── The exit contract ────────────────────────────────────────────────────────
+ * `form-gone` and `phrase` end the wait, then `readConfirmation` reads
+ * whatever the board put there. `budget` is not a verdict: the extract still
+ * reads the page and still decides, which is what keeps a board that genuinely
+ * rejected the application reported as one. The caller gates this on the URL
+ * wait actually having landed, so a board that never navigates does not pay a
+ * single extra millisecond of this window.
+ *
+ * `bounds` is a parameter so a unit test can pin the loop with a small window.
+ * Nothing in the pipeline passes it: the production window is the constant
+ * above, and the caller logs what the wait actually spent either way.
+ */
+export async function waitForPostLandedDomSettle(
+  page: Page,
+  bounds: SettleBounds = {
+    budgetMs: POST_LANDED_DOM_SETTLE_BUDGET_MS,
+    pollMs: POST_LANDED_DOM_SETTLE_POLL_MS,
+  }
+): Promise<PostLandedDomSettle> {
+  const startedAt = Date.now();
+  const deadline = startedAt + bounds.budgetMs;
+  for (;;) {
+    if (await formGoneNow(page)) {
+      return { waitedMs: Date.now() - startedAt, exit: "form-gone" };
+    }
+    if (await confirmationPhraseShown(page)) {
+      return { waitedMs: Date.now() - startedAt, exit: "phrase" };
+    }
+    if (Date.now() + bounds.pollMs >= deadline) break;
+    await sleep(bounds.pollMs);
+  }
+  return { waitedMs: Date.now() - startedAt, exit: "budget" };
+}
+
+/** JOB-302. True when the board's identity form is no longer in the DOM. */
+async function formGoneNow(page: Page): Promise<boolean> {
+  // The same floor the reading applies below: fewer than two identity slots
+  // means this is not an applicant's form, and a page between swaps or past
+  // the swap reads that way. `readCoreSlotsFromDom` never throws, so an
+  // unreadable page counts as having no fields, and ending the wait on it only
+  // means the extract is asked to look now rather than in three seconds.
+  const coreSlots = await readCoreSlotsFromDom(page);
+  return applicantIdentitySlots(coreSlots).length < MIN_IDENTITY_SLOTS_FOR_FORM;
+}
+
+/** JOB-302. True when the page is already showing the board's confirmation copy. */
+async function confirmationPhraseShown(page: Page): Promise<boolean> {
+  try {
+    const text = await page.evaluate(PAGE_TEXT_SCRIPT);
+    return typeof text === "string" && text.length > 0 && CONFIRMATION_PHRASE_RE.test(text);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Waits for the board to settle, reads the page, and reads it again if the
  * board moved while it was being read.
@@ -733,15 +852,23 @@ async function urlNow(page: Page): Promise<string | null> {
  * keeps looking until it sees something it prefers, which is the shape JOB-126
  * and JOB-109 exist to keep out of this file.
  *
+ * ── JOB-302 ──────────────────────────────────────────────────────────────────
+ * Between that landing and the reading there is one more wait, described above
+ * `waitForPostLandedDomSettle`: the URL settling and the DOM settling are two
+ * different events on Breezy, and the extract is only asked after both. The
+ * reading is still taken once, the cap is still two readings, and a board that
+ * navigates nowhere pays nothing extra. See that function for the full account.
+ *
  * Throws only what `readConfirmation` throws, which both call sites already
  * catch and report as a page that could not be read.
  *
  * `deps` is the seam the unit test drives this through, so the sequence below
  * is pinned by a test rather than only by a live board: the real window would
  * cost eight seconds of wall clock per case, and the real reading would cost a
- * model call. Nothing in the pipeline passes it, both defaults are the real
- * things, and neither can move what counts as a confirmation — one is a clock
- * and the other is the same `readConfirmation` every path uses.
+ * model call. Nothing in the pipeline passes it, the defaults are the real
+ * things including the JOB-302 wait, and neither can move what counts as a
+ * confirmation. One is a clock and the other is the same `readConfirmation`
+ * every path uses.
  */
 export async function readSettledConfirmation(
   session: BrowserSession,
@@ -750,13 +877,40 @@ export async function readSettledConfirmation(
   deps: {
     read: (session: BrowserSession) => Promise<ConfirmationCapture>;
     bounds: SettleBounds;
-  } = { read: readConfirmation, bounds: SUBMIT_SETTLE_BOUNDS }
+    /**
+     * JOB-302. Given a moment to watch the DOM after the URL has landed, so the
+     * extract is not asked to describe the board's view before the swap.
+     * Defaults to `waitForPostLandedDomSettle`; the seam exists for the unit
+     * test to pin the sequence without paying five seconds of wall clock per
+     * case.
+     */
+    settleDomAfterLanded?: (page: Page) => Promise<PostLandedDomSettle>;
+  } = {
+    read: readConfirmation,
+    bounds: SUBMIT_SETTLE_BOUNDS,
+    settleDomAfterLanded: waitForPostLandedDomSettle,
+  }
 ): Promise<ConfirmationCapture> {
+  const settleDomAfterLanded = deps.settleDomAfterLanded ?? waitForPostLandedDomSettle;
   const first = await waitForPostClickSettle(session.page, wasAt, deps.bounds);
   console.log(
     `${LOG} waited ${first.waitedMs}ms of ${first.budgetMs}ms for the board to settle after ` +
       `${what} (${first.looks} look(s), ended: ${first.exit})`
   );
+  // JOB-302. Only a URL that actually landed gets the extra wait: a board that
+  // never navigated has no view swap to wait out, so it pays nothing here and
+  // the reading is taken exactly where it was before this ticket. The wait ends
+  // early when the form leaves the DOM or the confirmation copy appears, and
+  // otherwise falls through on budget, so it can only ever decide when the
+  // reading happens, never what it is allowed to say.
+  if (first.exit === "landed") {
+    const dom = await settleDomAfterLanded(session.page);
+    console.log(
+      `${LOG} after landing, waited ${dom.waitedMs}ms of ` +
+        `${POST_LANDED_DOM_SETTLE_BUDGET_MS}ms for the confirmation copy to replace the form ` +
+        `(ended: ${dom.exit})`
+    );
+  }
   const capture = await deps.read(session);
 
   const movedTo = await urlNow(session.page);
