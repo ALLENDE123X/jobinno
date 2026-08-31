@@ -355,6 +355,179 @@ export function intakeSchema(userId: string) {
 
 export type IntakeInput = z.infer<ReturnType<typeof intakeSchema>>;
 
+// ── Per-step schemas ──────────────────────────────────────────────────────
+// Each validates only the fields that belong to one step of the multi-page
+// flow. They share the same sub-schemas as intakeSchema above so the
+// validation rules stay consistent. The full intakeSchema() is unchanged;
+// these are additive exports for the save-as-you-go path.
+
+/**
+ * Step 1: Resume + identity.
+ *
+ * Resume upload writes directly to the `resumes` table by way of
+ * `saveIntakeDraft`, so browser refresh mid-flow does not orphan the
+ * upload. The ownership check on the storage path is the same one the
+ * final `intakeSchema` uses: this is the moment the row is created, so
+ * this is the moment to reject a path that names somebody else's folder.
+ *
+ * `userId` is optional so callers that only want to validate the shape of
+ * a githubUrl (no upload) can still use this schema. Every code path that
+ * writes a resume path passes it.
+ */
+export function step1Schema(userId?: string) {
+  const objectPathBase = z
+    .string()
+    .regex(OBJECT_PATH_PATTERN, "That file was not uploaded correctly.");
+  const ownedObjectPath = userId
+    ? objectPathBase.refine(
+        (path) => path.startsWith(`${userId}/`),
+        "That file belongs to a different account.",
+      )
+    : objectPathBase;
+
+  return z.object({
+    githubUrl: githubUrl.default(null),
+    resumePath: ownedObjectPath.nullable().default(null),
+    linkedinPdfPath: ownedObjectPath.nullable().default(null),
+  });
+}
+
+/**
+ * Step 2: Work authorization.
+ *
+ * F1 cross-field check: if citizenshipStatus is "f1" then f1Status must
+ * not be null.
+ *
+ * workAuthorizedUs and requiresSponsorship are conditional on citizenship
+ * (per JOB-308 round two BLOCKING 1). For a US citizen or permanent
+ * resident these are auto-derived server-side by
+ * `deriveWorkAuthorizedUs` / `deriveRequiresSponsorship`, and the client
+ * omits them from the payload; the schema allows null in that case.
+ * For every other citizenship the client MUST send an explicit boolean;
+ * a null here is rejected so an F1 not yet on OPT can honestly answer
+ * workAuthorizedUs=false rather than have true silently fabricated on
+ * their behalf.
+ */
+export const step2Schema = z
+  .object({
+    citizenshipStatus,
+    f1Status: f1Status.nullable().default(null),
+    visaStatus: requiredText("Visa status", 200),
+    workAuthorizedUs: z.boolean().nullable().default(null),
+    requiresSponsorship: z.boolean().nullable().default(null),
+  })
+  .check((ctx) => {
+    const value = ctx.value;
+    if (value.citizenshipStatus === "f1" && value.f1Status === null) {
+      ctx.issues.push({
+        code: "custom",
+        input: value.f1Status,
+        path: ["f1Status"],
+        message: "Tell us which F1 work authorization you are on.",
+      });
+    }
+    if (value.citizenshipStatus !== "f1" && value.f1Status !== null) {
+      ctx.issues.push({
+        code: "custom",
+        input: value.f1Status,
+        path: ["f1Status"],
+        message: "OPT and CPT only apply to an F1 visa.",
+      });
+    }
+    const inherentlyAuthorized = (
+      INHERENTLY_AUTHORIZED as readonly string[]
+    ).includes(value.citizenshipStatus);
+    if (!inherentlyAuthorized) {
+      if (value.workAuthorizedUs === null) {
+        ctx.issues.push({
+          code: "custom",
+          input: value.workAuthorizedUs,
+          path: ["workAuthorizedUs"],
+          message: "Tell us whether you are authorized to work in the US.",
+        });
+      }
+      if (value.requiresSponsorship === null) {
+        ctx.issues.push({
+          code: "custom",
+          input: value.requiresSponsorship,
+          path: ["requiresSponsorship"],
+          message: "Tell us whether you will need sponsorship.",
+        });
+      }
+    }
+  });
+
+/**
+ * Step 3: Location + timing. targetLocations is validated as a comma
+ * separated string that becomes an array (min 1 entry).
+ */
+export const step3Schema = z.object({
+  streetAddress: requiredText("Street address", 200),
+  currentCity: requiredText("Current city"),
+  currentCountry: requiredText("Current country"),
+  postalCode: requiredText("Postal code", 20),
+  targetLocations: z
+    .array(requiredText("Target location"))
+    .min(1, "Add at least one place you want to work.")
+    .max(20, "That is more target locations than a search can use."),
+  willingToRelocate: z.boolean(),
+  needsSponsorshipNonUs: z.boolean(),
+  gradDate: z.iso.date("Graduation date must be a real date."),
+  earliestStart: z.iso.date("Earliest start date must be a real date."),
+});
+
+/**
+ * Step 4: Compliance + compensation. Includes the clearance cross-field
+ * check: active_clearance with never_held is a contradiction.
+ */
+export const step4Schema = z
+  .object({
+    salaryExpectation: requiredText("Salary expectation", 200),
+    subjectToRestrictiveCovenant: z.boolean(),
+    relativesAtTargetEmployers: z.boolean(),
+    previouslyEmployedAtTargetEmployers: z.boolean(),
+    clearanceEligibility,
+    clearanceLevelHeld,
+    highSchoolName: requiredText("High school name"),
+    highSchoolGradYear: z
+      .number()
+      .int("High school graduation year must be a year.")
+      .min(1900, "High school graduation year must be a real year.")
+      .max(2100, "High school graduation year must be a real year."),
+  })
+  .check((ctx) => {
+    const value = ctx.value;
+    if (
+      value.clearanceEligibility === "active_clearance" &&
+      value.clearanceLevelHeld === "never_held"
+    ) {
+      ctx.issues.push({
+        code: "custom",
+        input: value.clearanceLevelHeld,
+        path: ["clearanceLevelHeld"],
+        message:
+          "You said you hold an active clearance, so tell us which level it is.",
+      });
+    }
+  });
+
+/** Step 5: Attestation checkbox. */
+export const step5Schema = z.object({
+  attestation: z.literal(true, "You have to confirm this to continue."),
+});
+
+/** The schema for each step, keyed by step number (1..5). */
+export const stepSchemas: Record<
+  number,
+  { safeParse: (data: unknown) => { success: boolean; data?: unknown; error?: unknown } }
+> = {
+  1: step1Schema(),
+  2: step2Schema,
+  3: step3Schema,
+  4: step4Schema,
+  5: step5Schema,
+};
+
 /**
  * Field errors keyed by field name, which is the shape the form renders. Only
  * the first message per field: a control with three messages under it is worse

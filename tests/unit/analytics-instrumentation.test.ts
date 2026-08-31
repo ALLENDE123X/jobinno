@@ -140,6 +140,13 @@ vi.mock("@/lib/supabase/server", () => ({
         select: () => chain,
         update: () => chain,
         eq: () => chain,
+        // JOB-308 round two: submitIntake now looks up an existing
+        // resumes row before inserting, so the chain has to support
+        // .order().limit().maybeSingle(). Returning null from the
+        // resumes maybeSingle here keeps the tests exercising the
+        // insert path they were written against.
+        order: () => chain,
+        limit: () => chain,
         // JOB-112. `submitIntake` now reads the new row's id back, so the
         // insert chain has to keep chaining rather than resolve on its own.
         insert: () => chain,
@@ -147,7 +154,10 @@ vi.mock("@/lib/supabase/server", () => ({
           data: resumeInsertError === null ? { id: RESUME_ID } : null,
           error: resumeInsertError,
         }),
-        maybeSingle: async () => ({ data: profile, error: null }),
+        maybeSingle: async () =>
+          table === "resumes"
+            ? { data: null, error: null }
+            : { data: profile, error: null },
         then: (resolve: (value: { error: { message: string } | null }) => unknown) =>
           Promise.resolve(
             resolve({ error: table === "profiles" ? profileUpdateError : null })

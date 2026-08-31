@@ -40,7 +40,21 @@ import { ANALYTICS_EVENT } from "@/lib/analytics/events";
 import { captureServerEvent } from "@/lib/analytics/posthog-server";
 import { requestDocumentParse } from "@/lib/candidate-document-trigger";
 import { recordAttestation } from "@/lib/onboarding/attestation";
-import { intakeFieldErrors, intakeSchema } from "@/lib/onboarding/intake-schema";
+import {
+  clearanceLevelIsRelevant,
+  deriveNeedsSponsorshipNonUs,
+  deriveRequiresSponsorship,
+  deriveWorkAuthorizedUs,
+} from "@/lib/onboarding/intake-derivation";
+import {
+  intakeFieldErrors,
+  intakeSchema,
+  step1Schema,
+  step2Schema,
+  step3Schema,
+  step4Schema,
+  step5Schema,
+} from "@/lib/onboarding/intake-schema";
 import { RESUMES_BUCKET, createServerClient } from "@/lib/supabase/server";
 
 export type IntakeResult =
@@ -128,26 +142,61 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // Written after the profile, deliberately. The other order leaves a resume
   // pointing at a profile that never got its answers, which nothing downstream
   // can tell apart from a half filled form.
-  // JOB-112 added the `select`. The new row's id is what `intake/completed`
-  // carries, so the parse runs against the row this submit created rather than
-  // against whichever row a second lookup would have found — which for someone
-  // re-uploading is a race with their own previous resume.
-  const { data: resumeRow, error: resumeError } = await supabase
-    .from("resumes")
-    .insert({
-      user_id: user.id,
-      // Bucket qualified, matching the convention `lib/candidate-intake.ts` uses
-      // for every stored resume path: a path to sign a URL from, never a URL.
-      storage_path: `${RESUMES_BUCKET}/${intake.resumePath}`,
-      linkedin_pdf_path: intake.linkedinPdfPath
-        ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`
-        : null,
-    })
-    .select("id")
-    .single();
+  //
+  // JOB-308 round two: step 1 now inserts the resumes row via saveIntakeDraft
+  // so the multi page flow has a real row to key its routing off. When we
+  // reach this final submit, that row is already in place, so we look it up
+  // by storage_path rather than inserting a duplicate. If nothing matches
+  // (a user who somehow reached step 5 without a step 1 insert), we fall
+  // back to the original insert. Either way, the id we hand
+  // `requestDocumentParse` is a real row this user owns.
+  const bucketQualifiedResumePath = `${RESUMES_BUCKET}/${intake.resumePath}`;
+  const bucketQualifiedLinkedinPath = intake.linkedinPdfPath
+    ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`
+    : null;
 
-  if (resumeError) {
-    return { ok: false, message: `Could not save your resume: ${resumeError.message}` };
+  const { data: existingResume } = await supabase
+    .from("resumes")
+    .select("id, linkedin_pdf_path")
+    .eq("user_id", user.id)
+    .eq("storage_path", bucketQualifiedResumePath)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  let resumeRow: { id: string } | null = existingResume
+    ? { id: existingResume.id }
+    : null;
+
+  if (
+    existingResume &&
+    existingResume.linkedin_pdf_path !== bucketQualifiedLinkedinPath
+  ) {
+    // The LinkedIn PDF was added or replaced between step 1 and step 5.
+    await supabase
+      .from("resumes")
+      .update({ linkedin_pdf_path: bucketQualifiedLinkedinPath })
+      .eq("id", existingResume.id);
+  }
+
+  if (!existingResume) {
+    const { data: inserted, error: resumeError } = await supabase
+      .from("resumes")
+      .insert({
+        user_id: user.id,
+        storage_path: bucketQualifiedResumePath,
+        linkedin_pdf_path: bucketQualifiedLinkedinPath,
+      })
+      .select("id")
+      .single();
+
+    if (resumeError) {
+      return {
+        ok: false,
+        message: `Could not save your resume: ${resumeError.message}`,
+      };
+    }
+    resumeRow = inserted;
   }
 
   // Last, and only once everything it attests to is actually in the database.
@@ -219,6 +268,203 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // column is empty, so a failure here costs one slower first application and
   // nothing else. That is why it cannot fail the submit.
   await requestDocumentParse(user.id, String(resumeRow?.id ?? ""));
+
+  revalidatePath("/onboarding");
+  return { ok: true };
+}
+
+// ── Save as you go ────────────────────────────────────────────────────────
+// Each step of the multi-page onboarding saves a draft. The final submit
+// still goes through submitIntake above, which runs the full schema and
+// the attestation stamp. saveIntakeDraft validates only the step's own
+// fields, applies any derivations, and upserts into profiles.
+//
+// Step 1 writes resumes.storage_path directly rather than staging it in
+// component or window state, so browser refresh mid-flow does not orphan
+// the upload and users can resume where they left off. This also means
+// step-routing has a real row to key off (the resumes row is what marks
+// step 1 complete). A user who bounces mid-flow leaves a resumes row
+// linked to their user_id with no attested profile; this is the same
+// state as any pre-intake user, and the existing cleanup pattern handles
+// it. See JOB-308 round two BLOCKING 2 for why this had to change.
+
+export async function saveIntakeDraft(
+  payload: unknown,
+  step: number,
+): Promise<IntakeResult> {
+  const supabase = await createServerClient();
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return {
+      ok: false,
+      message: "Your session has expired. Sign in again and your files are still there.",
+    };
+  }
+
+  // Validate the step's fields with the appropriate schema.
+  let validated: Record<string, unknown>;
+  switch (step) {
+    case 1: {
+      const parsed = step1Schema(user.id).safeParse(payload);
+      if (!parsed.success)
+        return { ok: false, errors: intakeFieldErrors(parsed.error) };
+      validated = parsed.data;
+      break;
+    }
+    case 2: {
+      const parsed = step2Schema.safeParse(payload);
+      if (!parsed.success)
+        return { ok: false, errors: intakeFieldErrors(parsed.error) };
+      validated = parsed.data;
+      break;
+    }
+    case 3: {
+      const parsed = step3Schema.safeParse(payload);
+      if (!parsed.success)
+        return { ok: false, errors: intakeFieldErrors(parsed.error) };
+      validated = parsed.data;
+      break;
+    }
+    case 4: {
+      const parsed = step4Schema.safeParse(payload);
+      if (!parsed.success)
+        return { ok: false, errors: intakeFieldErrors(parsed.error) };
+      validated = parsed.data;
+      break;
+    }
+    case 5: {
+      const parsed = step5Schema.safeParse(payload);
+      if (!parsed.success)
+        return { ok: false, errors: intakeFieldErrors(parsed.error) };
+      validated = parsed.data;
+      break;
+    }
+    default:
+      return { ok: false, message: "Invalid step." };
+  }
+
+  // Build the profile update object from the validated step data,
+  // applying derivations where appropriate.
+  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+
+  switch (step) {
+    case 1:
+      // Step 1 collects GitHub URL and file paths. githubUrl goes on
+      // profiles; resume + LinkedIn PDF paths go into the resumes table
+      // below, after the profiles update lands. See file header for why
+      // this writes to resumes rather than staging in the browser.
+      if ("githubUrl" in validated) {
+        update.github_url = validated.githubUrl;
+      }
+      break;
+
+    case 2:
+      update.citizenship_status = validated.citizenshipStatus;
+      update.f1_status = validated.f1Status;
+      update.visa_status = validated.visaStatus;
+      // Derive workAuthorizedUs and requiresSponsorship: for US citizens
+      // and permanent residents these are forced; for others the explicit
+      // answer is used.
+      update.work_authorized_us = deriveWorkAuthorizedUs(
+        validated.citizenshipStatus as string,
+        validated.workAuthorizedUs as boolean | null,
+      );
+      update.requires_sponsorship = deriveRequiresSponsorship(
+        validated.citizenshipStatus as string,
+        validated.requiresSponsorship as boolean | null,
+      );
+      break;
+
+    case 3:
+      update.street_address = validated.streetAddress;
+      update.current_city = validated.currentCity;
+      update.current_country = validated.currentCountry;
+      update.postal_code = validated.postalCode;
+      update.target_locations = validated.targetLocations;
+      update.willing_to_relocate = validated.willingToRelocate;
+      update.grad_date = validated.gradDate;
+      update.earliest_start = validated.earliestStart;
+      // Derive needsSponsorshipNonUs: forced false when the question is
+      // not relevant (no non-US targets and not willing to relocate).
+      update.needs_sponsorship_non_us = deriveNeedsSponsorshipNonUs(
+        validated.targetLocations as string[],
+        validated.willingToRelocate as boolean,
+        validated.needsSponsorshipNonUs as boolean | null,
+      );
+      break;
+
+    case 4:
+      update.salary_expectation = validated.salaryExpectation;
+      update.subject_to_restrictive_covenant =
+        validated.subjectToRestrictiveCovenant;
+      update.relatives_at_target_employers =
+        validated.relativesAtTargetEmployers;
+      update.previously_employed_at_target_employers =
+        validated.previouslyEmployedAtTargetEmployers;
+      update.clearance_eligibility = validated.clearanceEligibility;
+      update.high_school_name = validated.highSchoolName;
+      update.high_school_grad_year = validated.highSchoolGradYear;
+      // Derive clearanceLevelHeld: forced to "never_held" when clearance
+      // eligibility is "no".
+      update.clearance_level_held = clearanceLevelIsRelevant(
+        validated.clearanceEligibility as string,
+      )
+        ? validated.clearanceLevelHeld
+        : "never_held";
+      break;
+
+    case 5:
+      // Step 5 only has attestation, which is not persisted as a draft.
+      // Attestation is exclusive to the submitIntake path via
+      // recordAttestation. Nothing to write on this step.
+      break;
+  }
+
+  // Never set attested_at from saveIntakeDraft; that is exclusive to
+  // submitIntake via recordAttestation.
+  const { error } = await supabase
+    .from("profiles")
+    .update(update)
+    .eq("id", user.id);
+
+  if (error) {
+    return {
+      ok: false,
+      message: `Could not save your details: ${error.message}`,
+    };
+  }
+
+  // Step 1 also writes the resume + LinkedIn PDF paths into the resumes
+  // table. Written after the profiles update, deliberately: the other
+  // order leaves a resume pointing at a profile the caller could not
+  // update. When a user re-uploads on an edit, the latest row (ordered
+  // by created_at desc) becomes their canonical resume; earlier rows
+  // stay behind as history.
+  if (step === 1) {
+    const resumePath = validated.resumePath as string | null;
+    const linkedinPdfPath = validated.linkedinPdfPath as string | null;
+    if (resumePath) {
+      // Bucket qualified, matching the convention `submitIntake` and
+      // `lib/candidate-intake.ts` write it under.
+      const { error: resumeError } = await supabase.from("resumes").insert({
+        user_id: user.id,
+        storage_path: `${RESUMES_BUCKET}/${resumePath}`,
+        linkedin_pdf_path: linkedinPdfPath
+          ? `${RESUMES_BUCKET}/${linkedinPdfPath}`
+          : null,
+      });
+      if (resumeError) {
+        return {
+          ok: false,
+          message: `Could not save your resume: ${resumeError.message}`,
+        };
+      }
+    }
+  }
 
   revalidatePath("/onboarding");
   return { ok: true };

@@ -1,27 +1,20 @@
 /**
- * Intake, in one sitting. Everything the pipeline needs to fill a real
- * application form, asked once.
+ * Redirect-only server component. Routes to the right onboarding step.
  *
- * Authorization lives here rather than in `middleware.ts`, next to the thing it
+ * Authorization lives here rather than in middleware.ts, next to the thing it
  * protects and where a redirect can say why. Middleware's job is keeping the
  * session fresh; deciding who may see a page is a page's own business.
+ *
+ * Step 1 completion is keyed off a resumes row rather than a profiles
+ * column, because there is no resume_path on profiles. See JOB-308 round
+ * two BLOCKING 2 for why this had to change.
  */
 
-import Link from "next/link";
 import { redirect } from "next/navigation";
 
-import { PageShell } from "@/components/page-shell";
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { createServerClient } from "@/lib/supabase/server";
 
-import { IntakeForm } from "./intake-form";
+import { earliestIncompleteStep } from "@/lib/onboarding/step-routing";
 
 export default async function OnboardingPage() {
   const supabase = await createServerClient();
@@ -32,58 +25,31 @@ export default async function OnboardingPage() {
 
   if (!user) redirect("/login");
 
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("attested_at")
-    .eq("id", user.id)
-    .maybeSingle();
+  const [{ data: profile }, { data: resumeRow }] = await Promise.all([
+    supabase
+      .from("profiles")
+      .select("citizenship_status, current_city, salary_expectation, attested_at")
+      .eq("id", user.id)
+      .maybeSingle(),
+    supabase
+      .from("resumes")
+      .select("storage_path")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
 
-  const attestedAt: string | null = profile?.attested_at ?? null;
-
-  return (
-    <PageShell>
-      <main className="relative mx-auto w-full max-w-2xl flex-1 px-4 py-12 sm:px-6 sm:py-16">
-        {attestedAt ? (
-          // Intake is answered once for now. Editing it again means deciding
-          // what happens to a run already in flight against these answers,
-          // and that is a question worth its own ticket rather than a second
-          // submit button.
-          <Card className="rounded-2xl shadow-xl">
-            <CardHeader>
-              <CardTitle className="text-2xl">You are set up</CardTitle>
-              <CardDescription className="text-base">
-                You confirmed your details on{" "}
-                {new Date(attestedAt).toLocaleDateString()}. To change
-                anything, get in touch and we will sort it out.
-              </CardDescription>
-            </CardHeader>
-            {/*
-              JOB-009. Without this there is no route to the dashboard anywhere
-              in the app: sign in lands here, and an onboarded person saw a
-              card with nothing after it.
-            */}
-            <CardContent>
-              <Button asChild size="lg" className="h-10 text-sm">
-                <Link href="/dashboard">Go to your applications</Link>
-              </Button>
-            </CardContent>
-          </Card>
-        ) : (
-          <>
-            <header className="mb-8 space-y-2">
-              <h1 className="text-3xl font-semibold tracking-tight text-balance sm:text-4xl">
-                Tell us about your search
-              </h1>
-              <p className="max-w-xl text-base text-pretty text-muted-foreground">
-                Jobinno fills real application forms with these answers, so it
-                is worth getting them right. It takes about three minutes.
-              </p>
-            </header>
-
-            <IntakeForm userId={user.id} />
-          </>
-        )}
-      </main>
-    </PageShell>
+  const step = earliestIncompleteStep(
+    {
+      citizenshipStatus: profile?.citizenship_status ?? null,
+      currentCity: profile?.current_city ?? null,
+      salaryExpectation: profile?.salary_expectation ?? null,
+      attestedAt: profile?.attested_at ?? null,
+    },
+    resumeRow ? { storagePath: resumeRow.storage_path ?? null } : null,
   );
+
+  if (step === 6) redirect("/dashboard");
+  redirect(`/onboarding/step/${step}`);
 }
