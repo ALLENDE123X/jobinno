@@ -4106,6 +4106,43 @@ export function buildFactCatalog(
     add(`work${index}.title`, `${where}: job title${from}`, entry.title);
     add(`work${index}.dates`, `${where}: dates${from}`, joinDates(entry.startDate, entry.endDate));
     add(`work${index}.summary`, `${where}: what they did${from}`, entry.summary);
+
+    // JOB-303. The three facts a SmartRecruiters Experience entry actually
+    // asks for: a From date, a To date, and the checkbox that says the job is
+    // ongoing. The pre existing `work${index}.dates` above joins them as one
+    // prose string ("Nov 2025 to Present") which reads well in a textarea and
+    // types badly into a date picker. Splitting the two here gives the
+    // decision layer a fact per picker without dropping the prose form.
+    //
+    // `normalizeWorkDate` returns the year-and-month a picker will accept in
+    // its `iso` slot and keeps the original string in `raw`; the emitted
+    // startDate value prefers the ISO shape and falls back to the raw string
+    // so a resume that only stated a year still contributes something. The
+    // endDate value is either the ISO shape, the raw string, or the literal
+    // "Present" sentinel Fix 3 checks for in `fillRepeatingSections`.
+    const startParts = normalizeWorkDate(entry.startDate);
+    if (startParts !== null) {
+      const startValue = startParts.iso ?? startParts.raw;
+      if (startValue !== "") {
+        add(`work${index}.startDate`, `${where}: start date (year and month, ISO)${from}`, startValue);
+      }
+    }
+    const endParts = normalizeWorkDate(entry.endDate);
+    if (endParts !== null) {
+      const endValue = endParts.isPresent ? "Present" : (endParts.iso ?? endParts.raw);
+      if (endValue !== "") {
+        add(
+          `work${index}.endDate`,
+          `${where}: end date (year and month ISO, or the sentinel "Present" for an ongoing job)${from}`,
+          endValue
+        );
+      }
+      add(
+        `work${index}.currentlyHere`,
+        `${where}: currently works here (for an "I currently work here" checkbox)${from}`,
+        endParts.isPresent ? "Yes" : "No"
+      );
+    }
   });
   const experience = totalYearsOfExperience(profile.workHistory);
   if (experience !== null) {
@@ -4359,6 +4396,88 @@ function joinDates(start: string | null, end: string | null): string | null {
   if (from === "") return to;
   if (to === "") return from;
   return `${from} to ${to}`;
+}
+
+/**
+ * JOB-303. What one workHistory date string means, split into the two pieces a
+ * spl-date-picker inside a SmartRecruiters Experience section can be answered
+ * from and the flag the peer "I currently work here" checkbox is answered from.
+ *
+ * `iso` is the year and month a picker will accept, "2025-11". `raw` is the
+ * original string the resume printed, kept because a text control that is not a
+ * date picker still wants that exact wording. `isPresent` is true when the
+ * string reads as an open ended end date ("Present", "Current", "Now", or a
+ * missing / empty value on an end date field).
+ *
+ * Deliberately coarse. Resume dates arrive as "November 2025", "Nov 2025",
+ * "11/2025", "2025-11" or bare "2025", and every one of these has to fold to
+ * year-plus-month or year alone. Day precision is never fabricated: SR's
+ * picker accepts year and month and does not require a day, and inventing a day
+ * here would put a claim on the form nobody made. A bare year yields
+ * `iso: "2025"` and lets the picker decide whether it wants a month too.
+ *
+ * Returns null when nothing usable can be parsed, so a caller can fall through
+ * to the raw string rather than emit a fact holding "".
+ */
+export type NormalizedWorkDate = {
+  iso: string | null;
+  raw: string;
+  isPresent: boolean;
+};
+
+export function normalizeWorkDate(value: string | null | undefined): NormalizedWorkDate | null {
+  const raw = (value ?? "").trim();
+  if (raw === "") return { iso: null, raw: "", isPresent: true };
+  if (/^(present|current|now|ongoing|to\s+date)$/i.test(raw)) {
+    return { iso: null, raw, isPresent: true };
+  }
+
+  // Pure ISO "2025-11" or "2025-11-15".
+  const iso = /^(\d{4})-(\d{1,2})(?:-(\d{1,2}))?$/.exec(raw);
+  if (iso !== null) {
+    const yearIso = iso[1]!;
+    const monthIso = String(Number(iso[2]!)).padStart(2, "0");
+    if (Number(monthIso) >= 1 && Number(monthIso) <= 12) {
+      return { iso: `${yearIso}-${monthIso}`, raw, isPresent: false };
+    }
+  }
+
+  // Numeric month and year "11/2025" or "11-2025".
+  const numeric = /^(\d{1,2})[\/\-](\d{4})$/.exec(raw);
+  if (numeric !== null) {
+    const monthNum = String(Number(numeric[1]!)).padStart(2, "0");
+    if (Number(monthNum) >= 1 && Number(monthNum) <= 12) {
+      return { iso: `${numeric[2]!}-${monthNum}`, raw, isPresent: false };
+    }
+  }
+
+  // Month name + year, in either order. "November 2025", "Nov 2025",
+  // "2025 November", "2025 Nov". `MONTH_NAMES` above is the source of the long
+  // spellings so the two match; the three letter forms are the same list
+  // sliced to three characters.
+  const monthLookup: Record<string, string> = {};
+  MONTH_NAMES.forEach((name, index) => {
+    const number = String(index + 1).padStart(2, "0");
+    monthLookup[name.toLowerCase()] = number;
+    monthLookup[name.slice(0, 3).toLowerCase()] = number;
+  });
+  const named = /^([A-Za-z]+)\.?\s+(\d{4})$|^(\d{4})\s+([A-Za-z]+)\.?$/.exec(raw);
+  if (named !== null) {
+    const monthText = (named[1] ?? named[4] ?? "").toLowerCase();
+    const yearText = (named[2] ?? named[3] ?? "");
+    const month = monthLookup[monthText];
+    if (month !== undefined) {
+      return { iso: `${yearText}-${month}`, raw, isPresent: false };
+    }
+  }
+
+  // Bare year. Kept as year only, since a month was never stated.
+  const bareYear = /^(19|20)\d{2}$/.exec(raw);
+  if (bareYear !== null) {
+    return { iso: raw, raw, isPresent: false };
+  }
+
+  return { iso: null, raw, isPresent: false };
 }
 
 /**
@@ -4826,6 +4945,40 @@ const SCHOOL_FIELD_LABEL_RE = /\b(school|university|college)\b/i;
  * `educationN.school`.
  */
 const SCHOOL_FACT_KEY_RE = /(?:^|\.)school$/;
+
+/**
+ * JOB-303. The Experience section labels a SmartRecruiters OneClick form uses,
+ * exactly, and one half of the same double gate `SCHOOL_FIELD_LABEL_RE` is
+ * one half of. `fillRepeatingSections` prefixes every entry field label with
+ * "Experience: ", so an anchored match on that prefix is a reliable way to
+ * tell an Experience typeahead apart from every other combobox on the page.
+ *
+ * These are the fields SmartRecruiters draws as `spl-autocomplete` typeaheads:
+ * Title looks up an occupation catalog, Company looks up an employer catalog,
+ * Office location looks up a place catalog. Every one of them accepts the
+ * typed text as a real answer when nothing on its suggestion list matches, but
+ * `chooseFromMenu` refuses to commit unmatched text without an explicit
+ * allowFreeText flag. That flag is what this regex, paired with
+ * `EXPERIENCE_FACT_KEY_RE` below, permits.
+ */
+const EXPERIENCE_FIELD_LABEL_RE =
+  /^Experience:\s*(Title|Company|Office\s+location|Location|Employer|Organization)\b/i;
+
+/**
+ * JOB-303. The fact keys that back an Experience typeahead answer. Same
+ * double-gate reasoning as `SCHOOL_FACT_KEY_RE`: a label alone cannot tell an
+ * Experience: Title typeahead apart from a form asking for the target role's
+ * title, so the fact backing the value has to actually be the candidate's own
+ * work entry (or a stated location) before free text is committed to it.
+ *
+ * `buildFactCatalog` writes `work${N}.title`, `work${N}.employer`, and
+ * `mostRecentEmployer` / `mostRecentTitle`. The location facts covered here
+ * (`resumeLocation`, `currentCity`, `currentCountry`) back the "Experience:
+ * Office location" typeahead where the candidate's stated location is what
+ * lands on the form.
+ */
+const EXPERIENCE_FACT_KEY_RE =
+  /^(?:work\d+\.(?:title|employer)|mostRecent(?:Employer|Title)|resumeLocation|currentCity|currentCountry|topLocationPreference)$/;
 
 /**
  * Matches "Confirm email", "Confirm your email", "Re-enter email",
@@ -5319,10 +5472,18 @@ function inferOrAsk(
       // in" org-structure question, and `proposed` typed as free text onto the
       // wrong one of those states something about the employer's org chart,
       // not the candidate.
+      //
+      // JOB-303 widens the same double gate to a SmartRecruiters Experience
+      // section entry: an "Experience: Title" typeahead accepts the candidate's
+      // real title as free text when the occupation catalog does not list it,
+      // and an "Experience: Company" typeahead the same way for an employer
+      // outside the standard catalog. See `EXPERIENCE_FIELD_LABEL_RE` and
+      // `EXPERIENCE_FACT_KEY_RE` for the label and fact key gates.
+      const sourceFactKey = decision?.sourceFact ?? "";
       if (
         field.kind === "combobox" &&
-        SCHOOL_FIELD_LABEL_RE.test(field.label) &&
-        SCHOOL_FACT_KEY_RE.test(decision?.sourceFact ?? "")
+        ((SCHOOL_FIELD_LABEL_RE.test(field.label) && SCHOOL_FACT_KEY_RE.test(sourceFactKey)) ||
+          (EXPERIENCE_FIELD_LABEL_RE.test(field.label) && EXPERIENCE_FACT_KEY_RE.test(sourceFactKey)))
       ) {
         return {
           kind: "apply",
@@ -6174,6 +6335,78 @@ async function awaitStableForm(session: BrowserSession): Promise<void> {
  * label travels as data in a typed field of a tool-free call, exactly as every
  * other form label already does.
  */
+
+/**
+ * JOB-303. The label test that decides whether a field inside an Experience
+ * entry is the To / end date picker whose value the "I currently work here"
+ * checkbox stands in for. Exported for the unit test rather than kept inline
+ * so both the runtime path in `fillRepeatingSections` and the test file
+ * share exactly one wording of the shape check.
+ *
+ * Matches "Experience: To", "Experience: End date", "Experience: End" and
+ * variants using "to date" as a suffix. Deliberately narrow, since a false
+ * positive here silently drops a field the ordinary path could have filled.
+ */
+export function isExperienceEndDateLabel(label: string): boolean {
+  return (
+    /^Experience:\s*(?:To|End(?:\s+date)?)\b/i.test(label) ||
+    /^Experience:\s*.*\bto\s+date\b/i.test(label)
+  );
+}
+
+/**
+ * JOB-303. Whether the decisions for one repeating section entry name an
+ * ongoing job through the `work${N}.currentlyHere` fact. Returns true only
+ * when the fact value is "Yes"; every other value keeps the ordinary end
+ * date apply path in play.
+ *
+ * Exported so the same shape check the runtime uses can be verified in the
+ * unit test without a browser mock.
+ */
+export function sectionCurrentlyHereActive(
+  decisions: readonly FieldDecision[],
+  factsByKey: ReadonlyMap<string, CandidateFact>
+): boolean {
+  return decisions.some((decision) => {
+    const factKey = decision.sourceFact ?? "";
+    if (!/^work\d+\.currentlyHere$/.test(factKey)) return false;
+    const fact = factsByKey.get(factKey);
+    return fact !== undefined && /^yes$/i.test(fact.value.trim());
+  });
+}
+
+/**
+ * JOB-303 Fix 4. One prose summary of the per field mismatches an entry saw,
+ * for the aggregate section escalation to name what actually failed rather
+ * than the previous single line that only said the section was still
+ * complaining. Bounded to the first three so a long list does not run away
+ * with the message, and each value truncated to eighty characters so a stray
+ * page paragraph in a read back does not either.
+ */
+export type RepeatingSectionMismatch = {
+  label: string;
+  attempted: string;
+  readBack: string;
+  detail: string;
+};
+
+export function summarizeRepeatingSectionMismatches(
+  entries: readonly RepeatingSectionMismatch[]
+): string {
+  if (entries.length === 0) return "";
+  const listed = entries
+    .slice(0, 3)
+    .map(
+      (row) =>
+        `${JSON.stringify(row.label)} was set to ` +
+        `${JSON.stringify(row.attempted.slice(0, 80))} and read back as ` +
+        `${JSON.stringify(row.readBack.slice(0, 80))} (${row.detail})`
+    )
+    .join("; ");
+  const tail = entries.length > 3 ? ` and ${entries.length - 3} more` : "";
+  return ` The following field(s) mismatched on read back: ${listed}${tail}`;
+}
+
 async function fillRepeatingSections(
   session: BrowserSession,
   state: ApplicationState,
@@ -6292,8 +6525,64 @@ async function fillRepeatingSections(
         });
       };
 
+      // JOB-303 Fix 4. Per field mismatch context, gathered across the apply
+      // loop so that if the section still reports itself unsatisfied at the
+      // end the aggregate needsInput row can name the fields that mismatched
+      // (label, attempted value, what the control read back) instead of the
+      // previous one liner that only said the section was still complaining.
+      // See `summarizeRepeatingSectionMismatches` above for the wording and
+      // the aggregate escalation at the bottom of this loop for the surfacing.
+      const entryMismatches: RepeatingSectionMismatch[] = [];
+
+      // JOB-303 Fix 3. The SmartRecruiters Experience entry pairs a To /
+      // end date `spl-date-picker` with an "I currently work here"
+      // `spl-checkbox`. Ticking the checkbox disables the To picker, so a
+      // work entry whose end date is still open must tick the checkbox and
+      // skip the To picker; typing "Present" into the picker instead
+      // mismatches on read back and blocks the section forever.
+      //
+      // The gate is deliberately conservative: `sectionCurrentlyHereActive`
+      // (exported for the unit test) is true only when a decision picked a
+      // `work${N}.currentlyHere` fact holding "Yes", and only then are peer
+      // To / end date fields marked as delegated to the checkbox. Every
+      // other value keeps the ordinary path in play, so a job that actually
+      // ended in a month and year still has that month and year typed into
+      // the To picker. The checkbox itself is filled through the ordinary
+      // path since its own decision resolves to the same "Yes" fact.
+      const currentlyHereActive = sectionCurrentlyHereActive(decisions, factsByKey);
+      const skipDueToCurrentlyHere = new Set<string>();
+      if (currentlyHereActive) {
+        for (const candidate of fresh) {
+          const decoratedLabel = `${section.heading}: ${candidate.label}`;
+          if (isExperienceEndDateLabel(decoratedLabel)) {
+            skipDueToCurrentlyHere.add(candidate.key);
+          }
+        }
+      }
+
       for (const field of fresh) {
         const decision = byKey.get(field.key);
+
+        // JOB-303 Fix 3. The peer end date picker for an ongoing job: the
+        // checkbox above disables it, so no value has to be typed into it
+        // and typing one would mismatch on read back. Recorded as filled and
+        // delegated so the outcomes trail names the reason, not skipped
+        // silently.
+        if (skipDueToCurrentlyHere.has(field.key)) {
+          outcomes.push({
+            field: field.key,
+            intended: null,
+            outcome: "filled",
+            detail:
+              `${section.heading} entry, left to the "I currently work here" checkbox to ` +
+              `disable this end date picker, since the candidate's stored end date is "Present"`,
+          });
+          console.log(
+            `${LOG} ${section.heading}: ${field.label} skipped (delegated to the currently here checkbox)`
+          );
+          continue;
+        }
+
         // JOB-262's `ats` parameter is deliberately NOT passed here. A
         // repeating work/education entry has no self-identification field to
         // begin with, and this function's own header already promises it
@@ -6348,10 +6637,26 @@ async function fillRepeatingSections(
           // name typed into a company picker that does not list it is left
           // unmatched instead, because an autocomplete holding unmatched text
           // looks filled and submits empty.
-          allowFreeText:
-            field.kind === "combobox" &&
-            SCHOOL_FIELD_LABEL_RE.test(field.label) &&
-            SCHOOL_FACT_KEY_RE.test(decision?.sourceFact ?? ""),
+          //
+          // JOB-303 widens it to a SmartRecruiters Experience section
+          // typeahead the same way, see `EXPERIENCE_FIELD_LABEL_RE` and
+          // `EXPERIENCE_FACT_KEY_RE`, so an "Experience: Title" combobox
+          // whose occupation catalog does not list the candidate's real title
+          // keeps the typed value instead of scoring the section unsatisfied.
+          allowFreeText: (() => {
+            if (field.kind !== "combobox") return false;
+            const sourceFactKey = decision?.sourceFact ?? "";
+            if (SCHOOL_FIELD_LABEL_RE.test(field.label) && SCHOOL_FACT_KEY_RE.test(sourceFactKey)) {
+              return true;
+            }
+            if (
+              EXPERIENCE_FIELD_LABEL_RE.test(field.label) &&
+              EXPERIENCE_FACT_KEY_RE.test(sourceFactKey)
+            ) {
+              return true;
+            }
+            return false;
+          })(),
           // JOB-051's tie break, on the same footing as the ordinary pass: the
           // country the candidate attested, used only to choose between
           // suggestions that already contain the value. JOB-246 falls back to
@@ -6388,6 +6693,16 @@ async function fillRepeatingSections(
             outcome: "mismatch",
             detail: `${section.heading} entry — ${outcome.detail}`,
             readBack: outcome.readBack,
+          });
+          // JOB-303 Fix 4. Capture the per field context so the aggregate
+          // section escalation below can name what actually mismatched
+          // rather than the previous one liner. Reads back into the
+          // skip_log through the needsInput.why the escalation surfaces.
+          entryMismatches.push({
+            label: field.label,
+            attempted: outcome.typedValue,
+            readBack: outcome.readBack,
+            detail: outcome.detail,
           });
           continue;
         }
@@ -6440,11 +6755,17 @@ async function fillRepeatingSections(
           : `required — one entry added to the "${section.heading}" section (${committed.detail})`,
       });
       if (stillComplaining) {
+        // JOB-303 Fix 4. When per field mismatches were seen during this
+        // entry, name them in the escalation through
+        // `summarizeRepeatingSectionMismatches`, so what actually failed
+        // reaches skip_log rather than the previous "the section is still
+        // complaining" one liner.
+        const mismatchSummary = summarizeRepeatingSectionMismatches(entryMismatches);
         needsInput.push({
           key: section.key,
           fieldLabel: section.heading,
           question: `The "${section.heading}" section still needs at least one entry. What should we put in it?`,
-          why: `an entry was filled in but ${committed.detail}`,
+          why: `an entry was filled in but ${committed.detail}.${mismatchSummary}`,
           required: true,
           kind: "other",
         });
@@ -6833,10 +7154,26 @@ async function fillRemainingFields(
       // and `chooseFromMenu`'s own comment on what this permits. The label
       // alone would also let free text through on an employer's own "School"
       // or "College" org-structure field, which is not what `value` answers.
-      allowFreeText:
-        field.kind === "combobox" &&
-        SCHOOL_FIELD_LABEL_RE.test(field.label) &&
-        SCHOOL_FACT_KEY_RE.test(decision?.sourceFact ?? ""),
+      //
+      // JOB-303 extends the same gate to a SmartRecruiters Experience section
+      // typeahead reached through this pass rather than through
+      // `fillRepeatingSections`: "Experience: Title" and "Experience: Company"
+      // both accept the candidate's real answer as free text when the vendor
+      // catalog does not list it.
+      allowFreeText: (() => {
+        if (field.kind !== "combobox") return false;
+        const sourceFactKey = decision?.sourceFact ?? "";
+        if (SCHOOL_FIELD_LABEL_RE.test(field.label) && SCHOOL_FACT_KEY_RE.test(sourceFactKey)) {
+          return true;
+        }
+        if (
+          EXPERIENCE_FIELD_LABEL_RE.test(field.label) &&
+          EXPERIENCE_FACT_KEY_RE.test(sourceFactKey)
+        ) {
+          return true;
+        }
+        return false;
+      })(),
       // JOB-051. The country the candidate told us they live in, so a location
       // search that comes back with the same city name on four continents can
       // be resolved from what they attested rather than by taking the first
