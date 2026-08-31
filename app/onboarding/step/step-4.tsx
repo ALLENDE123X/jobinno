@@ -12,7 +12,6 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -30,7 +29,7 @@ import {
 import { clearanceLevelIsRelevant } from "@/lib/onboarding/intake-derivation";
 
 import { saveIntakeDraft } from "../actions";
-import { Field, YesNoField, toBoolean, type YesNo } from "./_shared";
+import { Field, StepFooter, YesNoField, toBoolean, type YesNo } from "./_shared";
 
 type ClearanceValue = (typeof CLEARANCE_ELIGIBILITY_OPTIONS)[number]["value"];
 type ClearanceLevelValue = (typeof CLEARANCE_LEVEL_OPTIONS)[number]["value"];
@@ -299,18 +298,25 @@ export function Step4Form({
         </p>
       ) : null}
 
-      <div className="flex gap-3">
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => router.push("/onboarding/step/3")}
-        >
-          Back
-        </Button>
-        <Button type="submit" disabled={busy}>
-          {busy ? "Saving" : "Next"}
-        </Button>
-      </div>
+      <StepFooter
+        step={4}
+        backHref="/onboarding/step/3"
+        busy={busy}
+        draftPayload={{
+          salaryExpectation,
+          subjectToRestrictiveCovenant: toBoolean(
+            subjectToRestrictiveCovenant,
+          ),
+          relativesAtTargetEmployers: toBoolean(relativesAtTargetEmployers),
+          previouslyEmployedAtTargetEmployers: toBoolean(
+            previouslyEmployedAtTargetEmployers,
+          ),
+          clearanceEligibility,
+          clearanceLevelHeld: showClearanceLevel ? clearanceLevelHeld : null,
+          highSchoolName,
+          highSchoolGradYear,
+        }}
+      />
     </form>
   );
 }

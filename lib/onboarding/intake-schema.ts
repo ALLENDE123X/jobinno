@@ -511,6 +511,106 @@ export const step4Schema = z
     }
   });
 
+/**
+ * ── Draft schemas for Save and finish later (JOB-314) ───────────────────────
+ *
+ * step2Schema through step4Schema above enforce required means required, on
+ * purpose: those are the schemas that gate the `Next` button, and the header
+ * comment at the top of this file explains why a blank cannot reach the
+ * pipeline. `Save and finish later` is a different action with a different
+ * contract. It exists so a person can pause mid step without losing what
+ * they already typed, so it must never reject a payload for being
+ * incomplete, only for being the wrong shape.
+ *
+ * Every field below is optional. An empty string, a missing key, an out of
+ * range number or an unrecognized enum value all resolve to null rather than
+ * a validation error, so `saveIntakeDraft` can always persist whatever was
+ * filled in and never blocks a save on a field the person has not reached
+ * yet. The cross field checks (F1 status required for F1 citizenship, the
+ * clearance contradiction) are dropped entirely here for the same reason:
+ * they describe what a complete answer looks like, and a draft is not one.
+ */
+
+const draftEmptyToNull = (raw: unknown) =>
+  typeof raw === "string" && raw.trim() === "" ? null : raw;
+
+const draftText = (max: number) =>
+  z.preprocess(draftEmptyToNull, z.string().trim().max(max).nullable()).catch(null);
+
+const draftEnum = <T extends readonly [string, ...string[]]>(values: T) =>
+  z.preprocess(draftEmptyToNull, z.enum(values).nullable()).catch(null);
+
+const draftBoolean = () => z.boolean().nullable().catch(null);
+
+const draftDate = () =>
+  z.preprocess(draftEmptyToNull, z.iso.date().nullable()).catch(null);
+
+const draftStringArray = (max: number) =>
+  z
+    .array(z.string().trim().max(120))
+    .max(max)
+    .catch([]);
+
+const draftYear = () =>
+  z
+    .preprocess((raw) => {
+      if (typeof raw === "number") return raw;
+      if (typeof raw === "string" && /^\d+$/.test(raw.trim())) {
+        return Number(raw.trim());
+      }
+      return null;
+    }, z.number().int().min(1900).max(2100).nullable())
+    .catch(null);
+
+const citizenshipValues = CITIZENSHIP_OPTIONS.map((option) => option.value) as [
+  string,
+  ...string[],
+];
+const f1StatusValues = F1_STATUS_OPTIONS.map((option) => option.value) as [
+  string,
+  ...string[],
+];
+const clearanceEligibilityValues = CLEARANCE_ELIGIBILITY_OPTIONS.map(
+  (option) => option.value,
+) as [string, ...string[]];
+const clearanceLevelValues = CLEARANCE_LEVEL_OPTIONS.map(
+  (option) => option.value,
+) as [string, ...string[]];
+
+/** Step 2 draft: work authorization, with nothing required. */
+export const step2DraftSchema = z.object({
+  citizenshipStatus: draftEnum(citizenshipValues),
+  f1Status: draftEnum(f1StatusValues),
+  visaStatus: draftText(200),
+  workAuthorizedUs: draftBoolean(),
+  requiresSponsorship: draftBoolean(),
+});
+
+/** Step 3 draft: location and timing, with nothing required. */
+export const step3DraftSchema = z.object({
+  streetAddress: draftText(200),
+  currentCity: draftText(120),
+  currentCountry: draftText(120),
+  postalCode: draftText(20),
+  targetLocations: draftStringArray(20),
+  willingToRelocate: draftBoolean(),
+  needsSponsorshipNonUs: draftBoolean(),
+  gradDate: draftDate(),
+  earliestStart: draftDate(),
+});
+
+/** Step 4 draft: compliance and compensation, with nothing required. */
+export const step4DraftSchema = z.object({
+  salaryExpectation: draftText(200),
+  subjectToRestrictiveCovenant: draftBoolean(),
+  relativesAtTargetEmployers: draftBoolean(),
+  previouslyEmployedAtTargetEmployers: draftBoolean(),
+  clearanceEligibility: draftEnum(clearanceEligibilityValues),
+  clearanceLevelHeld: draftEnum(clearanceLevelValues),
+  highSchoolName: draftText(120),
+  highSchoolGradYear: draftYear(),
+});
+
 /** Step 5: Attestation checkbox. */
 export const step5Schema = z.object({
   attestation: z.literal(true, "You have to confirm this to continue."),

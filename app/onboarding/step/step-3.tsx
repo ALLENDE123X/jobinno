@@ -13,7 +13,6 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   intakeFieldErrors,
@@ -22,7 +21,7 @@ import {
 import { needsSponsorshipNonUsIsRelevant } from "@/lib/onboarding/intake-derivation";
 
 import { saveIntakeDraft } from "../actions";
-import { Field, YesNoField, toBoolean, type YesNo } from "./_shared";
+import { Field, StepFooter, YesNoField, toBoolean, type YesNo } from "./_shared";
 
 type ProfileData = {
   street_address: string | null;
@@ -259,18 +258,24 @@ export function Step3Form({
         </p>
       ) : null}
 
-      <div className="flex gap-3">
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => router.push("/onboarding/step/2")}
-        >
-          Back
-        </Button>
-        <Button type="submit" disabled={busy}>
-          {busy ? "Saving" : "Next"}
-        </Button>
-      </div>
+      <StepFooter
+        step={3}
+        backHref="/onboarding/step/2"
+        busy={busy}
+        draftPayload={{
+          streetAddress,
+          currentCity,
+          postalCode,
+          currentCountry,
+          targetLocations: parsedTargets,
+          willingToRelocate: toBoolean(willingToRelocate),
+          needsSponsorshipNonUs: showSponsorshipNonUs
+            ? toBoolean(needsSponsorshipNonUs)
+            : null,
+          gradDate,
+          earliestStart,
+        }}
+      />
     </form>
   );
 }

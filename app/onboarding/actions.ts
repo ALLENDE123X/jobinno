@@ -50,8 +50,11 @@ import {
   intakeFieldErrors,
   intakeSchema,
   step1Schema,
+  step2DraftSchema,
   step2Schema,
+  step3DraftSchema,
   step3Schema,
+  step4DraftSchema,
   step4Schema,
   step5Schema,
 } from "@/lib/onboarding/intake-schema";
@@ -287,11 +290,29 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
 // linked to their user_id with no attested profile; this is the same
 // state as any pre-intake user, and the existing cleanup pattern handles
 // it. See JOB-308 round two BLOCKING 2 for why this had to change.
+//
+// ── `options.partial`, for Save and finish later (JOB-314) ──────────────────
+// The `Next` button calls this with the strict per-step schema, because
+// leaving that step means the step's answers are supposed to be complete.
+// `Save and finish later` calls it with `partial: true`, which switches to
+// the draft schemas in intake-schema.ts (stepNDraftSchema) that treat every
+// field as optional and never reject a payload for being incomplete. Step 1
+// needs no such switch: step1Schema already has nothing required. Steps 3
+// and 4's derivations (deriveNeedsSponsorshipNonUs, clearanceLevelIsRelevant)
+// already resolve safely on missing input (an unanswered question is not
+// "relevant" yet, so they fall back to false / "never_held", which is true
+// either way). Step 2 is the one exception: deriveWorkAuthorizedUs and
+// deriveRequiresSponsorship turn "not answered" into a hard false, which
+// would misrepresent an unanswered question as a "no" in a half filled
+// draft, so the partial path below computes those two columns itself
+// instead of calling the derive functions.
 
 export async function saveIntakeDraft(
   payload: unknown,
   step: number,
+  options: { partial?: boolean } = {},
 ): Promise<IntakeResult> {
+  const partial = options.partial ?? false;
   const supabase = await createServerClient();
 
   const {
@@ -316,21 +337,27 @@ export async function saveIntakeDraft(
       break;
     }
     case 2: {
-      const parsed = step2Schema.safeParse(payload);
+      const parsed = (partial ? step2DraftSchema : step2Schema).safeParse(
+        payload,
+      );
       if (!parsed.success)
         return { ok: false, errors: intakeFieldErrors(parsed.error) };
       validated = parsed.data;
       break;
     }
     case 3: {
-      const parsed = step3Schema.safeParse(payload);
+      const parsed = (partial ? step3DraftSchema : step3Schema).safeParse(
+        payload,
+      );
       if (!parsed.success)
         return { ok: false, errors: intakeFieldErrors(parsed.error) };
       validated = parsed.data;
       break;
     }
     case 4: {
-      const parsed = step4Schema.safeParse(payload);
+      const parsed = (partial ? step4DraftSchema : step4Schema).safeParse(
+        payload,
+      );
       if (!parsed.success)
         return { ok: false, errors: intakeFieldErrors(parsed.error) };
       validated = parsed.data;
@@ -366,17 +393,45 @@ export async function saveIntakeDraft(
       update.citizenship_status = validated.citizenshipStatus;
       update.f1_status = validated.f1Status;
       update.visa_status = validated.visaStatus;
-      // Derive workAuthorizedUs and requiresSponsorship: for US citizens
-      // and permanent residents these are forced; for others the explicit
-      // answer is used.
-      update.work_authorized_us = deriveWorkAuthorizedUs(
-        validated.citizenshipStatus as string,
-        validated.workAuthorizedUs as boolean | null,
-      );
-      update.requires_sponsorship = deriveRequiresSponsorship(
-        validated.citizenshipStatus as string,
-        validated.requiresSponsorship as boolean | null,
-      );
+      if (partial) {
+        // See the "options.partial" header above: a half filled draft may
+        // not have a citizenship yet, and deriveWorkAuthorizedUs /
+        // deriveRequiresSponsorship both collapse "not answered" to false,
+        // which would store a "no" nobody gave. Force true / false only
+        // once citizenship is actually known to be US citizen or permanent
+        // resident; otherwise pass the explicit answer through as is,
+        // including null for "not answered yet".
+        // Same two values step2Schema's cross field check and
+        // lib/onboarding/intake-derivation.ts's INHERENTLY_AUTHORIZED both
+        // encode; kept inline here rather than exported and imported for a
+        // two item list that is unlikely to grow.
+        const inherentlyAuthorizedCitizenships = [
+          "us_citizen",
+          "permanent_resident",
+        ];
+        const citizenship = validated.citizenshipStatus as string | null;
+        const inherentlyAuthorized = citizenship
+          ? inherentlyAuthorizedCitizenships.includes(citizenship)
+          : false;
+        update.work_authorized_us = inherentlyAuthorized
+          ? true
+          : (validated.workAuthorizedUs as boolean | null);
+        update.requires_sponsorship = inherentlyAuthorized
+          ? false
+          : (validated.requiresSponsorship as boolean | null);
+      } else {
+        // Derive workAuthorizedUs and requiresSponsorship: for US citizens
+        // and permanent residents these are forced; for others the explicit
+        // answer is used.
+        update.work_authorized_us = deriveWorkAuthorizedUs(
+          validated.citizenshipStatus as string,
+          validated.workAuthorizedUs as boolean | null,
+        );
+        update.requires_sponsorship = deriveRequiresSponsorship(
+          validated.citizenshipStatus as string,
+          validated.requiresSponsorship as boolean | null,
+        );
+      }
       break;
 
     case 3:
