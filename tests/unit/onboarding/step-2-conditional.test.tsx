@@ -1,5 +1,5 @@
 /**
- * JOB-308 round two BLOCKING 1 UI test.
+ * JOB-308 round two BLOCKING 1 UI test, extended by JOB-312.
  *
  * The two Yes/No inputs for workAuthorizedUs and requiresSponsorship are
  * NOT rendered when citizenship is US citizen or permanent resident (the
@@ -7,6 +7,10 @@
  * F1, H1B or Other, and the F1 case is exercised here as the canonical
  * one, because an F1 not yet on OPT should be able to answer
  * workAuthorizedUs=false without having a true silently fabricated.
+ *
+ * JOB-312 adds the same expectation for the visa status field itself: not
+ * rendered for US citizen or permanent resident (server derives it via
+ * prefillVisaStatus), rendered and required for F1.
  */
 
 import { render, screen } from "@testing-library/react";
@@ -90,5 +94,45 @@ describe("Step2Form work authorization inputs", () => {
     expect(
       screen.getByText(/Will you need visa sponsorship/i),
     ).toBeInTheDocument();
+  });
+});
+
+describe("Step2Form visa status field", () => {
+  it("does not render the visa status field for a US citizen", () => {
+    render(<Step2Form profile={{ ...baseProfile(), citizenship_status: "us_citizen" }} />);
+
+    expect(
+      screen.queryByText(/Your current visa status/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not render the visa status field for a permanent resident", () => {
+    render(
+      <Step2Form
+        profile={{ ...baseProfile(), citizenship_status: "permanent_resident" }}
+      />,
+    );
+
+    expect(
+      screen.queryByText(/Your current visa status/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders the visa status field for an F1 student", () => {
+    render(<Step2Form profile={{ ...baseProfile(), citizenship_status: "f1" }} />);
+
+    expect(screen.getByText(/Your current visa status/i)).toBeInTheDocument();
+  });
+
+  it("renders the visa status field for an H1B holder", () => {
+    render(<Step2Form profile={{ ...baseProfile(), citizenship_status: "h1b" }} />);
+
+    expect(screen.getByText(/Your current visa status/i)).toBeInTheDocument();
+  });
+
+  it("renders the visa status field when citizenship is Other", () => {
+    render(<Step2Form profile={{ ...baseProfile(), citizenship_status: "other" }} />);
+
+    expect(screen.getByText(/Your current visa status/i)).toBeInTheDocument();
   });
 });

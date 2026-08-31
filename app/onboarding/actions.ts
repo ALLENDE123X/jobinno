@@ -45,6 +45,7 @@ import {
   deriveNeedsSponsorshipNonUs,
   deriveRequiresSponsorship,
   deriveWorkAuthorizedUs,
+  prefillVisaStatus,
 } from "@/lib/onboarding/intake-derivation";
 import {
   intakeFieldErrors,
@@ -362,10 +363,22 @@ export async function saveIntakeDraft(
       }
       break;
 
-    case 2:
-      update.citizenship_status = validated.citizenshipStatus;
+    case 2: {
+      const citizenship = validated.citizenshipStatus as string;
+      // Same forcing rule as deriveWorkAuthorizedUs / deriveRequiresSponsorship
+      // just below: a US citizen or permanent resident's visa status is not
+      // an opinion, it is "None, US citizen" or "Permanent resident" by
+      // definition, so the server is the sole author of it here and the
+      // client's field is hidden (see Step2Form). Anyone else's visa status
+      // is a fact only they can state, so their own answer is used as is.
+      // JOB-312.
+      const isUsOrPr =
+        citizenship === "us_citizen" || citizenship === "permanent_resident";
+      update.citizenship_status = citizenship;
       update.f1_status = validated.f1Status;
-      update.visa_status = validated.visaStatus;
+      update.visa_status = isUsOrPr
+        ? prefillVisaStatus(citizenship, null)
+        : validated.visaStatus;
       // Derive workAuthorizedUs and requiresSponsorship: for US citizens
       // and permanent residents these are forced; for others the explicit
       // answer is used.
@@ -378,6 +391,7 @@ export async function saveIntakeDraft(
         validated.requiresSponsorship as boolean | null,
       );
       break;
+    }
 
     case 3:
       update.street_address = validated.streetAddress;

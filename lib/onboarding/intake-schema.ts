@@ -407,12 +407,19 @@ export function step1Schema(userId?: string) {
  * a null here is rejected so an F1 not yet on OPT can honestly answer
  * workAuthorizedUs=false rather than have true silently fabricated on
  * their behalf.
+ *
+ * visaStatus follows the same rule, per JOB-312. For a US citizen or
+ * permanent resident the field is hidden client-side and the server
+ * derives it via `prefillVisaStatus` in `app/onboarding/actions.ts`, so
+ * the schema allows null here too. For every other citizenship the field
+ * is shown and required, since only the person can say what their visa
+ * status actually is.
  */
 export const step2Schema = z
   .object({
     citizenshipStatus,
     f1Status: f1Status.nullable().default(null),
-    visaStatus: requiredText("Visa status", 200),
+    visaStatus: requiredText("Visa status", 200).nullable().default(null),
     workAuthorizedUs: z.boolean().nullable().default(null),
     requiresSponsorship: z.boolean().nullable().default(null),
   })
@@ -438,6 +445,14 @@ export const step2Schema = z
       INHERENTLY_AUTHORIZED as readonly string[]
     ).includes(value.citizenshipStatus);
     if (!inherentlyAuthorized) {
+      if (value.visaStatus === null) {
+        ctx.issues.push({
+          code: "custom",
+          input: value.visaStatus,
+          path: ["visaStatus"],
+          message: "Tell us your current visa status.",
+        });
+      }
       if (value.workAuthorizedUs === null) {
         ctx.issues.push({
           code: "custom",
