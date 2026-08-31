@@ -150,23 +150,44 @@ describe("dispatchApplicationFill", () => {
     expect(legacy).not.toHaveBeenCalled();
   });
 
-  it("propagates the not implemented throw from the default agent", async () => {
+  // JOB-316 rewrote the two assertions below. They used to pin the scaffold
+  // behavior (`runAgentFill` always throws `AgentFillNotImplementedError`);
+  // the wet implementation landed, so what is pinned now is the opposite: the
+  // stub throw is gone, and a failure out of the default agent path is a real
+  // runtime failure, never the scaffold's marker error.
+  it("falls through to the real runAgentFill when no agent override is supplied", async () => {
     const legacy = vi.fn().mockResolvedValue(stubResult);
-
-    await expect(
-      dispatchApplicationFill(input, "greenhouse", {
+    // Blank the database env so the real `runAgentFill` fails fast at its
+    // guarded client builder instead of reaching any live project.
+    vi.stubEnv("SUPABASE_URL", "");
+    vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "");
+    try {
+      const failure = await dispatchApplicationFill(input, "greenhouse", {
         legacy,
-        // No `agent` supplied so the routing falls through to the real
-        // `runAgentFill` stub, which throws.
         env: { USE_AGENT_FILL: "true", USE_AGENT_FILL_ATS: "greenhouse" },
-      })
-    ).rejects.toBeInstanceOf(AgentFillNotImplementedError);
-    expect(legacy).not.toHaveBeenCalled();
+      }).then(
+        () => null,
+        (err: unknown) => err
+      );
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(AgentFillNotImplementedError);
+      expect(legacy).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
-  it("runAgentFill on its own always throws AgentFillNotImplementedError", async () => {
-    await expect(runAgentFill(input)).rejects.toBeInstanceOf(
-      AgentFillNotImplementedError
+  it("runAgentFill no longer throws the scaffold's not implemented error", async () => {
+    const failure = await runAgentFill(input, {
+      getSupabase: async () => {
+        throw new Error("no database in this test");
+      },
+    }).then(
+      () => null,
+      (err: unknown) => err
     );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("no database in this test");
+    expect(failure).not.toBeInstanceOf(AgentFillNotImplementedError);
   });
 });
