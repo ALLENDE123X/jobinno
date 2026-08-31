@@ -935,6 +935,34 @@ export const applications = pgTable(
      * ("EEO answers never appear here") now holds in the narrower form that
      * matters: no demographic identity is ever fabricated, defaulted, or
      * transmitted, only ever a decline the form itself offered.
+     *
+     * ── JOB-298: fabrication when there is no decline at all ──────────────
+     *
+     * A form on any board can require a self identification answer and offer
+     * nothing `findDeclineOption` or `findDeclineAnalogOption` recognises: no
+     * "N/A", no "prefer not", no way to decline at all. A real VetsEZ Breezy
+     * form did exactly this, a mandatory veteran status question offering only
+     * "Yes" and "No". Leaving it blank fails a required control and stopped
+     * the run as `needs_attestation`.
+     *
+     * The 2026 08 26 fabrication product decision in
+     * `feedback_pipeline_may_fabricate_form_answers` authorizes fabricating a
+     * permissive neutral default here too, and `resolveDecision` in
+     * `lib/fill-application-form.ts` now does so deterministically on every
+     * board: "No" (or a "no" shaped option) on a veteran service question,
+     * otherwise a "prefer not" shaped choice when one is present, otherwise
+     * the first non empty option. A `source: "fabricated_eeo_no_decline"`
+     * row is written here so an audit can tell this rung apart from the
+     * JOB-262 carve out and from an ordinary decline.
+     *
+     * The invariant above narrows rather than disappears, and this section
+     * states the narrower form honestly: this rung can and does hand a
+     * demographic category to the form, but it is always a literal option the
+     * form itself already offered, never a model inference and never free
+     * text. That is the same boundary JOB-262 draws, with the single
+     * difference that the chosen option need not be decline shaped. The value
+     * goes no further than `answer_provenance` and the form itself; no new
+     * column holds it and nothing infers it back.
      */
     answerProvenance: jsonb("answer_provenance"),
     createdAt: timestamp("created_at", { withTimezone: true })

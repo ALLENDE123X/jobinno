@@ -1915,7 +1915,11 @@ describe("a veteran status question is caught whatever a board calls it", () => 
     }
   });
 
-  it("does not answer one that offers no way to decline", () => {
+  it("fabricates the neutral No for a Yes/No veteran question with no decline", () => {
+    // JOB-298. The shape that used to stop the run: a required veteran
+    // question with exactly "Yes" and "No" and no way to decline, on no board
+    // in the JOB-262 carve out. The fabrication rung answers the permissive
+    // neutral default instead of escalating.
     const resolution = resolveDecision(
       field({
         label: "Have you served in the military?",
@@ -1927,7 +1931,13 @@ describe("a veteran status question is caught whatever a board calls it", () => 
       decision({ fieldKey: "have you served in the military?", decision: "infer", value: "No" }),
       facts()
     );
-    expect(resolution.kind).toBe("ask");
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("No");
+      expect(resolution.declined).toBe(true);
+      expect(resolution.fabricatedEeoNoDecline).toBe(true);
+      expect(resolution.fabricatedDecline).toBeUndefined();
+    }
   });
 });
 
@@ -1985,10 +1995,11 @@ describe("JOB-262: the SmartRecruiters and Breezy EEO decline analog carve out",
     }
   });
 
-  it("still escalates a veteran question with no honest adjacent option at all, ats or not", () => {
+  it("falls through an empty analog search on Breezy to the fabrication rung", () => {
     // The VetsEZ Tampa Cloud Integration case: a plain Yes/No leaves nothing
-    // for the widened pattern to find either, so the fabrication path never
-    // engages and `needs_attestation` behaviour is preserved.
+    // for the widened JOB-262 pattern to find, so that carve out never
+    // engages. JOB-298 now catches the same run: the fabrication rung fires on
+    // every board and answers the permissive neutral No instead of stopping.
     const resolution = resolveDecision(
       field({
         label: "Are you a veteran of any branch of the United States Armed Forces?",
@@ -2001,14 +2012,22 @@ describe("JOB-262: the SmartRecruiters and Breezy EEO decline analog carve out",
       facts(),
       "breezy"
     );
-    expect(resolution.kind).toBe("ask");
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("No");
+      expect(resolution.fabricatedDecline).toBeUndefined();
+      expect(resolution.fabricatedEeoNoDecline).toBe(true);
+    }
   });
 
-  it("does not widen the decline search on any other board", () => {
-    // Same options as the Bosch fixture above, but no ats — or an ats outside
-    // the ticket's scope — must still stop the run rather than picking "N/A".
-    // This is the boundary the ticket's non-goals list by name: Ashby, Lever,
-    // Workable, Greenhouse, Recruitee, BambooHR and JazzHR are all untouched.
+  it("keeps the analog search on the carve out boards, and fabricates elsewhere", () => {
+    // Same options as the Bosch fixture above. On a board outside the JOB-262
+    // carve out, the widened analog search must not run. The form is not
+    // answered with "N/A" and no `fabricatedDecline` marker is set. But the
+    // JOB-298 fabrication rung picks the first option the form itself offered
+    // instead of stopping the run, under its own marker: Ashby, Lever,
+    // Workable, Greenhouse, Recruitee, BambooHR and JazzHR stop being
+    // escalation sites and become fabrication sites.
     for (const ats of [undefined, "ashby", "greenhouse", "lever", "workable"]) {
       const resolution = resolveDecision(
         field({
@@ -2022,7 +2041,12 @@ describe("JOB-262: the SmartRecruiters and Breezy EEO decline analog carve out",
         facts(),
         ats
       );
-      expect(resolution.kind).toBe("ask");
+      expect(resolution.kind).toBe("apply");
+      if (resolution.kind === "apply") {
+        expect(resolution.value).toBe("Hispanic or Latino");
+        expect(resolution.fabricatedDecline).toBeUndefined();
+        expect(resolution.fabricatedEeoNoDecline).toBe(true);
+      }
     }
   });
 
@@ -2063,6 +2087,227 @@ describe("JOB-262: the SmartRecruiters and Breezy EEO decline analog carve out",
       decision({ fieldKey: "disability status", decision: "infer", value: "No", why: "best guess" }),
       facts(),
       "smartrecruiters"
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+/**
+ * JOB-298: the fabrication policy, wired into the attestation gate. When a
+ * required self identification question offers no way to decline at all, the
+ * EEO branch of `resolveDecision` no longer ends at `needs_attestation` on
+ * any board where the form's options were actually read. The permissive
+ * neutral default is chosen deterministically (never by a model) from the
+ * options the form itself offered and is marked `fabricatedEeoNoDecline`, so
+ * an audit can tell it apart from the JOB-262 carve out and from an ordinary
+ * decline. This is the literal reading of the 2026 08 26 fabrication product
+ * decision extended to EEO; see `feedback_pipeline_may_fabricate_form_answers`.
+ */
+describe("JOB-298: the no-decline EEO fabrication rung", () => {
+  it("answers the neutral No on a required veteran question on Ashby", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Veteran Status",
+        kind: "select",
+        options: ["Yes", "No"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "veteran status", decision: "infer", value: "Yes", why: "best guess" }),
+      facts(),
+      "ashby"
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("No");
+      expect(resolution.declined).toBe(true);
+      expect(resolution.fabricatedEeoNoDecline).toBe(true);
+    }
+  });
+
+  it("prefers an exact No over a No prefixed option on a veteran question", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Military service status",
+        kind: "select",
+        options: ["Yes", "No", "No, I have not served"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "military service status", decision: "infer", value: "Yes", why: "best guess" }),
+      facts(),
+      "greenhouse"
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("No");
+      expect(resolution.fabricatedEeoNoDecline).toBe(true);
+    }
+  });
+
+  it("falls back to a No prefixed option when no exact No exists", () => {
+    // The OFCCP style veteran control: the neutral option is the one that
+    // starts with "no", not the first one listed.
+    const resolution = resolveDecision(
+      field({
+        label: "Are you a protected veteran?",
+        kind: "radio",
+        options: ["Yes", "Not a protected veteran"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "are you a protected veteran?", decision: "infer", value: "Yes", why: "best guess" }),
+      facts(),
+      "ashby"
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Not a protected veteran");
+      expect(resolution.fabricatedEeoNoDecline).toBe(true);
+    }
+  });
+
+  it("picks the first offered option on a required race question with no decline", () => {
+    // The plurality / first sensible option the memory file asks for, taken
+    // deterministically and synchronously, without an LLM.
+    const resolution = resolveDecision(
+      field({
+        label: "Race/Ethnicity",
+        kind: "select",
+        options: ["White", "Black or African American", "Asian", "Hispanic or Latino"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "race/ethnicity", decision: "infer", value: "Black or African American", why: "best guess" }),
+      facts(),
+      "workable"
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("White");
+      expect(resolution.fabricatedEeoNoDecline).toBe(true);
+    }
+  });
+
+  it("prefers a prefer to skip option over the first listed one", () => {
+    // "Prefer to skip" slips past `DECLINE_OPTION_RE`, so it is the one
+    // decline shaped wording this rung must spot itself.
+    const resolution = resolveDecision(
+      field({
+        label: "Gender Identity",
+        kind: "select",
+        options: ["Male", "Female", "Prefer to skip"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "gender identity", decision: "infer", value: "Male", why: "best guess" }),
+      facts(),
+      "lever"
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Prefer to skip");
+      expect(resolution.fabricatedEeoNoDecline).toBe(true);
+    }
+  });
+
+  it("still answers Prefer not to say through the original decline path, unchanged", () => {
+    // A field that already offers a decline option is answered by that option
+    // with no fabrication marker at all. JOB-298 must not disturb this.
+    const resolution = resolveDecision(
+      field({
+        label: "Gender",
+        kind: "select",
+        options: ["Male", "Female", "Prefer not to say"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "gender", decision: "infer", value: "Male", why: "best guess" }),
+      facts(),
+      "smartrecruiters"
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Prefer not to say");
+      expect(resolution.fabricatedEeoNoDecline).toBeUndefined();
+      expect(resolution.fabricatedDecline).toBeUndefined();
+    }
+  });
+
+  it("still returns the SmartRecruiters decline analog, JOB-262 unchanged", () => {
+    // Regression: on a board in the carve out, an "N/A" analog is picked by
+    // the JOB-262 rung before this one ever runs.
+    const resolution = resolveDecision(
+      field({
+        label: "Disability Status",
+        kind: "select",
+        options: ["Yes", "No", "Not Applicable"],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "disability status", decision: "infer", value: "No", why: "best guess" }),
+      facts(),
+      "smartrecruiters"
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Not Applicable");
+      expect(resolution.fabricatedDecline).toBe(true);
+      expect(resolution.fabricatedEeoNoDecline).toBeUndefined();
+    }
+  });
+
+  it("still skips an optional self identification question, unchanged", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Race/Ethnicity",
+        kind: "select",
+        options: ["White", "Black or African American"],
+        optionsKnown: true,
+        required: false,
+      }),
+      decision({ fieldKey: "race/ethnicity", decision: "infer", value: "White", why: "best guess" }),
+      facts(),
+      "greenhouse"
+    );
+    expect(resolution.kind).toBe("skip");
+  });
+
+  it("still escalates when the options could not be read at all", () => {
+    // `optionsKnown: false`: the rung must not fire on a page this system
+    // never opened a menu on, so the safe escalation behavior is preserved
+    // even on a board the JOB-298 rung otherwise covers.
+    const resolution = resolveDecision(
+      field({
+        label: "Race/Ethnicity",
+        kind: "select",
+        options: [],
+        optionsKnown: false,
+        required: true,
+      }),
+      decision({ fieldKey: "race/ethnicity", decision: "infer", value: "White", why: "best guess" }),
+      facts(),
+      "ashby"
+    );
+    expect(resolution.kind).toBe("ask");
+  });
+
+  it("escalates rather than writing an empty string when every option is blank", () => {
+    // The "never pick empty string" rule: when every option is empty there is
+    // no form offered value, so the rung declines to invent one and the safe
+    // escalation stands.
+    const resolution = resolveDecision(
+      field({
+        label: "Veteran Status",
+        kind: "select",
+        options: ["", ""],
+        optionsKnown: true,
+        required: true,
+      }),
+      decision({ fieldKey: "veteran status", decision: "infer", value: "No", why: "best guess" }),
+      facts(),
+      "ashby"
     );
     expect(resolution.kind).toBe("ask");
   });

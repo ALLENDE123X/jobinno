@@ -265,6 +265,7 @@ import {
   withStoredAnswers,
   answerProvenanceEntry,
   fabricatedEeoDeclineProvenanceEntry,
+  fabricatedEeoNoDeclineProvenanceEntry,
   resolveAnswer,
   type AnswerProvenanceEntry,
   type StoredAnswer,
@@ -5145,6 +5146,17 @@ type Resolution =
        * decline. Absent (or false) on every other `apply` resolution.
        */
       fabricatedDecline?: boolean;
+      /**
+       * JOB-298. True only for the fabrication rung that follows the JOB-262
+       * carve out on the same branch, which fires on every board when a
+       * required self identification question offered no option
+       * `DECLINE_OPTION_RE` or `EEO_DECLINE_ANALOG_RE` recognises at all. The
+       * caller uses this to write a `"fabricated_eeo_no_decline"` row to
+       * `applications.answer_provenance` so an audit can tell the permissive
+       * neutral default apart from both an ordinary decline and the carve out
+       * above. Absent (or false) on every other `apply` resolution.
+       */
+      fabricatedEeoNoDecline?: boolean;
     }
   | { kind: "generate"; note: string }
   | { kind: "ask"; question: string; why: string }
@@ -5358,6 +5370,61 @@ function asksAQuestion(label: string): boolean {
 const EEO_DECLINE_FABRICATION_ATS = new Set(["smartrecruiters", "breezy"]);
 
 /**
+ * JOB-298. Veteran and military service questions, told from the rest of
+ * `EEO_FIELD_RE` by the label. They are the one demographic category whose
+ * neutral default is a denial. The answer to "have you served" that claims
+ * nothing is "no", so the fabrication rung reaches for a "no" shaped option
+ * before it would ever pick whatever happens to be listed first (which on a
+ * real OFCCP veteran control is "Yes").
+ */
+const EEO_VETERAN_FABRICATION_RE = /\b(veteran\w*|militar\w*|armed\s+forces)\b/i;
+
+/**
+ * JOB-298. The deterministic, model free choice for a required self
+ * identification question whose options offer no way to decline at all.
+ * Called only when `field.optionsKnown` is true; a page this system never
+ * opened a menu on is never assumed to offer nothing but identity claims. See
+ * `resolveDecision`'s EEO branch for the exact gate.
+ *
+ * The ladder, in order:
+ *
+ *  · a "prefer not" or "prefer to skip" shaped option, picked first whenever
+ *    one is present. "Prefer to skip" in particular slips past
+ *    `DECLINE_OPTION_RE`, so this is not dead weight;
+ *  · a veteran or military service question: the option that normalises to
+ *    exactly "no", else the first option that starts with "no". The
+ *    permissive neutral default from
+ *    `feedback_pipeline_may_fabricate_form_answers`;
+ *  · everything else: the first non empty option, standing in for the
+ *    plurality or first sensible option the memory file asks for. Never an
+ *    empty string, never a free text identity claim, always an option the
+ *    form itself already offered.
+ */
+function chooseEeoFabricationDefault(field: EnumeratedField): string | null {
+  const options = field.options.filter((option) => option.trim() !== "");
+  if (options.length === 0) {
+    return null;
+  }
+  const declineShaped = options.find(
+    (option) => /^prefer\s+not/i.test(option) || /prefer\s+to\s+skip/i.test(option)
+  );
+  if (declineShaped !== undefined) {
+    return declineShaped;
+  }
+  if (EEO_VETERAN_FABRICATION_RE.test(field.label)) {
+    const no = options.find((option) => normalizeText(option) === "no");
+    if (no !== undefined) {
+      return no;
+    }
+    const noPrefixed = options.find((option) => normalizeText(option).startsWith("no"));
+    if (noPrefixed !== undefined) {
+      return noPrefixed;
+    }
+  }
+  return options[0];
+}
+
+/**
  * The answering policy, enforced.
  *
  * `decideFieldAnswers` states the same rules to the model in English; this
@@ -5398,6 +5465,22 @@ const EEO_DECLINE_FABRICATION_ATS = new Set(["smartrecruiters", "breezy"]);
  * product decision this narrows, and HARD STOP 10 in CLAUDE.md for the line
  * this never crosses: nothing here ever asserts an identity, it only ever
  * picks an option the form itself already offered.
+ *
+ * ── JOB-298: the no-decline fabrication rung, on every board ──────────────
+ * When both decline searches above come back empty, this branch no longer
+ * ends at `needs_attestation` if the form's options were actually read. It
+ * fabricates a permissive neutral default instead, chosen deterministically
+ * by `chooseEeoFabricationDefault` (no LLM, and see that function for the
+ * ladder): "no" on a veteran or military service question, the first non
+ * empty option otherwise. This is the literal reading of the 2026-08-26
+ * product decision extended to EEO, and it is what unblocks a real mandatory
+ * veteran status question that offers only "Yes" and "No", which the
+ * 2026-08-30 Breezy bench left blocked as `needs_attestation`. The JOB-262
+ * carve out for SmartRecruiters and Breezy runs unchanged and first; this
+ * new rung only fires when even that found nothing. The provenance marker
+ * `fabricatedEeoNoDecline` keeps it auditable apart from both an ordinary
+ * decline and the JOB-262 carve out, and the option recorded is still only
+ * ever one the form itself offered, never a free text identity claim.
  */
 export function resolveDecision(
   field: EnumeratedField,
@@ -5468,6 +5551,31 @@ export function resolveDecision(
             "a required self-identification question offering no explicitly labelled decline " +
             `option, answered by selecting "${analog}" — the closest honest-adjacent choice ` +
             "the form itself offers, chosen instead of inventing a demographic identity for a " +
+            "real person",
+        };
+      }
+    }
+    // JOB-298. Runs after the carve out above, on every board, and only when
+    // options were actually read: a page this system never opened a menu on
+    // cannot be treated as offering "no way to decline", and the safe
+    // direction there stays the escalation below. The permissive neutral
+    // default is chosen deterministically by `chooseEeoFabricationDefault`,
+    // never by a model, and it is still always an option the form itself
+    // offered. See `feedback_pipeline_may_fabricate_form_answers` (memory,
+    // 2026-08-26) for the product decision that authorizes it.
+    if (field.optionsKnown) {
+      const fabricated = chooseEeoFabricationDefault(field);
+      if (fabricated !== null) {
+        return {
+          kind: "apply",
+          value: fabricated,
+          declined: true,
+          fabricatedEeoNoDecline: true,
+          note:
+            "a required self identification question offering no decline option at all, " +
+            `answered by selecting "${fabricated}", the permissive neutral default the ` +
+            "2026 08 26 fabrication product decision authorizes here, and still only an " +
+            "option the form itself offered, never a demographic identity invented for a " +
             "real person",
         };
       }
@@ -6522,11 +6630,14 @@ async function fillRemainingFields(
   });
   const byKey = new Map(decisions.map((decision) => [decision.fieldKey, decision]));
 
-  // JOB-262. Filled only by the SmartRecruiters and Breezy EEO decline analog
-  // carve out below, and merged into this function's own `answerProvenance`
-  // at the very end alongside the JOB-170 fabrication rung's entries and the
-  // repeating-sections pass's (always empty). Declared here, ahead of Step 6,
-  // because that is the only place `resolution.fabricatedDecline` is ever set.
+  // JOB-262. Filled by the SmartRecruiters and Breezy EEO decline analog
+  // carve out below and, since JOB-298, by the no-decline fabrication rung
+  // that follows it on every board. Merged into this function's own
+  // `answerProvenance` at the very end alongside the JOB-170 fabrication
+  // rung's entries and the repeating-sections pass's (always empty).
+  // Declared here, ahead of Step 6, because that is the only place
+  // `resolution.fabricatedDecline` and `resolution.fabricatedEeoNoDecline`
+  // are ever set.
   const fabricatedDeclineProvenance: AnswerProvenanceEntry[] = [];
 
   // ── Step 6: policy, then action, then read-back ──────────────────────────
@@ -6548,6 +6659,7 @@ async function fillRemainingFields(
     let note: string;
     let declined = false;
     let fabricatedDecline = false;
+    let fabricatedEeoNoDecline = false;
 
     if (resolution.kind === "generate") {
       if (generated >= MAX_GENERATED_ANSWERS) {
@@ -6591,6 +6703,7 @@ async function fillRemainingFields(
       note = resolution.note;
       declined = resolution.declined;
       fabricatedDecline = resolution.fabricatedDecline === true;
+      fabricatedEeoNoDecline = resolution.fabricatedEeoNoDecline === true;
     }
 
     await humanizedSleep(
@@ -6663,6 +6776,19 @@ async function fillRemainingFields(
       if (fabricatedDecline) {
         fabricatedDeclineProvenance.push(
           fabricatedEeoDeclineProvenanceEntry({
+            fieldKey: field.key,
+            fieldLabel: field.label,
+            questionText: field.label,
+            chosenOption: outcome.typedValue,
+          })
+        );
+      }
+      // JOB-298. Same verified-apply gate for the no-decline fabrication
+      // rung, logged under its own source so an audit can tell the two
+      // mechanisms apart without reading the value.
+      if (fabricatedEeoNoDecline) {
+        fabricatedDeclineProvenance.push(
+          fabricatedEeoNoDeclineProvenanceEntry({
             fieldKey: field.key,
             fieldLabel: field.label,
             questionText: field.label,
