@@ -43,6 +43,7 @@ import {
   resolveDecision,
   fallbackRefusalReason,
   sectionCurrentlyHereActive,
+  shouldWidenRepeatingSectionCombobox,
   summarizeRepeatingSectionMismatches,
   CONFIRM_EMAIL_RE,
   LEGAL_ATTESTATION_RE,
@@ -504,6 +505,156 @@ describe("an SR Experience typeahead commits free text on a fact backed answer",
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// JOB-303 round two. Regression coverage for the runtime shape the section
+// walker actually feeds: fields carry the RAW label ("Title", "Company", "From",
+// "To"), because the "${section.heading}: " decoration is applied only on the
+// decidable list handed to `decideFieldAnswers`. Round one's `allowFreeText`
+// widening keyed off `field.label` inline, so at runtime it never saw the
+// decorated form and never fired — the SR Experience typeahead scored the
+// section unsatisfied for exactly the shape this ticket exists to unstick, and
+// the round-one tests above passed only because they hand-constructed the
+// field with `label: "Experience: Title"` directly. This block asserts the
+// widening against the runtime shape.
+describe("the SR Experience widening fires on the raw label the walker feeds", () => {
+  it("widens Title with a raw label when the section heading is Experience", () => {
+    // The exact shape `fillRepeatingSections` iterates: label "Title", no
+    // "Experience: " prefix, backed by a work0.title fact. Round one's inline
+    // IIFE returned false here because `EXPERIENCE_FIELD_LABEL_RE` anchors on
+    // `^Experience:`, so nothing was permitted as free text and SmartRecruiters
+    // scored the section unsatisfied on Bertelsmann bench.
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "Title", kind: "combobox" },
+        "Experience",
+        "work0.title"
+      )
+    ).toBe(true);
+  });
+
+  it("widens Company with a raw label when the section heading is Experience", () => {
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "Company", kind: "combobox" },
+        "Experience",
+        "work0.employer"
+      )
+    ).toBe(true);
+  });
+
+  it("widens Office location with a raw label when the section heading is Experience", () => {
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "Office location", kind: "combobox" },
+        "Experience",
+        "resumeLocation"
+      )
+    ).toBe(true);
+  });
+
+  it("widens School with a raw label when the section heading is Education", () => {
+    // The parallel path the same helper covers: an Education entry's School
+    // combobox reached through the walker carries the raw "School" label, and
+    // the widening must fire off the decorated "Education: School" form.
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "School", kind: "combobox" },
+        "Education",
+        "education0.school"
+      )
+    ).toBe(true);
+  });
+
+  it("refuses free text when the fact key is outside the Experience allowlist", () => {
+    // The double gate at work: label alone would let a salary answer land on
+    // the Title box, so a fact key from outside `EXPERIENCE_FACT_KEY_RE` keeps
+    // the ordinary "menu did not offer this" refusal in place.
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "Title", kind: "combobox" },
+        "Experience",
+        "salaryExpectation"
+      )
+    ).toBe(false);
+  });
+
+  it("refuses free text on a From or To picker, which are date fields", () => {
+    // Only Title, Company, Office location, Employer and Organization are on
+    // the widening list. A From/To date picker on the same section stays on
+    // the ordinary date-parse path and must not be widened.
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "From", kind: "combobox" },
+        "Experience",
+        "work0.startDate"
+      )
+    ).toBe(false);
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "To", kind: "combobox" },
+        "Experience",
+        "work0.endDate"
+      )
+    ).toBe(false);
+  });
+
+  it("refuses to widen when the kind is not a combobox", () => {
+    // A plain text input for Title (which some boards render) is not the
+    // typeahead this widening exists for, so leave it on the ordinary
+    // read-back path.
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "Title", kind: "text" },
+        "Experience",
+        "work0.title"
+      )
+    ).toBe(false);
+  });
+
+  it("locks down that resolveDecision needs the decorated label to apply free text", () => {
+    // Twin assertion on `resolveDecision`'s own free-text branch: the raw
+    // label "Title" that `fillRepeatingSections` iterates does NOT trip the
+    // `EXPERIENCE_FIELD_LABEL_RE` gate at :5486, so passing it undecorated
+    // returns something other than "apply" — the exact defect the round-one
+    // fix left behind. `fillRepeatingSections` now wraps the field in a
+    // decorated copy before calling `resolveDecision`, and the same test with
+    // the decorated label further down proves the decorated path works.
+    const raw = resolveDecision(
+      field({
+        label: "Title",
+        kind: "combobox",
+        options: ["Software Engineer", "Product Manager"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "title",
+        decision: "answer",
+        value: "AI Engineer",
+        sourceFact: "work0.title",
+      }),
+      facts()
+    );
+    expect(raw.kind).not.toBe("apply");
+
+    const decorated = resolveDecision(
+      field({
+        label: "Experience: Title",
+        kind: "combobox",
+        options: ["Software Engineer", "Product Manager"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "experience: title",
+        decision: "answer",
+        value: "AI Engineer",
+        sourceFact: "work0.title",
+      }),
+      facts()
+    );
+    expect(decorated.kind).toBe("apply");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // JOB-303 Fix 3. A candidate whose current job is ongoing gets an "I
 // currently work here" checkbox ticked and the paired To picker skipped;
 // typing "Present" into the picker instead mismatches and blocks the section
@@ -647,6 +798,16 @@ describe("normalizeWorkDate folds the shapes a resume prints", () => {
     expect(normalizeWorkDate("November 2025")?.iso).toBe("2025-11");
     expect(normalizeWorkDate("Nov 2025")?.iso).toBe("2025-11");
     expect(normalizeWorkDate("Feb 2020")?.iso).toBe("2020-02");
+  });
+
+  it("accepts Sept as the one four letter abbreviation resumes actually print", () => {
+    // JOB-303 round two. Every other month either fits three letters or is
+    // itself under five, so the three-letter slice covers them; September is
+    // the odd one out ("Sept" is common in date columns), and without an
+    // explicit alias the fact catalog dropped it silently.
+    expect(normalizeWorkDate("Sept 2024")?.iso).toBe("2024-09");
+    expect(normalizeWorkDate("Sept. 2024")?.iso).toBe("2024-09");
+    expect(normalizeWorkDate("2024 Sept")?.iso).toBe("2024-09");
   });
 
   it("passes a bare year through as year only", () => {

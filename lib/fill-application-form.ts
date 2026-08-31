@@ -4461,6 +4461,14 @@ export function normalizeWorkDate(value: string | null | undefined): NormalizedW
     monthLookup[name.toLowerCase()] = number;
     monthLookup[name.slice(0, 3).toLowerCase()] = number;
   });
+  // JOB-303 round two. The one four letter abbreviation resumes actually print
+  // that the three letter slice above misses: "Sept" for September. Every
+  // other month either fits three letters ("Jan", "Feb", ..., "Dec") or is
+  // itself under five ("June", "July") and already reads through the full
+  // spelling. Explicit here rather than a prefix rule because a permissive
+  // "matches any prefix" would also accept "Ju" for June or July, which is
+  // exactly the ambiguity a fact catalog for a resume date must not have.
+  monthLookup["sept"] = "09";
   const named = /^([A-Za-z]+)\.?\s+(\d{4})$|^(\d{4})\s+([A-Za-z]+)\.?$/.exec(raw);
   if (named !== null) {
     const monthText = (named[1] ?? named[4] ?? "").toLowerCase();
@@ -6376,6 +6384,45 @@ export function sectionCurrentlyHereActive(
 }
 
 /**
+ * JOB-303 round two. The same widening the ordinary pass does inline for a
+ * school- or Experience-shaped combobox (see the `allowFreeText` IIFE in
+ * `fillRemainingFields`), extracted so the repeating-section walker can share
+ * it. The walker's own field objects carry the RAW label — "Title", "Company",
+ * "Office location" — because the "${section.heading}: " decoration is applied
+ * only to the decidable list handed to the model. Every downstream label check
+ * inside the walker has to redo that decoration or the anchored
+ * `EXPERIENCE_FIELD_LABEL_RE` never matches and the SR Experience typeahead
+ * scores the section unsatisfied, which is exactly the round-one bench failure
+ * this ticket exists to fix.
+ *
+ * The double gate is preserved: label alone would let a work fact land on a
+ * university's own "School" org-structure field or the other way, so the fact
+ * key that produced `value` has to sit inside the paired allowlist too. Both
+ * halves are the same regexes `resolveDecision`'s free-text branch consults.
+ *
+ * Exported for the unit test so the same wording of the shape check the
+ * runtime uses is what the test asserts on.
+ */
+export function shouldWidenRepeatingSectionCombobox(
+  field: Pick<EnumeratedField, "label" | "kind">,
+  sectionHeading: string,
+  sourceFactKey: string
+): boolean {
+  if (field.kind !== "combobox") return false;
+  const decoratedLabel = `${sectionHeading}: ${field.label}`;
+  if (SCHOOL_FIELD_LABEL_RE.test(decoratedLabel) && SCHOOL_FACT_KEY_RE.test(sourceFactKey)) {
+    return true;
+  }
+  if (
+    EXPERIENCE_FIELD_LABEL_RE.test(decoratedLabel) &&
+    EXPERIENCE_FACT_KEY_RE.test(sourceFactKey)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * JOB-303 Fix 4. One prose summary of the per field mismatches an entry saw,
  * for the aggregate section escalation to name what actually failed rather
  * than the previous single line that only said the section was still
@@ -6583,12 +6630,32 @@ async function fillRepeatingSections(
           continue;
         }
 
+        // JOB-303 round two. The decidable list handed to the model at
+        // `decideFieldAnswers` above decorates every entry field label with the
+        // section heading ("Experience: Title", "Education: School"), because
+        // "From", "To" and "Description" repeat between the two sections and a
+        // model asked to decide across them would be answering an unanswerable
+        // question. That decoration has to reach `resolveDecision` too: its
+        // `EXPERIENCE_FIELD_LABEL_RE` gate at :5486 anchors on `^Experience:`
+        // and would silently miss the raw "Title" this loop's `field.label`
+        // still carries, and a SmartRecruiters Experience typeahead scored the
+        // section unsatisfied on exactly that gap in round one.
+        //
+        // Escalations keep receiving the raw `field` because `escalate` above
+        // decorates the label itself when it composes `fieldLabel`; passing
+        // `decoratedField` would double-decorate to "Experience: Experience:
+        // Title" in the needsInput row.
+        const decoratedField: EnumeratedField = {
+          ...field,
+          label: `${section.heading}: ${field.label}`,
+        };
+
         // JOB-262's `ats` parameter is deliberately NOT passed here. A
         // repeating work/education entry has no self-identification field to
         // begin with, and this function's own header already promises it
         // "deliberately never fabricates" — that stays true rather than
         // gaining a silent exception nothing here would ever exercise.
-        const resolution = resolveDecision(field, decision, factsByKey);
+        const resolution = resolveDecision(decoratedField, decision, factsByKey);
 
         // Nothing in a work or education entry is a prose question, so a
         // "generate" verdict here means the field was not recognised rather
@@ -6630,7 +6697,7 @@ async function fillRepeatingSections(
           HUMANIZE_TIMINGS.fieldJitterMs[1]
         );
         const value = resolution.value;
-        const outcome = await applyWithReadBackTolerance(session.page, field, value, {
+        const outcome = await applyWithReadBackTolerance(session.page, decoratedField, value, {
           allowContains: OPTION_KINDS.has(field.kind) && field.options.length === 0,
           // The same double gate the ordinary pass uses: a school-shaped
           // combobox whose answer came from a school-shaped fact. An employer
@@ -6643,20 +6710,18 @@ async function fillRepeatingSections(
           // `EXPERIENCE_FACT_KEY_RE`, so an "Experience: Title" combobox
           // whose occupation catalog does not list the candidate's real title
           // keeps the typed value instead of scoring the section unsatisfied.
-          allowFreeText: (() => {
-            if (field.kind !== "combobox") return false;
-            const sourceFactKey = decision?.sourceFact ?? "";
-            if (SCHOOL_FIELD_LABEL_RE.test(field.label) && SCHOOL_FACT_KEY_RE.test(sourceFactKey)) {
-              return true;
-            }
-            if (
-              EXPERIENCE_FIELD_LABEL_RE.test(field.label) &&
-              EXPERIENCE_FACT_KEY_RE.test(sourceFactKey)
-            ) {
-              return true;
-            }
-            return false;
-          })(),
+          //
+          // Round two: the shape check is `shouldWidenRepeatingSectionCombobox`
+          // above rather than an inline IIFE. The inline version keyed off the
+          // raw `field.label`, which never carries the "${section.heading}: "
+          // prefix `EXPERIENCE_FIELD_LABEL_RE` anchors on, so the widening it
+          // was supposed to permit never fired at runtime and the fix landed
+          // as dead code — caught in review before the second SR bench.
+          allowFreeText: shouldWidenRepeatingSectionCombobox(
+            field,
+            section.heading,
+            decision?.sourceFact ?? ""
+          ),
           // JOB-051's tie break, on the same footing as the ordinary pass: the
           // country the candidate attested, used only to choose between
           // suggestions that already contain the value. JOB-246 falls back to
