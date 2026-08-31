@@ -4,7 +4,9 @@
  * This module is the entry point the pipeline reaches when a run has been
  * routed onto the agent path instead of the legacy widget fill. It is
  * deliberately empty of implementation. Every call throws
- * `AgentFillNotImplementedError` until the sub tickets B..H land.
+ * `AgentFillNotImplementedError` until the sub tickets B..H land, with one
+ * exception: `buildFactCatalog`, hoisted into `lib/agent/fact-catalog.ts` by
+ * JOB-296 and re-exported below, is real shared code and not a stub.
  *
  * The flag `USE_AGENT_FILL` defaults to false, and `USE_AGENT_FILL_ATS` is an
  * empty allowlist by default, so the routing helper answers `false` for every
@@ -67,6 +69,16 @@ export type {
   PrefillSlot,
   SkippedField,
 } from "@/lib/agent/prefill";
+
+/**
+ * JOB-296 (sub ticket G): the fact catalogue builder, moved from
+ * `lib/fill-application-form.ts` into `lib/agent/fact-catalog.ts` so the fill
+ * layer and the agent loop read one catalogue. Re-exported here so sub tickets
+ * can `import { buildFactCatalog } from "@/lib/agent"` without knowing the
+ * module layout. The stateful `buildAgentFactCatalog` sub ticket B promises is
+ * still a throwing stub in the same file and is not exposed yet.
+ */
+export { buildFactCatalog } from "@/lib/agent/fact-catalog";
 
 /**
  * Return type of `runAgentFill`. Kept as an alias of `SubmitApplicationResult`

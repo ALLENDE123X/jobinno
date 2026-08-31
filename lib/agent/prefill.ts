@@ -201,7 +201,7 @@ const PREFILL_SLOT_ORDER: readonly PrefillSlot[] = [
 /**
  * Which fact catalog paths hold the value for each slot. Every slot lists at
  * least one path; the first one that resolves against the catalog wins. The
- * paths mirror the keys `lib/fill-application-form.ts`'s `buildFactCatalog`
+ * paths mirror the keys `lib/agent/fact-catalog.ts`'s `buildFactCatalog`
  * writes, so a run whose fact catalog was built by that function fills the
  * expected slot even before sub ticket B's new catalog builder lands.
  */

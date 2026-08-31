@@ -32,7 +32,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   blockedForAnswers,
-  buildFactCatalog,
   countryContextTermsWithResumeFallback,
   currentCityWithResumeFallback,
   isAttestationField,
@@ -44,6 +43,7 @@ import {
   LEGAL_ATTESTATION_RE,
   type NeedsInputItem,
 } from "@/lib/fill-application-form";
+import { buildFactCatalog } from "@/lib/agent/fact-catalog";
 import type { CandidateApplicationAnswers } from "@/lib/candidate-intake";
 import type { CandidateFact, FieldDecision, ResumeProfile } from "@/lib/resume-parser";
 import { CONSENT_FIELD_RE, type EnumeratedField } from "@/lib/form-fields";
