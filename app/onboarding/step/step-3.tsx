@@ -15,6 +15,7 @@ import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { LocationPicker } from "@/components/onboarding/location-picker";
 import {
   intakeFieldErrors,
   step3Schema,
@@ -57,8 +58,8 @@ export function Step3Form({
         ? "no"
         : "",
   );
-  const [targetLocations, setTargetLocations] = useState(
-    profile.target_locations?.join(", ") ?? "",
+  const [targetLocations, setTargetLocations] = useState<string[]>(
+    profile.target_locations ?? [],
   );
   const [needsSponsorshipNonUs, setNeedsSponsorshipNonUs] = useState<YesNo>(
     profile.needs_sponsorship_non_us === true
@@ -75,13 +76,8 @@ export function Step3Form({
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const parsedTargets = targetLocations
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-
   const showSponsorshipNonUs = needsSponsorshipNonUsIsRelevant(
-    parsedTargets,
+    targetLocations,
     toBoolean(willingToRelocate) === true,
   );
 
@@ -97,7 +93,7 @@ export function Step3Form({
         currentCity,
         postalCode,
         currentCountry,
-        targetLocations: parsedTargets,
+        targetLocations,
         willingToRelocate: toBoolean(willingToRelocate),
         needsSponsorshipNonUs: showSponsorshipNonUs
           ? toBoolean(needsSponsorshipNonUs)
@@ -192,13 +188,12 @@ export function Step3Form({
           label="Places you want to work"
           htmlFor="targets"
           error={errors.targetLocations}
-          hint="Separate them with commas. Cities, states, or Remote."
+          hint="Search a city or pick Remote, or type your own and press enter."
         >
-          <Input
+          <LocationPicker
             id="targets"
             value={targetLocations}
-            onChange={(event) => setTargetLocations(event.target.value)}
-            placeholder="San Francisco, New York, Remote"
+            onChange={setTargetLocations}
           />
         </Field>
 
