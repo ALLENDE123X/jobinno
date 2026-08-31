@@ -12,9 +12,12 @@
  *      only writable when the call declares an `intake` source and quotes a
  *      resolvable `intakeFactPath`. This enforces HARD STOP 9 at the tool
  *      boundary rather than as a review after the fact.
- *   3. A handler that will do the actual work. At scaffold time every handler
- *      throws `AgentFillNotImplementedError`. Sub tickets B..H replace the
- *      throw with the real implementation.
+ *   3. A handler that does the actual work against the page handle on the
+ *      tool context. JOB-317 implemented the six handlers the scaffold left
+ *      throwing; every handler still preserves the scaffold contract of
+ *      throwing `AgentFillNotImplementedError` when the capability it needs
+ *      (the page handle, or a loop wiring hook) is absent from the context,
+ *      which is the shape the routing tests assert against.
  */
 
 import { z } from "zod";
@@ -22,7 +25,10 @@ import { z } from "zod";
 import { AgentFillNotImplementedError } from "@/lib/agent";
 import {
   commitFrameworkState,
+  isPageLike,
+  jsLiteral,
   type CommitResult,
+  type PageLike,
 } from "@/lib/agent/widget-adapters";
 
 /**
@@ -211,6 +217,66 @@ export interface ToolContext {
    * context they already build.
    */
   page?: unknown;
+  /**
+   * JOB-317: resolves a storage path in the run's private bucket to a
+   * local file path a browser file input can consume. Supplied by the run
+   * wiring; `uploadFile` throws `AgentFillNotImplementedError` when it is
+   * absent, because a handler that cannot reach the bucket has nothing
+   * honest to upload.
+   */
+  materializeUpload?: (storagePath: string) => Promise<string>;
+  /**
+   * JOB-317: receives the record every `markFieldUnanswerable` call
+   * produces. This is HARD STOP 9's safety valve: the loop wiring decides
+   * whether the run escalates or skips, and a context without the hook
+   * makes the handler throw rather than swallow the signal.
+   */
+  onFieldUnanswerable?: (record: UnanswerableFieldRecord) => void;
+  /**
+   * JOB-317: receives the `requestVerifyBeforeSubmit` signal. Same fail
+   * closed contract as `onFieldUnanswerable`: absent hook, thrown error,
+   * never a silently dropped verification request.
+   */
+  onVerifyRequested?: (record: VerifyRequestRecord) => void;
+}
+
+/**
+ * JOB-317: the outcome shape the page acting handlers return. `readBack`
+ * carries what the control reported after the action so the loop can put
+ * real evidence in the trace; `ok` is the handler's own verdict on whether
+ * the readback matches what was asked. A handler never throws for a value
+ * that would not land; it reports `ok: false` with the reason in `detail`
+ * so the agent can decide between retrying and `markFieldUnanswerable`.
+ */
+export interface FieldActionResult {
+  ok: boolean;
+  readBack: string;
+  detail: string;
+}
+
+/** JOB-317: what `markFieldUnanswerable` records and hands the loop. */
+export interface UnanswerableFieldRecord {
+  fieldId: string;
+  label: string;
+  reason: string;
+}
+
+/** JOB-317: what `requestVerifyBeforeSubmit` records and hands the loop. */
+export interface VerifyRequestRecord {
+  note: string;
+}
+
+/**
+ * JOB-317: the structural surface `uploadFile` needs beyond `PageLike`.
+ * Playwright exposes both shapes depending on how the caller holds the
+ * page; the handler feature detects per call rather than importing either
+ * library, in keeping with this module's no Stagehand import rule.
+ */
+interface PageWithFileInput extends PageLike {
+  setInputFiles?: (selector: string, files: string) => Promise<unknown>;
+  locator?: (selector: string) => {
+    setInputFiles: (files: string) => Promise<unknown>;
+  };
 }
 
 /**
@@ -293,17 +359,138 @@ export function assertSetFieldValueAllowed(
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 // Every handler parses its input through the zod schema (throws on invalid
-// shape), runs the exclusion list check where applicable, then throws
-// `AgentFillNotImplementedError` for the actual work. Sub tickets B..H
-// replace the throw with the real implementation.
+// shape), runs the exclusion list check where applicable, then does the
+// actual work against the context's page handle or wiring hook. The shape
+// every page acting handler follows is the one `selectDropdown` (JOB-281)
+// established: a context with no page throws `AgentFillNotImplementedError`
+// so the scaffold contract the routing tests assert against is preserved,
+// and a present page is narrowed structurally rather than through a
+// Stagehand import.
+
+/**
+ * Shared in page result coercion. Scripts return `{ ok, readBack, detail }`
+ * plain objects; anything else (a script that got mangled, an evaluate stub
+ * that answers with the wrong shape) collapses to a failed result rather
+ * than an exception, because a handler's failure mode is a reported
+ * `ok: false`, not a thrown surprise.
+ */
+function coerceFieldActionResult(value: unknown): FieldActionResult {
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    return {
+      ok: record.ok === true,
+      readBack: typeof record.readBack === "string" ? record.readBack : "",
+      detail:
+        typeof record.detail === "string"
+          ? record.detail
+          : "script returned no detail",
+    };
+  }
+  return {
+    ok: false,
+    readBack: "",
+    detail: "script returned an unexpected shape",
+  };
+}
+
+async function runFieldActionScript(
+  page: PageLike,
+  script: string
+): Promise<FieldActionResult> {
+  try {
+    return coerceFieldActionResult(await page.evaluate(script));
+  } catch (error) {
+    return {
+      ok: false,
+      readBack: "",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * The in page IIFE `setFieldValue` runs. Sets the value through the native
+ * prototype descriptor setter rather than plain assignment because React
+ * controlled inputs replace the instance `value` property and cache the
+ * last value they saw in `_valueTracker`; a plain assignment updates the
+ * cache too, so the `input` event that follows reads as no change and
+ * `onChange` never fires. Writing through the prototype setter leaves the
+ * cache stale, which is exactly what makes the dispatched `input` event
+ * register. For everything that is not React, the same setter is just the
+ * ordinary value write. Both `input` and `change` bubble and are composed
+ * so listeners above a shadow boundary see them.
+ */
+function setFieldValueScript(fieldSelector: string, value: string): string {
+  return `(() => {
+    const sel = ${jsLiteral(fieldSelector)};
+    const value = ${jsLiteral(value)};
+    const el = document.querySelector(sel);
+    if (!el) return { ok: false, readBack: "", detail: "selector did not resolve" };
+    const setNative = (node, v) => {
+      const proto = node.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype
+        : node.tagName === "SELECT" ? HTMLSelectElement.prototype
+        : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      if (desc && desc.set) desc.set.call(node, v); else node.value = v;
+    };
+    const fire = (node) => {
+      node.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      node.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    };
+    if (el.tagName === "SELECT") {
+      const t = String(value).trim();
+      let matched = null;
+      for (let i = 0; i < el.options.length; i++) {
+        const opt = el.options[i];
+        if ((opt.text || "").trim() === t || (opt.value || "").trim() === t) { matched = opt; break; }
+      }
+      if (!matched) {
+        return { ok: false, readBack: (el.value || ""), detail: "no option matched the value by text or value attribute" };
+      }
+      setNative(el, matched.value);
+      fire(el);
+      const selText = (el.selectedOptions && el.selectedOptions[0] ? el.selectedOptions[0].text : el.value) || "";
+      return { ok: el.value === matched.value, readBack: selText.trim(), detail: "matched select option" };
+    }
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
+      const prev = el.value;
+      setNative(el, value);
+      if (el._valueTracker && typeof el._valueTracker.setValue === "function") {
+        try { el._valueTracker.setValue(prev === value ? "" : prev); } catch (e) {}
+      }
+      fire(el);
+      return { ok: el.value === value, readBack: el.value, detail: "native setter plus input and change" };
+    }
+    if (el.isContentEditable) {
+      el.textContent = value;
+      el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      const readBack = (el.textContent || "").trim();
+      return { ok: readBack === String(value).trim(), readBack: readBack, detail: "contenteditable text write" };
+    }
+    return { ok: false, readBack: "", detail: "element is not a fillable control: " + (el.tagName || "").toLowerCase() };
+  })()`;
+}
 
 export async function setFieldValue(
   input: SetFieldValueInput,
   ctx: ToolContext
-): Promise<void> {
+): Promise<FieldActionResult> {
   const parsed = SetFieldValueInputSchema.parse(input);
   assertSetFieldValueAllowed(parsed, ctx);
-  throw new AgentFillNotImplementedError("setFieldValue");
+  if (ctx.page === undefined || ctx.page === null) {
+    throw new AgentFillNotImplementedError("setFieldValue");
+  }
+  if (!isPageLike(ctx.page)) {
+    return {
+      ok: false,
+      readBack: "",
+      detail: "page handle did not expose an evaluate method",
+    };
+  }
+  return runFieldActionScript(
+    ctx.page,
+    setFieldValueScript(parsed.fieldId, parsed.value)
+  );
 }
 
 /**
@@ -337,35 +524,221 @@ export async function selectDropdown(
   return commitFrameworkState(ctx.page, parsed.fieldId, parsed.optionValue);
 }
 
+/**
+ * The in page IIFE `toggleCheckbox` runs. Prefers a real `click()` because
+ * that is the one activation every framework observes natively (it fires
+ * `click`, `input`, and `change` and runs the default toggle). Only when
+ * the click provably did not move a native checkbox (a canceled default,
+ * an overlay eating the activation) does the script fall back to writing
+ * `checked` through the prototype descriptor and dispatching the events a
+ * real toggle produces. ARIA checkboxes get the click and are then judged
+ * by their own `aria-checked`; there is no property to force on those, so
+ * a widget that ignores the click reports `ok: false` honestly.
+ */
+function toggleCheckboxScript(fieldSelector: string, checked: boolean): string {
+  return `(() => {
+    const sel = ${jsLiteral(fieldSelector)};
+    const desired = ${checked ? "true" : "false"};
+    const el = document.querySelector(sel);
+    if (!el) return { ok: false, readBack: "", detail: "selector did not resolve" };
+    const isNativeCheckbox = (n) => n.tagName === "INPUT" && ((n.getAttribute("type") || "").toLowerCase() === "checkbox");
+    const isAriaCheckbox = (n) => n.getAttribute && n.getAttribute("role") === "checkbox";
+    let box = null;
+    if (isNativeCheckbox(el) || isAriaCheckbox(el)) box = el;
+    else if (el.querySelector) box = el.querySelector('input[type="checkbox"], [role="checkbox"]');
+    if (!box) return { ok: false, readBack: "", detail: "no checkbox found at or under the selector" };
+    const read = () => isNativeCheckbox(box) ? box.checked === true : box.getAttribute("aria-checked") === "true";
+    const asWord = (v) => (v ? "checked" : "unchecked");
+    if (read() === desired) {
+      return { ok: true, readBack: asWord(desired), detail: "already in the requested state" };
+    }
+    try { box.click(); } catch (e) {}
+    if (read() !== desired && isNativeCheckbox(box)) {
+      const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked");
+      if (desc && desc.set) desc.set.call(box, desired); else box.checked = desired;
+      box.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      box.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    }
+    const after = read();
+    return {
+      ok: after === desired,
+      readBack: asWord(after),
+      detail: after === desired ? "toggled" : "click and property write both left the control unmoved",
+    };
+  })()`;
+}
+
 export async function toggleCheckbox(
-  input: ToggleCheckboxInput
-): Promise<void> {
-  ToggleCheckboxInputSchema.parse(input);
-  throw new AgentFillNotImplementedError("toggleCheckbox");
+  input: ToggleCheckboxInput,
+  ctx: ToolContext
+): Promise<FieldActionResult> {
+  const parsed = ToggleCheckboxInputSchema.parse(input);
+  if (ctx.page === undefined || ctx.page === null) {
+    throw new AgentFillNotImplementedError("toggleCheckbox");
+  }
+  if (!isPageLike(ctx.page)) {
+    return {
+      ok: false,
+      readBack: "",
+      detail: "page handle did not expose an evaluate method",
+    };
+  }
+  return runFieldActionScript(
+    ctx.page,
+    toggleCheckboxScript(parsed.fieldId, parsed.checked)
+  );
+}
+
+/**
+ * The in page IIFE `addRepeatingSectionEntry` runs. Finds the pressable
+ * inside the section whose accessible text reads as an add control and
+ * clicks it. The vocabulary is deliberately narrow (add, another, a bare
+ * plus sign) because the section also contains edit, delete, and expand
+ * controls whose labels must never qualify, and a wrong click here mounts
+ * or destroys real form state. When nothing qualifies the script reports
+ * the labels it saw so the trace shows what the section actually offered.
+ */
+function addRepeatingSectionEntryScript(sectionSelector: string): string {
+  return `(() => {
+    const sel = ${jsLiteral(sectionSelector)};
+    const root = document.querySelector(sel);
+    if (!root) return { ok: false, readBack: "", detail: "selector did not resolve" };
+    const addRe = /(\\badd\\b|\\banother\\b|^\\s*\\+\\s*$)/i;
+    const labelOf = (n) => (((n.getAttribute && n.getAttribute("aria-label")) || n.textContent || "").replace(/\\s+/g, " ").trim());
+    const pressables = root.querySelectorAll('button, [role="button"], a');
+    const candidates = [];
+    let target = null;
+    for (const p of pressables) {
+      const label = labelOf(p);
+      if (!label) continue;
+      candidates.push(label);
+      if (!target && addRe.test(label)) target = { node: p, label: label };
+    }
+    if (!target) {
+      return {
+        ok: false,
+        readBack: "",
+        detail: "no add control found among: " + (candidates.slice(0, 8).join(" | ") || "no labeled pressables"),
+      };
+    }
+    try {
+      target.node.click();
+    } catch (e) {
+      return { ok: false, readBack: target.label, detail: "click threw: " + String(e && e.message ? e.message : e) };
+    }
+    return { ok: true, readBack: target.label, detail: 'clicked "' + target.label + '"' };
+  })()`;
 }
 
 export async function addRepeatingSectionEntry(
-  input: AddRepeatingSectionEntryInput
-): Promise<void> {
-  AddRepeatingSectionEntryInputSchema.parse(input);
-  throw new AgentFillNotImplementedError("addRepeatingSectionEntry");
+  input: AddRepeatingSectionEntryInput,
+  ctx: ToolContext
+): Promise<FieldActionResult> {
+  const parsed = AddRepeatingSectionEntryInputSchema.parse(input);
+  if (ctx.page === undefined || ctx.page === null) {
+    throw new AgentFillNotImplementedError("addRepeatingSectionEntry");
+  }
+  if (!isPageLike(ctx.page)) {
+    return {
+      ok: false,
+      readBack: "",
+      detail: "page handle did not expose an evaluate method",
+    };
+  }
+  return runFieldActionScript(
+    ctx.page,
+    addRepeatingSectionEntryScript(parsed.sectionId)
+  );
 }
 
-export async function uploadFile(input: UploadFileInput): Promise<void> {
-  UploadFileInputSchema.parse(input);
-  throw new AgentFillNotImplementedError("uploadFile");
+/**
+ * `uploadFile` needs two capabilities beyond the evaluate handle: the run
+ * wiring's `materializeUpload` (bucket path to local file) and a file input
+ * API on the page handle (Playwright's `setInputFiles`, direct or through
+ * `locator`). Either one absent means the wiring this handler belongs to
+ * has not been attached, and the scaffold contract (throw
+ * `AgentFillNotImplementedError`) is the honest report of that. A page
+ * that is present but exposes neither file API is a real runtime failure
+ * and reports `ok: false` instead.
+ */
+export async function uploadFile(
+  input: UploadFileInput,
+  ctx: ToolContext
+): Promise<FieldActionResult> {
+  const parsed = UploadFileInputSchema.parse(input);
+  if (ctx.page === undefined || ctx.page === null) {
+    throw new AgentFillNotImplementedError("uploadFile");
+  }
+  if (typeof ctx.materializeUpload !== "function") {
+    throw new AgentFillNotImplementedError("uploadFile");
+  }
+  const localPath = await ctx.materializeUpload(parsed.storagePath);
+  const page = ctx.page as PageWithFileInput;
+  try {
+    if (typeof page.setInputFiles === "function") {
+      await page.setInputFiles(parsed.fieldId, localPath);
+    } else if (typeof page.locator === "function") {
+      await page.locator(parsed.fieldId).setInputFiles(localPath);
+    } else {
+      return {
+        ok: false,
+        readBack: "",
+        detail: "page handle exposes no file input API",
+      };
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      readBack: "",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return {
+    ok: true,
+    readBack: localPath,
+    detail: `set files on ${parsed.fieldId} from ${parsed.storagePath}`,
+  };
 }
 
+/**
+ * HARD STOP 9's safety valve. Records that a field cannot be answered from
+ * the fact catalog and hands the record to the loop wiring, which decides
+ * whether the run escalates or skips. Never touches the page: the field
+ * stays exactly as it was, because writing anything at all here is the
+ * fabrication this tool exists to prevent.
+ */
 export async function markFieldUnanswerable(
-  input: MarkFieldUnanswerableInput
-): Promise<void> {
-  MarkFieldUnanswerableInputSchema.parse(input);
-  throw new AgentFillNotImplementedError("markFieldUnanswerable");
+  input: MarkFieldUnanswerableInput,
+  ctx: ToolContext
+): Promise<UnanswerableFieldRecord> {
+  const parsed = MarkFieldUnanswerableInputSchema.parse(input);
+  if (typeof ctx.onFieldUnanswerable !== "function") {
+    throw new AgentFillNotImplementedError("markFieldUnanswerable");
+  }
+  const record: UnanswerableFieldRecord = {
+    fieldId: parsed.fieldId,
+    label: parsed.label,
+    reason: parsed.reason,
+  };
+  ctx.onFieldUnanswerable(record);
+  return record;
 }
 
+/**
+ * Signals the loop that the agent wants the deterministic verify pass to
+ * run before any submit control is touched. Like `markFieldUnanswerable`
+ * this is a loop signal, not a page action, and it fails closed when the
+ * wiring hook is absent.
+ */
 export async function requestVerifyBeforeSubmit(
-  input: RequestVerifyBeforeSubmitInput
-): Promise<void> {
-  RequestVerifyBeforeSubmitInputSchema.parse(input);
-  throw new AgentFillNotImplementedError("requestVerifyBeforeSubmit");
+  input: RequestVerifyBeforeSubmitInput,
+  ctx: ToolContext
+): Promise<VerifyRequestRecord> {
+  const parsed = RequestVerifyBeforeSubmitInputSchema.parse(input);
+  if (typeof ctx.onVerifyRequested !== "function") {
+    throw new AgentFillNotImplementedError("requestVerifyBeforeSubmit");
+  }
+  const record: VerifyRequestRecord = { note: parsed.note };
+  ctx.onVerifyRequested(record);
+  return record;
 }

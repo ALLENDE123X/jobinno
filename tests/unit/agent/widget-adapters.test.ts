@@ -16,6 +16,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import {
   SRScreeningDropdownAdapter,
+  SRSplStateCommitAdapter,
   commitFrameworkState,
 } from "@/lib/agent/widget-adapters";
 
@@ -575,14 +576,17 @@ describe("commitFrameworkState", () => {
     // throwing evaluate only reaches `commit` when the fixture also passes
     // matches; the simplest way to force that is a page whose URL matches
     // and whose evaluate answers true for `matches` but throws once the
-    // commit script hits it.
+    // commit script hits it. JOB-317 note: the registry now consults the
+    // state commit adapter first, whose `matches` evaluate (call 1)
+    // declines this ARIA only fixture, so the event dispatch adapter's
+    // `matches` is call 2 and its commit is call 3.
     mountSrScreeningFixture();
     let call = 0;
     const flaky = {
       url: () => SR_URL,
       evaluate: async (fn: string) => {
         call += 1;
-        if (call === 1) {
+        if (call <= 2) {
           return eval(fn);
         }
         throw new Error("commit exploded");
@@ -592,5 +596,374 @@ describe("commitFrameworkState", () => {
     expect(result.status).toBe("adapter_failed");
     expect(result.adapterName).toBe("SRScreeningDropdownAdapter");
     expect(result.detail).toBe("commit exploded");
+  });
+});
+
+/**
+ * JOB-317. Cases for the spl component state commit adapter. The fixture
+ * below reproduces, method for method, the commit pipeline the 2026-08-31
+ * live recon decompiled out of SmartRecruiters' production OneClick bundle
+ * (see the block comments in lib/agent/widget-adapters.ts): an element
+ * whose public handleOptionSelect flips selectedOptionsDictionary, derives
+ * the value through optionsDictionary, assigns the reactive value backing
+ * field, and dispatches the spl-change CustomEvent Angular subscribes to.
+ * jsdom creates unknown dashed tags as plain HTMLElements, so the fixture
+ * attaches the pipeline as instance methods, which is exactly the surface
+ * the adapter feature detects.
+ */
+
+interface SplFixtureOption {
+  id?: string;
+  value: string;
+  label: string;
+}
+
+interface SplHostConfig {
+  options?: SplFixtureOption[];
+  allowCustomValues?: boolean;
+  optionFactory?: (value: string) => SplFixtureOption;
+  preselectedIds?: string[];
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function mountSplMultiselectFixture(config: SplHostConfig = {}): HTMLElement {
+  document.body.innerHTML = `
+    <form>
+      <div class="sr-field" id="wrap"></div>
+    </form>
+  `;
+  const wrap = document.querySelector("#wrap") as HTMLElement;
+  const host = document.createElement("spl-multiselect-autocomplete") as any;
+  host.id = "ms1";
+  host.__value = [];
+  Object.defineProperty(host, "value", {
+    get() {
+      return this.__value;
+    },
+    set(v) {
+      this.__value = v;
+    },
+    configurable: true,
+  });
+  host.options = config.options ?? [];
+  host.optionsDictionary = {};
+  host.selectedOptionsDictionary = {};
+  host.tags = [];
+  host.touchedState = false;
+  if (config.allowCustomValues) host.allowCustomValues = true;
+  if (config.optionFactory) host.optionFactory = config.optionFactory;
+  for (const id of config.preselectedIds ?? []) {
+    host.selectedOptionsDictionary[id] = true;
+    const opt = (config.options ?? []).find((o) => o.id === id);
+    if (opt) host.optionsDictionary[id] = opt;
+  }
+  host.updateSelection = function (id: string, on: boolean) {
+    this.selectedOptionsDictionary[id] = on;
+  };
+  host.getValue = function () {
+    return Object.keys(this.selectedOptionsDictionary)
+      .filter(
+        (id) =>
+          this.selectedOptionsDictionary[id] === true &&
+          this.optionsDictionary[id]
+      )
+      .map((id) => this.optionsDictionary[id].value);
+  };
+  host.emitChangeEvent = function () {
+    this.dispatchEvent(
+      new CustomEvent("spl-change", {
+        detail: { value: this.value },
+        bubbles: true,
+        composed: true,
+      })
+    );
+  };
+  host.handleChange = function (v: unknown) {
+    this.value = v;
+    this.emitChangeEvent();
+  };
+  host.handleOptionSelect = function (ev: CustomEvent) {
+    const id = ev.detail && ev.detail.value;
+    const selected = ev.detail && ev.detail.selected;
+    this.updateSelection(id, !selected);
+    this.handleChange(this.getValue());
+  };
+  host.markAsTouched = function () {
+    this.touchedState = true;
+    this.dispatchEvent(
+      new CustomEvent("spl-touched", { bubbles: true, composed: true })
+    );
+  };
+  wrap.appendChild(host);
+  return host as HTMLElement;
+}
+
+/**
+ * The base field shape (spl-select, spl-checkbox and friends share the
+ * form field base class): handleChange plus emitChangeEvent, but no
+ * handleOptionSelect and no selection dictionary.
+ */
+function mountSplBaseFieldFixture(): HTMLElement {
+  document.body.innerHTML = `
+    <form>
+      <div class="sr-field" id="wrap"></div>
+    </form>
+  `;
+  const wrap = document.querySelector("#wrap") as HTMLElement;
+  const host = document.createElement("spl-select") as any;
+  host.id = "sel1";
+  host.__value = "";
+  Object.defineProperty(host, "value", {
+    get() {
+      return this.__value;
+    },
+    set(v) {
+      this.__value = v;
+    },
+    configurable: true,
+  });
+  host.touchedState = false;
+  host.emitChangeEvent = function () {
+    this.dispatchEvent(
+      new CustomEvent("spl-change", {
+        detail: { value: this.value },
+        bubbles: true,
+        composed: true,
+      })
+    );
+  };
+  host.handleChange = function (v: unknown) {
+    this.value = v;
+    this.emitChangeEvent();
+  };
+  host.markAsTouched = function () {
+    this.touchedState = true;
+  };
+  wrap.appendChild(host);
+  return host as HTMLElement;
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+const US_OPTIONS: SplFixtureOption[] = [
+  { id: "o1", value: "United States", label: "United States" },
+  { id: "o2", value: "Canada", label: "Canada" },
+];
+
+describe("SRSplStateCommitAdapter.matches", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("matches a spl multiselect host on a SR URL, addressed directly", async () => {
+    mountSplMultiselectFixture({ options: US_OPTIONS });
+    const adapter = new SRSplStateCommitAdapter();
+    expect(await adapter.matches(fakePage(SR_URL), "#ms1")).toBe(true);
+  });
+
+  it("matches when the selector lands on a wrapper above the host", async () => {
+    mountSplMultiselectFixture({ options: US_OPTIONS });
+    const adapter = new SRSplStateCommitAdapter();
+    expect(await adapter.matches(fakePage(SR_URL), "#wrap")).toBe(true);
+  });
+
+  it("does not match outside a SmartRecruiters host", async () => {
+    mountSplMultiselectFixture({ options: US_OPTIONS });
+    const adapter = new SRSplStateCommitAdapter();
+    expect(await adapter.matches(fakePage(GH_URL), "#ms1")).toBe(false);
+  });
+
+  it("does not match the ARIA only screening fixture", async () => {
+    // The narrower match is what lets this adapter sit ahead of the event
+    // dispatch adapter in the registry without stealing its inputs.
+    mountSrScreeningFixture();
+    const adapter = new SRSplStateCommitAdapter();
+    expect(await adapter.matches(fakePage(SR_URL), "#q1")).toBe(false);
+  });
+
+  it("does not match a plain native select", async () => {
+    mountPlainSelectFixture();
+    const adapter = new SRSplStateCommitAdapter();
+    expect(await adapter.matches(fakePage(SR_URL), "#s1")).toBe(false);
+  });
+});
+
+describe("SRSplStateCommitAdapter.commit", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("commits through handleOptionSelect and verifies the reactive state", async () => {
+    const host = mountSplMultiselectFixture({ options: US_OPTIONS }) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const changes: unknown[] = [];
+    host.addEventListener("spl-change", (ev: CustomEvent) =>
+      changes.push(ev.detail.value)
+    );
+
+    const adapter = new SRSplStateCommitAdapter();
+    const result = await adapter.commit(
+      fakePage(SR_URL),
+      "#ms1",
+      "United States"
+    );
+
+    expect(result.status).toBe("committed");
+    expect(result.adapterName).toBe("SRSplStateCommitAdapter");
+    expect(result.stateVerified).toBe(true);
+    expect(result.detail).toContain("handleOptionSelect via options");
+    // The exact internals JOB-266 found empty after all six mechanisms.
+    expect(host.__value).toEqual(["United States"]);
+    expect(host.selectedOptionsDictionary).toEqual({ o1: true });
+    expect(host.optionsDictionary.o1).toEqual(US_OPTIONS[0]);
+    // The spl-change CustomEvent is what Angular's form binding hears.
+    expect(changes).toEqual([["United States"]]);
+  });
+
+  it("marks the field touched after the commit", async () => {
+    const host = mountSplMultiselectFixture({ options: US_OPTIONS }) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const adapter = new SRSplStateCommitAdapter();
+    await adapter.commit(fakePage(SR_URL), "#ms1", "United States");
+    expect(host.touchedState).toBe(true);
+  });
+
+  it("matches the option label case insensitively and trims whitespace", async () => {
+    const host = mountSplMultiselectFixture({ options: US_OPTIONS }) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const adapter = new SRSplStateCommitAdapter();
+    const result = await adapter.commit(
+      fakePage(SR_URL),
+      "#ms1",
+      "  united states "
+    );
+    expect(result.status).toBe("committed");
+    expect(result.stateVerified).toBe(true);
+    expect(host.__value).toEqual(["United States"]);
+  });
+
+  it("resolves the host from a wrapper selector", async () => {
+    const host = mountSplMultiselectFixture({ options: US_OPTIONS }) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const adapter = new SRSplStateCommitAdapter();
+    const result = await adapter.commit(fakePage(SR_URL), "#wrap", "Canada");
+    expect(result.status).toBe("committed");
+    expect(result.stateVerified).toBe(true);
+    expect(host.__value).toEqual(["Canada"]);
+  });
+
+  it("is idempotent when the option is already selected", async () => {
+    const host = mountSplMultiselectFixture({
+      options: US_OPTIONS,
+      preselectedIds: ["o1"],
+    }) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    host.__value = ["United States"];
+    const adapter = new SRSplStateCommitAdapter();
+    const result = await adapter.commit(
+      fakePage(SR_URL),
+      "#ms1",
+      "United States"
+    );
+    expect(result.status).toBe("committed");
+    expect(result.stateVerified).toBe(true);
+    expect(result.detail).toContain("already selected");
+    // Selecting an already selected option must not toggle it back off.
+    expect(host.selectedOptionsDictionary.o1).toBe(true);
+  });
+
+  it("builds a custom value through the component's own optionFactory", async () => {
+    const host = mountSplMultiselectFixture({
+      options: [],
+      allowCustomValues: true,
+      optionFactory: (v: string) => ({ id: `custom_${v}`, value: v, label: v }),
+    }) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const adapter = new SRSplStateCommitAdapter();
+    const result = await adapter.commit(fakePage(SR_URL), "#ms1", "Remote only");
+    expect(result.status).toBe("committed");
+    expect(result.stateVerified).toBe(true);
+    expect(result.detail).toContain("optionFactory custom value");
+    expect(host.__value).toEqual(["Remote only"]);
+  });
+
+  it("uses the value array path when a matched option has no id", async () => {
+    const host = mountSplMultiselectFixture({
+      options: [{ value: "United States", label: "United States" }],
+    }) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const adapter = new SRSplStateCommitAdapter();
+    const result = await adapter.commit(
+      fakePage(SR_URL),
+      "#ms1",
+      "United States"
+    );
+    expect(result.status).toBe("committed");
+    expect(result.stateVerified).toBe(true);
+    expect(result.detail).toContain("value array");
+    expect(host.__value).toEqual(["United States"]);
+  });
+
+  it("commits the base field shape through handleChange", async () => {
+    const host = mountSplBaseFieldFixture() as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const changes: unknown[] = [];
+    host.addEventListener("spl-change", (ev: CustomEvent) =>
+      changes.push(ev.detail.value)
+    );
+    const adapter = new SRSplStateCommitAdapter();
+    const result = await adapter.commit(fakePage(SR_URL), "#sel1", "Yes");
+    expect(result.status).toBe("committed");
+    expect(result.stateVerified).toBe(true);
+    expect(result.detail).toContain("handleChange");
+    expect(host.__value).toBe("Yes");
+    expect(changes).toEqual(["Yes"]);
+    expect(host.touchedState).toBe(true);
+  });
+
+  it("never selects a different option than the one asked for", async () => {
+    // HARD STOP 9 applied to widget plumbing: a target no option store can
+    // supply, on an instance without custom values, must fail rather than
+    // land the closest available option. The fallback event dispatch still
+    // runs (production parity), but the state verdict is false and the
+    // component's selection state is untouched.
+    const host = mountSplMultiselectFixture({ options: US_OPTIONS }) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const adapter = new SRSplStateCommitAdapter();
+    const result = await adapter.commit(fakePage(SR_URL), "#ms1", "Mexico");
+    expect(result.adapterName).toBe("SRSplStateCommitAdapter");
+    expect(result.stateVerified).toBe(false);
+    expect(result.detail).toContain("no option matched the target");
+    expect(result.detail).toContain("fell back to event dispatch");
+    expect(host.__value).toEqual([]);
+    expect(host.selectedOptionsDictionary).toEqual({});
+  });
+
+  it("reports the instance probe in the detail", async () => {
+    mountSplMultiselectFixture({ options: US_OPTIONS });
+    const adapter = new SRSplStateCommitAdapter();
+    const result = await adapter.commit(
+      fakePage(SR_URL),
+      "#ms1",
+      "United States"
+    );
+    expect(result.detail).toContain("spl-multiselect-autocomplete");
+    expect(result.detail).toContain("shape=multiselect");
+  });
+});
+
+describe("commitFrameworkState with the JOB-317 registry order", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("routes a spl component instance to the state commit adapter", async () => {
+    const host = mountSplMultiselectFixture({ options: US_OPTIONS }) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const result = await commitFrameworkState(
+      fakePage(SR_URL),
+      "#ms1",
+      "United States"
+    );
+    expect(result.adapterName).toBe("SRSplStateCommitAdapter");
+    expect(result.status).toBe("committed");
+    expect(result.stateVerified).toBe(true);
+    expect(host.__value).toEqual(["United States"]);
+  });
+
+  it("still routes the ARIA only fixture to the event dispatch adapter", async () => {
+    mountSrScreeningFixture();
+    const result = await commitFrameworkState(fakePage(SR_URL), "#q1", "Yes");
+    expect(result.adapterName).toBe("SRScreeningDropdownAdapter");
+    expect(result.status).toBe("committed");
   });
 });
