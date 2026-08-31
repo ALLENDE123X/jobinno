@@ -282,16 +282,15 @@ export default async function Home({
                 </h1>
 
                 <p className="max-w-xl text-base text-pretty text-muted-foreground sm:text-lg">
-                  Every other tool hands you a list and still makes you press
-                  apply, one posting at a time. Jobinno drives the real
-                  application forms itself, hundreds of them a night, from one
-                  resume and one short intake.
+                  Jobinno drives the real application forms itself. One resume
+                  and a three minute intake, then it fills and submits every
+                  night while you sleep.
                 </p>
 
                 <div className="flex w-full flex-col gap-3 sm:w-auto sm:flex-row sm:items-center">
                   <Button size="lg" asChild className="h-11 px-6 text-base">
                     <Link href={CTA_HREF}>
-                      {ctaLabel("Get started free")}
+                      {ctaLabel("Queue tonight's applications")}
                       <ArrowRight className="size-4" />
                     </Link>
                   </Button>
@@ -368,26 +367,11 @@ export default async function Home({
             ))}
           </div>
 
-          {/* Gmail scope justification (JOB-245). Mirrors the framing already
-              on /privacy: optional, narrow, and not live yet. Do not
-              overclaim past what that page says. Also mirrors /privacy's
-              gmail.readonly disclosure (app/privacy/page.tsx around line
-              136) so a Google OAuth reviewer sees the same distinction
-              between what the permission grants and what the code reads,
-              rather than a discrepancy between the two pages. */}
-          <p className="mx-auto mt-12 max-w-2xl text-center text-sm text-pretty text-muted-foreground">
-            Some job boards require creating an account before you can apply,
-            which means receiving a security code by email. Jobinno can
-            optionally connect to Gmail to read just that verification code
-            for the boards that need it. The Gmail permission itself is
-            broader than that: Google labels it &quot;View your email
-            messages and settings&quot; on the consent screen, and that
-            covers your whole inbox. Jobinno&apos;s code is written to
-            restrict itself to reading that one verification code and
-            nothing else in your inbox. This capability is not live yet:
-            connecting Gmail today stores the refresh token for when it
-            ships, and the app does not open any messages until then.
-          </p>
+          {/* Gmail scope justification (JOB-245) moved to /permissions in
+              JOB-306 to remove ~200 words of legal CYA copy from the
+              middle of the landing page while preserving the disclosure
+              a Google OAuth reviewer expects. See app/permissions/page.tsx
+              and the Permissions link in the footer below. */}
         </Section>
 
         {/* Stats. Two of the three numbers are placeholders, see stats-band.tsx. */}
@@ -511,6 +495,12 @@ export default async function Home({
               className="underline underline-offset-3 hover:text-foreground"
             >
               Privacy
+            </Link>
+            <Link
+              href="/permissions"
+              className="underline underline-offset-3 hover:text-foreground"
+            >
+              Permissions
             </Link>
             <Link
               href="/terms"
