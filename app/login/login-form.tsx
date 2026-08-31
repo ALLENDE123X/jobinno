@@ -152,7 +152,7 @@ export function LoginForm({ initialError }: { initialError?: string }) {
                 name="email"
                 type="email"
                 autoComplete="email"
-                placeholder="you@university.edu"
+                placeholder="you@gmail.com"
                 value={email}
                 onChange={(event) => setEmail(event.target.value)}
                 disabled={status.kind === "sending"}
