@@ -96,7 +96,7 @@ import type {
 
 /**
  * JOB-279 (sub ticket B): the snapshot type shapes and pure builders that
- * the agent loop threads through every turn. Re-exported from the package
+ * the agent loop threads through every turn. Exported again from the package
  * entry point so downstream tickets can `import { ... } from "@/lib/agent"`
  * without having to know which sibling file each name originally lives in.
  */
@@ -1213,6 +1213,14 @@ export async function runAgentFill(
         );
         throw err;
       }
+      // A browser dying under the verify pass (its captcha probe reads the
+      // live page) is the same stop as one dying under the loop.
+      if (
+        !(err instanceof AgentSessionLostError) &&
+        looksLikeSessionLoss(err)
+      ) {
+        return await sessionLost("the verify pass", err);
+      }
       throw err;
     }
 
@@ -1239,7 +1247,19 @@ export async function runAgentFill(
     }
 
     // ── Submit ──────────────────────────────────────────────────────────────
-    const leg = await (deps.submitLeg ?? defaultSubmitLeg)(session);
+    // The default leg resolves rather than throws for everything after the
+    // click, so a session loss escaping it can only have happened before
+    // anything was clicked, which makes the retryable `error` status safe. An
+    // injected leg owes the same guarantee.
+    let leg: SubmitLegOutcome;
+    try {
+      leg = await (deps.submitLeg ?? defaultSubmitLeg)(session);
+    } catch (err) {
+      if (looksLikeSessionLoss(err)) {
+        return await sessionLost("the submit leg, before any click", err);
+      }
+      throw err;
+    }
     if (!leg.clicked) {
       const blocked = await terminalBlocked(
         APPLICATION_STATUS.SUBMISSION_BLOCKED,
