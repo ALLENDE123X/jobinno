@@ -36,10 +36,15 @@ import {
   countryContextTermsWithResumeFallback,
   currentCityWithResumeFallback,
   isAttestationField,
+  isExperienceEndDateLabel,
   isSmartRecruitersPostalCodeCombobox,
+  normalizeWorkDate,
   resolveAdditionalAnswer,
   resolveDecision,
   fallbackRefusalReason,
+  sectionCurrentlyHereActive,
+  shouldWidenRepeatingSectionCombobox,
+  summarizeRepeatingSectionMismatches,
   CONFIRM_EMAIL_RE,
   LEGAL_ATTESTATION_RE,
   type NeedsInputItem,
@@ -305,6 +310,515 @@ describe("the fact catalogue carries what the person actually told us", () => {
     const known = facts({ citizenshipStatus: undefined, gradDate: undefined });
     expect(known.has("citizenshipStatus")).toBe(false);
     expect(known.has("graduationYear")).toBe(false);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JOB-303. The Experience section on a SmartRecruiters OneClick form asks for
+// three things the pre existing joined `workN.dates` fact cannot answer: a
+// From date picker, a To date picker, and an "I currently work here" checkbox
+// that disables the To picker. `buildFactCatalog` now splits every work entry
+// into `workN.startDate`, `workN.endDate` and `workN.currentlyHere`, and
+// keeps the prose joined form as a fallback for textareas.
+describe("buildFactCatalog splits work entry dates for the SR Experience section", () => {
+  const PRESENT_JOB: ResumeProfile = {
+    ...PROFILE,
+    workHistory: [
+      {
+        company: "Verinno",
+        title: "AI Engineer",
+        startDate: "Nov 2025",
+        endDate: "Present",
+        summary: "Building the fill layer.",
+      },
+    ],
+  };
+
+  it("emits an ISO start date, a Present end date and the currently here flag", () => {
+    const known = new Map(buildFactCatalog(PRESENT_JOB, ANSWERS, {}).map((f) => [f.key, f]));
+    expect(known.get("work0.startDate")?.value).toBe("2025-11");
+    expect(known.get("work0.endDate")?.value).toBe("Present");
+    expect(known.get("work0.currentlyHere")?.value).toBe("Yes");
+    // The joined prose fact is kept for widgets that want a single sentence.
+    expect(known.get("work0.dates")?.value).toBe("Nov 2025 to Present");
+  });
+
+  it("says the job is not ongoing when the end date is a real month", () => {
+    const closed: ResumeProfile = {
+      ...PROFILE,
+      workHistory: [
+        {
+          company: "Contoso",
+          title: "Intern",
+          startDate: "Jan 2023",
+          endDate: "May 2023",
+          summary: "",
+        },
+      ],
+    };
+    const known = new Map(buildFactCatalog(closed, ANSWERS, {}).map((f) => [f.key, f]));
+    expect(known.get("work0.startDate")?.value).toBe("2023-01");
+    expect(known.get("work0.endDate")?.value).toBe("2023-05");
+    expect(known.get("work0.currentlyHere")?.value).toBe("No");
+  });
+
+  it("accepts every date wording a resume prints, folding to year and month", () => {
+    const shapes: [string, string][] = [
+      ["November 2025", "2025-11"],
+      ["Nov 2025", "2025-11"],
+      ["11/2025", "2025-11"],
+      ["2025-11", "2025-11"],
+      ["2025-11-15", "2025-11"],
+    ];
+    for (const [written, iso] of shapes) {
+      const profile: ResumeProfile = {
+        ...PROFILE,
+        workHistory: [
+          {
+            company: "Anywhere",
+            title: "Whatever",
+            startDate: written,
+            endDate: "Present",
+            summary: "",
+          },
+        ],
+      };
+      const known = new Map(buildFactCatalog(profile, ANSWERS, {}).map((f) => [f.key, f]));
+      expect(known.get("work0.startDate")?.value).toBe(iso);
+    }
+  });
+
+  it("keeps a bare year rather than inventing a month it never had", () => {
+    const yearOnly: ResumeProfile = {
+      ...PROFILE,
+      workHistory: [
+        {
+          company: "Old Job",
+          title: "Contractor",
+          startDate: "2019",
+          endDate: "2020",
+          summary: "",
+        },
+      ],
+    };
+    const known = new Map(buildFactCatalog(yearOnly, ANSWERS, {}).map((f) => [f.key, f]));
+    expect(known.get("work0.startDate")?.value).toBe("2019");
+    expect(known.get("work0.endDate")?.value).toBe("2020");
+    expect(known.get("work0.currentlyHere")?.value).toBe("No");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JOB-303. An `spl-autocomplete` typeahead on a SmartRecruiters Experience
+// entry accepts free text when its vendor catalog does not list the answer.
+// The same double gate the school combobox uses (label plus fact key) now
+// covers the Experience: Title and Experience: Company shapes, so a real
+// title like "AI Engineer" that is not in SR's occupation catalog is still
+// committed to the form instead of scoring the entry unsatisfied.
+describe("an SR Experience typeahead commits free text on a fact backed answer", () => {
+  it("types the candidate's title into an Experience: Title combobox with no matching options", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Experience: Title",
+        kind: "combobox",
+        options: ["Software Engineer", "Product Manager", "Data Analyst"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "experience: title",
+        decision: "answer",
+        value: "AI Engineer",
+        sourceFact: "work0.title",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("AI Engineer");
+    }
+  });
+
+  it("types the candidate's employer into an Experience: Company combobox with no matching options", () => {
+    const resolution = resolveDecision(
+      field({
+        label: "Experience: Company",
+        kind: "combobox",
+        options: ["Google", "Meta", "Amazon"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "experience: company",
+        decision: "answer",
+        value: "Verinno",
+        sourceFact: "work0.employer",
+      }),
+      facts()
+    );
+    expect(resolution.kind).toBe("apply");
+    if (resolution.kind === "apply") {
+      expect(resolution.value).toBe("Verinno");
+    }
+  });
+
+  it("refuses free text for an Experience typeahead backed by an unrelated fact", () => {
+    // The double gate at work: label alone would let anything through, but a
+    // fact key from outside the Experience allowlist keeps the ordinary
+    // "menu did not offer this" refusal in place.
+    const resolution = resolveDecision(
+      field({
+        label: "Experience: Title",
+        kind: "combobox",
+        options: ["Software Engineer", "Product Manager"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "experience: title",
+        decision: "answer",
+        value: "Prefer not to say",
+        sourceFact: "salaryExpectation",
+      }),
+      facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+
+  it("still gates a school combobox on a school fact rather than a work one", () => {
+    // Regression coverage on the pre existing branch: extending the label
+    // list must not let a work fact land on a school field or the other way.
+    const resolution = resolveDecision(
+      field({
+        label: "School",
+        kind: "combobox",
+        options: ["MIT", "Stanford"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "school",
+        decision: "answer",
+        value: "Verinno",
+        sourceFact: "work0.employer",
+      }),
+      facts()
+    );
+    expect(resolution.kind).not.toBe("apply");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JOB-303 round two. Regression coverage for the runtime shape the section
+// walker actually feeds: fields carry the RAW label ("Title", "Company", "From",
+// "To"), because the "${section.heading}: " decoration is applied only on the
+// decidable list handed to `decideFieldAnswers`. Round one's `allowFreeText`
+// widening keyed off `field.label` inline, so at runtime it never saw the
+// decorated form and never fired — the SR Experience typeahead scored the
+// section unsatisfied for exactly the shape this ticket exists to unstick, and
+// the round-one tests above passed only because they hand-constructed the
+// field with `label: "Experience: Title"` directly. This block asserts the
+// widening against the runtime shape.
+describe("the SR Experience widening fires on the raw label the walker feeds", () => {
+  it("widens Title with a raw label when the section heading is Experience", () => {
+    // The exact shape `fillRepeatingSections` iterates: label "Title", no
+    // "Experience: " prefix, backed by a work0.title fact. Round one's inline
+    // IIFE returned false here because `EXPERIENCE_FIELD_LABEL_RE` anchors on
+    // `^Experience:`, so nothing was permitted as free text and SmartRecruiters
+    // scored the section unsatisfied on Bertelsmann bench.
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "Title", kind: "combobox" },
+        "Experience",
+        "work0.title"
+      )
+    ).toBe(true);
+  });
+
+  it("widens Company with a raw label when the section heading is Experience", () => {
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "Company", kind: "combobox" },
+        "Experience",
+        "work0.employer"
+      )
+    ).toBe(true);
+  });
+
+  it("widens Office location with a raw label when the section heading is Experience", () => {
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "Office location", kind: "combobox" },
+        "Experience",
+        "resumeLocation"
+      )
+    ).toBe(true);
+  });
+
+  it("widens School with a raw label when the section heading is Education", () => {
+    // The parallel path the same helper covers: an Education entry's School
+    // combobox reached through the walker carries the raw "School" label, and
+    // the widening must fire off the decorated "Education: School" form.
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "School", kind: "combobox" },
+        "Education",
+        "education0.school"
+      )
+    ).toBe(true);
+  });
+
+  it("refuses free text when the fact key is outside the Experience allowlist", () => {
+    // The double gate at work: label alone would let a salary answer land on
+    // the Title box, so a fact key from outside `EXPERIENCE_FACT_KEY_RE` keeps
+    // the ordinary "menu did not offer this" refusal in place.
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "Title", kind: "combobox" },
+        "Experience",
+        "salaryExpectation"
+      )
+    ).toBe(false);
+  });
+
+  it("refuses free text on a From or To picker, which are date fields", () => {
+    // Only Title, Company, Office location, Employer and Organization are on
+    // the widening list. A From/To date picker on the same section stays on
+    // the ordinary date-parse path and must not be widened.
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "From", kind: "combobox" },
+        "Experience",
+        "work0.startDate"
+      )
+    ).toBe(false);
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "To", kind: "combobox" },
+        "Experience",
+        "work0.endDate"
+      )
+    ).toBe(false);
+  });
+
+  it("refuses to widen when the kind is not a combobox", () => {
+    // A plain text input for Title (which some boards render) is not the
+    // typeahead this widening exists for, so leave it on the ordinary
+    // read-back path.
+    expect(
+      shouldWidenRepeatingSectionCombobox(
+        { label: "Title", kind: "text" },
+        "Experience",
+        "work0.title"
+      )
+    ).toBe(false);
+  });
+
+  it("locks down that resolveDecision needs the decorated label to apply free text", () => {
+    // Twin assertion on `resolveDecision`'s own free-text branch: the raw
+    // label "Title" that `fillRepeatingSections` iterates does NOT trip the
+    // `EXPERIENCE_FIELD_LABEL_RE` gate at :5486, so passing it undecorated
+    // returns something other than "apply" — the exact defect the round-one
+    // fix left behind. `fillRepeatingSections` now wraps the field in a
+    // decorated copy before calling `resolveDecision`, and the same test with
+    // the decorated label further down proves the decorated path works.
+    const raw = resolveDecision(
+      field({
+        label: "Title",
+        kind: "combobox",
+        options: ["Software Engineer", "Product Manager"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "title",
+        decision: "answer",
+        value: "AI Engineer",
+        sourceFact: "work0.title",
+      }),
+      facts()
+    );
+    expect(raw.kind).not.toBe("apply");
+
+    const decorated = resolveDecision(
+      field({
+        label: "Experience: Title",
+        kind: "combobox",
+        options: ["Software Engineer", "Product Manager"],
+        optionsKnown: true,
+      }),
+      decision({
+        fieldKey: "experience: title",
+        decision: "answer",
+        value: "AI Engineer",
+        sourceFact: "work0.title",
+      }),
+      facts()
+    );
+    expect(decorated.kind).toBe("apply");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JOB-303 Fix 3. A candidate whose current job is ongoing gets an "I
+// currently work here" checkbox ticked and the paired To picker skipped;
+// typing "Present" into the picker instead mismatches and blocks the section
+// forever. `sectionCurrentlyHereActive` is the pure helper the runtime uses.
+describe("the currently here checkbox stands in for the To date picker", () => {
+  it("recognises the fact key and the Yes value that turn the delegation on", () => {
+    const factsByKey = new Map<CandidateFact["key"], CandidateFact>([
+      [
+        "work0.currentlyHere",
+        {
+          key: "work0.currentlyHere",
+          label: "Most recent: currently works here",
+          value: "Yes",
+        },
+      ],
+    ]);
+    const decisions: FieldDecision[] = [
+      decision({
+        fieldKey: "experience: i currently work here",
+        decision: "answer",
+        value: "Yes",
+        sourceFact: "work0.currentlyHere",
+      }),
+    ];
+    expect(sectionCurrentlyHereActive(decisions, factsByKey)).toBe(true);
+  });
+
+  it("stays off when the same fact is No, so the ordinary To pick still runs", () => {
+    const factsByKey = new Map<CandidateFact["key"], CandidateFact>([
+      [
+        "work0.currentlyHere",
+        {
+          key: "work0.currentlyHere",
+          label: "Most recent: currently works here",
+          value: "No",
+        },
+      ],
+    ]);
+    const decisions: FieldDecision[] = [
+      decision({
+        fieldKey: "experience: i currently work here",
+        decision: "answer",
+        value: "No",
+        sourceFact: "work0.currentlyHere",
+      }),
+    ];
+    expect(sectionCurrentlyHereActive(decisions, factsByKey)).toBe(false);
+  });
+
+  it.each([
+    "Experience: To",
+    "Experience: End date",
+    "Experience: End",
+    "Experience: End Date",
+  ])("names %j as the end date picker to delegate", (label) => {
+    expect(isExperienceEndDateLabel(label)).toBe(true);
+  });
+
+  it.each([
+    "Experience: From",
+    "Experience: Start date",
+    "Experience: Title",
+    "Education: To",
+    "Salary expectation",
+  ])("does not name %j as the end date picker", (label) => {
+    expect(isExperienceEndDateLabel(label)).toBe(false);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JOB-303 Fix 4. When one entry field mismatches on read back inside a
+// repeating section, the aggregate section escalation should quote the label,
+// the attempted value, and what the control read back, so skip_log names what
+// actually failed rather than the previous "the section is still complaining"
+// one liner. `summarizeRepeatingSectionMismatches` is the pure helper the
+// runtime uses to compose that message.
+describe("a repeating section escalation names the fields that mismatched", () => {
+  it("returns an empty string when nothing mismatched", () => {
+    expect(summarizeRepeatingSectionMismatches([])).toBe("");
+  });
+
+  it("quotes the label, the attempted value and the read back for one field", () => {
+    const summary = summarizeRepeatingSectionMismatches([
+      {
+        label: "Title",
+        attempted: "AI Engineer",
+        readBack: "",
+        detail: "the combobox refused free text",
+      },
+    ]);
+    expect(summary).toContain("Title");
+    expect(summary).toContain("AI Engineer");
+    expect(summary).toContain("the combobox refused free text");
+  });
+
+  it("bounds the list to three entries so a long run does not blow the message", () => {
+    const summary = summarizeRepeatingSectionMismatches([
+      { label: "A", attempted: "1", readBack: "", detail: "d" },
+      { label: "B", attempted: "2", readBack: "", detail: "d" },
+      { label: "C", attempted: "3", readBack: "", detail: "d" },
+      { label: "D", attempted: "4", readBack: "", detail: "d" },
+      { label: "E", attempted: "5", readBack: "", detail: "d" },
+    ]);
+    expect(summary).toContain("and 2 more");
+    expect(summary).toContain("A");
+    expect(summary).not.toContain('"D"');
+  });
+
+  it("truncates a very long attempted value or read back to eighty characters", () => {
+    const long = "x".repeat(200);
+    const summary = summarizeRepeatingSectionMismatches([
+      { label: "Title", attempted: long, readBack: long, detail: "d" },
+    ]);
+    // The JSON quoted form of an eighty character run of x's is 82 characters
+    // once the surrounding double quotes are included, so the summary should
+    // contain that but not the full 200 character run.
+    expect(summary).toContain("x".repeat(80));
+    expect(summary).not.toContain("x".repeat(120));
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JOB-303. `normalizeWorkDate` folds every date wording a resume prints into
+// { iso, raw, isPresent }. Covered indirectly through buildFactCatalog above
+// too, but exercised directly here so an edge case in one folding does not
+// depend on a compound test to name it.
+describe("normalizeWorkDate folds the shapes a resume prints", () => {
+  it("reports an ongoing job through isPresent for Present, Current, Now", () => {
+    for (const raw of ["Present", "current", "Now", "ongoing"]) {
+      expect(normalizeWorkDate(raw)).toMatchObject({ isPresent: true });
+    }
+  });
+
+  it("reports an ongoing job for a missing or empty value", () => {
+    expect(normalizeWorkDate(null)?.isPresent).toBe(true);
+    expect(normalizeWorkDate(undefined)?.isPresent).toBe(true);
+    expect(normalizeWorkDate("")?.isPresent).toBe(true);
+  });
+
+  it("folds a month name to a two digit month", () => {
+    expect(normalizeWorkDate("November 2025")?.iso).toBe("2025-11");
+    expect(normalizeWorkDate("Nov 2025")?.iso).toBe("2025-11");
+    expect(normalizeWorkDate("Feb 2020")?.iso).toBe("2020-02");
+  });
+
+  it("accepts Sept as the one four letter abbreviation resumes actually print", () => {
+    // JOB-303 round two. Every other month either fits three letters or is
+    // itself under five, so the three-letter slice covers them; September is
+    // the odd one out ("Sept" is common in date columns), and without an
+    // explicit alias the fact catalog dropped it silently.
+    expect(normalizeWorkDate("Sept 2024")?.iso).toBe("2024-09");
+    expect(normalizeWorkDate("Sept. 2024")?.iso).toBe("2024-09");
+    expect(normalizeWorkDate("2024 Sept")?.iso).toBe("2024-09");
+  });
+
+  it("passes a bare year through as year only", () => {
+    expect(normalizeWorkDate("2019")?.iso).toBe("2019");
+  });
+
+  it("returns null iso for a string it cannot parse, keeping the raw form", () => {
+    const parsed = normalizeWorkDate("Winter '23");
+    expect(parsed?.iso).toBe(null);
+    expect(parsed?.raw).toBe("Winter '23");
+    expect(parsed?.isPresent).toBe(false);
   });
 });
 
