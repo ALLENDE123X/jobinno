@@ -91,7 +91,7 @@ function FeedRow({ role, company, tint, board, ago }: FeedEvent) {
       className={cn(
         "relative mx-auto w-full overflow-hidden rounded-xl p-3 sm:p-4",
         "bg-card ring-1 ring-border",
-        "dark:bg-white/[0.04] dark:ring-white/10 dark:backdrop-blur-sm"
+        "dark:bg-white/[0.08] dark:ring-white/15 dark:backdrop-blur-sm"
       )}
     >
       <div className="flex items-center gap-3">
