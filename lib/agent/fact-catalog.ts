@@ -21,7 +21,6 @@
  * accidentally ship a run that thinks it read from the catalog.
  */
 
-import { AgentFillNotImplementedError } from "@/lib/agent";
 import type { CandidateApplicationAnswers } from "@/lib/candidate-intake";
 import type { CandidateFact, DocumentSource, ResumeProfile } from "@/lib/resume-parser";
 
@@ -666,19 +665,182 @@ export function resolveFactPath(
 }
 
 /**
- * Stub. Returns a typed empty catalog shape for a given user id so that
- * subsequent tickets can widen this in place without breaking every
- * downstream import; today every call throws so no caller can accidentally
- * ship a run that thinks it read from the catalog.
+ * The dependencies `buildAgentFactCatalog` reads from. Kept as an interface
+ * so tests can pass fakes that satisfy the shape without spinning up
+ * Supabase, a resume parse, or the whole document-loader stack. The
+ * production defaults resolve through `lib/candidate-intake`,
+ * `lib/resume-parser`, and `lib/candidate-documents` so the run reads the
+ * same profile and answers the legacy fill would have.
  *
- * JOB-296 (sub ticket G) renamed this from `buildFactCatalog` so the ported
- * builder above could take the name. Sub ticket B reads the profile, resume,
- * and candidate answers for `userId` and populates the returned catalog.
+ *  - `loadProfile` returns the parsed `ResumeProfile` for the user. The
+ *    default composes `loadCandidate` + `loadResume` + `resolveCandidateProfile`
+ *    behind Supabase so a real run reads the stored parse when one exists,
+ *    exactly the way `runBrowserFlow` in `lib/fill-application-form.ts` does.
+ *  - `loadAnswers` returns the recorded intake answers plus any per-run
+ *    `additionalAnswers` the caller supplied for a `pending_user_input` retry.
+ *    The default reads them off the same `CandidateRecord` `loadCandidate`
+ *    returned so both sides of the catalog share one source.
  */
-export async function buildAgentFactCatalog(userId: string): Promise<FactCatalog> {
-  // Reference the argument so eslint does not flag it while the body is a
-  // stub; sub ticket B reads the profile, resume, and candidate answers
-  // for `userId` and populates the returned catalog.
-  void userId;
-  throw new AgentFillNotImplementedError("buildAgentFactCatalog");
+export interface BuildAgentFactCatalogOptions {
+  loadProfile?: (userId: string) => Promise<ResumeProfile>;
+  loadAnswers?: (
+    userId: string
+  ) => Promise<{ answers: CandidateApplicationAnswers; additional: Record<string, string> }>;
+  /** Extra answers a caller (typically the pipeline) collected out of band. Merged over `loadAnswers` output. */
+  additionalAnswers?: Record<string, string>;
+}
+
+/**
+ * Builds the read only view of the user's intake data the agent loop sees.
+ *
+ * The V2 shape (`FactCatalog { userId, entries: FactEntry[] }`) the system
+ * prompt builder already imports is produced by adapting the V1
+ * `CandidateFact[]` shape `buildFactCatalog` above returns: every `CandidateFact`
+ * becomes one `FactEntry`, with the `key` becoming a dotted `path`, the
+ * `label` carried across verbatim, and the `value` string preserved. The
+ * `source` field is derived defensively: an `answer:` prefix (which the
+ * merge answers block above writes for per run additional answers) maps to
+ * `candidate_answer`, an `education` or `work` prefix or a
+ * resume derived name (`skills`, `mostRecent...`) maps to `resume`, and
+ * anything else defaults to `profile`. This preserves the traceability the
+ * scaffold's zod schema promised without inventing a new provenance layer.
+ *
+ * HARD STOP 9 stays enforced at the tool boundary in `lib/agent/tools.ts`:
+ * this builder only reads the same catalogue the fill layer already reads,
+ * so a fact the agent quotes back on a `setFieldValue` call resolves to the
+ * same value the legacy fill would have written. No new fact class is
+ * invented here; anything the intake did not record stays absent.
+ */
+export async function buildAgentFactCatalog(
+  userId: string,
+  options: BuildAgentFactCatalogOptions = {}
+): Promise<FactCatalog> {
+  const trimmed = userId.trim();
+  if (trimmed === "") {
+    throw new Error("buildAgentFactCatalog requires a non-empty userId.");
+  }
+
+  const loadProfile = options.loadProfile ?? defaultLoadProfile;
+  const loadAnswers = options.loadAnswers ?? defaultLoadAnswers;
+
+  const [profile, rawAnswers] = await Promise.all([
+    loadProfile(trimmed),
+    loadAnswers(trimmed),
+  ]);
+  const additional = {
+    ...(rawAnswers.additional ?? {}),
+    ...(options.additionalAnswers ?? {}),
+  };
+
+  const facts = buildFactCatalog(profile, rawAnswers.answers, additional);
+
+  const entries: FactEntry[] = facts.map((fact) => ({
+    path: fact.key,
+    label: fact.label,
+    value: fact.value,
+    source: sourceOf(fact.key),
+  }));
+
+  return { userId: trimmed, entries };
+}
+
+/**
+ * Classifies one fact key onto the `FactEntry.source` union. Kept as a small
+ * lookup so the adaptation is checkable on the diff and stays honest about
+ * what came from where. See `buildFactCatalog` above for where each family
+ * of keys is written.
+ */
+function sourceOf(key: string): FactEntry["source"] {
+  if (key.startsWith("answer:")) return "candidate_answer";
+  // Indexed resume rows: `work0.employer`, `education3.school`, etc. Matched
+  // by the dotted shape, not the leading word — `workAuthorizedUs` and other
+  // intake booleans that happen to start with "work" are profile facts and
+  // must not classify as resume rows.
+  if (/^work\d+\./.test(key) || /^education\d+\./.test(key)) return "resume";
+  if (
+    key === "skills" ||
+    key === "mostRecentEmployer" ||
+    key === "mostRecentTitle" ||
+    key === "school" ||
+    key === "degree" ||
+    key === "discipline" ||
+    key === "yearsOfExperience" ||
+    key === "resumeLocation" ||
+    key === "githubUrl"
+  ) {
+    return "resume";
+  }
+  return "profile";
+}
+
+/**
+ * Default profile loader. Reads the user's intake row and stored resume
+ * parse the same way the legacy fill does, so the agent path sees the same
+ * `ResumeProfile` shape a legacy run would have built. Lives on a dynamic
+ * import so `lib/agent/fact-catalog.ts`'s module graph does not pull in the
+ * whole document loader stack when a test only touches the pure adapter.
+ */
+async function defaultLoadProfile(userId: string): Promise<ResumeProfile> {
+  const [
+    { loadCandidate },
+    { loadResume },
+    { resolveCandidateProfile },
+    { createClient },
+  ] = await Promise.all([
+    import("@/lib/candidate-intake"),
+    import("@/lib/resume-parser"),
+    import("@/lib/candidate-documents"),
+    import("@supabase/supabase-js"),
+  ]);
+  const { assertSupabaseProject } = await import("@/lib/supabase-project-guard");
+
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) {
+    throw new Error(
+      "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars are required to build the agent fact catalog. See .env.example."
+    );
+  }
+  assertSupabaseProject(url);
+  const supabase = createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+
+  const candidate = await loadCandidate(userId);
+  const resume = await loadResume(supabase, candidate.resumeUrl);
+  // `resolveCandidateProfile` reads the resume-parser `CandidateRecord`
+  // shape (`id` rather than `userId`), which is a subset of the intake
+  // shape `loadCandidate` returned. Same adapter the legacy fill uses at
+  // `lib/fill-application-form.ts` line 2073.
+  return await resolveCandidateProfile(
+    supabase,
+    {
+      resumeId: candidate.resumeId,
+      resumePath: candidate.resumeUrl,
+      linkedinPdfPath: candidate.linkedinPdfPath,
+    },
+    resume.text,
+    {
+      id: candidate.userId,
+      applicationEmail: candidate.applicationEmail,
+      linkedinUrl: candidate.linkedinUrl,
+      githubUrl: candidate.githubUrl,
+    }
+  );
+}
+
+/**
+ * Default answers loader. Reads the recorded intake answers plus the
+ * `stored_answers` log a prior `pending_user_input` round wrote. Lives on a
+ * dynamic import for the same module graph reason `defaultLoadProfile` does.
+ * `additional` starts empty on this path; a caller (typically the pipeline)
+ * merges per run answers over the top through
+ * `BuildAgentFactCatalogOptions.additionalAnswers`.
+ */
+async function defaultLoadAnswers(
+  userId: string
+): Promise<{ answers: CandidateApplicationAnswers; additional: Record<string, string> }> {
+  const { loadCandidate } = await import("@/lib/candidate-intake");
+  const candidate = await loadCandidate(userId);
+  return { answers: candidate.applicationAnswers, additional: {} };
 }
