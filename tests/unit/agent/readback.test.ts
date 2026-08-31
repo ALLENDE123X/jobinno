@@ -221,6 +221,26 @@ describe("buildFullSnapshot", () => {
       SnapshotBudgetExceededError
     );
   });
+
+  it("throws when the a11y tree yields duplicate field refs", async () => {
+    // Two producer nodes sharing a ref used to fold silently into one entry
+    // by the Map in `buildDiffSnapshot`, dropping the loser from every diff.
+    // JOB-287 parses the build output through `AgentSnapshotSchema`, so the
+    // producer bug now surfaces as an error naming the builder.
+    const tree: RawAccessibilityNode = {
+      role: "form",
+      name: "Duplicate refs",
+      ref: "form_dup",
+      children: [
+        { role: "textbox", name: "First name", required: true, ref: "dup" },
+        { role: "textbox", name: "Last name", required: true, ref: "dup" },
+      ],
+    };
+    const page = pageFromTree("https://example.test/dup", "Dup", tree);
+    await expect(buildFullSnapshot(page)).rejects.toThrow(
+      /AgentSnapshot fields must have unique refs/
+    );
+  });
 });
 
 describe("buildDiffSnapshot", () => {
@@ -454,5 +474,28 @@ describe("buildDiffSnapshot", () => {
 
     const changedRefs = diff.sections.changed.map((s) => s.ref);
     expect(changedRefs).toContain("section_basics");
+  });
+
+  it("throws when the current tree introduces duplicate refs", async () => {
+    const before = srOneClickFixture();
+    const page1 = pageFromTree("https://example.test/apply/sr-1", "Apply", before);
+    const prev = await buildFullSnapshot(page1);
+
+    // The producer emits a second field reusing an existing ref. The Map
+    // in `buildDiffSnapshot` would fold the two and drop one from the diff;
+    // the intermediate snapshot parse now throws instead of folding.
+    const after = srOneClickFixture();
+    const basics = (after.children ?? []).find(
+      (c) => c.ref === "section_basics"
+    )!;
+    basics.children = [
+      { role: "textbox", name: "First name copy", ref: "field_first_name" },
+      ...(basics.children ?? []),
+    ];
+
+    const page2 = pageFromTree("https://example.test/apply/sr-1", "Apply", after);
+    await expect(buildDiffSnapshot(prev, page2)).rejects.toThrow(
+      /AgentSnapshot fields must have unique refs/
+    );
   });
 });

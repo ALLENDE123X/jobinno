@@ -119,6 +119,24 @@ export const SectionHandleSchema = z.object({
 export type SectionHandle = z.infer<typeof SectionHandleSchema>;
 
 /**
+ * True when the concatenation of the given ref lists has no repeats. The
+ * build path keys fields on ref, so two producers sharing a ref fold into
+ * one and one of them silently drops out of every diff; a duplicate ref is
+ * always a bug and the schema rejects it at the parse boundary rather than
+ * letting it ride through to the diff.
+ */
+function refsUnique(lists: string[][]): boolean {
+  const seen = new Set<string>();
+  for (const list of lists) {
+    for (const ref of list) {
+      if (seen.has(ref)) return false;
+      seen.add(ref);
+    }
+  }
+  return true;
+}
+
+/**
  * A full snapshot. Sent to the LLM on the first turn of a run, and never
  * again for the same page unless the loop asks for one explicitly (for
  * example after a hard navigation the diff cannot reconcile against).
@@ -145,6 +163,13 @@ export const AgentSnapshotSchema = z
       return true;
     },
     { message: "every field.sectionRef must reference a section in sections[]" }
+  )
+  // Two fields sharing a ref is a producer bug: the Map in
+  // `buildDiffSnapshot` keys on ref and would fold them into one, dropping
+  // the loser's state from every diff. Reject at the parse boundary.
+  .refine(
+    (snap) => refsUnique([snap.fields.map((f) => f.ref)]),
+    { message: "AgentSnapshot fields must have unique refs" }
   );
 export type AgentSnapshot = z.infer<typeof AgentSnapshotSchema>;
 
@@ -193,5 +218,32 @@ export const AgentSnapshotDiffSchema = z.object({
     changed: z.array(SectionHandleSchema),
   }),
   capturedAt: z.number().int().nonnegative(),
-});
+})
+  // Each field ref may appear at most once across `added`, `removed`, and
+  // `updated`. A ref listed in two of the three is contradictory (a field
+  // being added and updated in the same diff, for example) and is a hand
+  // rolled diff bug rather than a page state.
+  .refine(
+    (diff) =>
+      refsUnique([
+        diff.added.map((f) => f.ref),
+        diff.removed,
+        diff.updated.map((u) => u.ref),
+      ]),
+    { message: "diff field refs must be unique across added, removed, and updated" }
+  )
+  // The same contract for the section level lists: a section cannot be
+  // added and changed in the same diff any more than a field can.
+  .refine(
+    (diff) =>
+      refsUnique([
+        diff.sections.added.map((s) => s.ref),
+        diff.sections.removed,
+        diff.sections.changed.map((s) => s.ref),
+      ]),
+    {
+      message:
+        "diff section refs must be unique across sections.added, sections.removed, and sections.changed",
+    }
+  );
 export type AgentSnapshotDiff = z.infer<typeof AgentSnapshotDiffSchema>;
