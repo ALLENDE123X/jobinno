@@ -57,12 +57,18 @@ const RLS_TABLES = TABLES;
  * `0016_resumes_column_privileges.sql` closed on `resumes.parsed`. The pipeline
  * writes it with the service role, from an answer the person gave in response
  * to a question a real form really asked.
+ *
+ * `re_engagement_sent_at` (JOB-311) is here for the same reason
+ * `stripe_customer_id` is: it is our record of whether we already emailed
+ * this person, not an answer they gave, and `inngest/reengagement-cron.ts`
+ * is the one writer, through the service role.
  */
 const PROFILE_SYSTEM_COLUMNS = [
   "applications_cap",
   "applications_used",
   "attested_at",
   "plan",
+  "re_engagement_sent_at",
   "stored_answers",
   "stripe_customer_id",
 ] as const;

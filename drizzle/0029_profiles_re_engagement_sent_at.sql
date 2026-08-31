@@ -1,0 +1,31 @@
+-- profiles.re_engagement_sent_at (JOB-311): when the founder personal re
+-- engagement email went out to this person, or null if it never has.
+-- `inngest/reengagement-cron.ts` reads it to find who is due (unattested,
+-- between 24h and 7 days old, never sent) and stamps it right after a send
+-- succeeds, so the cron never nudges the same profile twice.
+--
+-- The grant this column needs is
+-- `0030_profiles_re_engagement_sent_at_privileges.sql`, a separate file for
+-- the reason `github_url` (0015) and its grant (0016), and
+-- `gmail_refresh_token` (0025) and its grant (0026), are two files each:
+-- `drizzle-kit push`, which CI uses to build its throwaway database, applies
+-- a plain ALTER TABLE like this one on its own by diffing
+-- `lib/db/schema.ts`, but cannot see a GRANT at all because the Drizzle
+-- schema DSL has no way to express one.
+--
+-- ── The backfill this migration also carries ─────────────────────────────
+-- Aryareed (aryareed.907660@gmail.com) was the first real cold traffic Meta
+-- ad signup, bounced pre attestation, and was already sent this exact email
+-- by hand through Resend on 2026-08-31 21:00 UTC (Resend id
+-- b44c6f46-8803-4b84-bfe1-96369547a98e) before this cron existed to send it
+-- automatically. Stamping her row with that real timestamp in the same
+-- migration that adds the column is what keeps the first cron run, once it
+-- goes live, from reading her as still due and sending a second copy of an
+-- email she already has.
+--
+-- A single row, matched by email and updated to a value that already
+-- happened, not a bulk write and nothing destructive — HARD STOP 5 in
+-- CLAUDE.md.
+ALTER TABLE "profiles" ADD COLUMN "re_engagement_sent_at" timestamp with time zone;--> statement-breakpoint
+UPDATE "profiles" SET "re_engagement_sent_at" = '2026-08-31 21:00:00+00'::timestamptz
+WHERE "email" = 'aryareed.907660@gmail.com';
