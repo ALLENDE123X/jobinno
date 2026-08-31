@@ -16,6 +16,7 @@
  */
 
 import type {
+  ApprovalDecision,
   SubmitApplicationInput,
   SubmitApplicationResult,
 } from "@/lib/submit-application";
@@ -178,6 +179,23 @@ export interface AgentSubmitOutcome {
   unconfirmedReason: string | null;
   finalUrl: string;
   pageTitle: string;
+  /**
+   * The approval decision the submit flow actually made. Carried on the
+   * outcome rather than fabricated by the mapper, because a custom
+   * `input.approveSubmission` gate can run inside the injected submit
+   * callback and its verdict has to survive into the result a consumer
+   * reads. Both fields are required on purpose: an outcome producer that
+   * cannot say what happened is a compile error, not a silent claim of
+   * automatic approval.
+   */
+  approval: ApprovalDecision & { gate: "auto" | "custom" };
+  /**
+   * Whether the `applications` row was updated to match this outcome. False
+   * means a consumer must reconcile the row itself; reporting true when the
+   * write failed would make every consumer skip that reconciliation against
+   * a stale row.
+   */
+  rowUpdated: boolean;
 }
 
 /**
@@ -244,12 +262,28 @@ export interface RunAgentFillDeps {
 }
 
 /**
+ * Collapses every run of tab, carriage return, and newline characters into a
+ * single space. The serializer below writes one tab separated line per fact,
+ * and values originate in free text the candidate controls (a resume parse, a
+ * typed intake answer). Without this a value containing a newline would read
+ * as an extra catalog line, and a tab would shift the remaining columns, which
+ * is enough to forge a fact the model then trusts (a crafted resume line could
+ * plant a high stakes entry such as `isUsCitizen`). Normalizing the path and
+ * the label too keeps the whole line single line by construction rather than
+ * by trusting any one field.
+ */
+const oneLine = (text: string): string => text.replace(/[\t\r\n]+/g, " ").trim();
+
+/**
  * Wraps a `FactCatalog` into the text block the router hands the model on
  * every turn. One entry per line, tab separated, path first so a model
  * quoting a path back on a `setFieldValue` call can pattern match on the
  * leading token. Empty catalogs collapse to the placeholder string a run
  * can still safely be prompted with, rather than an empty prompt that a
- * cache marker would attach to.
+ * cache marker would attach to. Tabs and newlines inside a path, a label, or
+ * a string value are collapsed to spaces (see `oneLine` above) so no entry
+ * can span lines or shift columns; `source` is a closed union and numbers and
+ * booleans stringify without whitespace, so neither needs the same treatment.
  */
 export function serializeFactCatalog(catalog: FactCatalog): string {
   if (catalog.entries.length === 0) {
@@ -261,9 +295,11 @@ export function serializeFactCatalog(catalog: FactCatalog): string {
       entry.value === null
         ? "(null)"
         : typeof entry.value === "string"
-          ? entry.value
+          ? oneLine(entry.value)
           : String(entry.value);
-    lines.push(`${entry.path}\t${entry.label}\t${value}\t${entry.source}`);
+    lines.push(
+      `${oneLine(entry.path)}\t${oneLine(entry.label)}\t${value}\t${entry.source}`
+    );
   }
   return lines.join("\n");
 }
@@ -324,7 +360,12 @@ function blockedResult(
  * Builds a `SubmitApplicationResult` from an `AgentSubmitOutcome`. Preserves
  * the "one logical submission" invariant `submit-application.ts` carries:
  * `submitAttempted` reflects whether the click was issued, and the terminal
- * status is one of the three the outcome enumerates.
+ * status is one of the three the outcome enumerates. `approval` and
+ * `rowUpdated` are propagated from the outcome verbatim, never fabricated
+ * here: the submit flow is the only party that knows whether a custom gate
+ * approved and whether the `applications` row write landed, and a mapper
+ * that hard codes them reports approvals and row updates that never
+ * happened.
  */
 function resultFromSubmitOutcome(
   input: SubmitApplicationInput,
@@ -338,7 +379,7 @@ function resultFromSubmitOutcome(
     confirmationRef: outcome.confirmationRef,
     confirmation: null,
     securityCode: null,
-    approval: { approved: true, gate: "auto", detail: "agent fill" },
+    approval: outcome.approval,
     submitControlLabel: outcome.submitControlLabel,
     fill: null,
     finalUrl: outcome.finalUrl,
@@ -346,7 +387,7 @@ function resultFromSubmitOutcome(
     screenshotPath: null,
     blockedReason: outcome.blockedReason,
     unconfirmedReason: outcome.unconfirmedReason,
-    rowUpdated: true,
+    rowUpdated: outcome.rowUpdated,
   };
 }
 

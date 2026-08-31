@@ -280,17 +280,26 @@ export function buildFactCatalog(
   // there is no fact to write and the question goes to the candidate, which is
   // exactly where a question only they can answer belongs. Writing a "Yes" here
   // would be the system telling an employer something nobody told it.
+  //
+  // The labels state the affirmative claim and the value carries the "No",
+  // the same shape as every other yes/no fact in this builder. An earlier
+  // draft put the negative claim in the label ("Has no relatives ...") with
+  // the value still "No", and read as a pair that asserted the opposite of
+  // the stored answer; the agent loop narrates these labels verbatim, so the
+  // pair has to read correctly on its own. The keys keep their "no" prefix
+  // because they are identifiers the fill layer and the tests match on, not
+  // prose.
   if (answers.relativesAtTargetEmployers === false) {
     add(
       "noRelativesAtThisEmployer",
-      "Has no relatives or immediate family employed at any company they are applying to, this one included",
+      "Has relatives or immediate family employed at any company they are applying to, this one included",
       "No"
     );
   }
   if (answers.previouslyEmployedAtTargetEmployers === false) {
     add(
       "noPriorEmploymentAtThisEmployer",
-      "Has never previously been employed by any company they are applying to, this one included",
+      "Has previously been employed by any company they are applying to, this one included",
       "No"
     );
   }
