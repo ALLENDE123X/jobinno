@@ -40,7 +40,21 @@ import { ANALYTICS_EVENT } from "@/lib/analytics/events";
 import { captureServerEvent } from "@/lib/analytics/posthog-server";
 import { requestDocumentParse } from "@/lib/candidate-document-trigger";
 import { recordAttestation } from "@/lib/onboarding/attestation";
-import { intakeFieldErrors, intakeSchema } from "@/lib/onboarding/intake-schema";
+import {
+  clearanceLevelIsRelevant,
+  deriveNeedsSponsorshipNonUs,
+  deriveRequiresSponsorship,
+  deriveWorkAuthorizedUs,
+} from "@/lib/onboarding/intake-derivation";
+import {
+  intakeFieldErrors,
+  intakeSchema,
+  step1Schema,
+  step2Schema,
+  step3Schema,
+  step4Schema,
+  step5Schema,
+} from "@/lib/onboarding/intake-schema";
 import { RESUMES_BUCKET, createServerClient } from "@/lib/supabase/server";
 
 export type IntakeResult =
@@ -219,6 +233,173 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // column is empty, so a failure here costs one slower first application and
   // nothing else. That is why it cannot fail the submit.
   await requestDocumentParse(user.id, String(resumeRow?.id ?? ""));
+
+  revalidatePath("/onboarding");
+  return { ok: true };
+}
+
+// ── Save as you go ────────────────────────────────────────────────────────
+// Each step of the multi-page onboarding saves a draft. The final submit
+// still goes through submitIntake above, which runs the full schema and
+// the attestation stamp. saveIntakeDraft validates only the step's own
+// fields, applies any derivations, and upserts into profiles.
+//
+// Resume upload state is kept in step 1's local component state and only
+// persisted to the resumes table on step 5's final submit (via
+// submitIntake). The tradeoff is that a user who uploads a resume on
+// step 1 but abandons the flow has an orphaned file in storage; the
+// bucket's lifecycle policy handles cleanup, and the simpler component
+// state avoids a draft insert into resumes that has no upsert semantics
+// and would need a second write on step 5 anyway.
+
+export async function saveIntakeDraft(
+  payload: unknown,
+  step: number,
+): Promise<IntakeResult> {
+  const supabase = await createServerClient();
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return {
+      ok: false,
+      message: "Your session has expired. Sign in again and your files are still there.",
+    };
+  }
+
+  // Validate the step's fields with the appropriate schema.
+  let validated: Record<string, unknown>;
+  switch (step) {
+    case 1: {
+      const parsed = step1Schema().safeParse(payload);
+      if (!parsed.success)
+        return { ok: false, errors: intakeFieldErrors(parsed.error) };
+      validated = parsed.data;
+      break;
+    }
+    case 2: {
+      const parsed = step2Schema.safeParse(payload);
+      if (!parsed.success)
+        return { ok: false, errors: intakeFieldErrors(parsed.error) };
+      validated = parsed.data;
+      break;
+    }
+    case 3: {
+      const parsed = step3Schema.safeParse(payload);
+      if (!parsed.success)
+        return { ok: false, errors: intakeFieldErrors(parsed.error) };
+      validated = parsed.data;
+      break;
+    }
+    case 4: {
+      const parsed = step4Schema.safeParse(payload);
+      if (!parsed.success)
+        return { ok: false, errors: intakeFieldErrors(parsed.error) };
+      validated = parsed.data;
+      break;
+    }
+    case 5: {
+      const parsed = step5Schema.safeParse(payload);
+      if (!parsed.success)
+        return { ok: false, errors: intakeFieldErrors(parsed.error) };
+      validated = parsed.data;
+      break;
+    }
+    default:
+      return { ok: false, message: "Invalid step." };
+  }
+
+  // Build the profile update object from the validated step data,
+  // applying derivations where appropriate.
+  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+
+  switch (step) {
+    case 1:
+      // Step 1 only collects GitHub URL and file paths. Resume upload
+      // state lives in the client component (see file header). Only
+      // githubUrl is persisted to profiles on this step.
+      if ("githubUrl" in validated) {
+        update.github_url = validated.githubUrl;
+      }
+      break;
+
+    case 2:
+      update.citizenship_status = validated.citizenshipStatus;
+      update.f1_status = validated.f1Status;
+      update.visa_status = validated.visaStatus;
+      // Derive workAuthorizedUs and requiresSponsorship: for US citizens
+      // and permanent residents these are forced; for others the explicit
+      // answer is used.
+      update.work_authorized_us = deriveWorkAuthorizedUs(
+        validated.citizenshipStatus as string,
+        validated.workAuthorizedUs as boolean | null,
+      );
+      update.requires_sponsorship = deriveRequiresSponsorship(
+        validated.citizenshipStatus as string,
+        validated.requiresSponsorship as boolean | null,
+      );
+      break;
+
+    case 3:
+      update.street_address = validated.streetAddress;
+      update.current_city = validated.currentCity;
+      update.current_country = validated.currentCountry;
+      update.postal_code = validated.postalCode;
+      update.target_locations = validated.targetLocations;
+      update.willing_to_relocate = validated.willingToRelocate;
+      update.grad_date = validated.gradDate;
+      update.earliest_start = validated.earliestStart;
+      // Derive needsSponsorshipNonUs: forced false when the question is
+      // not relevant (no non-US targets and not willing to relocate).
+      update.needs_sponsorship_non_us = deriveNeedsSponsorshipNonUs(
+        validated.targetLocations as string[],
+        validated.willingToRelocate as boolean,
+        validated.needsSponsorshipNonUs as boolean | null,
+      );
+      break;
+
+    case 4:
+      update.salary_expectation = validated.salaryExpectation;
+      update.subject_to_restrictive_covenant =
+        validated.subjectToRestrictiveCovenant;
+      update.relatives_at_target_employers =
+        validated.relativesAtTargetEmployers;
+      update.previously_employed_at_target_employers =
+        validated.previouslyEmployedAtTargetEmployers;
+      update.clearance_eligibility = validated.clearanceEligibility;
+      update.high_school_name = validated.highSchoolName;
+      update.high_school_grad_year = validated.highSchoolGradYear;
+      // Derive clearanceLevelHeld: forced to "never_held" when clearance
+      // eligibility is "no".
+      update.clearance_level_held = clearanceLevelIsRelevant(
+        validated.clearanceEligibility as string,
+      )
+        ? validated.clearanceLevelHeld
+        : "never_held";
+      break;
+
+    case 5:
+      // Step 5 only has attestation, which is not persisted as a draft.
+      // Attestation is exclusive to the submitIntake path via
+      // recordAttestation. Nothing to write on this step.
+      break;
+  }
+
+  // Never set attested_at from saveIntakeDraft; that is exclusive to
+  // submitIntake via recordAttestation.
+  const { error } = await supabase
+    .from("profiles")
+    .update(update)
+    .eq("id", user.id);
+
+  if (error) {
+    return {
+      ok: false,
+      message: `Could not save your details: ${error.message}`,
+    };
+  }
 
   revalidatePath("/onboarding");
   return { ok: true };
