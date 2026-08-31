@@ -98,7 +98,7 @@ export default async function OnboardingStepPage({
     {
       citizenshipStatus: profile.citizenship_status ?? null,
       currentCity: profile.current_city ?? null,
-      salaryExpectation: profile.salary_expectation ?? null,
+      clearanceEligibility: profile.clearance_eligibility ?? null,
       attestedAt: profile.attested_at ?? null,
     },
     resumeRow ? { storagePath: resumeRow.storage_path ?? null } : null,
