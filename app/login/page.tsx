@@ -42,7 +42,7 @@ export default async function LoginPage({
 
   return (
     <PageShell>
-      <main className="relative flex flex-1 items-center justify-center px-4 py-16 sm:px-6">
+      <main className="relative flex flex-1 items-center justify-center px-4 py-8 sm:px-6 sm:py-16">
         <LoginForm initialError={typeof error === "string" ? error : undefined} />
       </main>
     </PageShell>
