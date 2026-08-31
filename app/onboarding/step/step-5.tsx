@@ -31,8 +31,10 @@ import {
 } from "@/lib/onboarding/intake-schema";
 
 import { submitIntake } from "../actions";
+import { StoredAnswersPreview } from "./stored-answers-preview";
 
 type ProfileData = {
+  email: string | null;
   github_url: string | null;
   resume_path: string | null;
   linkedin_pdf_path: string | null;
@@ -312,6 +314,18 @@ export function Step5Form({
           }
         />
       </SummarySection>
+
+      <StoredAnswersPreview
+        profile={{
+          email: profile.email,
+          github_url: profile.github_url,
+          current_city: profile.current_city,
+          visa_status: profile.visa_status,
+          salary_expectation: profile.salary_expectation,
+          work_authorized_us: profile.work_authorized_us,
+          requires_sponsorship: profile.requires_sponsorship,
+        }}
+      />
 
       <section className="space-y-3 rounded-2xl border bg-card/40 p-6 sm:p-8">
         <div className="flex items-start gap-3">
