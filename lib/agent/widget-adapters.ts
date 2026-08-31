@@ -674,7 +674,12 @@ function splCommitScript(fieldSelector: string, optionValue: string): string {
     }
     const norm = (v) => String(v == null ? "" : v).trim().toLowerCase();
     const safeJson = (v) => {
-      try { return JSON.stringify(v); } catch (e) { return "[unserializable]"; }
+      try {
+        const s = JSON.stringify(v);
+        return s === undefined ? "undefined" : s;
+      } catch (e) {
+        return "[unserializable]";
+      }
     };
     const zoneEvents = [];
     try {
