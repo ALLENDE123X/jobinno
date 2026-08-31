@@ -28,12 +28,18 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  */
 const stubs = vi.hoisted(() => ({
   signInWithOtp: vi.fn(),
+  signInWithOAuth: vi.fn(),
   /** Swapped per test to choose which failure the form has to survive. */
   origin: "https://jobinno-git-preview.vercel.app",
 }));
 
 vi.mock("@/lib/supabase/client", () => ({
-  createClient: () => ({ auth: { signInWithOtp: stubs.signInWithOtp } }),
+  createClient: () => ({
+    auth: {
+      signInWithOtp: stubs.signInWithOtp,
+      signInWithOAuth: stubs.signInWithOAuth,
+    },
+  }),
 }));
 
 vi.mock("@/components/analytics", () => ({
@@ -87,6 +93,7 @@ describe("the sign in form's failure copy", () => {
     vi.clearAllMocks();
     stubs.origin = "https://jobinno-git-preview.vercel.app";
     stubs.signInWithOtp.mockResolvedValue({ error: null });
+    stubs.signInWithOAuth.mockResolvedValue({ error: null });
     // The form is a client component, so its log lands in the browser console.
     // Silenced here so an expected failure does not print as noise, and spied
     // on so the test can prove the detail still goes somewhere.
@@ -131,6 +138,7 @@ describe("the sign in form's failure copy", () => {
 
       expect(captureClientEvent).toHaveBeenCalledWith("magic_link_requested", {
         outcome: "refused",
+        method: "email",
       });
     });
   });
@@ -175,5 +183,119 @@ describe("the sign in form's failure copy", () => {
       "Enter your email address."
     );
     expect(stubs.signInWithOtp).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * JOB-307. The Google OAuth button is the primary CTA and shares the sign in
+ * form's failure copy: `authCallbackUrlFor` throws the same paragraph if the
+ * origin is not allowlisted, and Supabase can hand back the same operator
+ * shaped strings, so the same one sentence collapses both.
+ */
+describe("the Continue with Google button", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    stubs.origin = PRODUCTION_ORIGIN;
+    stubs.signInWithOtp.mockResolvedValue({ error: null });
+    stubs.signInWithOAuth.mockResolvedValue({ error: null });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  it("renders above the email form as the primary call to action", () => {
+    render(<LoginForm />);
+
+    const googleButton = screen.getByRole("button", {
+      name: "Continue with Google",
+    });
+    const emailButton = screen.getByRole("button", { name: "Email me a link" });
+
+    // `compareDocumentPosition` reads the DOM order rather than a class, so a
+    // later reshuffle that puts Google below by accident still fails this.
+    expect(
+      googleButton.compareDocumentPosition(emailButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+  });
+
+  it("hands Supabase the provider and the allowlisted callback URL", async () => {
+    render(<LoginForm />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue with Google" }));
+
+    await waitFor(() => expect(stubs.signInWithOAuth).toHaveBeenCalledTimes(1));
+    expect(stubs.signInWithOAuth).toHaveBeenCalledWith({
+      provider: "google",
+      options: { redirectTo: `${PRODUCTION_ORIGIN}/auth/callback` },
+    });
+  });
+
+  it("counts the click in the funnel with method=google", async () => {
+    render(<LoginForm />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue with Google" }));
+
+    await waitFor(() =>
+      expect(captureClientEvent).toHaveBeenCalledWith("magic_link_requested", {
+        outcome: "sent",
+        method: "google",
+      })
+    );
+  });
+
+  it("shows the same calm copy on a Supabase failure and files it as refused", async () => {
+    stubs.signInWithOAuth.mockResolvedValueOnce({
+      error: { message: "provider disabled" },
+    });
+    render(<LoginForm />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue with Google" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(CALM_COPY);
+    expect(captureClientEvent).toHaveBeenCalledWith("magic_link_requested", {
+      outcome: "refused",
+      method: "google",
+    });
+  });
+
+  it("collapses an allowlist rejection to the same one sentence", async () => {
+    stubs.origin = "https://jobinno-git-preview.vercel.app";
+    render(<LoginForm />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue with Google" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(CALM_COPY);
+    for (const internal of LEAKED_INTERNALS) {
+      expect(alert.textContent).not.toContain(internal);
+    }
+    expect(stubs.signInWithOAuth).not.toHaveBeenCalled();
+    expect(captureClientEvent).toHaveBeenCalledWith("magic_link_requested", {
+      outcome: "refused",
+      method: "google",
+    });
+  });
+
+  it("disables both buttons while the OAuth handoff is in flight", async () => {
+    let resolveOAuth: (value: { error: null }) => void = () => {};
+    stubs.signInWithOAuth.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveOAuth = resolve;
+      })
+    );
+    render(<LoginForm />);
+
+    const googleButton = screen.getByRole("button", {
+      name: "Continue with Google",
+    });
+    fireEvent.click(googleButton);
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Redirecting" })
+      ).toBeDisabled()
+    );
+    // Same shared status flips the email button's own label to "Sending", so
+    // there is no way for someone to click either path while the redirect to
+    // Google is in flight.
+    expect(screen.getByRole("button", { name: "Sending" })).toBeDisabled();
+
+    resolveOAuth({ error: null });
   });
 });

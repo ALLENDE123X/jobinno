@@ -100,20 +100,77 @@ export function LoginForm({ initialError }: { initialError?: string }) {
       // the whole payload, and `sanitizeProperties` would drop the address
       // anyway if a later edit tried to add it.
       if (error) {
-        captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, { outcome: "refused" });
+        captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, {
+          outcome: "refused",
+          method: "email",
+        });
         console.error("Jobinno could not send a sign in link.", error);
         setStatus({ kind: "error", message: SEND_FAILURE_MESSAGE });
         return;
       }
 
-      captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, { outcome: "sent" });
+      captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, {
+        outcome: "sent",
+        method: "email",
+      });
       setStatus({ kind: "sent", email: trimmed });
     } catch (error) {
       // Where the allowlist safeguard lands. `authCallbackUrlFor` throws before
       // `signInWithOtp` is ever called, so this branch is reached with nothing
       // captured yet, and the funnel would otherwise lose the failure entirely.
-      captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, { outcome: "refused" });
+      captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, {
+        outcome: "refused",
+        method: "email",
+      });
       console.error("Jobinno could not send a sign in link.", error);
+      setStatus({ kind: "error", message: SEND_FAILURE_MESSAGE });
+    }
+  }
+
+  /**
+   * JOB-307. The Google OAuth entry point. Supabase handles the whole redirect
+   * itself, so this just tells it where to send the person after the round
+   * trip: the same `/auth/callback` route the emailed link uses. The route
+   * exchanges whatever it is given for a session and takes it from there.
+   *
+   * The `authCallbackUrlFor` guard is the same one the email flow runs, and it
+   * throws the same developer sentence when the origin is not allowlisted, so
+   * the catch below collapses it to `SEND_FAILURE_MESSAGE` for the same reason.
+   */
+  async function onGoogleSignIn() {
+    setStatus({ kind: "sending" });
+
+    try {
+      const supabase = createClient();
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: authCallbackUrlFor(window.location.origin) },
+      });
+
+      if (error) {
+        captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, {
+          outcome: "refused",
+          method: "google",
+        });
+        console.error("Jobinno could not start Google sign in.", error);
+        setStatus({ kind: "error", message: SEND_FAILURE_MESSAGE });
+        return;
+      }
+
+      // On success Supabase navigates the browser to Google, so this code path
+      // typically unmounts before it can be observed. Fire the funnel event
+      // anyway on the chance the redirect is delayed, and leave the status on
+      // "sending" so the button stays disabled during the handoff.
+      captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, {
+        outcome: "sent",
+        method: "google",
+      });
+    } catch (error) {
+      captureClientEvent(ANALYTICS_EVENT.MAGIC_LINK_REQUESTED, {
+        outcome: "refused",
+        method: "google",
+      });
+      console.error("Jobinno could not start Google sign in.", error);
       setStatus({ kind: "error", message: SEND_FAILURE_MESSAGE });
     }
   }
@@ -144,37 +201,56 @@ export function LoginForm({ initialError }: { initialError?: string }) {
             </Button>
           </div>
         ) : (
-          <form onSubmit={onSubmit} className="space-y-5" noValidate>
-            <div className="space-y-2">
-              <Label htmlFor="email">Email</Label>
-              <Input
-                id="email"
-                name="email"
-                type="email"
-                autoComplete="email"
-                placeholder="you@gmail.com"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                disabled={status.kind === "sending"}
-                required
-              />
-            </div>
-
-            {status.kind === "error" ? (
-              <p className="text-sm text-destructive" role="alert">
-                {status.message}
-              </p>
-            ) : null}
-
+          <>
             <Button
-              type="submit"
+              type="button"
               size="lg"
               className="h-10 w-full text-sm"
+              onClick={onGoogleSignIn}
               disabled={status.kind === "sending"}
             >
-              {status.kind === "sending" ? "Sending" : "Email me a link"}
+              {status.kind === "sending" ? "Redirecting" : "Continue with Google"}
             </Button>
-          </form>
+
+            <div className="my-4 flex items-center gap-3">
+              <div className="h-px flex-1 bg-border" />
+              <span className="text-xs text-muted-foreground">or</span>
+              <div className="h-px flex-1 bg-border" />
+            </div>
+
+            <form onSubmit={onSubmit} className="space-y-5" noValidate>
+              <div className="space-y-2">
+                <Label htmlFor="email">Email</Label>
+                <Input
+                  id="email"
+                  name="email"
+                  type="email"
+                  autoComplete="email"
+                  placeholder="you@gmail.com"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  disabled={status.kind === "sending"}
+                  required
+                />
+              </div>
+
+              {status.kind === "error" ? (
+                <p className="text-sm text-destructive" role="alert">
+                  {status.message}
+                </p>
+              ) : null}
+
+              <Button
+                type="submit"
+                variant="outline"
+                size="lg"
+                className="h-10 w-full text-sm"
+                disabled={status.kind === "sending"}
+              >
+                {status.kind === "sending" ? "Sending" : "Email me a link"}
+              </Button>
+            </form>
+          </>
         )}
       </CardContent>
     </Card>
