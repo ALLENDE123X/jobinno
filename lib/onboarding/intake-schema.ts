@@ -364,28 +364,57 @@ export type IntakeInput = z.infer<ReturnType<typeof intakeSchema>>;
 /**
  * Step 1: Resume + identity.
  *
- * File uploads (resume, LinkedIn) are handled client-side and stored in
- * component state only. Their paths are validated by the full intakeSchema
- * on step 5's final submit. This schema validates only githubUrl, which is
- * the one field persisted to profiles on this step.
+ * Resume upload writes directly to the `resumes` table by way of
+ * `saveIntakeDraft`, so browser refresh mid-flow does not orphan the
+ * upload. The ownership check on the storage path is the same one the
+ * final `intakeSchema` uses: this is the moment the row is created, so
+ * this is the moment to reject a path that names somebody else's folder.
+ *
+ * `userId` is optional so callers that only want to validate the shape of
+ * a githubUrl (no upload) can still use this schema. Every code path that
+ * writes a resume path passes it.
  */
-export function step1Schema() {
+export function step1Schema(userId?: string) {
+  const objectPathBase = z
+    .string()
+    .regex(OBJECT_PATH_PATTERN, "That file was not uploaded correctly.");
+  const ownedObjectPath = userId
+    ? objectPathBase.refine(
+        (path) => path.startsWith(`${userId}/`),
+        "That file belongs to a different account.",
+      )
+    : objectPathBase;
+
   return z.object({
     githubUrl: githubUrl.default(null),
+    resumePath: ownedObjectPath.nullable().default(null),
+    linkedinPdfPath: ownedObjectPath.nullable().default(null),
   });
 }
 
 /**
- * Step 2: Work authorization. F1 cross-field check is included: if
- * citizenshipStatus is "f1" then f1Status must not be null.
+ * Step 2: Work authorization.
+ *
+ * F1 cross-field check: if citizenshipStatus is "f1" then f1Status must
+ * not be null.
+ *
+ * workAuthorizedUs and requiresSponsorship are conditional on citizenship
+ * (per JOB-308 round two BLOCKING 1). For a US citizen or permanent
+ * resident these are auto-derived server-side by
+ * `deriveWorkAuthorizedUs` / `deriveRequiresSponsorship`, and the client
+ * omits them from the payload; the schema allows null in that case.
+ * For every other citizenship the client MUST send an explicit boolean;
+ * a null here is rejected so an F1 not yet on OPT can honestly answer
+ * workAuthorizedUs=false rather than have true silently fabricated on
+ * their behalf.
  */
 export const step2Schema = z
   .object({
     citizenshipStatus,
     f1Status: f1Status.nullable().default(null),
     visaStatus: requiredText("Visa status", 200),
-    workAuthorizedUs: z.boolean(),
-    requiresSponsorship: z.boolean(),
+    workAuthorizedUs: z.boolean().nullable().default(null),
+    requiresSponsorship: z.boolean().nullable().default(null),
   })
   .check((ctx) => {
     const value = ctx.value;
@@ -404,6 +433,27 @@ export const step2Schema = z
         path: ["f1Status"],
         message: "OPT and CPT only apply to an F1 visa.",
       });
+    }
+    const inherentlyAuthorized = (
+      INHERENTLY_AUTHORIZED as readonly string[]
+    ).includes(value.citizenshipStatus);
+    if (!inherentlyAuthorized) {
+      if (value.workAuthorizedUs === null) {
+        ctx.issues.push({
+          code: "custom",
+          input: value.workAuthorizedUs,
+          path: ["workAuthorizedUs"],
+          message: "Tell us whether you are authorized to work in the US.",
+        });
+      }
+      if (value.requiresSponsorship === null) {
+        ctx.issues.push({
+          code: "custom",
+          input: value.requiresSponsorship,
+          path: ["requiresSponsorship"],
+          message: "Tell us whether you will need sponsorship.",
+        });
+      }
     }
   });
 

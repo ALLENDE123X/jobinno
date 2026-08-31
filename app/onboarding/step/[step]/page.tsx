@@ -1,22 +1,18 @@
 /**
  * Server component that routes to the correct step client component.
  *
- * Validates the step param, fetches the profile, and computes routing
- * to prevent skipping ahead. Each step component receives the profile
- * data it needs to pre-fill its fields.
+ * Validates the step param, fetches the profile plus the user's latest
+ * resumes row, and computes routing to prevent skipping ahead. Each step
+ * component receives the profile data it needs to pre-fill its fields.
+ *
+ * The resumes row is the source of truth for step 1 completion, and
+ * step 5's summary reads the file path from it (there is no resume_path
+ * column on profiles). See JOB-308 round two BLOCKING 2.
  */
 
-import Link from "next/link";
 import { redirect } from "next/navigation";
 
 import { PageShell } from "@/components/page-shell";
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-} from "@/components/ui/card";
 import { earliestIncompleteStep } from "@/lib/onboarding/step-routing";
 import { createServerClient } from "@/lib/supabase/server";
 
@@ -35,8 +31,8 @@ const TOTAL_STEPS = 5;
  */
 type ProfileData = {
   resume_path: string | null;
-  github_url: string | null;
   linkedin_pdf_path: string | null;
+  github_url: string | null;
   citizenship_status: string | null;
   f1_status: string | null;
   visa_status: string | null;
@@ -85,21 +81,28 @@ export default async function OnboardingStepPage({
 
   if (!user) redirect("/login");
 
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("*")
-    .eq("id", user.id)
-    .maybeSingle();
+  const [{ data: profile }, { data: resumeRow }] = await Promise.all([
+    supabase.from("profiles").select("*").eq("id", user.id).maybeSingle(),
+    supabase
+      .from("resumes")
+      .select("storage_path, linkedin_pdf_path")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
 
   if (!profile) redirect("/login");
 
-  const incompleteStep = earliestIncompleteStep({
-    resumePath: profile.resume_path ?? null,
-    citizenshipStatus: profile.citizenship_status ?? null,
-    currentCity: profile.current_city ?? null,
-    salaryExpectation: profile.salary_expectation ?? null,
-    attestedAt: profile.attested_at ?? null,
-  });
+  const incompleteStep = earliestIncompleteStep(
+    {
+      citizenshipStatus: profile.citizenship_status ?? null,
+      currentCity: profile.current_city ?? null,
+      salaryExpectation: profile.salary_expectation ?? null,
+      attestedAt: profile.attested_at ?? null,
+    },
+    resumeRow ? { storagePath: resumeRow.storage_path ?? null } : null,
+  );
 
   // If attested and not in edit mode, redirect to dashboard.
   if (incompleteStep === 6 && edit !== "1") redirect("/dashboard");
@@ -110,10 +113,18 @@ export default async function OnboardingStepPage({
     redirect(`/onboarding/step/${incompleteStep}`);
   }
 
+  // resumes.storage_path is bucket qualified (see submitIntake and
+  // saveIntakeDraft). The step components deal in object paths, so strip
+  // the leading "resumes/" prefix when passing them down.
+  const resumeObjectPath = stripBucketPrefix(resumeRow?.storage_path ?? null);
+  const linkedinObjectPath = stripBucketPrefix(
+    resumeRow?.linkedin_pdf_path ?? null,
+  );
+
   const profileData: ProfileData = {
-    resume_path: profile.resume_path ?? null,
+    resume_path: resumeObjectPath,
+    linkedin_pdf_path: linkedinObjectPath,
     github_url: profile.github_url ?? null,
-    linkedin_pdf_path: profile.linkedin_pdf_path ?? null,
     citizenship_status: profile.citizenship_status ?? null,
     f1_status: profile.f1_status ?? null,
     visa_status: profile.visa_status ?? null,
@@ -173,4 +184,12 @@ export default async function OnboardingStepPage({
       </main>
     </PageShell>
   );
+}
+
+function stripBucketPrefix(bucketQualifiedPath: string | null): string | null {
+  if (!bucketQualifiedPath) return null;
+  const prefix = "resumes/";
+  return bucketQualifiedPath.startsWith(prefix)
+    ? bucketQualifiedPath.slice(prefix.length)
+    : bucketQualifiedPath;
 }

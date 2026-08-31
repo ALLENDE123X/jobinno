@@ -15,14 +15,6 @@ import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   intakeFieldErrors,
   step3Schema,
@@ -30,8 +22,7 @@ import {
 import { needsSponsorshipNonUsIsRelevant } from "@/lib/onboarding/intake-derivation";
 
 import { saveIntakeDraft } from "../actions";
-
-type YesNo = "yes" | "no" | "";
+import { Field, YesNoField, toBoolean, type YesNo } from "./_shared";
 
 type ProfileData = {
   street_address: string | null;
@@ -44,67 +35,6 @@ type ProfileData = {
   grad_date: string | null;
   earliest_start: string | null;
 };
-
-function Field({
-  label,
-  htmlFor,
-  error,
-  hint,
-  children,
-}: {
-  label: string;
-  htmlFor?: string;
-  error?: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-2">
-      <Label htmlFor={htmlFor}>{label}</Label>
-      {children}
-      {hint ? <p className="text-muted-foreground text-xs">{hint}</p> : null}
-      {error ? (
-        <p className="text-destructive text-sm" role="alert">
-          {error}
-        </p>
-      ) : null}
-    </div>
-  );
-}
-
-function YesNoField({
-  label,
-  value,
-  onChange,
-  error,
-  hint,
-}: {
-  label: string;
-  value: YesNo;
-  onChange: (value: YesNo) => void;
-  error?: string;
-  hint?: string;
-}) {
-  return (
-    <Field label={label} error={error} hint={hint}>
-      <Select value={value} onValueChange={(next) => onChange(next as YesNo)}>
-        <SelectTrigger className="w-full">
-          <SelectValue placeholder="Choose one" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="yes">Yes</SelectItem>
-          <SelectItem value="no">No</SelectItem>
-        </SelectContent>
-      </Select>
-    </Field>
-  );
-}
-
-function toBoolean(value: YesNo): boolean | null {
-  if (value === "yes") return true;
-  if (value === "no") return false;
-  return null;
-}
 
 export function Step3Form({
   profile,
@@ -274,6 +204,7 @@ export function Step3Form({
 
         <YesNoField
           label="Would you relocate for the right role"
+          htmlFor="willing-to-relocate"
           value={willingToRelocate}
           onChange={setWillingToRelocate}
           error={errors.willingToRelocate}
@@ -282,6 +213,7 @@ export function Step3Form({
         {showSponsorshipNonUs ? (
           <YesNoField
             label="Outside the US, would you need sponsorship to work"
+            htmlFor="needs-sponsorship-non-us"
             value={needsSponsorshipNonUs}
             onChange={setNeedsSponsorshipNonUs}
             error={errors.needsSponsorshipNonUs}

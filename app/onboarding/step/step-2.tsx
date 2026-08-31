@@ -3,10 +3,19 @@
 /**
  * Step 2: Work authorization.
  *
- * workAuthorizedUs and requiresSponsorship are auto-derived for US citizens
- * and permanent residents and hidden from the form. The F1 sub-field is
- * shown only when citizenship is F1. visaStatus is pre-filled from
- * citizenship.
+ * For US citizens and permanent residents, workAuthorizedUs and
+ * requiresSponsorship are auto-derived server-side (true and false
+ * respectively) and the explicit Yes/No inputs are not rendered. The
+ * client omits those two fields from the payload in that case, so the
+ * server's `deriveWorkAuthorizedUs` / `deriveRequiresSponsorship` are
+ * the sole authors of the stored values.
+ *
+ * For every other citizenship the Yes/No inputs ARE rendered and are
+ * required. An F1 not yet on OPT can then honestly answer
+ * workAuthorizedUs=false rather than have true silently fabricated on
+ * their behalf. This is the JOB-308 round two BLOCKING 1 fix, and
+ * directly serves HARD STOP 9: no answer we submit on a person's behalf
+ * is one they did not enter themselves.
  *
  * No prose hyphens or em dashes per HARD STOP 8.
  */
@@ -16,7 +25,6 @@ import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -33,6 +41,7 @@ import {
 import { prefillVisaStatus } from "@/lib/onboarding/intake-derivation";
 
 import { saveIntakeDraft } from "../actions";
+import { Field, YesNoField, toBoolean, type YesNo } from "./_shared";
 
 type CitizenshipValue = (typeof CITIZENSHIP_OPTIONS)[number]["value"];
 type F1Value = (typeof F1_STATUS_OPTIONS)[number]["value"];
@@ -44,33 +53,6 @@ type ProfileData = {
   work_authorized_us: boolean | null;
   requires_sponsorship: boolean | null;
 };
-
-function Field({
-  label,
-  htmlFor,
-  error,
-  hint,
-  children,
-}: {
-  label: string;
-  htmlFor?: string;
-  error?: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-2">
-      <Label htmlFor={htmlFor}>{label}</Label>
-      {children}
-      {hint ? <p className="text-muted-foreground text-xs">{hint}</p> : null}
-      {error ? (
-        <p className="text-destructive text-sm" role="alert">
-          {error}
-        </p>
-      ) : null}
-    </div>
-  );
-}
 
 export function Step2Form({
   profile,
@@ -84,8 +66,20 @@ export function Step2Form({
   const [f1Status, setF1Status] = useState<F1Value | "">(
     (profile.f1_status as F1Value) ?? "",
   );
-  const [visaStatus, setVisaStatus] = useState(
-    profile.visa_status ?? "",
+  const [visaStatus, setVisaStatus] = useState(profile.visa_status ?? "");
+  const [workAuthorizedUs, setWorkAuthorizedUs] = useState<YesNo>(
+    profile.work_authorized_us === true
+      ? "yes"
+      : profile.work_authorized_us === false
+        ? "no"
+        : "",
+  );
+  const [requiresSponsorship, setRequiresSponsorship] = useState<YesNo>(
+    profile.requires_sponsorship === true
+      ? "yes"
+      : profile.requires_sponsorship === false
+        ? "no"
+        : "",
   );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<string | null>(null);
@@ -110,13 +104,19 @@ export function Step2Form({
     setErrors({});
 
     try {
-      const payload = {
+      // For US citizens and permanent residents, workAuthorizedUs and
+      // requiresSponsorship are auto-derived server-side; the payload
+      // omits them so the server is the sole author. For every other
+      // citizenship the explicit answer is required.
+      const payload: Record<string, unknown> = {
         citizenshipStatus,
         f1Status: isF1 ? (f1Status === "" ? null : f1Status) : null,
         visaStatus,
-        workAuthorizedUs: isUsOrPr ? true : true,
-        requiresSponsorship: isUsOrPr ? false : false,
       };
+      if (!isUsOrPr) {
+        payload.workAuthorizedUs = toBoolean(workAuthorizedUs);
+        payload.requiresSponsorship = toBoolean(requiresSponsorship);
+      }
 
       const parsed = step2Schema.safeParse(payload);
       if (!parsed.success) {
@@ -147,14 +147,18 @@ export function Step2Form({
       <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
         <h2 className="text-lg font-medium">Work authorization</h2>
 
-        <Field label="Citizenship status" error={errors.citizenshipStatus}>
+        <Field
+          label="Citizenship status"
+          htmlFor="citizenship"
+          error={errors.citizenshipStatus}
+        >
           <Select
             value={citizenshipStatus}
             onValueChange={(next) =>
               handleCitizenshipChange(next as CitizenshipValue)
             }
           >
-            <SelectTrigger className="w-full">
+            <SelectTrigger id="citizenship" className="w-full">
               <SelectValue placeholder="Choose one" />
             </SelectTrigger>
             <SelectContent>
@@ -168,12 +172,16 @@ export function Step2Form({
         </Field>
 
         {isF1 ? (
-          <Field label="Which F1 work authorization" error={errors.f1Status}>
+          <Field
+            label="Which F1 work authorization"
+            htmlFor="f1-status"
+            error={errors.f1Status}
+          >
             <Select
               value={f1Status}
               onValueChange={(next) => setF1Status(next as F1Value)}
             >
-              <SelectTrigger className="w-full">
+              <SelectTrigger id="f1-status" className="w-full">
                 <SelectValue placeholder="Choose one" />
               </SelectTrigger>
               <SelectContent>
@@ -206,7 +214,26 @@ export function Step2Form({
             As a {citizenshipStatus === "us_citizen" ? "US citizen" : "permanent resident"}, you are
             authorized to work in the US and do not need sponsorship.
           </p>
-        ) : null}
+        ) : citizenshipStatus === "" ? null : (
+          <>
+            <YesNoField
+              label="Are you authorized to work in the US"
+              htmlFor="work-authorized"
+              value={workAuthorizedUs}
+              onChange={setWorkAuthorizedUs}
+              error={errors.workAuthorizedUs}
+              hint="Answer yes only if you can work in the US today without new sponsorship. An F1 on OPT can answer yes; an F1 not yet on OPT should answer no."
+            />
+            <YesNoField
+              label="Will you need visa sponsorship, now or in the future"
+              htmlFor="requires-sponsorship"
+              value={requiresSponsorship}
+              onChange={setRequiresSponsorship}
+              error={errors.requiresSponsorship}
+              hint="Answer yes if any US employer would need to sponsor you now or when your current authorization ends."
+            />
+          </>
+        )}
       </section>
 
       {message ? (

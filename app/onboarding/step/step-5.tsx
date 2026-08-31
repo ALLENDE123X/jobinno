@@ -7,11 +7,9 @@
  * checkbox, and the final submit button. This step calls submitIntake
  * (the full-submit action), NOT saveIntakeDraft.
  *
- * File paths (resume, LinkedIn) are read from the transient
- * window.__onboardingDraft map that step 1 stored. If the user navigated
- * directly to step 5 without going through step 1 in this session, those
- * paths will be null and submitIntake will reject the missing resume path,
- * which is the correct behavior.
+ * File paths (resume, LinkedIn) come from the resumes-table lookup in
+ * the server component that renders this step, so a browser refresh at
+ * step 5 does not lose them. See JOB-308 round two BLOCKING 2.
  *
  * No prose hyphens or em dashes per HARD STOP 8.
  */
@@ -131,19 +129,11 @@ export function Step5Form({
     setErrors({});
 
     try {
-      // Read file paths from the transient window map that step 1 stored.
-      const w =
-        typeof window !== "undefined"
-          ? (window as unknown as Record<string, unknown>)
-          : null;
-      const draft =
-        w && typeof w.__onboardingDraft === "object" && w.__onboardingDraft !== null
-          ? (w.__onboardingDraft as Record<string, unknown>)
-          : null;
-
-      const resumePath = (draft?.resumePath as string) ?? profile.resume_path;
-      const linkedinPdfPath =
-        (draft?.linkedinPdfPath as string) ?? profile.linkedin_pdf_path;
+      // resume_path and linkedin_pdf_path come from the server component
+      // that renders this step; it reads the user's latest resumes row
+      // and strips the bucket prefix. See app/onboarding/step/[step]/page.tsx.
+      const resumePath = profile.resume_path;
+      const linkedinPdfPath = profile.linkedin_pdf_path;
 
       const payload = {
         citizenshipStatus: profile.citizenship_status,

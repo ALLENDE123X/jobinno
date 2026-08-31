@@ -14,7 +14,6 @@ import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -31,10 +30,10 @@ import {
 import { clearanceLevelIsRelevant } from "@/lib/onboarding/intake-derivation";
 
 import { saveIntakeDraft } from "../actions";
+import { Field, YesNoField, toBoolean, type YesNo } from "./_shared";
 
 type ClearanceValue = (typeof CLEARANCE_ELIGIBILITY_OPTIONS)[number]["value"];
 type ClearanceLevelValue = (typeof CLEARANCE_LEVEL_OPTIONS)[number]["value"];
-type YesNo = "yes" | "no" | "";
 
 type ProfileData = {
   salary_expectation: string | null;
@@ -46,67 +45,6 @@ type ProfileData = {
   high_school_name: string | null;
   high_school_grad_year: number | null;
 };
-
-function Field({
-  label,
-  htmlFor,
-  error,
-  hint,
-  children,
-}: {
-  label: string;
-  htmlFor?: string;
-  error?: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-2">
-      <Label htmlFor={htmlFor}>{label}</Label>
-      {children}
-      {hint ? <p className="text-muted-foreground text-xs">{hint}</p> : null}
-      {error ? (
-        <p className="text-destructive text-sm" role="alert">
-          {error}
-        </p>
-      ) : null}
-    </div>
-  );
-}
-
-function YesNoField({
-  label,
-  value,
-  onChange,
-  error,
-  hint,
-}: {
-  label: string;
-  value: YesNo;
-  onChange: (value: YesNo) => void;
-  error?: string;
-  hint?: string;
-}) {
-  return (
-    <Field label={label} error={error} hint={hint}>
-      <Select value={value} onValueChange={(next) => onChange(next as YesNo)}>
-        <SelectTrigger className="w-full">
-          <SelectValue placeholder="Choose one" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="yes">Yes</SelectItem>
-          <SelectItem value="no">No</SelectItem>
-        </SelectContent>
-      </Select>
-    </Field>
-  );
-}
-
-function toBoolean(value: YesNo): boolean | null {
-  if (value === "yes") return true;
-  if (value === "no") return false;
-  return null;
-}
 
 export function Step4Form({
   profile,
@@ -222,6 +160,7 @@ export function Step4Form({
 
         <Field
           label="Do you hold a clearance, or could you get one"
+          htmlFor="clearance-eligibility"
           error={errors.clearanceEligibility}
         >
           <Select
@@ -230,7 +169,7 @@ export function Step4Form({
               setClearanceEligibility(next as ClearanceValue)
             }
           >
-            <SelectTrigger className="w-full">
+            <SelectTrigger id="clearance-eligibility" className="w-full">
               <SelectValue placeholder="Choose one" />
             </SelectTrigger>
             <SelectContent>
@@ -246,6 +185,7 @@ export function Step4Form({
         {showClearanceLevel ? (
           <Field
             label="The highest clearance you have ever held"
+            htmlFor="clearance-level"
             error={errors.clearanceLevelHeld}
           >
             <Select
@@ -254,7 +194,7 @@ export function Step4Form({
                 setClearanceLevelHeld(next as ClearanceLevelValue)
               }
             >
-              <SelectTrigger className="w-full">
+              <SelectTrigger id="clearance-level" className="w-full">
                 <SelectValue placeholder="Choose one" />
               </SelectTrigger>
               <SelectContent>
@@ -278,6 +218,7 @@ export function Step4Form({
 
         <YesNoField
           label="Are you under a non compete or non solicitation agreement"
+          htmlFor="restrictive-covenant"
           value={subjectToRestrictiveCovenant}
           onChange={setSubjectToRestrictiveCovenant}
           error={errors.subjectToRestrictiveCovenant}
@@ -286,6 +227,7 @@ export function Step4Form({
 
         <YesNoField
           label="Do you have relatives working at any company you might apply to"
+          htmlFor="relatives-at-target"
           value={relativesAtTargetEmployers}
           onChange={setRelativesAtTargetEmployers}
           error={errors.relativesAtTargetEmployers}
@@ -294,6 +236,7 @@ export function Step4Form({
 
         <YesNoField
           label="Have you ever worked at any company you might apply to"
+          htmlFor="previously-employed-at-target"
           value={previouslyEmployedAtTargetEmployers}
           onChange={setPreviouslyEmployedAtTargetEmployers}
           error={errors.previouslyEmployedAtTargetEmployers}

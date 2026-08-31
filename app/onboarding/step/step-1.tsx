@@ -3,9 +3,11 @@
 /**
  * Step 1: Resume + identity.
  *
- * File uploads happen here and stay in component state. Their paths are
- * validated by the full intakeSchema on step 5's final submit. The one
- * field persisted to profiles on this step is githubUrl.
+ * File uploads go straight to Storage, then straight into the resumes
+ * table via saveIntakeDraft on this step. That way step-routing has a
+ * real row to key off (step 1 is complete iff a resumes row exists) and
+ * a browser refresh mid-flow does not orphan the upload. See JOB-308
+ * round two BLOCKING 2.
  *
  * No prose hyphens or em dashes per HARD STOP 8.
  */
@@ -15,41 +17,16 @@ import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { RESUMES_BUCKET, createClient } from "@/lib/supabase/client";
 
 import { saveIntakeDraft } from "../actions";
+import { Field } from "./_shared";
 
 type ProfileData = {
   github_url: string | null;
+  resume_path: string | null;
+  linkedin_pdf_path: string | null;
 };
-
-function Field({
-  label,
-  htmlFor,
-  error,
-  hint,
-  children,
-}: {
-  label: string;
-  htmlFor?: string;
-  error?: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-2">
-      <Label htmlFor={htmlFor}>{label}</Label>
-      {children}
-      {hint ? <p className="text-muted-foreground text-xs">{hint}</p> : null}
-      {error ? (
-        <p className="text-destructive text-sm" role="alert">
-          {error}
-        </p>
-      ) : null}
-    </div>
-  );
-}
 
 export function Step1Form({
   userId,
@@ -67,6 +44,8 @@ export function Step1Form({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  const hasExistingResume = Boolean(profile.resume_path);
 
   async function upload(file: File): Promise<string> {
     const supabase = createClient();
@@ -87,7 +66,7 @@ export function Step1Form({
     setErrors({});
 
     try {
-      if (!resumeFile && !isEdit) {
+      if (!resumeFile && !hasExistingResume) {
         setErrors({ resumePath: "Attach your resume as a PDF." });
         setBusy(false);
         return;
@@ -103,23 +82,15 @@ export function Step1Form({
         linkedinPdfPath = await upload(linkedinFile);
       }
 
-      // Persist only githubUrl to the server. File paths live in
-      // component state until step 5's final submit. The window object
-      // is used to pass file paths between steps via a transient map;
-      // this avoids adding a database column for draft state that is
-      // only needed across a single navigation.
-      if (typeof window !== "undefined") {
-        const w = window as unknown as Record<string, unknown>;
-        w.__onboardingDraft = {
-          ...(typeof w.__onboardingDraft === "object" && w.__onboardingDraft !== null
-            ? (w.__onboardingDraft as Record<string, unknown>)
-            : {}),
+      const result = await saveIntakeDraft(
+        {
+          githubUrl: githubUrl || null,
           resumePath,
           linkedinPdfPath,
-        };
-      }
+        },
+        1,
+      );
 
-      const result = await saveIntakeDraft({ githubUrl: githubUrl || null }, 1);
       if (result.ok) {
         router.push("/onboarding/step/2");
         return;
@@ -145,14 +116,18 @@ export function Step1Form({
           label="Resume, as a PDF"
           htmlFor="resume"
           error={errors.resumePath}
-          hint="This is the file we attach to every application."
+          hint={
+            hasExistingResume
+              ? "Upload a new file to replace the one on record, or leave blank to keep it."
+              : "This is the file we attach to every application."
+          }
         >
           <Input
             id="resume"
             type="file"
             accept="application/pdf"
             onChange={(event) => setResumeFile(event.target.files?.[0] ?? null)}
-            required={!isEdit}
+            required={!hasExistingResume && !isEdit}
           />
         </Field>
 

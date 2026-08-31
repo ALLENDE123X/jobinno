@@ -142,26 +142,61 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // Written after the profile, deliberately. The other order leaves a resume
   // pointing at a profile that never got its answers, which nothing downstream
   // can tell apart from a half filled form.
-  // JOB-112 added the `select`. The new row's id is what `intake/completed`
-  // carries, so the parse runs against the row this submit created rather than
-  // against whichever row a second lookup would have found — which for someone
-  // re-uploading is a race with their own previous resume.
-  const { data: resumeRow, error: resumeError } = await supabase
-    .from("resumes")
-    .insert({
-      user_id: user.id,
-      // Bucket qualified, matching the convention `lib/candidate-intake.ts` uses
-      // for every stored resume path: a path to sign a URL from, never a URL.
-      storage_path: `${RESUMES_BUCKET}/${intake.resumePath}`,
-      linkedin_pdf_path: intake.linkedinPdfPath
-        ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`
-        : null,
-    })
-    .select("id")
-    .single();
+  //
+  // JOB-308 round two: step 1 now inserts the resumes row via saveIntakeDraft
+  // so the multi page flow has a real row to key its routing off. When we
+  // reach this final submit, that row is already in place, so we look it up
+  // by storage_path rather than inserting a duplicate. If nothing matches
+  // (a user who somehow reached step 5 without a step 1 insert), we fall
+  // back to the original insert. Either way, the id we hand
+  // `requestDocumentParse` is a real row this user owns.
+  const bucketQualifiedResumePath = `${RESUMES_BUCKET}/${intake.resumePath}`;
+  const bucketQualifiedLinkedinPath = intake.linkedinPdfPath
+    ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`
+    : null;
 
-  if (resumeError) {
-    return { ok: false, message: `Could not save your resume: ${resumeError.message}` };
+  const { data: existingResume } = await supabase
+    .from("resumes")
+    .select("id, linkedin_pdf_path")
+    .eq("user_id", user.id)
+    .eq("storage_path", bucketQualifiedResumePath)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  let resumeRow: { id: string } | null = existingResume
+    ? { id: existingResume.id }
+    : null;
+
+  if (
+    existingResume &&
+    existingResume.linkedin_pdf_path !== bucketQualifiedLinkedinPath
+  ) {
+    // The LinkedIn PDF was added or replaced between step 1 and step 5.
+    await supabase
+      .from("resumes")
+      .update({ linkedin_pdf_path: bucketQualifiedLinkedinPath })
+      .eq("id", existingResume.id);
+  }
+
+  if (!existingResume) {
+    const { data: inserted, error: resumeError } = await supabase
+      .from("resumes")
+      .insert({
+        user_id: user.id,
+        storage_path: bucketQualifiedResumePath,
+        linkedin_pdf_path: bucketQualifiedLinkedinPath,
+      })
+      .select("id")
+      .single();
+
+    if (resumeError) {
+      return {
+        ok: false,
+        message: `Could not save your resume: ${resumeError.message}`,
+      };
+    }
+    resumeRow = inserted;
   }
 
   // Last, and only once everything it attests to is actually in the database.
@@ -244,13 +279,14 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
 // the attestation stamp. saveIntakeDraft validates only the step's own
 // fields, applies any derivations, and upserts into profiles.
 //
-// Resume upload state is kept in step 1's local component state and only
-// persisted to the resumes table on step 5's final submit (via
-// submitIntake). The tradeoff is that a user who uploads a resume on
-// step 1 but abandons the flow has an orphaned file in storage; the
-// bucket's lifecycle policy handles cleanup, and the simpler component
-// state avoids a draft insert into resumes that has no upsert semantics
-// and would need a second write on step 5 anyway.
+// Step 1 writes resumes.storage_path directly rather than staging it in
+// component or window state, so browser refresh mid-flow does not orphan
+// the upload and users can resume where they left off. This also means
+// step-routing has a real row to key off (the resumes row is what marks
+// step 1 complete). A user who bounces mid-flow leaves a resumes row
+// linked to their user_id with no attested profile; this is the same
+// state as any pre-intake user, and the existing cleanup pattern handles
+// it. See JOB-308 round two BLOCKING 2 for why this had to change.
 
 export async function saveIntakeDraft(
   payload: unknown,
@@ -273,7 +309,7 @@ export async function saveIntakeDraft(
   let validated: Record<string, unknown>;
   switch (step) {
     case 1: {
-      const parsed = step1Schema().safeParse(payload);
+      const parsed = step1Schema(user.id).safeParse(payload);
       if (!parsed.success)
         return { ok: false, errors: intakeFieldErrors(parsed.error) };
       validated = parsed.data;
@@ -317,9 +353,10 @@ export async function saveIntakeDraft(
 
   switch (step) {
     case 1:
-      // Step 1 only collects GitHub URL and file paths. Resume upload
-      // state lives in the client component (see file header). Only
-      // githubUrl is persisted to profiles on this step.
+      // Step 1 collects GitHub URL and file paths. githubUrl goes on
+      // profiles; resume + LinkedIn PDF paths go into the resumes table
+      // below, after the profiles update lands. See file header for why
+      // this writes to resumes rather than staging in the browser.
       if ("githubUrl" in validated) {
         update.github_url = validated.githubUrl;
       }
@@ -399,6 +436,34 @@ export async function saveIntakeDraft(
       ok: false,
       message: `Could not save your details: ${error.message}`,
     };
+  }
+
+  // Step 1 also writes the resume + LinkedIn PDF paths into the resumes
+  // table. Written after the profiles update, deliberately: the other
+  // order leaves a resume pointing at a profile the caller could not
+  // update. When a user re-uploads on an edit, the latest row (ordered
+  // by created_at desc) becomes their canonical resume; earlier rows
+  // stay behind as history.
+  if (step === 1) {
+    const resumePath = validated.resumePath as string | null;
+    const linkedinPdfPath = validated.linkedinPdfPath as string | null;
+    if (resumePath) {
+      // Bucket qualified, matching the convention `submitIntake` and
+      // `lib/candidate-intake.ts` write it under.
+      const { error: resumeError } = await supabase.from("resumes").insert({
+        user_id: user.id,
+        storage_path: `${RESUMES_BUCKET}/${resumePath}`,
+        linkedin_pdf_path: linkedinPdfPath
+          ? `${RESUMES_BUCKET}/${linkedinPdfPath}`
+          : null,
+      });
+      if (resumeError) {
+        return {
+          ok: false,
+          message: `Could not save your resume: ${resumeError.message}`,
+        };
+      }
+    }
   }
 
   revalidatePath("/onboarding");
