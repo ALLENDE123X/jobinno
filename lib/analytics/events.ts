@@ -92,8 +92,11 @@ export type AnalyticsProperties = Record<string, AnalyticsPropertyValue>;
  * fact about the funnel and none of them is a fact about a person.
  */
 export const ALLOWED_PROPERTIES: Readonly<Record<AnalyticsEvent, ReadonlySet<string>>> = {
-  // "sent" or "refused". Never the address the link was sent to.
-  [ANALYTICS_EVENT.MAGIC_LINK_REQUESTED]: new Set(["outcome"]),
+  // "sent" or "refused". Never the address the link was sent to. `method` is
+  // "email" for the emailed sign in link and "google" for the Google OAuth
+  // button, so a funnel can split conversion by the entry point the person
+  // actually picked (JOB-307).
+  [ANALYTICS_EVENT.MAGIC_LINK_REQUESTED]: new Set(["outcome", "method"]),
   // One of the routes the callback actually redirects to, or "other". Bucketed
   // in the route rather than passed through; see `knownDestination` there.
   [ANALYTICS_EVENT.SESSION_ESTABLISHED]: new Set(["destination"]),
