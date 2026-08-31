@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   classifiedIntentMustBlock,
   fabricatedEeoDeclineProvenanceEntry,
+  fabricatedEeoNoDeclineProvenanceEntry,
   parseStoredAnswers,
   rememberAnswers,
   resolveAnswer,
@@ -534,6 +535,48 @@ describe("fabricatedEeoDeclineProvenanceEntry", () => {
 
   it("truncates each string field the same way answerProvenanceEntry does", () => {
     const entry = fabricatedEeoDeclineProvenanceEntry({
+      fieldKey: "x".repeat(400),
+      fieldLabel: "y".repeat(400),
+      questionText: "z".repeat(600),
+      chosenOption: "w".repeat(3_000),
+    });
+    expect(entry.field_key).toHaveLength(300);
+    expect(entry.field_label).toHaveLength(300);
+    expect(entry.question_text).toHaveLength(500);
+    expect(entry.answered_value).toHaveLength(2_000);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+/**
+ * JOB-298. `fabricatedEeoNoDeclineProvenanceEntry` writes the
+ * `"fabricated_eeo_no_decline"` bucket `lib/fill-application-form.ts`'s
+ * no-decline fabrication rung logs into `applications.answer_provenance`, so
+ * a later audit can tell it apart from the JOB-262 carve out and from an
+ * ordinary `"llm_fabrication"` or `"sane_default"` row: no model ever ran
+ * for this field, and the value recorded is always an option the form itself
+ * already offered.
+ */
+describe("fabricatedEeoNoDeclineProvenanceEntry", () => {
+  it("records the chosen option under the fabricated_eeo_no_decline source, with no model confidence", () => {
+    const entry = fabricatedEeoNoDeclineProvenanceEntry({
+      fieldKey: "veteran status",
+      fieldLabel: "Veteran Status",
+      questionText: "Veteran Status",
+      chosenOption: "No",
+    });
+    expect(entry).toEqual({
+      field_key: "veteran status",
+      field_label: "Veteran Status",
+      question_text: "Veteran Status",
+      answered_value: "No",
+      source: "fabricated_eeo_no_decline",
+    });
+    expect(entry.model_confidence).toBeUndefined();
+  });
+
+  it("truncates each string field the same way fabricatedEeoDeclineProvenanceEntry does", () => {
+    const entry = fabricatedEeoNoDeclineProvenanceEntry({
       fieldKey: "x".repeat(400),
       fieldLabel: "y".repeat(400),
       questionText: "z".repeat(600),

@@ -411,13 +411,29 @@ export type ResolvedAnswer = {
  * on purpose: no model ever sees this field and no free text is ever
  * written, only an option the form itself offered, so a later audit should
  * be able to tell the two mechanisms apart at a glance.
+ *
+ * `"fabricated_eeo_no_decline"` is JOB-298's addition. It is written for
+ * the same branch on every board, when a required self identification
+ * question offered no option `DECLINE_OPTION_RE` or `EEO_DECLINE_ANALOG_RE`
+ * recognises at all and `resolveDecision` picks the permissive neutral
+ * default from the options the form itself offered: "No" (or a "no" shaped
+ * option) on a veteran status question, otherwise a "prefer not" shaped
+ * choice or the first non empty option. It is kept apart from the sources
+ * above on the same argument, because the exact same invariants hold: no
+ * model ever sees this field, no free text is ever written, only an option
+ * the form itself offered, so a later audit should be able to tell the
+ * mechanisms apart at a glance.
  */
 export type AnswerProvenanceEntry = {
   field_key: string;
   field_label: string;
   question_text: string;
   answered_value: string;
-  source: "llm_fabrication" | "sane_default" | "fabricated_eeo_decline";
+  source:
+    | "llm_fabrication"
+    | "sane_default"
+    | "fabricated_eeo_decline"
+    | "fabricated_eeo_no_decline";
   model_confidence?: number;
 };
 
@@ -465,6 +481,31 @@ export function fabricatedEeoDeclineProvenanceEntry(input: {
     question_text: input.questionText.slice(0, 500),
     answered_value: input.chosenOption.slice(0, 2_000),
     source: "fabricated_eeo_decline",
+  };
+}
+
+/**
+ * JOB-298. Builds one `"fabricated_eeo_no_decline"` provenance entry
+ * directly from the field and the option chosen for it, mirroring
+ * `fabricatedEeoDeclineProvenanceEntry` above for the wider rung that
+ * follows the JOB-262 carve out. There is no `ResolvedAnswer` to build one
+ * from here either: this path never calls the fabrication rung, never sees a
+ * model, and never has a confidence score. It only ever picks an option the
+ * form itself already offered, so the entry records that option and nothing
+ * else.
+ */
+export function fabricatedEeoNoDeclineProvenanceEntry(input: {
+  fieldKey: string;
+  fieldLabel: string;
+  questionText: string;
+  chosenOption: string;
+}): AnswerProvenanceEntry {
+  return {
+    field_key: input.fieldKey.slice(0, 300),
+    field_label: input.fieldLabel.slice(0, 300),
+    question_text: input.questionText.slice(0, 500),
+    answered_value: input.chosenOption.slice(0, 2_000),
+    source: "fabricated_eeo_no_decline",
   };
 }
 

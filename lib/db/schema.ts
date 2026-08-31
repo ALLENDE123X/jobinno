@@ -289,9 +289,33 @@ function inList(column: string, values: readonly string[]) {
  * user cascades here, and from here to resumes and applications, which is the
  * whole account deletion story in one constraint.
  *
- * Note what is not here: race, gender, veteran status and disability status.
- * HARD STOP 10 says those are answered "decline to self identify" on every form
- * and never stored, so there is deliberately nowhere to store them.
+ * ── HARD STOP #10, in two invariants, since JOB-298 round two ──────────────
+ *
+ * The persistence invariant still holds unchanged: race, gender, veteran
+ * status and disability status are never stored in a `profiles` column and
+ * never in any other persistent Supabase column. Nothing on this table is a
+ * demographic self identification, and nothing anywhere else is either. The
+ * only place a form provided demographic option is ever recorded is the
+ * transient `applications.answer_provenance` jsonb (see that column's
+ * docstring), which is a record of what the pipeline sent the employer for a
+ * specific run, not a stored identity anything can query back to derive a
+ * profile fact from.
+ *
+ * The transmission invariant narrows. The round one wording said those four
+ * fields are "answered 'decline to self identify' on every form", which is
+ * no longer literally true. JOB-298 authorizes the pipeline to transmit an
+ * option the form itself offered on veteran and disability fields where the
+ * form provides no decline option at all, choosing the "no" shaped default
+ * per `feedback_pipeline_may_fabricate_form_answers.md`. Race, gender,
+ * ethnicity, national origin, sexual orientation and every other demographic
+ * category still escalate to `needs_attestation` on a no decline form
+ * rather than transmit a fabricated answer, because there is no neutral
+ * default for those without inventing an identity for a real person. See
+ * `resolveDecision`'s EEO branch and `chooseEeoFabricationDefault` in
+ * `lib/fill-application-form.ts` for the exact fabrication policy, and
+ * HARD STOP #10 in CLAUDE.md for the boundary neither of those may cross:
+ * nothing here ever asserts an identity, and every option ever selected is
+ * one the form itself already offered.
  */
 export const profiles = pgTable(
   "profiles",
@@ -935,6 +959,49 @@ export const applications = pgTable(
      * ("EEO answers never appear here") now holds in the narrower form that
      * matters: no demographic identity is ever fabricated, defaulted, or
      * transmitted, only ever a decline the form itself offered.
+     *
+     * ── JOB-298: fabrication when there is no decline at all ──────────────
+     *
+     * A form on any board can require a self identification answer and offer
+     * nothing `findDeclineOption` or `findDeclineAnalogOption` recognises: no
+     * "N/A", no "prefer not", no way to decline at all. A real VetsEZ Breezy
+     * form did exactly this, a mandatory veteran status question offering only
+     * "Yes" and "No". Leaving it blank fails a required control and stopped
+     * the run as `needs_attestation`.
+     *
+     * The 2026 08 26 fabrication product decision in
+     * `feedback_pipeline_may_fabricate_form_answers` authorizes fabricating a
+     * permissive neutral default here too, and `resolveDecision` in
+     * `lib/fill-application-form.ts` now does so deterministically on every
+     * board, but only for the two demographic categories whose neutral
+     * default is genuinely a denial: veteran / military service, and
+     * disability. "No" (or a "no" shaped option) on a veteran service
+     * question, "No, I do not have a disability" (or the closest "no"
+     * shape) on a disability control, or a "prefer not" shaped choice when
+     * one is present on either. A `source: "fabricated_eeo_no_decline"`
+     * row is written here so an audit can tell this rung apart from the
+     * JOB-262 carve out and from an ordinary decline.
+     *
+     * Round two of JOB-298, per the red team finding on this same PR: race,
+     * gender, ethnicity, national origin and every other demographic
+     * category still escalate rather than fabricate on a no decline form.
+     * The round one shape returned `options[0]` for those and would have
+     * written a false ancestry claim or a false OFCCP disability
+     * affirmative to the employer, which the round two narrowing per
+     * Pranav's product call refuses. Those categories therefore continue
+     * never to appear in this jsonb: a race dropdown with no decline
+     * option produces a `needs_attestation` row on `applications`, not an
+     * `answer_provenance` entry.
+     *
+     * The persistence invariant above narrows rather than disappears, and
+     * this section states the narrower form honestly: this rung can and
+     * does hand a demographic category to the form for the two named
+     * categories, but it is always a literal option the form itself already
+     * offered, never a model inference and never free text. That is the
+     * same boundary JOB-262 draws, with the single difference that the
+     * chosen option need not be decline shaped. The value goes no further
+     * than `answer_provenance` and the form itself; no new column holds it
+     * and nothing infers it back.
      */
     answerProvenance: jsonb("answer_provenance"),
     createdAt: timestamp("created_at", { withTimezone: true })
