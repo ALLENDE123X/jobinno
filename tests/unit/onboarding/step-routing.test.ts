@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   earliestIncompleteStep,
+  postAuthOnboardingPath,
   type ProfileForRouting,
   type ResumeForRouting,
 } from "@/lib/onboarding/step-routing";
@@ -125,5 +126,26 @@ describe("earliestIncompleteStep", () => {
       resumeRow,
     );
     expect(result).toBe(1);
+  });
+});
+
+// JOB-309. postAuthOnboardingPath is what actually decides where a signed in
+// user lands: app/onboarding/page.tsx (the real post-auth destination) and
+// app/onboarding/preview/page.tsx both redirect through it rather than each
+// hardcoding their own view of what step 1 or step 6 means.
+describe("postAuthOnboardingPath", () => {
+  it("sends someone who has not started step 1 to the preview page, not straight to step 1", () => {
+    expect(postAuthOnboardingPath(1)).toBe("/onboarding/preview");
+  });
+
+  it("sends an already attested profile to the dashboard", () => {
+    expect(postAuthOnboardingPath(6)).toBe("/dashboard");
+  });
+
+  it("sends anyone mid intake to their own numbered step", () => {
+    expect(postAuthOnboardingPath(2)).toBe("/onboarding/step/2");
+    expect(postAuthOnboardingPath(3)).toBe("/onboarding/step/3");
+    expect(postAuthOnboardingPath(4)).toBe("/onboarding/step/4");
+    expect(postAuthOnboardingPath(5)).toBe("/onboarding/step/5");
   });
 });
