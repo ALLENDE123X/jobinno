@@ -25,7 +25,7 @@ describe("the dashboard upgrade cards", () => {
     expect(
       starter.getByRole("heading", { level: 3, name: "Starter" }),
     ).toBeInTheDocument();
-    expect(starter.getByText("$29")).toBeInTheDocument();
+    expect(starter.getByText("$9")).toBeInTheDocument();
     expect(starter.getByText("per month")).toBeInTheDocument();
     expect(
       starter.getByText("150 applications every month"),
@@ -40,7 +40,7 @@ describe("the dashboard upgrade cards", () => {
     expect(
       season.getByRole("heading", { level: 3, name: "Season Pass" }),
     ).toBeInTheDocument();
-    expect(season.getByText("$99")).toBeInTheDocument();
+    expect(season.getByText("$29")).toBeInTheDocument();
     expect(season.getByText("one time")).toBeInTheDocument();
     expect(
       season.getByText("500 applications, valid 6 months"),
