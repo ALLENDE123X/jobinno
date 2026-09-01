@@ -35,13 +35,17 @@
  * proving the same thing.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import Link from "next/link";
 import { FileText, LogIn, Moon } from "lucide-react";
 
 import { captureClientEvent } from "@/components/analytics";
 import { ANALYTICS_EVENT } from "@/lib/analytics/events";
+import {
+  META_EVENT,
+  trackMetaPixelEvent,
+} from "@/lib/analytics/meta-pixel-client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -130,6 +134,18 @@ export function LoginForm({ initialError }: { initialError?: string }) {
   const [status, setStatus] = useState<Status>(
     initialError ? { kind: "error", message: initialError } : { kind: "idle" }
   );
+
+  // JOB-328. Meta Pixel Lead event, fired once per mount of this form. The
+  // Meta ad auction learns which impressions produced a Lead by seeing the
+  // event fire on the landing page a click delivered to. `page.tsx` already
+  // redirects a signed-in visitor away from this route, so the effect only
+  // runs for a visitor who is actually seeing the sign-in form and is a
+  // legitimate top of funnel event. Empty deps so a route change back to
+  // /login refires once rather than on every re-render. Silently no-ops
+  // when NEXT_PUBLIC_META_PIXEL_ID is unset; see meta-pixel-client.ts.
+  useEffect(() => {
+    trackMetaPixelEvent(META_EVENT.LEAD);
+  }, []);
 
   async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
