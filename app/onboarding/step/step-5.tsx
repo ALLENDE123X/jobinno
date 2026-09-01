@@ -200,7 +200,8 @@ export function Step5Form({
       >
         <p className="text-lg font-medium">Thanks, that is everything.</p>
         <p className="text-muted-foreground text-sm">
-          We have your resume and your answers.
+          Your first applications are queued. They will appear on your
+          dashboard as they go out, usually within a few minutes.
         </p>
         <Button asChild size="lg" className="h-10">
           <Link href="/dashboard">Go to your applications</Link>

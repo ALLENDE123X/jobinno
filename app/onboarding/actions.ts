@@ -39,6 +39,7 @@ import { revalidatePath } from "next/cache";
 import { ANALYTICS_EVENT } from "@/lib/analytics/events";
 import { captureServerEvent } from "@/lib/analytics/posthog-server";
 import { requestDocumentParse } from "@/lib/candidate-document-trigger";
+import { requestJobSearch } from "@/lib/job-search-trigger";
 import { recordAttestation } from "@/lib/onboarding/attestation";
 import {
   clearanceLevelIsRelevant,
@@ -273,6 +274,22 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // column is empty, so a failure here costs one slower first application and
   // nothing else. That is why it cannot fail the submit.
   await requestDocumentParse(user.id, String(resumeRow?.id ?? ""));
+
+  // JOB-326. Fire the first job search as part of attestation, not deferred
+  // to the daily cron or a second button press. The marketing copy sells
+  // "set it up once, wake up to applications"; without this call, a freshly
+  // attested user lands on an empty dashboard and either waits up to 24h for
+  // the cron or has to press Find jobs now themselves, and neither is what
+  // the landing page promised. Best effort: the attestation write above is
+  // the point of no return, so an Inngest event send that fails here goes to
+  // the server log and the daily cron picks up the row as a fallback. The
+  // existing concurrency guard in discoverListings (keyed on userId) handles
+  // the double fire case if the user also clicks Find jobs now on landing.
+  try {
+    await requestJobSearch(user.id);
+  } catch (error) {
+    console.error("[onboarding] requestJobSearch failed after attestation:", error);
+  }
 
   revalidatePath("/onboarding");
   return { ok: true };
