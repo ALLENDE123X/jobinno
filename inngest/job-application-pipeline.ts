@@ -485,10 +485,49 @@ export const discoverListings = inngest.createFunction(
         );
       }
 
-      // Attestation and a resume, checked once here rather than N times in N
-      // fanned out runs. The live search this replaced had the same property by
-      // accident: it called `loadCandidate`, which threw on either. Neither
-      // improves by being retried, so neither is retried.
+      // JOB-330: the "no active resume" case is now expected and not an
+      // error. Cold mobile signups take the LinkedIn URL deferred lane on
+      // step 1, attest, and enter the funnel with `linkedin_url_pending`
+      // set but no `resumes` row. The daily cron (see
+      // `inngest/job-search-schedule.ts`) fires for them like any other
+      // attested profile, and the right behavior on that fire is a quiet
+      // no-op with a matched: 0 return: no fan-out, no listings dispatched,
+      // no `NonRetriableError` filling the Inngest dashboard, and no
+      // ceremony until the person uploads a real PDF from their laptop
+      // through the follow-up email's deep link. The `applyToJob` claim
+      // step also gates on this (defense in depth, and the place that
+      // writes the `skip_log.reason = 'awaiting_resume_upload'` row) so
+      // any manually-fired event for this pair still refuses cleanly.
+      //
+      // The attestation guard stays a NonRetriableError: a profile with
+      // no `attested_at` should never have reached this handler in the
+      // first place (the cron and every UI path filter attested only), so
+      // hitting it here is a broken event rather than a slow one.
+      if (profile.attestedAt === null) {
+        throw new NonRetriableError(
+          `No search for ${userId}: this profile has never attested to its intake. ` +
+            "Nothing may be submitted on this person's behalf until they have confirmed " +
+            "their answers at /onboarding."
+        );
+      }
+      if (!profile.hasActiveResume) {
+        console.log(
+          `${LOG} no search for ${userId}: awaiting resume upload (linkedin_url_pending ` +
+            `deferred lane on step 1 was taken but no resumes row exists yet). No fan out, ` +
+            "no allowance spent. See JOB-330 for the deep-link upload path."
+        );
+        return {
+          jobIds: [] as string[],
+          remaining: remainingAllowance(profile),
+          limit: 0,
+          cap: profile.applicationsCap,
+          used: profile.applicationsUsed,
+        };
+      }
+      // A defense-in-depth check for any future guard `searchBlockedReason`
+      // might grow. Both known cases (attestation, active resume) are
+      // handled explicitly above; anything else it flags still stops the
+      // run rather than fanning out silently.
       const blocked = searchBlockedReason(profile);
       if (blocked !== null) {
         throw new NonRetriableError(`No search for ${userId}: ${blocked}`);
@@ -779,6 +818,73 @@ export const applyToJob = inngest.createFunction(
       `${LOG} applications ${applicationId} — ${claim.company} / ${claim.title} ` +
         `(${claim.created ? "new" : "reusing existing row"})`
     );
+
+    // ── JOB-330: refuse before the browser if there is no active resume ─────
+    //
+    // Defense in depth. `discoverListings` already skips fan-out for a
+    // profile with `linkedin_url_pending` set and no `resumes` row, so in
+    // the ordinary cron path `applyToJob` never fires for one. This gate
+    // handles anything else that can produce a job-application/requested
+    // event for such a profile: a manual re-send, a legacy queue message,
+    // or a race where the resume row is deleted between the fan-out and
+    // this run. HARD STOP 9 forbids opening a browser at an employer's
+    // form on behalf of somebody with no attested resume, so this refuses
+    // and writes the skip.
+    //
+    // Runs AFTER the claim step so a `skip_log` row can hang off a real
+    // `applications.id`, matching the shape every other row on this table
+    // takes. Runs BEFORE `reserve-application-slot` below so a pending
+    // profile spends no allowance on refused matches. `recordSkipQuietly`,
+    // not `recordSkip`, so the guarantee this branch exists to enforce
+    // ("no allowance reserved, no browser opened") holds even if
+    // `drizzle/0033_awaiting_resume_upload_skip_reason.sql` has not landed
+    // yet and Postgres refuses the new reason value.
+    const resumeGate = await step.run("check-active-resume", async () => {
+      const supabase = getSupabaseClient();
+      const { count, error } = await supabase
+        .from("resumes")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("is_active", true);
+      if (error) {
+        throw new Error(`resumes lookup failed: ${error.message}`);
+      }
+      return { hasActiveResume: (count ?? 0) > 0 };
+    });
+
+    if (!resumeGate.hasActiveResume) {
+      await step.run("auto-skip-awaiting-resume-upload", async () => {
+        const supabase = getSupabaseClient();
+        await recordSkipQuietly(supabase, {
+          applicationId,
+          jobId,
+          ats: claim.ats,
+          reason: "awaiting_resume_upload",
+          message:
+            `${claim.company} / ${claim.title} — profile ${userId} has no active resume ` +
+            "yet. The person took the LinkedIn URL deferred lane on step 1 of onboarding " +
+            "(profiles.linkedin_url_pending) and the resume PDF is expected via the " +
+            "follow-up email's deep link. Refused before a browser opened; no allowance " +
+            "was spent. See JOB-330 and HARD STOP 9.",
+        }, LOG);
+      });
+
+      console.warn(
+        `${LOG} applications ${applicationId} — ${claim.company} / ${claim.title}: ` +
+          `awaiting resume upload from profile ${userId}, refused before reserving an ` +
+          "allowance or opening a browser."
+      );
+
+      return {
+        applicationId,
+        jobId,
+        status: APPLICATION_STATUS.DISCOVERED,
+        submitted: false,
+        confirmationRef: null,
+        listing: summary,
+        needsHuman: false,
+      };
+    }
 
     // ── Refuse before the browser, if this platform is a known dead end ─────
     // See `lib/known-unsolved-platforms.ts` for what this checks and why it

@@ -1,0 +1,26 @@
+-- `profiles.linkedin_url_pending`. JOB-330.
+--
+-- The second lane on step 1 of onboarding, opened for the cold mobile
+-- traffic funnel-optimization pass on 2026-09-01 flagged as the exact cliff
+-- aryareed hit on the pre-JOB-308 flow. Step 1 hard-blocks every signup on
+-- a PDF resume upload, and a phone-only user cannot produce a PDF from
+-- their laptop right now. Storing a LinkedIn profile URL here lets that
+-- person proceed through the rest of intake and attest, while the pipeline
+-- keeps its queue blocked (HARD STOP 9 — the fill path never fabricates a
+-- resume) until they upload a real one from their laptop later via the
+-- follow-up email's deep link.
+--
+-- Owned by the person, not by us, so the sibling
+-- `drizzle/0032_profiles_linkedin_url_pending_privileges.sql` grants it to
+-- `authenticated` by name (UPDATE and SELECT), following the rules
+-- `drizzle/0003_profiles_column_privileges.sql` and
+-- `drizzle/0027_profiles_column_select_lockdown.sql` state: `authenticated`
+-- holds neither a table wide UPDATE nor a table wide SELECT on `profiles`
+-- any more, so a new column is invisible to a user session until a
+-- migration grants it by name for each verb.
+--
+-- Null on every existing row, meaning nobody has taken the deferred lane
+-- yet, which is the correct starting state and is also what tells
+-- `lib/onboarding/step-routing.ts` to keep pinning that user to step 1
+-- rather than letting them past it.
+ALTER TABLE "profiles" ADD COLUMN "linkedin_url_pending" text;

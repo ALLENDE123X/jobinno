@@ -194,6 +194,14 @@ export const SKIP_REASON_TEXT: Record<SkipReason, string> = {
   // `lib/known-unsolved-platforms.ts` for the registry this reads from.
   platform_unsolved:
     "This job board runs on a platform we already know blocks automated submissions, so we did not try. This one did not count against your application limit.",
+  // JOB-330. Someone who took the LinkedIn URL deferred lane on step 1 of
+  // onboarding does not have a resume PDF yet, and Jobinno never invents
+  // one from a URL. Every listing that matches during that window shows
+  // up here so the person sees why nothing is going out and what to do.
+  // Nothing was spent against the plan; the follow-up email carries the
+  // deep link back to the upload page.
+  awaiting_resume_upload:
+    "We are still waiting for your resume PDF. Nothing goes out on your behalf until it lands, and we never invent one from a LinkedIn URL. Check the email we sent for the upload link, or open onboarding on a laptop and upload the PDF there.",
 };
 
 /** Why a run stopped, or null when the reason code is not one we know. */

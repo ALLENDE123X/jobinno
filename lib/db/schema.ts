@@ -207,6 +207,27 @@ export const SKIP_REASONS = [
   // rather than moving to `form_fill_blocked`: no attempt was made, so nothing
   // is charged against the person's allowance.
   "platform_unsolved",
+  // ── JOB-330: the LinkedIn URL deferred lane on step 1 ────────────────────
+  //
+  // Distinct from every other reason on this list. `needs_attestation` names a
+  // legal question a run reached and could not answer from stored intake;
+  // `platform_unsolved` names a match refused before a browser opened because
+  // the platform is a known dead end. This one names a match refused before a
+  // browser opened because the person themselves has no active `resumes` row
+  // yet, only a `profiles.linkedin_url_pending` from the second lane on step 1
+  // of onboarding. HARD STOP 9 forbids the fill pipeline from fabricating a
+  // resume out of a LinkedIn URL — a resume is a candidate's own attested
+  // document, and inventing one is exactly the failure mode HARD STOP 9
+  // exists to prevent — so the run refuses instead of trying, and the
+  // follow-up email's deep link is what actually unblocks the queue when the
+  // person uploads a real PDF from their laptop later.
+  //
+  // Applied in production by `drizzle/0033_awaiting_resume_upload_skip_reason.sql`.
+  // See that migration's header for why it is not applied by CI's
+  // `drizzle-kit push` (which regenerates the CHECK from this array
+  // dynamically) but is applied by name in production per CLAUDE.md's
+  // migration rules.
+  "awaiting_resume_upload",
 ] as const;
 export type SkipReason = (typeof SKIP_REASONS)[number];
 
@@ -399,6 +420,43 @@ export const profiles = pgTable(
      * adds it grants it by name.
      */
     githubUrl: text("github_url"),
+
+    /**
+     * JOB-330. The second lane on step 1 of onboarding.
+     *
+     * `profiles.linkedin_url_pending` holds a LinkedIn profile URL a person
+     * pasted on step 1 instead of uploading a resume, so cold mobile signups
+     * (funnel-optimization workflow 2026-09-01, the exact cliff aryareed hit
+     * on the pre-JOB-308 flow) can proceed through the rest of intake and
+     * attest even when they cannot produce a PDF from their phone right now.
+     * `lib/onboarding/step-routing.ts` treats a non null value here as "step
+     * 1 is complete", so the same person's next visit lands on step 2 rather
+     * than looping them back to a resume upload they still cannot do; and
+     * `app/onboarding/actions.ts`'s `submitLinkedInDeferred` writes it inside
+     * the same server action that queues the Resend follow-up email carrying
+     * the deep link back to `/onboarding/step/1?resumeUpload=1` for later
+     * upload from a laptop.
+     *
+     * ── This is NOT a resume, and no run behaves as if it were ──────────────
+     * HARD STOP 9 is explicit that the fill pipeline never fabricates a
+     * resume, and a LinkedIn URL is not one. A URL is not attested writing on
+     * behalf of the person the way the PDF they upload is: a person owns
+     * their profile page, but nothing standing between us and the boards
+     * treats that page as "the applicant's own statement" the way an
+     * uploaded document does. So a profile whose `resumes` row is missing
+     * has its runs refused by `inngest/job-application-pipeline.ts` with a
+     * `skip_log.reason = 'awaiting_resume_upload'` until an actual `resumes`
+     * row arrives, no matter what this column holds. See
+     * `SKIP_REASONS` above for the reason value and its comment for why no
+     * existing reason already covers this state.
+     *
+     * Owned by the person, not by us, so it is granted to `authenticated` by
+     * name (both UPDATE and SELECT) in
+     * `drizzle/0032_profiles_linkedin_url_pending_privileges.sql`, per the
+     * rules `drizzle/0003_profiles_column_privileges.sql` and
+     * `drizzle/0027_profiles_column_select_lockdown.sql` state.
+     */
+    linkedinUrlPending: text("linkedin_url_pending"),
 
     /**
      * ── JOB-101: the answers that were blocking real applications ───────────

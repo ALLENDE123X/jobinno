@@ -52,6 +52,7 @@ import {
 import {
   intakeFieldErrors,
   intakeSchema,
+  linkedinPendingUrlSchema,
   step1Schema,
   step2DraftSchema,
   step2Schema,
@@ -61,6 +62,11 @@ import {
   step4Schema,
   step5Schema,
 } from "@/lib/onboarding/intake-schema";
+import {
+  buildResumeFollowupIdempotencyKey,
+  sendResumeFollowupEmail,
+} from "@/lib/resume-followup/email";
+import { buildResumeFollowupEmail } from "@/lib/resume-followup/template";
 import { RESUMES_BUCKET, createServerClient } from "@/lib/supabase/server";
 
 export type IntakeResult =
@@ -87,6 +93,42 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   }
 
   const intake = parsed.data;
+
+  // JOB-330. The schema now allows `resumePath` to be null so the JOB-330
+  // second lane on step 1 (paste a LinkedIn URL, finish from a laptop
+  // later) can carry a person through the rest of intake and attestation
+  // without a PDF right now. This branch enforces the honest form of the
+  // "either lane taken" rule server side: no resume AND no
+  // `linkedin_url_pending` on the profile means the person has done
+  // neither lane, and there is nothing to attest to on their behalf.
+  //
+  // Read here rather than trusted from the payload for the same reason
+  // `getUser` is checked against the Auth server rather than a cookie:
+  // this is the last place before `recordAttestation` stamps the profile,
+  // and a client payload naming a pending URL that the row does not
+  // actually carry has to be refused. The read is against the user scoped
+  // client, so RLS narrows it to this person's own row automatically.
+  const { data: pendingRow, error: pendingError } = await supabase
+    .from("profiles")
+    .select("linkedin_url_pending")
+    .eq("id", user.id)
+    .maybeSingle();
+  if (pendingError) {
+    return {
+      ok: false,
+      message: `Could not save your details: ${pendingError.message}`,
+    };
+  }
+  const hasPendingLinkedin = Boolean(pendingRow?.linkedin_url_pending);
+  if (!intake.resumePath && !hasPendingLinkedin) {
+    return {
+      ok: false,
+      errors: {
+        resumePath:
+          "Attach your resume as a PDF, or paste your LinkedIn URL on step 1 first.",
+      },
+    };
+  }
 
   const { error: profileError } = await supabase
     .from("profiles")
@@ -156,53 +198,63 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // (a user who somehow reached step 5 without a step 1 insert), we fall
   // back to the original insert. Either way, the id we hand
   // `requestDocumentParse` is a real row this user owns.
-  const bucketQualifiedResumePath = `${RESUMES_BUCKET}/${intake.resumePath}`;
-  const bucketQualifiedLinkedinPath = intake.linkedinPdfPath
-    ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`
-    : null;
+  //
+  // JOB-330: `intake.resumePath` can now legitimately be null when a person
+  // took the LinkedIn URL deferred lane on step 1 and no PDF exists yet.
+  // The whole resumes block is skipped in that case (there is nothing to
+  // insert), and `requestDocumentParse` below is skipped too. The pipeline
+  // gate in `inngest/job-application-pipeline.ts` refuses to open a browser
+  // for a profile with no active `resumes` row, so no run is dispatched on
+  // behalf of a pending person before they upload the real PDF.
+  let resumeRow: { id: string } | null = null;
 
-  const { data: existingResume } = await supabase
-    .from("resumes")
-    .select("id, linkedin_pdf_path")
-    .eq("user_id", user.id)
-    .eq("storage_path", bucketQualifiedResumePath)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  if (intake.resumePath) {
+    const bucketQualifiedResumePath = `${RESUMES_BUCKET}/${intake.resumePath}`;
+    const bucketQualifiedLinkedinPath = intake.linkedinPdfPath
+      ? `${RESUMES_BUCKET}/${intake.linkedinPdfPath}`
+      : null;
 
-  let resumeRow: { id: string } | null = existingResume
-    ? { id: existingResume.id }
-    : null;
-
-  if (
-    existingResume &&
-    existingResume.linkedin_pdf_path !== bucketQualifiedLinkedinPath
-  ) {
-    // The LinkedIn PDF was added or replaced between step 1 and step 5.
-    await supabase
+    const { data: existingResume } = await supabase
       .from("resumes")
-      .update({ linkedin_pdf_path: bucketQualifiedLinkedinPath })
-      .eq("id", existingResume.id);
-  }
+      .select("id, linkedin_pdf_path")
+      .eq("user_id", user.id)
+      .eq("storage_path", bucketQualifiedResumePath)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-  if (!existingResume) {
-    const { data: inserted, error: resumeError } = await supabase
-      .from("resumes")
-      .insert({
-        user_id: user.id,
-        storage_path: bucketQualifiedResumePath,
-        linkedin_pdf_path: bucketQualifiedLinkedinPath,
-      })
-      .select("id")
-      .single();
+    resumeRow = existingResume ? { id: existingResume.id } : null;
 
-    if (resumeError) {
-      return {
-        ok: false,
-        message: `Could not save your resume: ${resumeError.message}`,
-      };
+    if (
+      existingResume &&
+      existingResume.linkedin_pdf_path !== bucketQualifiedLinkedinPath
+    ) {
+      // The LinkedIn PDF was added or replaced between step 1 and step 5.
+      await supabase
+        .from("resumes")
+        .update({ linkedin_pdf_path: bucketQualifiedLinkedinPath })
+        .eq("id", existingResume.id);
     }
-    resumeRow = inserted;
+
+    if (!existingResume) {
+      const { data: inserted, error: resumeError } = await supabase
+        .from("resumes")
+        .insert({
+          user_id: user.id,
+          storage_path: bucketQualifiedResumePath,
+          linkedin_pdf_path: bucketQualifiedLinkedinPath,
+        })
+        .select("id")
+        .single();
+
+      if (resumeError) {
+        return {
+          ok: false,
+          message: `Could not save your resume: ${resumeError.message}`,
+        };
+      }
+      resumeRow = inserted;
+    }
   }
 
   // Last, and only once everything it attests to is actually in the database.
@@ -273,7 +325,13 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
   // next depends on it, and the fill pipeline parses inline anyway when the
   // column is empty, so a failure here costs one slower first application and
   // nothing else. That is why it cannot fail the submit.
-  await requestDocumentParse(user.id, String(resumeRow?.id ?? ""));
+  //
+  // JOB-330: skipped entirely when `resumeRow` is null, i.e. the person took
+  // the LinkedIn URL deferred lane and there is no PDF to parse yet. The
+  // deep link's later upload path is what fires this off for those profiles.
+  if (resumeRow) {
+    await requestDocumentParse(user.id, String(resumeRow.id ?? ""));
+  }
 
   // JOB-326. Fire the first job search as part of attestation, not deferred
   // to the daily cron or a second button press. The marketing copy sells
@@ -638,6 +696,123 @@ export async function saveIntakeDraft(
         };
       }
     }
+  }
+
+  revalidatePath("/onboarding");
+  return { ok: true };
+}
+
+// ── JOB-330: LinkedIn URL deferred lane on step 1 ─────────────────────────
+//
+// The second lane on step 1 for a phone-only signup that cannot produce a
+// PDF right now. Validates the URL shape (see `linkedinPendingUrlSchema`
+// in `lib/onboarding/intake-schema.ts` for what the regex accepts and why
+// no scrape or existence check happens here), writes the normalized URL
+// to `profiles.linkedin_url_pending`, and queues one Resend send with a
+// deep link back to `/onboarding/step/1?resumeUpload=1` so the person can
+// finish from a laptop later.
+//
+// The email send is best effort: onboarding cannot stall on a mailbox that
+// bounces or a Resend outage, so a failure is logged and the caller still
+// routes to step 2. See `lib/resume-followup/email.ts` for the send's own
+// non-throwing failure posture.
+//
+// ── HARD STOP 9 is unaffected ──────────────────────────────────────────
+// A URL is not a resume. Nothing about writing this column authorizes any
+// run to fabricate a resume out of it, and the pipeline gate in
+// `inngest/job-application-pipeline.ts` refuses to open a browser for any
+// profile with no active `resumes` row (logging
+// `skip_log.reason = 'awaiting_resume_upload'` per attempted listing). The
+// gate holds regardless of what this column carries.
+
+export type SubmitLinkedInDeferredResult =
+  | { ok: true }
+  | { ok: false; message?: string; errors?: Record<string, string> };
+
+export async function submitLinkedInDeferred(
+  url: unknown,
+): Promise<SubmitLinkedInDeferredResult> {
+  const supabase = await createServerClient();
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return {
+      ok: false,
+      message:
+        "Your session has expired. Sign in again and your progress is still saved.",
+    };
+  }
+
+  const parsed = linkedinPendingUrlSchema.safeParse(url);
+  if (!parsed.success) {
+    // First message under the URL field, same shape `intakeFieldErrors`
+    // produces for every other server action here.
+    const first = parsed.error.issues[0]?.message;
+    return {
+      ok: false,
+      errors: {
+        linkedinUrl:
+          first ??
+          "Enter a LinkedIn profile URL, like https://linkedin.com/in/yourhandle.",
+      },
+    };
+  }
+
+  const normalized = parsed.data;
+
+  const { error: updateError } = await supabase
+    .from("profiles")
+    .update({
+      linkedin_url_pending: normalized,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", user.id);
+
+  if (updateError) {
+    console.error(
+      "[onboarding] submitLinkedInDeferred write failed:",
+      updateError,
+    );
+    return {
+      ok: false,
+      message:
+        "Could not save your LinkedIn URL. Please try again in a moment.",
+    };
+  }
+
+  // Best effort: the write above is the point of no return for the routing
+  // change (the person's next visit already lands on step 2), so a mail
+  // send that misses is a follow-up problem, not a submit blocker. Logged
+  // rather than surfaced, matching the posture `requestJobSearch` in
+  // `submitIntake` above takes for the same reason.
+  const email = user.email;
+  if (email) {
+    try {
+      const content = buildResumeFollowupEmail(email);
+      const result = await sendResumeFollowupEmail({
+        to: email,
+        subject: content.subject,
+        text: content.text,
+        idempotencyKey: buildResumeFollowupIdempotencyKey(user.id),
+      });
+      if (!result.sent) {
+        console.warn(
+          `[onboarding] submitLinkedInDeferred: follow-up email not sent (${result.reason}).`,
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[onboarding] submitLinkedInDeferred: follow-up email threw:",
+        error,
+      );
+    }
+  } else {
+    console.warn(
+      "[onboarding] submitLinkedInDeferred: user has no email on file; follow-up email skipped.",
+    );
   }
 
   revalidatePath("/onboarding");

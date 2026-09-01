@@ -192,6 +192,27 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0030_profiles_re_engagement_sent_at_privileges.sql
 
+      - name: Apply the JOB-330 linkedin_url_pending privilege migration
+        # JOB-330. Same reasoning again, and its own line rather than a
+        # glob for the reason eight steps up. This one grants
+        # `linkedin_url_pending` on `profiles`, which
+        # `0031_profiles_linkedin_url_pending.sql`'s ALTER TABLE (picked up
+        # by the `drizzle-kit push` step, which diffs `lib/db/schema.ts`
+        # and never runs `0031`'s SQL file directly) already added by the
+        # time this runs, to `authenticated` by name for both UPDATE and
+        # SELECT; see the migration file for why both verbs are needed
+        # (0003 revoked table wide UPDATE, 0027 revoked table wide SELECT,
+        # and this column is user-owned so the person legitimately writes
+        # and reads it back). The awaiting_resume_upload skip reason value
+        # in `SKIP_REASONS` is picked up by drizzle-kit push through the
+        # dynamic CHECK constraint in schema.ts, so
+        # `drizzle/0033_awaiting_resume_upload_skip_reason.sql` has no
+        # matching CI step here (see that file's header for the production
+        # apply instructions).
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0032_profiles_linkedin_url_pending_privileges.sql
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -364,6 +385,15 @@ jobs:
         run: >-
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0030_profiles_re_engagement_sent_at_privileges.sql
+
+      - name: Apply the JOB-330 linkedin_url_pending privilege migration
+        # JOB-330. Same reasoning as the corresponding step in the `test`
+        # job above; both jobs run drizzle-kit push against a throwaway
+        # container and need the hand written privilege files applied by
+        # name after the push.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0032_profiles_linkedin_url_pending_privileges.sql
 
       - name: Build
         run: npm run build

@@ -132,6 +132,42 @@ describe("earliestIncompleteStep", () => {
     );
     expect(result).toBe(1);
   });
+
+  // JOB-330. The second lane on step 1 stores a LinkedIn URL on
+  // `profiles.linkedin_url_pending` and lets the person move on without
+  // a resumes row. Step routing must treat that as "step 1 complete" so
+  // the person is not looped back to a resume upload they still cannot
+  // do; the pipeline gate in `inngest/job-application-pipeline.ts`
+  // enforces HARD STOP 9 by refusing to open a browser until a real
+  // `resumes` row exists.
+  it("returns 2 when a LinkedIn URL pending is set but no resumes row exists (JOB-330)", () => {
+    expect(
+      earliestIncompleteStep(
+        profile({ linkedinUrlPending: "https://linkedin.com/in/pat" }),
+        null,
+      ),
+    ).toBe(2);
+  });
+
+  it("still returns 1 when neither a resumes row nor a LinkedIn URL pending exists", () => {
+    expect(
+      earliestIncompleteStep(
+        profile({ linkedinUrlPending: null }),
+        null,
+      ),
+    ).toBe(1);
+  });
+
+  it("prefers whichever step 1 signal exists (resume OR pending URL)", () => {
+    // Both signals present: still counts as step 1 complete; the person
+    // moves to step 2 regardless of which one landed first.
+    expect(
+      earliestIncompleteStep(
+        profile({ linkedinUrlPending: "https://linkedin.com/in/pat" }),
+        resume(),
+      ),
+    ).toBe(2);
+  });
 });
 
 // JOB-309. postAuthOnboardingPath is what actually decides where a signed in

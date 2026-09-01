@@ -1,0 +1,44 @@
+-- Grants `linkedin_url_pending` to `authenticated`. JOB-330.
+--
+-- Two grants, one file, for a reason each covers.
+--
+-- ── UPDATE ──────────────────────────────────────────────────────────────────
+-- `drizzle/0003_profiles_column_privileges.sql` revoked the table wide UPDATE
+-- grant Supabase's defaults left on `profiles` and granted back, by name, the
+-- columns a person owns about themselves, and said plainly that a new column
+-- added after it is not writable by `authenticated` until a migration grants
+-- it. `linkedin_url_pending` is one a person owns: they choose the profile
+-- URL, they submit it themselves through the second lane on step 1 of
+-- onboarding, and only they can say what their own profile URL is. So it
+-- belongs on the same UPDATE grant list `0003` and every column ticket since
+-- has added to.
+--
+-- ── SELECT ──────────────────────────────────────────────────────────────────
+-- `drizzle/0027_profiles_column_select_lockdown.sql` revoked the table wide
+-- SELECT grant Supabase's defaults left on `profiles` and granted SELECT back
+-- on every column except three we hold about the person rather than about
+-- their answers. That same rule applies here in the opposite direction: the
+-- column is the person's own answer, so `authenticated` reading it back is
+-- legitimate (the step-page server component reads it to decide whether to
+-- show the deep-link upload UI, and step 5 reads it to decide whether an
+-- attestation without a resume is allowed). Without this grant a
+-- `select("*")` from a user session errors on the missing column privilege.
+--
+-- A separate file rather than an edit to `0003` or `0027` themselves, for
+-- the reason those files' own headers give for being hand written in the
+-- first place: they are already journalled and already applied wherever this
+-- schema has been pushed, and rewriting an applied migration's content is
+-- how a checksum mismatch or a silently-missing grant happens on whatever
+-- database was migrated before this shipped. A later privilege change is a
+-- new file, always.
+--
+-- Hand written rather than generated, same as 0003 and 0027: the Drizzle
+-- schema DSL has no way to express GRANT, so this was created with
+-- `drizzle-kit generate --custom` to stay journalled in
+-- `drizzle.__drizzle_migrations` and then filled in by hand.
+-- `.github/workflows/ci.yml` applies this file by explicit name because
+-- `drizzle-kit push` cannot see it.
+
+GRANT UPDATE (linkedin_url_pending) ON public.profiles TO authenticated;
+--> statement-breakpoint
+GRANT SELECT (linkedin_url_pending) ON public.profiles TO authenticated;

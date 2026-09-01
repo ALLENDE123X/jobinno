@@ -34,6 +34,13 @@ type ProfileData = {
   resume_path: string | null;
   linkedin_pdf_path: string | null;
   github_url: string | null;
+  /**
+   * JOB-330. The LinkedIn URL from the deferred lane on step 1, or null
+   * if nobody has taken that lane on this profile. Step 1 reads it to
+   * decide whether to show the deferred lane again; step 5 reads it to
+   * decide whether attestation without a resume is allowed.
+   */
+  linkedin_url_pending: string | null;
   citizenship_status: string | null;
   f1_status: string | null;
   visa_status: string | null;
@@ -64,10 +71,10 @@ export default async function OnboardingStepPage({
   searchParams,
 }: {
   params: Promise<{ step: string }>;
-  searchParams: Promise<{ edit?: string }>;
+  searchParams: Promise<{ edit?: string; resumeUpload?: string }>;
 }) {
   const { step: stepParam } = await params;
-  const { edit } = await searchParams;
+  const { edit, resumeUpload } = await searchParams;
   const step = Number(stepParam);
 
   if (!Number.isFinite(step) || step < 1 || step > TOTAL_STEPS) {
@@ -101,15 +108,37 @@ export default async function OnboardingStepPage({
       currentCity: profile.current_city ?? null,
       clearanceEligibility: profile.clearance_eligibility ?? null,
       attestedAt: profile.attested_at ?? null,
+      // JOB-330: the deferred lane on step 1 also satisfies step 1 for
+      // routing purposes. Without this, a person who pasted a LinkedIn
+      // URL from mobile would be looped straight back to step 1 every
+      // time they returned, defeating the whole point of the lane.
+      linkedinUrlPending: profile.linkedin_url_pending ?? null,
     },
     resumeRow ? { storagePath: resumeRow.storage_path ?? null } : null,
   );
 
+  // JOB-330: the deep link from the follow-up email arrives as
+  // `/onboarding/step/1?resumeUpload=1`. On that path we WANT to render
+  // step 1 (so the person can upload) even though `earliestIncompleteStep`
+  // may say step 2 (they already have a LinkedIn URL pending). Treat the
+  // deep link as an implicit edit-mode override for step 1 only, so the
+  // "step > incompleteStep and not edit" redirect below does not bounce
+  // them past the upload UI. Any other step ignores the flag.
+  const deepLinkForUpload = step === 1 && resumeUpload === "1";
+
   // If attested and not in edit mode, redirect to dashboard.
-  if (incompleteStep === 6 && edit !== "1") redirect("/dashboard");
+  // JOB-330: the resume-upload deep link is an exception. An already
+  // attested person who deferred on step 1 needs to be able to come back
+  // and upload their resume; the deep link lands them on step 1 with
+  // `resumeUpload=1`, so honor that instead of bouncing to the dashboard.
+  if (incompleteStep === 6 && edit !== "1" && !deepLinkForUpload) {
+    redirect("/dashboard");
+  }
 
   // If requested step is ahead of where they are, redirect back,
-  // unless the user clicked an edit link (edit=1).
+  // unless the user clicked an edit link (edit=1). The resume-upload
+  // deep link never trips this condition (step 1 is at or before every
+  // possible `incompleteStep`), so it is naturally exempt.
   if (step > incompleteStep && edit !== "1") {
     redirect(`/onboarding/step/${incompleteStep}`);
   }
@@ -126,6 +155,7 @@ export default async function OnboardingStepPage({
     email: profile.email ?? null,
     resume_path: resumeObjectPath,
     linkedin_pdf_path: linkedinObjectPath,
+    linkedin_url_pending: profile.linkedin_url_pending ?? null,
     github_url: profile.github_url ?? null,
     citizenship_status: profile.citizenship_status ?? null,
     f1_status: profile.f1_status ?? null,
@@ -175,6 +205,7 @@ export default async function OnboardingStepPage({
             userId={user.id}
             profile={profileData}
             isEdit={edit === "1"}
+            resumeUploadOnly={deepLinkForUpload}
           />
         )}
         {step === 2 && <Step2Form profile={profileData} />}

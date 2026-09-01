@@ -29,6 +29,16 @@ export type ProfileForRouting = {
   currentCity?: string | null;
   clearanceEligibility?: string | null;
   attestedAt?: string | Date | null;
+  /**
+   * JOB-330. The LinkedIn URL a person pasted on step 1's second lane when
+   * they could not produce a PDF from mobile. A non null value here counts
+   * as "step 1 complete" alongside a real `resumes` row, so the person is
+   * routed to step 2 rather than looped back to a resume upload they still
+   * cannot do. See `linkedinUrlPending` in `lib/db/schema.ts` for the
+   * column, and the header on this file for why routing changed to admit
+   * this second signal.
+   */
+  linkedinUrlPending?: string | null;
 };
 
 /**
@@ -44,19 +54,33 @@ export type ResumeForRouting = {
  * Returns the earliest incomplete step (1..5).
  *
  * The progression is linear and sequential:
- *   1 - resume uploaded (a resumes row exists)
+ *   1 - resume uploaded (a resumes row exists) OR LinkedIn URL pasted on
+ *       the JOB-330 deferred lane (profile.linkedinUrlPending is non-null)
  *   2 - citizenship chosen (citizenshipStatus is non-null)
  *   3 - location filled (currentCity is non-null)
  *   4 - clearance gate answered (clearanceEligibility is non-null)
  *   5 - attestation done (attestedAt is non-null)
  *
  * If everything is complete, returns 6 (caller redirects to /dashboard).
+ *
+ * ── Why linkedinUrlPending counts as step 1 complete ────────────────────
+ * JOB-330. Cold mobile signups cannot always produce a PDF from a phone,
+ * so the second lane on step 1 lets a person paste their LinkedIn URL
+ * instead. Once that URL is stored, step 1 is done for routing purposes
+ * and the person moves on to citizenship. The gate that HARD STOP 9
+ * actually depends on is unchanged and lives in the pipeline (see
+ * `inngest/job-application-pipeline.ts`): a profile with no active
+ * `resumes` row has its runs refused with a `skip_log.reason =
+ * 'awaiting_resume_upload'` row per attempted listing, no matter what
+ * this column holds. This function only decides which onboarding page to
+ * render.
  */
 export function earliestIncompleteStep(
   profile: ProfileForRouting,
   resume: ResumeForRouting = null,
 ): number {
-  if (!resume) return 1;
+  const step1Complete = Boolean(resume) || Boolean(profile.linkedinUrlPending);
+  if (!step1Complete) return 1;
   if (!profile.citizenshipStatus) return 2;
   if (!profile.currentCity) return 3;
   if (!profile.clearanceEligibility) return 4;
@@ -102,6 +126,8 @@ export type IntakeProfileRow = {
   current_city?: string | null;
   clearance_eligibility?: string | null;
   attested_at?: string | Date | null;
+  /** JOB-330. See `ProfileForRouting.linkedinUrlPending`. */
+  linkedin_url_pending?: string | null;
 };
 
 export type IntakeResumeRow = {
@@ -151,6 +177,7 @@ export function resolveIntakeStep(
       currentCity: profile?.current_city ?? null,
       clearanceEligibility: profile?.clearance_eligibility ?? null,
       attestedAt: profile?.attested_at ?? null,
+      linkedinUrlPending: profile?.linkedin_url_pending ?? null,
     },
     resume ? { storagePath: resume.storage_path ?? null } : null,
   );

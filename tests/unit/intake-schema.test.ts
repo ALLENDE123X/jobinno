@@ -85,12 +85,21 @@ describe("intakeSchema", () => {
     // Both default to null, so an empty submission is not missing them; the F1
     // sub status only becomes required once the citizenship answer asks for it.
     //
-    // JOB-310 lazy loads six of these out of intake: highSchoolGradYear,
+    // JOB-310 lazy loaded six of these out of intake: highSchoolGradYear,
     // highSchoolName, previouslyEmployedAtTargetEmployers,
     // relativesAtTargetEmployers, salaryExpectation and
     // subjectToRestrictiveCovenant all default to null now, the same way
     // f1Status and linkedinPdfPath already did, so none of them belongs in
     // this list any more either.
+    //
+    // JOB-330 lazy loaded resumePath out too: the second lane on step 1 of
+    // onboarding lets a person paste a LinkedIn URL and finish the rest
+    // of intake without a PDF right now (they upload later via the
+    // follow-up email's deep link). The "either lane taken" rule is
+    // enforced server side in `submitIntake`, not in this schema, and
+    // the pipeline gate refuses to open a browser at any listing until a
+    // real `resumes` row exists (HARD STOP 9). So resumePath is optional
+    // here now, matching the other lazy loaded fields above.
     expect(failedFields({})).toEqual([
       "attestation",
       "citizenshipStatus",
@@ -103,13 +112,26 @@ describe("intakeSchema", () => {
       "needsSponsorshipNonUs",
       "postalCode",
       "requiresSponsorship",
-      "resumePath",
       "streetAddress",
       "targetLocations",
       "visaStatus",
       "willingToRelocate",
       "workAuthorizedUs",
     ]);
+  });
+
+  it("accepts a submission with no resume path (JOB-330 deferred lane)", () => {
+    // The second lane on step 1 lets a person paste a LinkedIn URL
+    // instead of uploading a PDF. Step 5's client validation and
+    // `submitIntake`'s server parse both call this schema, and both
+    // must accept `resumePath: null` so a deferred-lane person can
+    // reach attestation. `submitIntake` then checks that either
+    // `intake.resumePath` OR `profiles.linkedin_url_pending` is set;
+    // that server-side check is what actually enforces HARD STOP 9
+    // together with the pipeline gate in
+    // `inngest/job-application-pipeline.ts`.
+    const result = schema.safeParse({ ...validIntake(), resumePath: null });
+    expect(result.success).toBe(true);
   });
 
   it.each([
@@ -128,7 +150,11 @@ describe("intakeSchema", () => {
     "targetLocations",
     "gradDate",
     "earliestStart",
-    "resumePath",
+    // JOB-330 moved resumePath off this list: the second lane on step 1
+    // lets a person attest without a PDF right now, and the "either
+    // lane taken" rule is enforced server-side in `submitIntake`, not
+    // by the schema. See the JOB-330 acceptance test above and the
+    // pipeline gate in `inngest/job-application-pipeline.ts`.
     "attestation",
   ])("rejects a submission missing %s", (field) => {
     const input: Record<string, unknown> = validIntake();

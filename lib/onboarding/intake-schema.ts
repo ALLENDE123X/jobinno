@@ -176,6 +176,45 @@ const githubUrl = z.preprocess((raw) => {
 }, githubUrlText.nullable());
 
 /**
+ * JOB-330. Matches `linkedin.com/in/<handle>` on the second lane of step 1.
+ * The `<handle>` segment cannot be empty, and a trailing path or query
+ * string is allowed because LinkedIn's own profile URLs sometimes carry
+ * one. Anything that names a different domain fails on purpose: a person
+ * who pastes their portfolio or their GitHub here by mistake should see an
+ * error, not have it saved as a LinkedIn URL.
+ *
+ * The regex is a shape check, not an existence check. Whether the profile
+ * actually exists at that URL is not something we verify: LinkedIn's own
+ * TOS bars scraping, and the ticket's stretch section is explicit that a
+ * server-side fetch of the public page is out of scope until legal reviews
+ * it. So this schema accepts a well shaped URL and the follow-up email is
+ * where a mistyped one shows up (it bounces or a real person tells us).
+ */
+export const LINKEDIN_URL_PATTERN =
+  /^(?:https?:\/\/)?(?:www\.|m\.)?linkedin\.com\/in\/[A-Za-z0-9\-_%.]+\/?(?:[?#].*)?$/i;
+
+const linkedinPendingUrlText = z
+  .string()
+  .trim()
+  .max(300, "That LinkedIn URL is too long.")
+  .regex(
+    LINKEDIN_URL_PATTERN,
+    "Enter a LinkedIn profile URL, like https://linkedin.com/in/yourhandle.",
+  )
+  .transform((value) =>
+    /^https?:\/\//i.test(value) ? value : `https://${value}`,
+  );
+
+/**
+ * Zod schema for `profiles.linkedin_url_pending`. Used by
+ * `submitLinkedInDeferred` in `app/onboarding/actions.ts`. An empty string
+ * fails validation rather than being coerced to null, because this schema
+ * runs the moment the user submits the lane and an empty submission is a
+ * bug in the caller, not a legitimate deferred lane.
+ */
+export const linkedinPendingUrlSchema = linkedinPendingUrlText;
+
+/**
  * A key inside the private `resumes` bucket, which by convention is
  * `{userId}/{uuid}.pdf`. The first segment is not decoration: it is what the
  * bucket's storage policies compare against `auth.uid()`, so a path with the
@@ -312,7 +351,29 @@ export function intakeSchema(userId: string) {
       highSchoolName: highSchoolNameField,
       highSchoolGradYear: highSchoolGradYearField,
 
-      resumePath: ownedObjectPath,
+      /**
+       * ── JOB-330: nullable here on purpose ─────────────────────────────────
+       *
+       * Was required. Cold mobile traffic on step 1 cannot always produce a
+       * PDF from a phone, and the JOB-330 second lane on that step lets a
+       * person paste their LinkedIn URL instead (see
+       * `profiles.linkedinUrlPending` in `lib/db/schema.ts`) and finish the
+       * rest of intake and attest from mobile, uploading the real PDF later
+       * from their laptop through the follow-up email's deep link. So this
+       * schema no longer refuses an intake that carries no `resumePath`.
+       *
+       * That does NOT relax HARD STOP 9. The server action
+       * `submitIntake` in `app/onboarding/actions.ts` refuses attestation
+       * when both `resumePath` and `profiles.linkedin_url_pending` are null
+       * (the "neither lane taken" state), and the pipeline in
+       * `inngest/job-application-pipeline.ts` refuses to open a browser for
+       * any profile with no active `resumes` row, logging a
+       * `skip_log.reason = 'awaiting_resume_upload'` row per attempted
+       * listing. A LinkedIn URL is not a resume and never becomes one; the
+       * fill path continues to require a real PDF and to fabricate nothing
+       * in its place.
+       */
+      resumePath: ownedObjectPath.nullable().default(null),
       /**
        * Optional, in both senses: someone without a LinkedIn export still has a
        * resume, and a caller that has nothing to send may leave the key off

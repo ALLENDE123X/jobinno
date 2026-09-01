@@ -1,0 +1,31 @@
+-- JOB-330: one more value for `skip_log.reason`, `awaiting_resume_upload`.
+--
+-- The column's CHECK constraint is built from `SKIP_REASONS` in
+-- `lib/db/schema.ts`, so the two have to move together, exactly as
+-- `drizzle/0007_skip_reason_taxonomy.sql`, `drizzle/0008_bot_detected_skip_reason.sql`
+-- and `drizzle/0028_platform_unsolved_skip_reason.sql` did before it. See the
+-- comment beside the value in `SKIP_REASONS` for what it names and why no
+-- existing reason already covers it: this one records that the user finished
+-- attestation on the LinkedIn URL deferred lane (`profiles.linkedin_url_pending`
+-- set, no `resumes` row) and the pipeline refused to open a browser at any
+-- listing until they upload a real resume from their laptop, per HARD STOP 9.
+--
+-- ── Read this before applying ────────────────────────────────────────────────
+-- Not applied against the production database by this change. HARD STOP 5
+-- forbids running any write against a real `DATABASE_URL` without an
+-- explicit opt in, and this ticket's own scope is code and test changes
+-- only. Until this migration lands, Postgres refuses a `skip_log` insert
+-- carrying `awaiting_resume_upload`, and the fan-out and claim gates in
+-- `inngest/job-application-pipeline.ts` call `recordSkipQuietly` rather than
+-- `recordSkip` specifically so that refusal degrades to a loud
+-- `console.error` instead of a thrown, retried Inngest step: the property
+-- those gates exist to guarantee (no allowance reserved, no browser opened
+-- on behalf of a resume-less profile) has to hold either way. Applying this
+-- migration is still what makes the reason actually land in the table
+-- rather than only in the log. Apply through the IPv4 session mode pooler
+-- per CLAUDE.md's own instructions on `drizzle-kit migrate` against
+-- Supabase, then confirm the constraint changed against the live database
+-- rather than trusting the command's exit code.
+ALTER TABLE "skip_log" DROP CONSTRAINT IF EXISTS "skip_log_reason_check";
+--> statement-breakpoint
+ALTER TABLE "skip_log" ADD CONSTRAINT "skip_log_reason_check" CHECK ("reason" in ('unanswerable_required', 'verification_required', 'captcha', 'dom_changed', 'timeout', 'submit_failed', 'blocked_redirect', 'needs_attestation', 'internal_error', 'bot_detected', 'platform_unsolved', 'awaiting_resume_upload'));
