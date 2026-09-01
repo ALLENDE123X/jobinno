@@ -1,10 +1,11 @@
 /**
  * JOB-316. Golden assertions over the agent's system prompt.
  *
- * The acceptance criterion is literal: the HARD STOP 9 and HARD STOP 10
- * language must be present such that a regex can assert it. These tests are
- * that regex. If one of them fails, the guardrail wording was weakened, and
- * the correct fix is the prompt, not the test.
+ * The acceptance criterion is literal: the runtime fabrication policy (set
+ * 2026 08 26 per the memory file feedback_pipeline_may_fabricate_form_answers)
+ * and the HARD STOP 10 EEO handling must be present such that a regex can
+ * assert them. These tests are that regex. If one of them fails, the policy
+ * wording was weakened, and the correct fix is the prompt, not the test.
  */
 
 import { describe, expect, it } from "vitest";
@@ -38,23 +39,41 @@ const EMPTY_CATALOG: FactCatalog = { userId: "u1", entries: [] };
 const BASE_CONFIG = { ats: "greenhouse", maxSteps: 30, escalated: false };
 
 describe("buildSystemPrompt", () => {
-  it("encodes HARD STOP 9 literally and operationally", () => {
+  it("encodes the runtime fabrication policy (2026 08 26)", () => {
     const prompt = buildSystemPrompt(FULL_CATALOG, BASE_CONFIG);
-    expect(prompt).toMatch(/HARD STOP 9/);
+    expect(prompt).toContain("Runtime fabrication policy");
+    expect(prompt).toContain("2026 08 26");
+    expect(prompt).toContain("feedback_pipeline_may_fabricate_form_answers");
     expect(prompt).toContain(
-      "Never invent a fact that is not in the user's intake data."
+      "apply a permissive default rather than stopping the run"
     );
-    expect(prompt).toContain("markFieldUnanswerable");
+    expect(prompt).toMatch(
+      /answer "no" for yes\/no questions about restrictive status/
+    );
+    expect(prompt).toMatch(
+      /answer "yes" for yes\/no questions about work authorization/
+    );
+    expect(prompt).toContain("first sensible option for dropdowns");
+    expect(prompt).toContain("sourceHint");
     expect(prompt).toContain("intakeFactPath");
-    // The tool pressure case the ticket names: a salary gap must read as
-    // unanswerable, never as a number to compose.
+  });
+
+  it("keeps escalation for salary, background check critical, and resume contradictions", () => {
+    const prompt = buildSystemPrompt(FULL_CATALOG, BASE_CONFIG);
+    expect(prompt).toContain("Two exceptions to the fabrication policy");
+    expect(prompt).toContain("markFieldUnanswerable");
     expect(prompt).toMatch(
       /missing salaryExpectation fact means the salary question is unanswerable/
     );
     expect(prompt).toMatch(/never a number you compose/);
+    expect(prompt).toMatch(/background check critical/);
+    expect(prompt).toMatch(/quoted verbatim from the catalog or the resume/);
+    expect(prompt).toMatch(
+      /demonstrably false against the resume/
+    );
   });
 
-  it("encodes HARD STOP 10 literally: decline only, never inferred", () => {
+  it("encodes HARD STOP 10: prefer decline, fabricate when no decline option", () => {
     const prompt = buildSystemPrompt(FULL_CATALOG, BASE_CONFIG);
     expect(prompt).toMatch(/HARD STOP 10/);
     expect(prompt).toContain("Decline to self identify");
@@ -63,6 +82,11 @@ describe("buildSystemPrompt", () => {
     expect(prompt).toMatch(/veteran/i);
     expect(prompt).toMatch(/disability/i);
     expect(prompt).toMatch(/Never infer, guess, or derive a demographic answer/);
+    expect(prompt).toContain("When no decline option exists on the form");
+    expect(prompt).toContain("fabricate a permissive neutral answer");
+    expect(prompt).toContain(
+      "US software engineering demographic"
+    );
   });
 
   it("carries one platform note per supported ats, each distinct", () => {
