@@ -305,7 +305,7 @@ export default async function Home({
                 </div>
 
                 <p className="text-sm text-muted-foreground">
-                  3 applications free. No card needed.
+                  10 applications free. No card needed.
                 </p>
               </div>
 

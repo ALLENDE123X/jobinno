@@ -167,7 +167,7 @@ async function startCheckout(request: NextRequest, planSlug: string | null) {
   // ── Do not sell somebody something they already have ──────────────────────
   // Pressing "Get Starter" a second time used to open a second Checkout
   // Session, and Stripe creates a second live subscription from it quite
-  // happily: same person, same card, $29 a month twice, and nothing downstream
+  // happily: same person, same card, $9 a month twice, and nothing downstream
   // notices because the webhook writes the same plan either way. The double
   // press is the ordinary case here, not an attack. Somebody presses the button
   // again because the first checkout was slow to open, or they came back to the

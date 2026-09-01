@@ -119,14 +119,14 @@ export function renderRecapCta(recipient: RecapRecipient): string {
   if (usedAll) {
     return [
       "That was your free trial. On Starter, we keep this pace up every day.",
-      `${PAID_PLANS.starter.label} is $29 a month: ${RECAP_PRICING_URL}`,
+      `${PAID_PLANS.starter.label} is $9 a month: ${RECAP_PRICING_URL}`,
     ].join("\n");
   }
 
   return [
     `That is ${recipient.applicationsUsed} of your ${trialSize} free applications.`,
     "Want to keep going?",
-    `${PAID_PLANS.starter.label} at $29 a month or the ${PAID_PLANS.season_pass.label} at $99 up front: ${RECAP_PRICING_URL}`,
+    `${PAID_PLANS.starter.label} at $9 a month or the ${PAID_PLANS.season_pass.label} at $29 up front: ${RECAP_PRICING_URL}`,
   ].join("\n");
 }
 

@@ -75,7 +75,7 @@ export const LANDING_PLANS: readonly PricingPlan[] = [
   {
     slug: "starter",
     name: "Starter",
-    price: "$29",
+    price: "$9",
     cadence: "per month",
     allowance: `${PAID_PLANS.starter.applicationsCap} applications every month`,
     features: [
@@ -90,7 +90,7 @@ export const LANDING_PLANS: readonly PricingPlan[] = [
   {
     slug: "season_pass",
     name: "Season Pass",
-    price: "$99",
+    price: "$29",
     cadence: "one time",
     allowance: `${PAID_PLANS.season_pass.applicationsCap} applications, valid 6 months`,
     features: [

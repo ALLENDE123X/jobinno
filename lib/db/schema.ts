@@ -1408,7 +1408,7 @@ export const creators = pgTable(
  * box is at this selector", which is a fact about a public job board that every
  * user's run reads and every user's run may improve. That sharing is the whole
  * point: `observe()` is an LLM call, and paying for it once per form shape
- * rather than once per application is what makes a $99 Season Pass covering 500
+ * rather than once per application is what makes a $29 Season Pass covering 500
  * applications work at all.
  *
  * `lib/form-action-cache.ts` owns the format and the rules, including why no
