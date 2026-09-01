@@ -218,6 +218,20 @@
       "when": 1788216069155,
       "tag": "0030_profiles_re_engagement_sent_at_privileges",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1788304200000,
+      "tag": "0031_profiles_re_engagement_send_failures",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1788304201000,
+      "tag": "0032_profiles_re_engagement_send_failures_privileges",
+      "breakpoints": true
     }
   ]
 }

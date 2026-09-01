@@ -62,12 +62,17 @@ const RLS_TABLES = TABLES;
  * `stripe_customer_id` is: it is our record of whether we already emailed
  * this person, not an answer they gave, and `inngest/reengagement-cron.ts`
  * is the one writer, through the service role.
+ *
+ * `re_engagement_send_failures` (JOB-321) is here for the same reason
+ * `re_engagement_sent_at` is: it is bookkeeping the cron writes through
+ * `releaseReEngagementSlot`, never a value the person sees or edits.
  */
 const PROFILE_SYSTEM_COLUMNS = [
   "applications_cap",
   "applications_used",
   "attested_at",
   "plan",
+  "re_engagement_send_failures",
   "re_engagement_sent_at",
   "stored_answers",
   "stripe_customer_id",

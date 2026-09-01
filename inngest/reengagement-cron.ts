@@ -51,7 +51,7 @@
 // keeps the ordering that file's header depends on.
 import { inngest } from "./job-application-pipeline";
 
-import { and, between, eq, isNull } from "drizzle-orm";
+import { and, between, eq, isNull, sql } from "drizzle-orm";
 
 import { db } from "@/lib/db/client";
 import { profiles } from "@/lib/db/schema";
@@ -73,6 +73,19 @@ export const REENGAGEMENT_WINDOW_MIN_HOURS = 24;
 export const REENGAGEMENT_WINDOW_MAX_DAYS = 7;
 /** At most this many sends per run. */
 export const REENGAGEMENT_BATCH_LIMIT = 50;
+/**
+ * JOB-321. The upper bound on how many times a candidate's row will cycle
+ * back through this cron after a Resend rejection before the stamp is left
+ * on the row terminally, taking it out of the query for good.
+ *
+ * Three, on the reasoning three failures across three hours is long enough
+ * to distinguish a transient Resend blip (rate limit, one 5xx, a network
+ * flake) from a permanent condition (rotated key, bounced address) that
+ * no amount of automatic retrying is going to move. Beyond that a human
+ * has to look, and the row goes on sitting `re_engagement_sent_at` stamped
+ * with `re_engagement_send_failures >= 3` to say why.
+ */
+export const REENGAGEMENT_MAX_SEND_FAILURES = 3;
 
 export type ReEngagementDatabase = ReturnType<typeof db>;
 
@@ -162,6 +175,91 @@ export async function claimReEngagementSend(
   return claimed ?? null;
 }
 
+/**
+ * JOB-321. The compensating half of `claimReEngagementSend`.
+ *
+ * A send that failed after a successful claim left the row stamped and
+ * unemailed before this function existed, and the next hour's cron would
+ * refuse to pick it up again because the WHERE clause on `re_engagement_sent_at
+ * IS NULL` excluded it. That was the whole of the gap the JOB-311 red team
+ * flagged: a rotated Resend key, a bounced address, a network blip, all
+ * looked identical to a successful send at the database level, and every
+ * one of them silently lost the candidate.
+ *
+ * The shape of this UPDATE follows `reserveApplicationSlot` and
+ * `releaseApplicationSlot` in `lib/application-quota.ts`, and for the same
+ * reason: a plain read of the failure counter followed by a separate write
+ * has a window in it that two overlapping runs can both walk through and
+ * both write "one more failure", so this is one statement — Postgres
+ * evaluates the CASE against the new incremented value and either unstamps
+ * the row (retry on the next hour) or leaves the stamp in place (terminal
+ * fail), atomically, on the row lock. `claimReEngagementSend` re acquires
+ * the row the ordinary way on the next hour if this call unstamped it, so
+ * no follow up state has to survive across the boundary.
+ *
+ * The CASE expression takes the new value (`re_engagement_send_failures +
+ * 1`, evaluated against the OLD row per Postgres UPDATE semantics) and
+ * compares it to `REENGAGEMENT_MAX_SEND_FAILURES`. Below the cap the
+ * stamp is cleared and the row becomes eligible again; at or above the
+ * cap the stamp is preserved so the WHERE clause on
+ * `listReEngagementCandidates` refuses it forever, and the failure counter
+ * on the row records why. `authenticated` can never hit either path
+ * regardless of what happens here: the two columns are UPDATE-locked to
+ * `service_role` in
+ * `drizzle/0030_profiles_re_engagement_sent_at_privileges.sql` and
+ * `drizzle/0032_profiles_re_engagement_send_failures_privileges.sql`.
+ *
+ * Exported for the same reason `claimReEngagementSend` above is: a live
+ * test can hit it directly against a real database without also standing
+ * up an Inngest step around it.
+ *
+ * Returns which outcome landed so the caller's log line can tell a
+ * transient failure from a terminal one, and returns `null` when the row
+ * did not exist to be released (which would be a bug in the cron rather
+ * than an operating condition; logged loudly and moved past regardless).
+ */
+export type ReleaseOutcome =
+  | { released: true; failures: number; terminal: false }
+  | { released: false; failures: number; terminal: true }
+  | { released: false; failures: 0; terminal: false; reason: "no_profile" };
+
+export async function releaseReEngagementSlot(
+  database: ReEngagementDatabase,
+  candidateId: string,
+  maxFailures: number = REENGAGEMENT_MAX_SEND_FAILURES
+): Promise<ReleaseOutcome> {
+  const [row] = await database
+    .update(profiles)
+    .set({
+      reEngagementSendFailures: sql`${profiles.reEngagementSendFailures} + 1`,
+      // `re_engagement_sent_at` clears on the same statement when the
+      // incremented counter is still under the cap. Above the cap the
+      // stamp stays, which is what turns the WHERE clause on
+      // `listReEngagementCandidates` into the terminal state; see the
+      // function docstring above for why this is one UPDATE rather than a
+      // read then a write.
+      reEngagementSentAt: sql`case when ${profiles.reEngagementSendFailures} + 1 >= ${maxFailures} then ${profiles.reEngagementSentAt} else null end`,
+      updatedAt: new Date(),
+    })
+    .where(eq(profiles.id, candidateId))
+    .returning({
+      failures: profiles.reEngagementSendFailures,
+      stamp: profiles.reEngagementSentAt,
+    });
+
+  if (!row) {
+    // The candidate id came from `list-candidates` in the same run, so this
+    // is a bug rather than an operating condition. Reported so the outer
+    // log line can say what happened, and moved past.
+    return { released: false, failures: 0, terminal: false, reason: "no_profile" };
+  }
+
+  const terminal = row.failures >= maxFailures;
+  return terminal
+    ? { released: false, failures: row.failures, terminal: true }
+    : { released: true, failures: row.failures, terminal: false };
+}
+
 export const reengagementCron = inngest.createFunction(
   {
     id: "reengagement-cron",
@@ -224,18 +322,44 @@ export const reengagementCron = inngest.createFunction(
         });
 
         if (!result.sent) {
-          // The row is already stamped from the claim above and this cron
-          // does not undo that: rolling the stamp back would reopen the same
-          // race the claim exists to close, since the reason this specific
-          // send failed (a rotated key, a bounced address, a network blip)
-          // is not guaranteed to be gone by the next run either. Logged
-          // loudly and explicitly so a real failure here is something a
-          // human finds and can retry by hand, matching the reasoning
-          // `buildReEngagementIdempotencyKey` documents.
-          console.warn(
-            `[job-311] send to ${claimedCandidate.id} failed after claiming the row: ${result.reason}. ` +
-              "Row stays stamped; this candidate will not be retried automatically."
-          );
+          // JOB-321. The row was stamped by the claim above, and pre JOB-321
+          // it stayed stamped and this cron never touched the candidate
+          // again: the WHERE clause on `re_engagement_sent_at IS NULL`
+          // excluded them, a rotated Resend key or a transient 5xx read the
+          // same as a real send at the database level, and the candidate
+          // silently never got the email. `releaseReEngagementSlot` closes
+          // that gap by unstamping the row on the same UPDATE that
+          // increments `re_engagement_send_failures`, so the next hourly
+          // run picks them up again — up to `REENGAGEMENT_MAX_SEND_FAILURES`.
+          // Beyond the cap the stamp stays and the failure counter records
+          // why, matching the "logged loudly, human retries by hand"
+          // posture the earlier comment described but now with a bounded
+          // automatic retry ahead of that hand off. `Idempotency-Key`
+          // (see `buildReEngagementIdempotencyKey`) still guards against
+          // the "Resend accepted the request but the response got lost"
+          // corner: a replay of the same profile inside Resend's 24 hour
+          // retention window is deduplicated on their end.
+          const release = await releaseReEngagementSlot(db(), claimedCandidate.id);
+          if (release.terminal) {
+            console.error(
+              `[job-321] send to ${claimedCandidate.id} failed after claiming the row: ${result.reason}. ` +
+                `Failure count is ${release.failures}, at or above the cap of ${REENGAGEMENT_MAX_SEND_FAILURES}; ` +
+                "the row stays stamped and this cron will not retry it. A human should look."
+            );
+          } else if (release.released) {
+            console.warn(
+              `[job-321] send to ${claimedCandidate.id} failed after claiming the row: ${result.reason}. ` +
+                `Failure count is ${release.failures}; row was unstamped and the next hourly run will retry.`
+            );
+          } else {
+            // `no_profile`: the candidate id came from `list-candidates` in
+            // the same run, so this is a bug rather than an operating
+            // condition. Logged so the next reader can see it happened.
+            console.error(
+              `[job-321] send to ${claimedCandidate.id} failed after claiming the row: ${result.reason}. ` +
+                "Release could not find the profile to unstamp; the row stays as the claim left it."
+            );
+          }
           return { sent: false, reason: result.reason };
         }
 
