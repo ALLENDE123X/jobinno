@@ -37,8 +37,19 @@ const LOG = "[job-311-reengagement]";
  * the local part and the full domain, masks the rest. Enough to tell log
  * lines about different people apart without writing a real recipient
  * address into logs a person other than that recipient can read.
+ *
+ * The `typeof` guard is defensive rather than reachable today: `profiles.email`
+ * is `notNull()` in the schema and `SendReEngagementEmailInput.to` is a
+ * required `string`, so every real caller already hands this function a
+ * string. It sits here anyway because this is a logging helper, and a logging
+ * helper that itself throws would take a whole cron run down over one row
+ * whose email column drifted to `null` in some future schema state. The
+ * signature stays `string` on purpose so TypeScript still catches callers who
+ * pass an obviously wrong shape; the guard is a runtime backstop, not a
+ * license to loosen the type.
  */
 export function redactEmail(email: string): string {
+  if (typeof email !== "string") return "[invalid]";
   const [local, domain] = email.split("@");
   if (!local || !domain) return "[invalid]";
   return `${local.slice(0, 2)}***@${domain}`;
