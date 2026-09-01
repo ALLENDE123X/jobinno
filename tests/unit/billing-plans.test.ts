@@ -77,14 +77,14 @@ describe("what each plan costs and buys", () => {
     expect(LAPSED_PLAN_CAP).toBe(0);
   });
 
-  it("promises the same three applications the landing page does", () => {
-    // `app/page.tsx`'s pricing card and hero subhead both say "3 applications,
-    // total" as of the 2026-08-25 product decision to cap the free trial at 3
-    // while v1 iterates on submit success rate (see the commit message on
-    // `lib/billing/plans.ts`). `lib/onboarding/attestation.ts` is the one place
-    // that number is actually granted, and it reads this constant rather than
-    // a literal 3.
-    expect(FREE_PLAN_APPLICATIONS_CAP).toBe(3);
+  it("promises the same free applications the landing page does", () => {
+    // `app/page.tsx`'s pricing card and hero subhead both say "10 applications,
+    // total" as of the 2026-09-01 pricing cut. JOB-331 raised the free trial
+    // from 3 to 10 so a cold visitor can actually see the product submit real
+    // applications overnight before the paywall lands.
+    // `lib/onboarding/attestation.ts` is the one place that number is actually
+    // granted, and it reads this constant rather than a literal.
+    expect(FREE_PLAN_APPLICATIONS_CAP).toBe(10);
   });
 });
 

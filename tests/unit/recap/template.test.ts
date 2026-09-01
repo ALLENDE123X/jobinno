@@ -121,24 +121,24 @@ describe("buildRecapEmail", () => {
 describe("renderRecapCta", () => {
   it("free tier at cap: pitches Starter with a pricing link", () => {
     const cta = renderRecapCta(
-      baseRecipient({ plan: "free", applicationsUsed: 3, applicationsCap: 3 })
+      baseRecipient({ plan: "free", applicationsUsed: 10, applicationsCap: 10 })
     );
     expect(cta).toContain("free trial");
     expect(cta).toContain("Starter");
-    expect(cta).toContain("$29");
+    expect(cta).toContain("$9");
     expect(cta).toContain(RECAP_PRICING_URL);
     expect(cta).not.toContain("Cap:");
   });
 
   it("free tier with room left: names the count remaining and both paid options", () => {
     const cta = renderRecapCta(
-      baseRecipient({ plan: "free", applicationsUsed: 2, applicationsCap: 3 })
+      baseRecipient({ plan: "free", applicationsUsed: 2, applicationsCap: 10 })
     );
-    expect(cta).toContain("2 of your 3 free applications");
+    expect(cta).toContain("2 of your 10 free applications");
     expect(cta).toContain("Starter");
-    expect(cta).toContain("$29");
+    expect(cta).toContain("$9");
     expect(cta).toContain("Season Pass");
-    expect(cta).toContain("$99");
+    expect(cta).toContain("$29");
     expect(cta).toContain(RECAP_PRICING_URL);
   });
 
@@ -150,7 +150,7 @@ describe("renderRecapCta", () => {
     expect(cta).toContain("12 of 150");
     expect(cta).toContain(RECAP_DASHBOARD_URL);
     expect(cta).not.toContain(RECAP_PRICING_URL);
-    expect(cta).not.toContain("$29");
+    expect(cta).not.toContain("$9");
   });
 
   it("season pass tier: names the plan and the used/cap ratio, not a pitch", () => {

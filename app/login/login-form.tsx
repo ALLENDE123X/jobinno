@@ -82,7 +82,7 @@ const SEND_FAILURE_MESSAGE =
 const FLOW_STEPS = [
   { icon: LogIn, label: "Sign in" },
   { icon: FileText, label: "3 minute intake" },
-  { icon: Moon, label: "First 3 applications go out tonight" },
+  { icon: Moon, label: "First 10 applications go out tonight" },
 ] as const;
 
 type Status =
@@ -296,7 +296,7 @@ export function LoginForm({ initialError }: { initialError?: string }) {
                 data-testid="login-free-tier-chip"
                 className="rounded-full border bg-muted/40 px-3 py-1.5 text-center font-medium text-foreground/80"
               >
-                Free tier: 3 applications. No card required.
+                Free tier: 10 applications. No card required.
               </p>
               <p
                 data-testid="login-gmail-scope-chip"

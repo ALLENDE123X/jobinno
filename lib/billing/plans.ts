@@ -5,8 +5,8 @@
  * ── Why this module imports nothing ─────────────────────────────────────────
  * The pricing cards on the landing page need the plan slugs, and the webhook
  * handler needs the caps. If those two read different lists they will drift,
- * and the way that drift surfaces is somebody paying $99 and being given the
- * $29 allowance. So there is one list, and it is kept free of imports so that
+ * and the way that drift surfaces is somebody paying $29 and being given the
+ * $9 allowance. So there is one list, and it is kept free of imports so that
  * a server component can read it without pulling the Stripe SDK or Drizzle's
  * `pg-core` into a browser bundle. `lib/billing/stripe.ts` is the server half.
  *
@@ -116,7 +116,7 @@ export type PlanSlug = "free" | PaidPlanSlug;
  * proved what happens when a number like this lives in two places, which is
  * that they drift.
  */
-export const FREE_PLAN_APPLICATIONS_CAP = 3;
+export const FREE_PLAN_APPLICATIONS_CAP = 10;
 
 export interface PaidPlan {
   slug: PaidPlanSlug;
@@ -205,7 +205,7 @@ export function planSlugOf(value: unknown): PlanSlug {
  * True when they hold a paid plan of the same tier or better. Pressing "Get
  * Starter" twice is the case this exists for: without it the second press opens
  * a second Checkout Session and Stripe will happily create a second live
- * subscription against the same card, billing the person $29 a month twice for
+ * subscription against the same card, billing the person $9 a month twice for
  * one account. Upgrading is still allowed, because that is a real thing to want.
  */
 export function alreadyCoveredBy(current: PlanSlug, wanted: PaidPlanSlug): boolean {

@@ -291,13 +291,13 @@ describe("the Continue with Google button", () => {
     const steps = flow.textContent ?? "";
     expect(steps).toContain("Sign in");
     expect(steps).toContain("3 minute intake");
-    expect(steps).toContain("First 3 applications go out tonight");
+    expect(steps).toContain("First 10 applications go out tonight");
 
     expect(screen.getByTestId("login-gmail-scope-chip").textContent).toBe(
       "Read only Gmail access is requested later, not on this screen."
     );
     expect(screen.getByTestId("login-free-tier-chip").textContent).toBe(
-      "Free tier: 3 applications. No card required."
+      "Free tier: 10 applications. No card required."
     );
 
     // Terms and Privacy are inline under the buttons, both linking to the

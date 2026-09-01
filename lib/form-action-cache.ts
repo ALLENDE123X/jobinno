@@ -4,7 +4,7 @@
  * ── Why this exists ─────────────────────────────────────────────────────────
  * Every field this pipeline fills costs an `observe()` call, and `observe()` is
  * an LLM call. A full application is roughly 20 to 40 of them. At the Season
- * Pass price of $99 for 500 applications, paying that on every application puts
+ * Pass price of $29 for 500 applications, paying that on every application puts
  * LLM cost somewhere around 75% of revenue, which is not a business.
  *
  * The saving is sitting in plain sight: Jobinno hits the same handful of ATS
