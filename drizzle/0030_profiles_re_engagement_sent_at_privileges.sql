@@ -1,0 +1,32 @@
+-- Grants `re_engagement_sent_at` to `service_role` only. JOB-311.
+--
+-- A second file rather than folding this into 0029, for the reason 0029's
+-- own header gives: `drizzle-kit push`, which CI uses to build its throwaway
+-- database, applies the ALTER TABLE in that file on its own by diffing
+-- `lib/db/schema.ts`, but cannot see a GRANT at all, so
+-- `.github/workflows/ci.yml` needs to apply this file by explicit name the
+-- same way it already does for `0016_profiles_github_url_privileges.sql`,
+-- `0020_profiles_intake_fields_privileges.sql`,
+-- `0021_resumes_column_privileges.sql`,
+-- `0023_profiles_answer_memory_privileges.sql` and
+-- `0026_profiles_gmail_refresh_token_privileges.sql`.
+--
+-- Hand written rather than generated, same as those five: the Drizzle schema
+-- DSL has no way to express GRANT, so this was created with `drizzle-kit
+-- generate --custom` to stay journalled in `drizzle.__drizzle_migrations`
+-- and then filled in by hand.
+--
+-- ── Not granted to `authenticated`, on purpose ──────────────────────────────
+-- `re_engagement_sent_at` is not something a person owns or types in; it is
+-- our record of whether we already emailed them, on the same side of the
+-- line as `stripe_customer_id`, `browserbase_context_id` and
+-- `gmail_refresh_token` above it in `lib/db/schema.ts`, all likewise granted
+-- to nobody but the service role.
+--
+-- `service_role` already holds a table wide UPDATE and bypasses row level
+-- security besides, so the grant below is redundant in practice — the same
+-- redundancy `0003_profiles_column_privileges.sql` notes for the four
+-- columns it grants back to `service_role` by name. Written down anyway so a
+-- reader can see who the one writer is without checking Supabase's role
+-- defaults.
+GRANT UPDATE (re_engagement_sent_at) ON public.profiles TO service_role;

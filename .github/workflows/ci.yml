@@ -178,6 +178,20 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0027_profiles_column_select_lockdown.sql
 
+      - name: Apply the JOB-311 re-engagement privilege migration
+        # JOB-311. Same reasoning again, and its own line rather than a glob
+        # for the reason seven steps up. This one grants
+        # `re_engagement_sent_at`, which `0029_profiles_re_engagement_sent_at.sql`'s
+        # ALTER TABLE (picked up by the `drizzle-kit push` step, which diffs
+        # `lib/db/schema.ts` and never runs `0029`'s SQL file directly)
+        # already added by the time this runs, to `service_role` only,
+        # deliberately not to `authenticated`; see the migration file for
+        # why. `0029` carries only that ALTER TABLE, no backfill statement,
+        # so there is nothing else here for this step to run.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0030_profiles_re_engagement_sent_at_privileges.sql
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -336,6 +350,20 @@ jobs:
         run: >-
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0027_profiles_column_select_lockdown.sql
+
+      - name: Apply the JOB-311 re-engagement privilege migration
+        # JOB-311. Same reasoning again, and its own line rather than a glob
+        # for the reason seven steps up. This one grants
+        # `re_engagement_sent_at`, which `0029_profiles_re_engagement_sent_at.sql`'s
+        # ALTER TABLE (picked up by the `drizzle-kit push` step, which diffs
+        # `lib/db/schema.ts` and never runs `0029`'s SQL file directly)
+        # already added by the time this runs, to `service_role` only,
+        # deliberately not to `authenticated`; see the migration file for
+        # why. `0029` carries only that ALTER TABLE, no backfill statement,
+        # so there is nothing else here for this step to run.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0030_profiles_re_engagement_sent_at_privileges.sql
 
       - name: Build
         run: npm run build

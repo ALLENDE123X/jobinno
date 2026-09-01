@@ -1,0 +1,21 @@
+-- profiles.re_engagement_sent_at (JOB-311): when the founder personal re
+-- engagement email went out to this person, or null if it never has.
+-- `inngest/reengagement-cron.ts` reads it to find who is due (unattested,
+-- between 24h and 7 days old, never sent) and stamps it right after a send
+-- succeeds, so the cron never nudges the same profile twice.
+--
+-- The grant this column needs is
+-- `0030_profiles_re_engagement_sent_at_privileges.sql`, a separate file for
+-- the reason `github_url` (0015) and its grant (0016), and
+-- `gmail_refresh_token` (0025) and its grant (0026), are two files each:
+-- `drizzle-kit push`, which CI uses to build its throwaway database, applies
+-- a plain ALTER TABLE like this one on its own by diffing
+-- `lib/db/schema.ts`, but cannot see a GRANT at all because the Drizzle
+-- schema DSL has no way to express one.
+--
+-- This file carries only the schema change. Column level backfill for a
+-- candidate who was already emailed by hand, before this cron existed to
+-- send it automatically, is applied out of band via ops actions per the
+-- JOB-311 backfill runbook rather than as a statement here, so no recipient
+-- data lives in version controlled source or repository history.
+ALTER TABLE "profiles" ADD COLUMN "re_engagement_sent_at" timestamp with time zone;
