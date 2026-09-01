@@ -263,6 +263,25 @@ describe("what an event is allowed to carry", () => {
   it("returns an empty object rather than throwing when handed nothing", () => {
     expect(sanitizeProperties(ANALYTICS_EVENT.SEARCH_REQUESTED, undefined)).toEqual({});
   });
+
+  it("keeps preview_listing_count on the two preview events and drops anything else", () => {
+    // JOB-320. The preview cards render server side from real jobs rows, and
+    // a call site with the whole `PreviewJob[]` in scope is the kind of place
+    // a company name gets sent by accident. The count is a fact about the
+    // funnel; every other key on that array is a fact about a listing.
+    for (const event of [
+      ANALYTICS_EVENT.PREVIEW_VIEWED,
+      ANALYTICS_EVENT.PREVIEW_CTA_CLICKED,
+    ] as const) {
+      const clean = sanitizeProperties(event, {
+        preview_listing_count: 5,
+        company: "Stripe",
+        job_title: "Software Engineer Intern",
+        ats: "greenhouse",
+      });
+      expect(clean).toEqual({ preview_listing_count: 5 });
+    }
+  });
 });
 
 describe("the outcome bucket", () => {

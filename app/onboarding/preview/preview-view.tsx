@@ -30,6 +30,7 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
+import { captureClientEvent } from "@/components/analytics";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -39,6 +40,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { ANALYTICS_EVENT } from "@/lib/analytics/events";
 import type { PreviewJob } from "@/lib/onboarding/preview-query";
 
 const PREVIEW_SEEN_KEY = "jobinno.onboarding.preview_seen";
@@ -85,8 +87,14 @@ export function PreviewView({ jobs }: { jobs: PreviewJob[] }) {
       // the preview an extra time on a later visit costs nothing next to
       // blocking onboarding on a browser API that will not cooperate.
     }
+    // The visitor is actually going to see this render, so the funnel event
+    // fires now rather than on the auto redirected path above. `jobs.length`
+    // is the shape of what they saw, and the only property this event carries.
+    captureClientEvent(ANALYTICS_EVENT.PREVIEW_VIEWED, {
+      preview_listing_count: jobs.length,
+    });
     setReady(true);
-  }, [router]);
+  }, [router, jobs.length]);
 
   if (!ready) return null;
 
@@ -139,7 +147,17 @@ export function PreviewView({ jobs }: { jobs: PreviewJob[] }) {
       )}
 
       <div className="flex flex-wrap items-center gap-3">
-        <Button size="lg" onClick={() => router.push(STEP_1_PATH)}>
+        <Button
+          size="lg"
+          onClick={() => {
+            // Fire before the client side navigation, so a router.push that
+            // throws or a tab close mid transition still records the click.
+            captureClientEvent(ANALYTICS_EVENT.PREVIEW_CTA_CLICKED, {
+              preview_listing_count: jobs.length,
+            });
+            router.push(STEP_1_PATH);
+          }}
+        >
           Continue and attach resume
         </Button>
         {hasMore ? (

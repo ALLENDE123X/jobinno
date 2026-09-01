@@ -76,6 +76,20 @@ export const ANALYTICS_EVENT = {
   SEARCH_REQUESTED: "search_requested",
   /** One listing finished, however it finished. The bottom of the funnel. */
   APPLICATION_OUTCOME: "application_outcome",
+  /**
+   * The preview page rendered for real, meaning the visitor saw it rather than
+   * being redirected past it by the localStorage skip. `$pageview` alone cannot
+   * distinguish the two, which is the whole point of a dedicated event
+   * (JOB-309's red team review). `preview_listing_count` is the count of cards
+   * the visitor actually saw and nothing about the listings themselves.
+   */
+  PREVIEW_VIEWED: "preview_viewed",
+  /**
+   * The primary "Continue and attach resume" CTA was clicked. Fires before the
+   * client side navigation to step 1, and carries the same `preview_listing_count`
+   * as `PREVIEW_VIEWED` so a funnel step can be built without joining events.
+   */
+  PREVIEW_CTA_CLICKED: "preview_cta_clicked",
 } as const;
 
 export type AnalyticsEvent = (typeof ANALYTICS_EVENT)[keyof typeof ANALYTICS_EVENT];
@@ -112,6 +126,11 @@ export const ALLOWED_PROPERTIES: Readonly<Record<AnalyticsEvent, ReadonlySet<str
     "ats",
     "submit_attempted",
   ]),
+  // Count of listings actually rendered on the page. Shape, not content: no
+  // titles, no companies, no ids. Same key on both preview events so a funnel
+  // can compare the two without joining on a listing.
+  [ANALYTICS_EVENT.PREVIEW_VIEWED]: new Set(["preview_listing_count"]),
+  [ANALYTICS_EVENT.PREVIEW_CTA_CLICKED]: new Set(["preview_listing_count"]),
 };
 
 // ───────────────────────────────────
