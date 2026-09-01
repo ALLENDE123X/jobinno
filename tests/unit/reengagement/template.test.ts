@@ -29,12 +29,15 @@ describe("buildReEngagementEmail", () => {
   });
 
   it("does not put one person's address in another person's email", () => {
-    const first = buildReEngagementEmail("aryareed.907660@gmail.com");
-    const second = buildReEngagementEmail("courtneylmuro@gmail.com");
-    expect(first.text).toContain("aryareed.907660@gmail.com");
-    expect(first.text).not.toContain("courtneylmuro@gmail.com");
-    expect(second.text).toContain("courtneylmuro@gmail.com");
-    expect(second.text).not.toContain("aryareed.907660@gmail.com");
+    // `.test` is the RFC 2606 reserved TLD for exactly this: fixtures that
+    // are guaranteed not to resolve to a real recipient, unlike the two real
+    // looking Gmail addresses this test used to carry.
+    const first = buildReEngagementEmail("first@example.test");
+    const second = buildReEngagementEmail("second@example.test");
+    expect(first.text).toContain("first@example.test");
+    expect(first.text).not.toContain("second@example.test");
+    expect(second.text).toContain("second@example.test");
+    expect(second.text).not.toContain("first@example.test");
   });
 
   it("links back to the exact onboarding step the ticket names", () => {

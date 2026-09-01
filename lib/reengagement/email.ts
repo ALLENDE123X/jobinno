@@ -15,9 +15,44 @@
  * `fetch` rather than the Resend SDK, matching the project wide rule of not
  * adding a dependency for one HTTP call that `lib/notifier.ts` already
  * established.
+ *
+ * ── Idempotency key ───────────────────────────────────────────────────────
+ * `inngest/reengagement-cron.ts` claims a profile (stamps
+ * `re_engagement_sent_at`) before calling this function, not after, so a send
+ * that fails partway through never leaves a profile both stamped and
+ * unemailed with no way to tell. `buildReEngagementIdempotencyKey` gives that
+ * claim a matching Resend side guard: the same deterministic key for the same
+ * profile means a retried request against Resend within its documented 24
+ * hour retention window is deduplicated on Resend's end too, so replaying a
+ * send for a profile that already claimed its row (through an ops action, for
+ * example) can never double email that person.
  */
 
+import { createHash } from "node:crypto";
+
 const LOG = "[job-311-reengagement]";
+
+/**
+ * Redacts an email address for logging: keeps the first two characters of
+ * the local part and the full domain, masks the rest. Enough to tell log
+ * lines about different people apart without writing a real recipient
+ * address into logs a person other than that recipient can read.
+ */
+export function redactEmail(email: string): string {
+  const [local, domain] = email.split("@");
+  if (!local || !domain) return "[invalid]";
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
+/**
+ * A deterministic key, one per profile, for Resend's `Idempotency-Key` header. See
+ * the module header for why this exists; the string it hashes is versioned
+ * (`-reengagement-v1`) so a future, deliberately different email to the same
+ * profile would not be silently deduplicated against this one.
+ */
+export function buildReEngagementIdempotencyKey(profileId: string): string {
+  return createHash("sha256").update(`${profileId}-reengagement-v1`).digest("hex");
+}
 
 /**
  * Where a reply to this email actually lands. Fixed rather than read from an
@@ -31,6 +66,13 @@ export type SendReEngagementEmailInput = {
   to: string;
   subject: string;
   text: string;
+  /**
+   * Passed through to Resend as `Idempotency-Key`. Optional in the type only
+   * so a caller who has not yet minted one does not fail to type check; the
+   * cron itself always supplies one, built with
+   * `buildReEngagementIdempotencyKey`.
+   */
+  idempotencyKey?: string;
 };
 
 /**
@@ -56,7 +98,7 @@ export async function sendReEngagementEmail(
   const from = process.env.RESEND_FROM_ADDRESS ?? "noreply@jobinno.app";
 
   if (!apiKey || apiKey.trim() === "") {
-    console.warn(`${LOG} RESEND_API_KEY is not set; email to ${input.to} was not sent.`);
+    console.warn(`${LOG} RESEND_API_KEY is not set; email to ${redactEmail(input.to)} was not sent.`);
     return { sent: false, reason: "missing_api_key" };
   }
 
@@ -66,6 +108,7 @@ export async function sendReEngagementEmail(
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${apiKey}`,
+        ...(input.idempotencyKey ? { "Idempotency-Key": input.idempotencyKey } : {}),
       },
       body: JSON.stringify({
         from,
@@ -76,8 +119,11 @@ export async function sendReEngagementEmail(
       }),
     });
     if (!response.ok) {
-      const body = await response.text();
-      console.warn(`${LOG} resend rejected ${response.status}: ${body.slice(0, 300)}`);
+      // The response body is never logged, even truncated: a Resend
+      // rejection body can itself echo back the recipient address, which is
+      // exactly the data this log line exists to avoid writing anywhere.
+      // The status code is enough to tell a bad key apart from a bad address.
+      console.warn(`${LOG} resend rejected the request for ${redactEmail(input.to)}: status ${response.status}.`);
       return { sent: false, reason: "rejected" };
     }
     return { sent: true };

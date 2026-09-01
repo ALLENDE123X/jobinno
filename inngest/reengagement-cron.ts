@@ -55,7 +55,11 @@ import { and, between, eq, isNull } from "drizzle-orm";
 
 import { db } from "@/lib/db/client";
 import { profiles } from "@/lib/db/schema";
-import { sendReEngagementEmail } from "@/lib/reengagement/email";
+import {
+  buildReEngagementIdempotencyKey,
+  redactEmail,
+  sendReEngagementEmail,
+} from "@/lib/reengagement/email";
 import { buildReEngagementEmail } from "@/lib/reengagement/template";
 
 // Every hour, on the hour. Described in words here rather than in a block
@@ -118,6 +122,46 @@ function isDryRun(): boolean {
   return (process.env.RE_ENGAGEMENT_DRY_RUN ?? "").trim().toLowerCase() === "true";
 }
 
+/**
+ * Attempts to claim one profile for sending, atomically. Stamps
+ * `re_engagement_sent_at` only if the profile is still unattested and not
+ * already stamped at the moment this statement runs, exactly the same
+ * conditional update shape `claimSearchSlot` in `lib/search-cooldown.ts`
+ * uses for the same reason: a plain read followed by a separate write can
+ * always go stale between the two, and a single `UPDATE ... WHERE ...
+ * RETURNING` cannot, since Postgres evaluates the WHERE clause and performs
+ * the write in one atomic step.
+ *
+ * Exported, rather than kept inline in the send step below, so this
+ * statement can be tested directly against a real database without also
+ * standing up an Inngest step around it, the same reasoning
+ * `listReEngagementCandidates` above gives for its own `limit` parameter.
+ *
+ * Returns the claimed row's id and current email on success, or `null` when
+ * the claim raced a concurrent stamp or an attestation that landed since the
+ * candidate was selected in `list-candidates`. A `null` result means nothing
+ * should be sent.
+ */
+export async function claimReEngagementSend(
+  database: ReEngagementDatabase,
+  candidateId: string,
+  now: Date = new Date()
+): Promise<ReEngagementCandidate | null> {
+  const [claimed] = await database
+    .update(profiles)
+    .set({ reEngagementSentAt: now })
+    .where(
+      and(
+        eq(profiles.id, candidateId),
+        isNull(profiles.attestedAt),
+        isNull(profiles.reEngagementSentAt)
+      )
+    )
+    .returning({ id: profiles.id, email: profiles.email });
+
+  return claimed ?? null;
+}
+
 export const reengagementCron = inngest.createFunction(
   {
     id: "reengagement-cron",
@@ -127,9 +171,11 @@ export const reengagementCron = inngest.createFunction(
     concurrency: { limit: 1 },
   },
   async ({ step }) => {
-    // Only the id and email cross the step boundary; both are re read fresh
-    // inside the send step below rather than trusted from here, the same
-    // discipline `job-search-schedule.ts` and `board-sync.ts` both follow.
+    // Only the id and email cross the step boundary. Neither is trusted as
+    // still eligible by the time the send step below runs: a candidate here
+    // can attest, or get claimed by a concurrent run, in the gap between this
+    // step and that one. The send step re checks eligibility itself with a
+    // conditional claim rather than assuming this list is still accurate.
     const candidates = await step.run("list-candidates", () => listReEngagementCandidates());
 
     if (candidates.length === 0) {
@@ -142,39 +188,55 @@ export const reengagementCron = inngest.createFunction(
 
     for (const candidate of candidates) {
       const outcome = await step.run(`send-${candidate.id}`, async () => {
-        const { subject, text } = buildReEngagementEmail(candidate.email);
-
         if (dryRun) {
-          console.log(
-            `[job-311] dry run: would send to ${candidate.email} (${candidate.id})`
-          );
+          console.log(`[job-311] dry run: would send to ${redactEmail(candidate.email)} (${candidate.id})`);
           return { sent: false };
         }
 
-        const result = await sendReEngagementEmail({ to: candidate.email, subject, text });
+        // Conditional atomic claim, done before any send. A candidate who
+        // attested, or who a concurrent run already stamped, between
+        // `list-candidates` and here no longer matches `claimReEngagementSend`'s
+        // WHERE clause, so it returns `null` and nothing is sent: this is
+        // what closes the stale eligibility race the plain re read approach
+        // in the list step above cannot close on its own, since a plain read
+        // can still go stale again before the send that follows it.
+        //
+        // Claiming before sending, rather than after, also means a send that
+        // fails partway through never leaves a profile stamped but unemailed
+        // with no way to tell them apart from one that is stamped and really
+        // was sent: this cron does not retry a claimed row automatically
+        // (see the warning below), so `buildReEngagementIdempotencyKey` gives
+        // any deliberate, ops driven retry against Resend a safe key to
+        // replay with instead.
+        const claimedCandidate = await claimReEngagementSend(db(), candidate.id);
+
+        if (claimedCandidate === null) {
+          console.log(`[job-311] skipped ${candidate.id}: no longer eligible, raced by attestation or another run.`);
+          return { sent: false, reason: "raced" as const };
+        }
+
+        const { subject, text } = buildReEngagementEmail(claimedCandidate.email);
+        const result = await sendReEngagementEmail({
+          to: claimedCandidate.email,
+          subject,
+          text,
+          idempotencyKey: buildReEngagementIdempotencyKey(claimedCandidate.id),
+        });
+
         if (!result.sent) {
+          // The row is already stamped from the claim above and this cron
+          // does not undo that: rolling the stamp back would reopen the same
+          // race the claim exists to close, since the reason this specific
+          // send failed (a rotated key, a bounced address, a network blip)
+          // is not guaranteed to be gone by the next run either. Logged
+          // loudly and explicitly so a real failure here is something a
+          // human finds and can retry by hand, matching the reasoning
+          // `buildReEngagementIdempotencyKey` documents.
           console.warn(
-            `[job-311] send to ${candidate.email} (${candidate.id}) failed: ${result.reason}`
+            `[job-311] send to ${claimedCandidate.id} failed after claiming the row: ${result.reason}. ` +
+              "Row stays stamped; this candidate will not be retried automatically."
           );
-          return { sent: false };
-        }
-
-        // Stamped through the raw Drizzle client rather than throwing on
-        // failure, the same posture `lib/notifier.ts` takes for
-        // `escalation_notified_at`: the email is already sent and cannot be
-        // unsent, so a stamp write that fails is a warning to fix by hand,
-        // never a reason to retry the step and send a second copy of an
-        // email that already landed.
-        try {
-          await db()
-            .update(profiles)
-            .set({ reEngagementSentAt: new Date() })
-            .where(eq(profiles.id, candidate.id));
-        } catch (err) {
-          console.warn(
-            `[job-311] could not stamp re_engagement_sent_at on ${candidate.id}: ` +
-              `${err instanceof Error ? err.message : String(err)}`
-          );
+          return { sent: false, reason: result.reason };
         }
 
         return { sent: true };

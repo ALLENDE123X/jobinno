@@ -13,19 +13,9 @@
 -- `lib/db/schema.ts`, but cannot see a GRANT at all because the Drizzle
 -- schema DSL has no way to express one.
 --
--- ── The backfill this migration also carries ─────────────────────────────
--- Aryareed (aryareed.907660@gmail.com) was the first real cold traffic Meta
--- ad signup, bounced pre attestation, and was already sent this exact email
--- by hand through Resend on 2026-08-31 21:00 UTC (Resend id
--- b44c6f46-8803-4b84-bfe1-96369547a98e) before this cron existed to send it
--- automatically. Stamping her row with that real timestamp in the same
--- migration that adds the column is what keeps the first cron run, once it
--- goes live, from reading her as still due and sending a second copy of an
--- email she already has.
---
--- A single row, matched by email and updated to a value that already
--- happened, not a bulk write and nothing destructive — HARD STOP 5 in
--- CLAUDE.md.
-ALTER TABLE "profiles" ADD COLUMN "re_engagement_sent_at" timestamp with time zone;--> statement-breakpoint
-UPDATE "profiles" SET "re_engagement_sent_at" = '2026-08-31 21:00:00+00'::timestamptz
-WHERE "email" = 'aryareed.907660@gmail.com';
+-- This file carries only the schema change. Column level backfill for a
+-- candidate who was already emailed by hand, before this cron existed to
+-- send it automatically, is applied out of band via ops actions per the
+-- JOB-311 backfill runbook rather than as a statement here, so no recipient
+-- data lives in version controlled source or repository history.
+ALTER TABLE "profiles" ADD COLUMN "re_engagement_sent_at" timestamp with time zone;

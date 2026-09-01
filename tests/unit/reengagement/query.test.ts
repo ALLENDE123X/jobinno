@@ -56,6 +56,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ??= "test-service-role-key";
 
 const {
   listReEngagementCandidates,
+  claimReEngagementSend,
   REENGAGEMENT_WINDOW_MIN_HOURS,
   REENGAGEMENT_WINDOW_MAX_DAYS,
   REENGAGEMENT_BATCH_LIMIT,
@@ -199,5 +200,70 @@ liveDbSuite("the re engagement candidate query", () => {
 
     const rows = await listReEngagementCandidates(database, NOW, 1);
     expect(rows).toHaveLength(1);
+  });
+
+  /**
+   * JOB-311 red team MAJOR 1 and MAJOR 2: `claimReEngagementSend` is the
+   * conditional atomic claim that closes the stale eligibility race
+   * `listReEngagementCandidates` alone cannot close, since a candidate list
+   * read once at the top of the run can go stale (attestation, a concurrent
+   * run's own claim) before a send actually happens. These tests exercise
+   * the claim directly against a real database rather than through the
+   * Inngest step that calls it, the same reasoning the module gives for
+   * exporting it in the first place.
+   */
+  describe("claimReEngagementSend", () => {
+    it("claims a still eligible profile and stamps it", async () => {
+      const { id, email } = await insertProfile({ createdAt: daysAgo(3) });
+
+      const claimed = await claimReEngagementSend(database, id, NOW);
+      expect(claimed).toEqual({ id, email });
+
+      const [row] = await sql`select re_engagement_sent_at from public.profiles where id = ${id}`;
+      expect(row.re_engagement_sent_at).not.toBeNull();
+    });
+
+    it("refuses to claim a profile that has already attested", async () => {
+      const { id } = await insertProfile({ createdAt: daysAgo(3), attested: true });
+
+      const claimed = await claimReEngagementSend(database, id, NOW);
+      expect(claimed).toBeNull();
+    });
+
+    it("refuses to claim a profile that is already stamped", async () => {
+      const { id } = await insertProfile({ createdAt: daysAgo(3), reEngagementSentAt: hoursAgo(1) });
+
+      const claimed = await claimReEngagementSend(database, id, NOW);
+      expect(claimed).toBeNull();
+    });
+
+    it("lets only the first of two racing claims on the same profile through", async () => {
+      // This is the TOCTOU scenario itself: two overlapping attempts to claim
+      // the same profile, exactly what two overlapping cron runs (or a run
+      // racing an attestation that lands mid run) would do. Only one may
+      // succeed, and the loser has to come back `null` rather than a second
+      // copy of the claim, or this cron would send the email twice.
+      const { id, email } = await insertProfile({ createdAt: daysAgo(3) });
+
+      const [first, second] = await Promise.all([
+        claimReEngagementSend(database, id, NOW),
+        claimReEngagementSend(database, id, NOW),
+      ]);
+
+      const winners = [first, second].filter((claim) => claim !== null);
+      expect(winners).toHaveLength(1);
+      expect(winners[0]).toEqual({ id, email });
+    });
+
+    it("does not affect a different profile's eligibility", async () => {
+      const claimedProfile = await insertProfile({ createdAt: daysAgo(3) });
+      const other = await insertProfile({ createdAt: daysAgo(2) });
+
+      await claimReEngagementSend(database, claimedProfile.id, NOW);
+
+      const rows = await listReEngagementCandidates(database, NOW);
+      expect(rows.map((row) => row.id)).not.toContain(claimedProfile.id);
+      expect(rows.map((row) => row.id)).toContain(other.id);
+    });
   });
 });
