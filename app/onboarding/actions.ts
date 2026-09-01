@@ -37,6 +37,10 @@
 import { revalidatePath } from "next/cache";
 
 import { ANALYTICS_EVENT } from "@/lib/analytics/events";
+import {
+  sendMetaCapiEvent,
+} from "@/lib/analytics/meta-conversions-api";
+import { META_EVENT } from "@/lib/analytics/meta-pixel-client";
 import { captureServerEvent } from "@/lib/analytics/posthog-server";
 import { requestDocumentParse } from "@/lib/candidate-document-trigger";
 import { requestJobSearch } from "@/lib/job-search-trigger";
@@ -264,6 +268,20 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
         ? intake.targetLocations.length
         : 0,
     },
+  });
+
+  // JOB-328. Meta CompleteRegistration via the Conversions API, fired
+  // alongside PostHog and for a different consumer: PostHog owns the product
+  // funnel this file already writes to, Meta needs its own event so the ad
+  // auction can optimize for people who actually finish onboarding rather
+  // than for cheap tappers. The user's email is hashed inside sendMetaCapiEvent
+  // (SHA-256 of lowercased trimmed value, Meta's canonical `em` identifier);
+  // the raw address is never sent (HARD STOP 9). No op when the Meta env vars
+  // are unset, so this ships safely before Pranav sets them on Vercel.
+  await sendMetaCapiEvent({
+    eventName: META_EVENT.COMPLETE_REGISTRATION,
+    email: user.email ?? null,
+    eventId: `intake_${user.id}`,
   });
 
   // JOB-112. The resume and the LinkedIn export get parsed once, now, rather

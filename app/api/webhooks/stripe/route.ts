@@ -30,6 +30,8 @@
 
 import { NextResponse, type NextRequest } from "next/server";
 
+import { sendMetaCapiEvent } from "@/lib/analytics/meta-conversions-api";
+import { META_EVENT } from "@/lib/analytics/meta-pixel-client";
 import { createStripeClient } from "@/lib/billing/stripe";
 import {
   applyPlanChange,
@@ -157,6 +159,35 @@ export async function POST(request: NextRequest) {
   console.info(
     `[stripe-webhook] ${event.type} (${event.id}): ${result.applied}, ${result.detail}`
   );
+
+  // JOB-328. Meta Purchase via the Conversions API. Fired only when the plan
+  // actually activated on a checkout.session.completed event, so a redelivery
+  // that the idempotency guard above already collapsed to "nothing" or a
+  // subscription lapse cannot double count. The Stripe event id doubles as
+  // Meta's dedupe key so that a Pixel-fired Purchase and this server side
+  // Purchase for the same checkout resolve to one event on Meta's side.
+  // The customer's email is hashed inside sendMetaCapiEvent (HARD STOP 9);
+  // amount_total is in the smallest currency unit per Stripe convention, so
+  // it is divided by 100 to give Meta the value in whole currency units.
+  if (
+    event.type === "checkout.session.completed" &&
+    result.applied === "activated"
+  ) {
+    const session = event.data.object;
+    const amountTotal = session.amount_total ?? 0;
+    const email =
+      session.customer_details?.email ??
+      (typeof session.customer_email === "string"
+        ? session.customer_email
+        : null);
+    await sendMetaCapiEvent({
+      eventName: META_EVENT.PURCHASE,
+      email,
+      eventId: event.id,
+      value: amountTotal / 100,
+      currency: (session.currency ?? "usd").toLowerCase(),
+    });
+  }
 
   return NextResponse.json({ received: true, applied: result.applied });
 }

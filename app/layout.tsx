@@ -1,10 +1,16 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import Script from "next/script";
 import "./globals.css";
 
 import { AnalyticsProvider } from "@/components/analytics";
 import { FeedbackWidget } from "@/components/feedback-widget";
 import { ThemeProvider } from "@/components/theme";
+
+// JOB-328. Meta Pixel base code, gated on the pixel id being set. Read once
+// at module scope so a redeploy is what changes it; the pixel id is a
+// build-time constant on purpose (see lib/analytics/meta-pixel-client.ts).
+const META_PIXEL_ID = (process.env.NEXT_PUBLIC_META_PIXEL_ID ?? "").trim();
 
 /**
  * The variable is `--font-sans` and not `--font-geist-sans` on purpose. The
@@ -57,6 +63,29 @@ export default function RootLayout({
       suppressHydrationWarning
     >
       <body className="antialiased">
+        {/* JOB-328. Meta Pixel base code. Renders only when the pixel id is
+            set; every deployment that has not yet had the env var set on
+            Vercel emits nothing at all, so this is safe to ship ahead of the
+            configuration change. `strategy="afterInteractive"` is Meta's own
+            recommended install pattern: the loader stub assigns window.fbq
+            synchronously and queues track calls until the real library
+            arrives, so a call from a client component's useEffect that runs
+            after hydration is safe. The paired secret is
+            META_CAPI_ACCESS_TOKEN and never appears in this bundle. */}
+        {META_PIXEL_ID !== "" ? (
+          <Script id="meta-pixel" strategy="afterInteractive">
+            {`!function(f,b,e,v,n,t,s)
+{if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+n.callMethod.apply(n,arguments):n.queue.push(arguments)};
+if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';
+n.queue=[];t=b.createElement(e);t.async=!0;
+t.src=v;s=b.getElementsByTagName(e)[0];
+s.parentNode.insertBefore(t,s)}(window,document,'script',
+'https://connect.facebook.net/en_US/fbevents.js');
+fbq('init', '${META_PIXEL_ID}');
+fbq('track', 'PageView');`}
+          </Script>
+        ) : null}
         {/* Outermost of the two providers because it is the one that has to see
             every route change, including the ones that happen before a theme
             has resolved. It renders nothing and no op's entirely when no
