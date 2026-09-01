@@ -58,6 +58,7 @@ import { syncJobBoards } from "@/inngest/board-sync";
 import { applyToJob, discoverListings, inngest } from "@/inngest/job-application-pipeline";
 import { scheduleJobSearches } from "@/inngest/job-search-schedule";
 import { parseCandidateDocuments } from "@/inngest/parse-candidate-documents";
+import { reengagementCron } from "@/inngest/reengagement-cron";
 
 /**
  * Node, not Edge. Non negotiable rather than a preference: the pipeline reaches
@@ -97,6 +98,11 @@ export const { GET, POST, PUT } = serve({
     // nothing sent `job-search/requested` at all, so the two functions below
     // were registered, correct, and unreachable.
     scheduleJobSearches,
+    // JOB-311. The hourly cron that nudges an unattested signup back, once,
+    // between a day and a week after they arrived. Same property as the two
+    // crons above: unregistered here it has a cron expression and no
+    // schedule.
+    reengagementCron,
     // JOB-112. Fired by onboarding, once per uploaded resume. Parses the
     // resume and the LinkedIn export and stores the result on the row, so the
     // fill pipeline reads it instead of re-deriving it every application.

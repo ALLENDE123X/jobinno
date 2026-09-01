@@ -678,6 +678,27 @@ export const profiles = pgTable(
      */
     gmailRefreshToken: text("gmail_refresh_token"),
 
+    /**
+     * JOB-311. When the founder personal re engagement email went out to this
+     * person, or null if it never has. `inngest/reengagement-cron.ts` reads
+     * this to find who is due and stamps it right after a send succeeds, so
+     * the same profile is never nudged twice.
+     *
+     * Ours, not the person's, so it stays out of every grant list the same
+     * way `stripe_customer_id`, `browserbase_context_id` and
+     * `gmail_refresh_token` above do: no `authenticated` UPDATE, granted only
+     * to `service_role` in
+     * `drizzle/0030_profiles_re_engagement_sent_at_privileges.sql`, following
+     * the rule `drizzle/0003_profiles_column_privileges.sql` states.
+     *
+     * Null on every existing row, which is exactly what "never sent" should
+     * read as. The one exception on record is aryareed's row, backfilled in
+     * the same migration to the real timestamp of the manual send that
+     * preceded this cron, so the cron does not repeat a nudge that already
+     * went out.
+     */
+    reEngagementSentAt: timestamp("re_engagement_sent_at", { withTimezone: true }),
+
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

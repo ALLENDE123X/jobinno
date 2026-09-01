@@ -30,7 +30,6 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -48,7 +47,7 @@ import {
 import { prefillVisaStatus } from "@/lib/onboarding/intake-derivation";
 
 import { saveIntakeDraft } from "../actions";
-import { Field, YesNoField, toBoolean, type YesNo } from "./_shared";
+import { Field, StepFooter, YesNoField, toBoolean, type YesNo } from "./_shared";
 
 type CitizenshipValue = (typeof CITIZENSHIP_OPTIONS)[number]["value"];
 type F1Value = (typeof F1_STATUS_OPTIONS)[number]["value"];
@@ -252,14 +251,18 @@ export function Step2Form({
         </p>
       ) : null}
 
-      <div className="flex gap-3">
-        <Button type="button" variant="outline" onClick={() => router.push("/onboarding/step/1")}>
-          Back
-        </Button>
-        <Button type="submit" disabled={busy}>
-          {busy ? "Saving" : "Next"}
-        </Button>
-      </div>
+      <StepFooter
+        step={2}
+        backHref="/onboarding/step/1"
+        busy={busy}
+        draftPayload={{
+          citizenshipStatus,
+          f1Status: isF1 ? (f1Status === "" ? null : f1Status) : null,
+          visaStatus,
+          workAuthorizedUs: isUsOrPr ? null : toBoolean(workAuthorizedUs),
+          requiresSponsorship: isUsOrPr ? null : toBoolean(requiresSponsorship),
+        }}
+      />
     </form>
   );
 }

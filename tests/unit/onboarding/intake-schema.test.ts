@@ -212,20 +212,24 @@ describe("step3Schema", () => {
 });
 
 describe("step4Schema", () => {
+  // JOB-310: only the clearance gate is required now. `base` intentionally
+  // omits the other six JOB-134 fields to match what step 4's form actually
+  // sends after this ticket.
   const base = {
-    salaryExpectation: "market rate",
-    subjectToRestrictiveCovenant: false,
-    relativesAtTargetEmployers: false,
-    previouslyEmployedAtTargetEmployers: false,
     clearanceEligibility: "eligible",
     clearanceLevelHeld: "never_held",
-    highSchoolName: "Lincoln High School",
-    highSchoolGradYear: 2021,
   };
 
-  it("accepts a complete compliance and comp payload", () => {
+  it("accepts the minimum viable step 4: clearance gate alone", () => {
     const result = step4Schema.safeParse(base);
     expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.salaryExpectation).toBeNull();
+    expect(result.data.highSchoolName).toBeNull();
+    expect(result.data.highSchoolGradYear).toBeNull();
+    expect(result.data.subjectToRestrictiveCovenant).toBeNull();
+    expect(result.data.relativesAtTargetEmployers).toBeNull();
+    expect(result.data.previouslyEmployedAtTargetEmployers).toBeNull();
   });
 
   it("rejects an active clearance that says never held", () => {
@@ -248,14 +252,48 @@ describe("step4Schema", () => {
     expect(result.success).toBe(true);
   });
 
-  it("rejects a graduation year outside the bounds", () => {
+  it("rejects an empty submission, since clearance eligibility alone is still required", () => {
+    const result = step4Schema.safeParse({});
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const paths = result.error.issues.map((issue) => issue.path[0]);
+      expect(paths).toContain("clearanceEligibility");
+      expect(paths).toContain("clearanceLevelHeld");
+    }
+  });
+
+  // The six lazy loaded fields still validate their shape when a value is
+  // actually given, even though none of them is required any more.
+  it("accepts every optional field fully filled in, unchanged from before", () => {
+    const result = step4Schema.safeParse({
+      ...base,
+      salaryExpectation: "market rate",
+      subjectToRestrictiveCovenant: false,
+      relativesAtTargetEmployers: false,
+      previouslyEmployedAtTargetEmployers: false,
+      highSchoolName: "Lincoln High School",
+      highSchoolGradYear: 2021,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a graduation year outside the bounds, when one is given", () => {
     const result = step4Schema.safeParse({ ...base, highSchoolGradYear: 1800 });
     expect(result.success).toBe(false);
   });
 
-  it("rejects a missing salary expectation", () => {
+  it("treats a blank salary expectation the same as none given", () => {
     const result = step4Schema.safeParse({ ...base, salaryExpectation: "" });
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.salaryExpectation).toBeNull();
+  });
+
+  it("treats a blank high school name the same as none given", () => {
+    const result = step4Schema.safeParse({ ...base, highSchoolName: "   " });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.highSchoolName).toBeNull();
   });
 });
 
