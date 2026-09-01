@@ -20,19 +20,34 @@
  * Deliberately out of scope. getPreviewJobs returns the same shaped result
  * for anyone at step 1, because there is no resume to have parsed yet.
  * Personalization is the next ticket, once a resume exists to key off.
+ *
+ * ── JOB-319: both Supabase reads' errors are checked ────────────────────────
+ * The routing decision moves through `resolveIntakeStep` so a transient read
+ * failure on either query surfaces as a typed error branch instead of
+ * silently falling through as a null row. A null row from `.maybeSingle()`
+ * used to be indistinguishable from a genuine "no profile yet" or "no
+ * resume yet", which for an already-attested visitor would render the
+ * preview instead of bouncing them onward. The error branch now redirects
+ * to `/login` with a soft error param, matching the pattern the
+ * not-authenticated redirect above already sets.
  */
 
 import { redirect } from "next/navigation";
 
 import { PageShell } from "@/components/page-shell";
 import {
-  earliestIncompleteStep,
   postAuthOnboardingPath,
+  resolveIntakeStep,
 } from "@/lib/onboarding/step-routing";
+import { describeSupabaseReadError } from "@/lib/onboarding/log-supabase-error";
 import { getPreviewJobs } from "@/lib/onboarding/preview-query";
 import { createServerClient } from "@/lib/supabase/server";
 
 import { PreviewView } from "./preview-view";
+
+const LOG = "[job-319-onboarding-preview]";
+const READ_FAILED_REASON =
+  "Could not load your account right now. Please try again in a moment.";
 
 export default async function OnboardingPreviewPage() {
   const supabase = await createServerClient();
@@ -43,7 +58,10 @@ export default async function OnboardingPreviewPage() {
 
   if (!user) redirect("/login");
 
-  const [{ data: profile }, { data: resumeRow }] = await Promise.all([
+  const [
+    { data: profile, error: profileError },
+    { data: resumeRow, error: resumeError },
+  ] = await Promise.all([
     supabase
       .from("profiles")
       .select("citizenship_status, current_city, clearance_eligibility, attested_at")
@@ -58,22 +76,25 @@ export default async function OnboardingPreviewPage() {
       .maybeSingle(),
   ]);
 
-  const step = earliestIncompleteStep(
-    {
-      citizenshipStatus: profile?.citizenship_status ?? null,
-      currentCity: profile?.current_city ?? null,
-      clearanceEligibility: profile?.clearance_eligibility ?? null,
-      attestedAt: profile?.attested_at ?? null,
-    },
-    resumeRow ? { storagePath: resumeRow.storage_path ?? null } : null,
+  const resolved = resolveIntakeStep(
+    { data: profile, error: profileError },
+    { data: resumeRow, error: resumeError },
   );
+
+  if (resolved.kind === "error") {
+    console.error(
+      `${LOG} could not read ${resolved.where} for user ${user.id}: ` +
+        describeSupabaseReadError(resolved.error),
+    );
+    redirect(`/login?error=${encodeURIComponent(READ_FAILED_REASON)}`);
+  }
 
   // Step 1 is the only step this preview stands in front of. Anyone who has
   // already uploaded a resume gets sent wherever a fresh visit to
   // /onboarding would have sent them: their real next step, or the
   // dashboard once everything is done.
-  if (step !== 1) {
-    redirect(postAuthOnboardingPath(step));
+  if (resolved.step !== 1) {
+    redirect(postAuthOnboardingPath(resolved.step));
   }
 
   const jobs = await getPreviewJobs(supabase);

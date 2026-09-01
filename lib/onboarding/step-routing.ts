@@ -81,3 +81,79 @@ export function postAuthOnboardingPath(step: number): string {
   if (step === 6) return "/dashboard";
   return `/onboarding/step/${step}`;
 }
+
+/**
+ * JOB-319. The Supabase read shape both `app/onboarding/page.tsx` and
+ * `app/onboarding/preview/page.tsx` see from a single-row `.maybeSingle()`
+ * call: either a row and no error, or a null row and an error, or a null
+ * row and no error (the row genuinely does not exist yet).
+ *
+ * Typed as `unknown` for the error so the helper does not have to pull the
+ * `PostgrestError` type in, since the two pages already pass whatever
+ * supabase-js hands back.
+ */
+export type IntakeReadResult<T> = {
+  data: T | null;
+  error: unknown | null;
+};
+
+export type IntakeProfileRow = {
+  citizenship_status?: string | null;
+  current_city?: string | null;
+  clearance_eligibility?: string | null;
+  attested_at?: string | Date | null;
+};
+
+export type IntakeResumeRow = {
+  storage_path?: string | null;
+};
+
+/**
+ * JOB-319. Turns the pair of `.maybeSingle()` reads the onboarding router
+ * needs into either an error branch or a step branch, so a Supabase read
+ * that failed transiently cannot be silently treated as "no row" and
+ * misroute a user.
+ *
+ * Before this helper, both `app/onboarding/page.tsx` and
+ * `app/onboarding/preview/page.tsx` destructured `data` off the pair and
+ * dropped the `error` field, so a transient PostgREST error came through as
+ * `null` and `earliestIncompleteStep` interpreted that as "profile not
+ * filled in yet". For an already-attested user, that silently sent them
+ * back into onboarding; for a mid-flow user, it bounced them to an earlier
+ * step than they had actually reached.
+ *
+ * The kind: "error" branch carries the underlying error so the caller can
+ * log it (with whatever user identifiers belong on the log line, per
+ * JOB-311's `redactEmail`), and names which of the two reads failed so the
+ * log points at the right query.
+ */
+export type ResolveIntakeStepResult =
+  | { kind: "error"; where: "profile" | "resume"; error: unknown }
+  | { kind: "step"; step: number };
+
+export function resolveIntakeStep(
+  profileRead: IntakeReadResult<IntakeProfileRow>,
+  resumeRead: IntakeReadResult<IntakeResumeRow>,
+): ResolveIntakeStepResult {
+  if (profileRead.error) {
+    return { kind: "error", where: "profile", error: profileRead.error };
+  }
+  if (resumeRead.error) {
+    return { kind: "error", where: "resume", error: resumeRead.error };
+  }
+
+  const profile = profileRead.data;
+  const resume = resumeRead.data;
+
+  const step = earliestIncompleteStep(
+    {
+      citizenshipStatus: profile?.citizenship_status ?? null,
+      currentCity: profile?.current_city ?? null,
+      clearanceEligibility: profile?.clearance_eligibility ?? null,
+      attestedAt: profile?.attested_at ?? null,
+    },
+    resume ? { storagePath: resume.storage_path ?? null } : null,
+  );
+
+  return { kind: "step", step };
+}
