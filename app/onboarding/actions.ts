@@ -45,6 +45,7 @@ import {
   deriveNeedsSponsorshipNonUs,
   deriveRequiresSponsorship,
   deriveWorkAuthorizedUs,
+  needsSponsorshipNonUsIsRelevant,
 } from "@/lib/onboarding/intake-derivation";
 import {
   intakeFieldErrors,
@@ -297,15 +298,31 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
 // `Save and finish later` calls it with `partial: true`, which switches to
 // the draft schemas in intake-schema.ts (stepNDraftSchema) that treat every
 // field as optional and never reject a payload for being incomplete. Step 1
-// needs no such switch: step1Schema already has nothing required. Steps 3
-// and 4's derivations (deriveNeedsSponsorshipNonUs, clearanceLevelIsRelevant)
-// already resolve safely on missing input (an unanswered question is not
-// "relevant" yet, so they fall back to false / "never_held", which is true
-// either way). Step 2 is the one exception: deriveWorkAuthorizedUs and
-// deriveRequiresSponsorship turn "not answered" into a hard false, which
-// would misrepresent an unanswered question as a "no" in a half filled
-// draft, so the partial path below computes those two columns itself
-// instead of calling the derive functions.
+// needs no such switch: step1Schema already has nothing required.
+//
+// Steps 2 and 3 both need a partial specific branch, and for the same
+// reason: their derive functions collapse "not answered yet" into a
+// definite value the user never actually gave. deriveWorkAuthorizedUs and
+// deriveRequiresSponsorship turn an unanswered question into a hard false
+// unconditionally; deriveNeedsSponsorshipNonUs does the same thing whenever
+// it is called with a null explicit answer, whether or not the question
+// was ever relevant. An earlier version of this comment claimed steps 3
+// and 4 "already resolve safely on missing input" and needed no partial
+// branch. That was wrong for step 3: `deriveNeedsSponsorshipNonUs([],
+// null, null)` returns `false`, and that false was being written to
+// `needs_sponsorship_non_us` under the user's name before the user ever
+// saw the question, in violation of HARD STOP 9. Fixed below the same way
+// step 2 is fixed: the partial branch never calls the derive function.
+// It forces null when the question is not relevant yet, and otherwise
+// passes the explicit answer straight through, including null for
+// "relevant, shown, but not chosen yet".
+//
+// Step 4's clearanceLevelIsRelevant is the one derivation that genuinely
+// is safe on missing input: clearanceLevelIsRelevant(null) evaluates
+// `null !== "no"` which is true, so the ternary in the step 4 branch below
+// passes clearanceLevelHeld through as null rather than forcing
+// "never_held". That is existing, verified behavior and is left
+// unchanged.
 
 export async function saveIntakeDraft(
   payload: unknown,
@@ -401,17 +418,18 @@ export async function saveIntakeDraft(
         // once citizenship is actually known to be US citizen or permanent
         // resident; otherwise pass the explicit answer through as is,
         // including null for "not answered yet".
-        // Same two values step2Schema's cross field check and
-        // lib/onboarding/intake-derivation.ts's INHERENTLY_AUTHORIZED both
-        // encode; kept inline here rather than exported and imported for a
-        // two item list that is unlikely to grow.
-        const inherentlyAuthorizedCitizenships = [
-          "us_citizen",
-          "permanent_resident",
-        ];
+        // lib/onboarding/intake-derivation.ts's INHERENTLY_AUTHORIZED list
+        // is not exported (it is a private module constant), so it cannot
+        // be imported directly here without changing that file, which is
+        // out of scope for this ticket. deriveWorkAuthorizedUs already
+        // encodes the same list: for an inherently authorized citizenship
+        // it always returns true no matter what explicit answer is
+        // passed in, so calling it here with an explicit answer of null
+        // is exactly an "is this citizenship inherently authorized" check,
+        // with no second list to keep in sync.
         const citizenship = validated.citizenshipStatus as string | null;
         const inherentlyAuthorized = citizenship
-          ? inherentlyAuthorizedCitizenships.includes(citizenship)
+          ? deriveWorkAuthorizedUs(citizenship, null)
           : false;
         update.work_authorized_us = inherentlyAuthorized
           ? true
@@ -443,13 +461,49 @@ export async function saveIntakeDraft(
       update.willing_to_relocate = validated.willingToRelocate;
       update.grad_date = validated.gradDate;
       update.earliest_start = validated.earliestStart;
-      // Derive needsSponsorshipNonUs: forced false when the question is
-      // not relevant (no non-US targets and not willing to relocate).
-      update.needs_sponsorship_non_us = deriveNeedsSponsorshipNonUs(
-        validated.targetLocations as string[],
-        validated.willingToRelocate as boolean,
-        validated.needsSponsorshipNonUs as boolean | null,
-      );
+      if (partial) {
+        // See the "options.partial" header above: a half filled draft may
+        // have an empty targetLocations and a null willingToRelocate,
+        // which means the needsSponsorshipNonUs question was never shown
+        // to this user at all. deriveNeedsSponsorshipNonUs would collapse
+        // that into a hard false and this save would write "does not need
+        // sponsorship outside the US" under the user's name for a
+        // question they never answered, which submitIntake later attests
+        // and step 5 never displays for correction (HARD STOP 9).
+        //
+        // Note this cannot simply call deriveNeedsSponsorshipNonUs once
+        // the question is known to be relevant either, the way an earlier
+        // draft of this fix did: that function itself collapses a null
+        // explicit answer to false (`explicitAnswer === true`), which
+        // would fabricate a "no" for someone who saved and finished later
+        // partway through step 3, after naming a non-US target location
+        // but before picking yes or no on this question. So this mirrors
+        // step 2's partial branch above exactly: never call the derive
+        // function here. Force null when the question is not relevant,
+        // and otherwise pass the explicit answer straight through,
+        // including null for "not answered yet".
+        const targetLocations = (validated.targetLocations as string[]) ?? [];
+        const willingToRelocate = validated.willingToRelocate === true;
+        const questionShown = needsSponsorshipNonUsIsRelevant(
+          targetLocations,
+          willingToRelocate,
+        );
+        update.needs_sponsorship_non_us = questionShown
+          ? (validated.needsSponsorshipNonUs as boolean | null)
+          : null;
+      } else {
+        // Derive needsSponsorshipNonUs: forced false when the question is
+        // not relevant (no non-US targets and not willing to relocate).
+        // Safe here, unlike the partial branch above: the strict Next
+        // path requires targetLocations and willingToRelocate to already
+        // be real answers to reach this branch at all, so "not relevant"
+        // here reflects an answer the user gave, not one they skipped.
+        update.needs_sponsorship_non_us = deriveNeedsSponsorshipNonUs(
+          validated.targetLocations as string[],
+          validated.willingToRelocate as boolean,
+          validated.needsSponsorshipNonUs as boolean | null,
+        );
+      }
       break;
 
     case 4:
@@ -465,6 +519,22 @@ export async function saveIntakeDraft(
       update.high_school_grad_year = validated.highSchoolGradYear;
       // Derive clearanceLevelHeld: forced to "never_held" when clearance
       // eligibility is "no".
+      //
+      // This is one derivation call shared by both the strict Next path
+      // and the partial Save and finish later path, and unlike step 3's
+      // needsSponsorshipNonUs above it does not need a separate partial
+      // branch. clearanceLevelIsRelevant(clearanceEligibility) is
+      // `clearanceEligibility !== "no"`, so on a partial draft where
+      // clearanceEligibility has not been answered yet (null),
+      // `null !== "no"` evaluates true, the ternary takes the first
+      // branch, and clearanceLevelHeld passes through unchanged, which is
+      // also null on an unanswered draft. Nothing here forces
+      // "never_held" onto a question the user has not reached. CodeRabbit
+      // flagged this call as the same pattern as the step 3 bug fixed
+      // above; a red team review checked the actual truth table and
+      // confirmed this one does not fabricate on partial input, so it is
+      // deliberately left unchanged rather than given a partial branch it
+      // does not need.
       update.clearance_level_held = clearanceLevelIsRelevant(
         validated.clearanceEligibility as string,
       )

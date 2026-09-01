@@ -148,8 +148,22 @@ export function StepFooter({
       });
 
       if (!result.ok) {
+        // Step 1's saveIntakeDraft validates against step1Schema even in
+        // partial mode (step1Schema already has nothing required, so it
+        // has no draft variant), which means a malformed GitHub URL or a
+        // resume path naming somebody else's folder comes back as a field
+        // level error on `result.errors` rather than a top level
+        // `result.message`. Surface the first field error when there is
+        // one so a Save and finish later failure on step 1 says what is
+        // actually wrong instead of falling through to the generic
+        // fallback.
+        const firstFieldError = result.errors
+          ? Object.values(result.errors)[0]
+          : undefined;
         setSaveError(
-          result.message ?? "Could not save your progress. Try again.",
+          firstFieldError ??
+            result.message ??
+            "Could not save your progress. Try again.",
         );
         setSavingForLater(false);
         return;
