@@ -121,6 +121,9 @@ describe("the Inngest serve route", () => {
     // `reengagement-cron` is JOB-311's, same property again: it has a cron
     // expression whether or not it is on this list, and only being on this
     // list gives it an actual schedule.
+    // `recap-cron` is JOB-329's, same property again: it has a cron
+    // expression whether or not it is on this list, and only being on this
+    // list gives it an actual schedule.
     // `parse-candidate-documents` is JOB-112's, and it has the same property as
     // the ones above: `intake/completed` is sent by onboarding and reaches
     // nothing at all unless this route registers the function that consumes it,
@@ -130,6 +133,7 @@ describe("the Inngest serve route", () => {
       "sync-job-boards",
       "schedule-job-searches",
       "reengagement-cron",
+      "recap-cron",
       "parse-candidate-documents",
       "discover-listings",
       "apply-to-job",
@@ -140,7 +144,7 @@ describe("the Inngest serve route", () => {
     const { status, body } = await introspect();
 
     expect(status).toBe(200);
-    expect(body.function_count).toBe(6);
+    expect(body.function_count).toBe(7);
     expect(body.mode).toBe("dev");
     // Present, whatever its value: the handler reports the schema it speaks and
     // a reply without one is not an Inngest introspection response.

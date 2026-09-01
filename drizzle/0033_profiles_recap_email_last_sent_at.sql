@@ -1,0 +1,26 @@
+-- profiles.recap_email_last_sent_at (JOB-329): when the morning recap email
+-- last went out to this person, or null if it never has.
+-- `inngest/recap-cron.ts` reads it to gate a second send within a 20 hour
+-- window and stamps it right after a send succeeds, so a person whose
+-- overnight applications keep landing across two cron ticks is never emailed
+-- twice in the same morning.
+--
+-- The grant this column needs is
+-- `0034_profiles_recap_email_last_sent_at_privileges.sql`, a separate file
+-- for the reason `re_engagement_sent_at` (0029) and its grant (0030) are two
+-- files each: `drizzle-kit push`, which CI uses to build its throwaway
+-- database, applies a plain ALTER TABLE like this one on its own by diffing
+-- `lib/db/schema.ts`, but cannot see a GRANT at all because the Drizzle
+-- schema DSL has no way to express one.
+--
+-- This file carries only the schema change. There is no backfill. The
+-- absence of a stamp on an existing row is the correct starting state: it
+-- means the person has never received a recap yet, and the query in
+-- `inngest/recap-cron.ts` reads a null stamp as "eligible" the same way it
+-- does for a value older than 20 hours.
+--
+-- A timestamptz rather than a boolean because the eligibility check is
+-- "20 hours since the last send or never" rather than "ever sent". A boolean
+-- would need a separate reset job to unlock a person the day after their
+-- first recap; the timestamp answers the same question in one column.
+ALTER TABLE "profiles" ADD COLUMN "recap_email_last_sent_at" timestamp with time zone;

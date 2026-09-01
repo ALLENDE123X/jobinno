@@ -206,6 +206,21 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1
           -f drizzle/0032_profiles_re_engagement_send_failures_privileges.sql
 
+      - name: Apply the JOB-329 recap privilege migration
+        # JOB-329. Same reasoning again, and its own line rather than a glob
+        # for the reason eight steps up. This one grants
+        # `recap_email_last_sent_at`, which
+        # `0033_profiles_recap_email_last_sent_at.sql`'s ALTER TABLE
+        # (picked up by the `drizzle-kit push` step, which diffs
+        # `lib/db/schema.ts` and never runs `0033`'s SQL file directly)
+        # already added by the time this runs, to `service_role` only,
+        # deliberately not to `authenticated`; see the migration file for
+        # why. `0033` carries only that ALTER TABLE, no backfill
+        # statement, so there is nothing else here for this step to run.
+        run: >-
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          -f drizzle/0034_profiles_recap_email_last_sent_at_privileges.sql
+
       - name: Type check
         run: npx tsc --noEmit
 

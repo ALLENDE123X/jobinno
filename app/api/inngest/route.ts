@@ -58,6 +58,7 @@ import { syncJobBoards } from "@/inngest/board-sync";
 import { applyToJob, discoverListings, inngest } from "@/inngest/job-application-pipeline";
 import { scheduleJobSearches } from "@/inngest/job-search-schedule";
 import { parseCandidateDocuments } from "@/inngest/parse-candidate-documents";
+import { recapCron } from "@/inngest/recap-cron";
 import { reengagementCron } from "@/inngest/reengagement-cron";
 
 /**
@@ -103,6 +104,11 @@ export const { GET, POST, PUT } = serve({
     // crons above: unregistered here it has a cron expression and no
     // schedule.
     reengagementCron,
+    // JOB-329. The hourly cron that sends a morning recap email to anybody
+    // whose overnight pipeline landed two or more real submissions in the
+    // last twelve hours. Same property as the crons above: unregistered
+    // here it has a cron expression and no schedule.
+    recapCron,
     // JOB-112. Fired by onboarding, once per uploaded resume. Parses the
     // resume and the LinkedIn export and stores the result on the row, so the
     // fill pipeline reads it instead of re-deriving it every application.
