@@ -42,7 +42,15 @@ export default async function LoginPage({
 
   return (
     <PageShell>
-      <main className="relative flex flex-1 items-center justify-center px-4 py-8 sm:px-6 sm:py-16">
+      {/*
+        JOB-327: the sign in view now carries the same continuation copy the
+        landing built (H1 that echoes the landing CTA, a three step preview,
+        Gmail scope chip, free tier chip, Terms and Privacy inline). All of
+        that lives inside `LoginForm` so the copy is testable alongside the
+        buttons themselves; this shell only centres the block and gives it
+        top padding room for the added header content.
+      */}
+      <main className="relative flex flex-1 justify-center px-4 py-8 sm:px-6 sm:py-16">
         <LoginForm initialError={typeof error === "string" ? error : undefined} />
       </main>
     </PageShell>

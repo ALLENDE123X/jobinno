@@ -272,6 +272,54 @@ describe("the Continue with Google button", () => {
     });
   });
 
+  it("carries the primary continuation copy above the two auth CTAs (JOB-327)", () => {
+    // Funnel analysis of the ad click drop off (2026-09-01) attributed the
+    // top of the signup loss to a login shell that stripped every trust cue
+    // the landing built. Locking the five above the CTAs pieces in one test
+    // makes it obvious the moment any of them regress: the H1 that echoes
+    // the landing's "Queue tonight's applications" hook, a three step
+    // preview of the flow, the Gmail scope sentence, the free tier chip,
+    // and the Terms and Privacy pair inline. A screenreader label on the
+    // three step list gives us one stable anchor for the strip without
+    // pinning the icon markup itself.
+    render(<LoginForm />);
+
+    const heading = screen.getByRole("heading", { level: 1 });
+    expect(heading.textContent).toBe("One step to tonight's applications.");
+
+    const flow = screen.getByRole("list", { name: "What happens next" });
+    const steps = flow.textContent ?? "";
+    expect(steps).toContain("Sign in");
+    expect(steps).toContain("3 minute intake");
+    expect(steps).toContain("First 3 applications go out tonight");
+
+    expect(screen.getByTestId("login-gmail-scope-chip").textContent).toBe(
+      "Read only Gmail access is requested later, not on this screen."
+    );
+    expect(screen.getByTestId("login-free-tier-chip").textContent).toBe(
+      "Free tier: 3 applications. No card required."
+    );
+
+    // Terms and Privacy are inline under the buttons, both linking to the
+    // pages that already exist on the marketing surface. The test asserts
+    // both are present and pointed at those routes so a later edit that
+    // drops either one or points one at the wrong route fails here.
+    const termsLink = screen.getByRole("link", { name: "Terms" });
+    const privacyLink = screen.getByRole("link", { name: "Privacy" });
+    expect(termsLink.getAttribute("href")).toBe("/terms");
+    expect(privacyLink.getAttribute("href")).toBe("/privacy");
+  });
+
+  it("labels the divider between the two paths so the email path reads as the fallback", () => {
+    // JOB-327 reweights the two paths: Google is the full width primary and
+    // the emailed link is a secondary path below a divider whose label
+    // spells out what the second path is for. The old divider said just
+    // "or", which invited a coin flip between the two.
+    render(<LoginForm />);
+
+    expect(screen.getByText("or use email instead")).toBeTruthy();
+  });
+
   it("disables both buttons while the OAuth handoff is in flight", async () => {
     let resolveOAuth: (value: { error: null }) => void = () => {};
     stubs.signInWithOAuth.mockReturnValueOnce(
