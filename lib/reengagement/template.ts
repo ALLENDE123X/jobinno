@@ -16,10 +16,10 @@
  *
  * ── Subject and copy are fixed by the ticket, not tunable here ──────────────
  * JOB-311 names the subject line exactly, and the body is the founder
- * personal draft that already went out once, by hand, to aryareed before
- * this cron existed to send it. Keeping the wording out of any config or env
- * var is deliberate: a copy change is a code review of prose that reaches
- * real people, not a runtime toggle.
+ * personal draft that re engages unattested profiles between 24h and 7d old
+ * with a winback. Keeping the wording out of any config or env var is
+ * deliberate: a copy change is a code review of prose that reaches real
+ * people, not a runtime toggle.
  *
  * No em dashes and no prose hyphens anywhere below, per HARD STOP 8 in
  * CLAUDE.md. "new grad" and "one time", not the hyphenated forms.
