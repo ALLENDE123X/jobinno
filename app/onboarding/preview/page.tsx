@@ -46,7 +46,7 @@ export default async function OnboardingPreviewPage() {
   const [{ data: profile }, { data: resumeRow }] = await Promise.all([
     supabase
       .from("profiles")
-      .select("citizenship_status, current_city, salary_expectation, attested_at")
+      .select("citizenship_status, current_city, clearance_eligibility, attested_at")
       .eq("id", user.id)
       .maybeSingle(),
     supabase
@@ -62,7 +62,7 @@ export default async function OnboardingPreviewPage() {
     {
       citizenshipStatus: profile?.citizenship_status ?? null,
       currentCity: profile?.current_city ?? null,
-      salaryExpectation: profile?.salary_expectation ?? null,
+      clearanceEligibility: profile?.clearance_eligibility ?? null,
       attestedAt: profile?.attested_at ?? null,
     },
     resumeRow ? { storagePath: resumeRow.storage_path ?? null } : null,

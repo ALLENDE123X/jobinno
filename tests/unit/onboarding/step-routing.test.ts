@@ -13,7 +13,7 @@ function profile(
   return {
     citizenshipStatus: null,
     currentCity: null,
-    salaryExpectation: null,
+    clearanceEligibility: null,
     attestedAt: null,
     ...overrides,
   };
@@ -45,7 +45,7 @@ describe("earliestIncompleteStep", () => {
     ).toBe(3);
   });
 
-  it("returns 4 when compliance and comp are missing", () => {
+  it("returns 4 when the clearance gate is missing", () => {
     expect(
       earliestIncompleteStep(
         profile({ citizenshipStatus: "f1", currentCity: "Austin" }),
@@ -54,13 +54,17 @@ describe("earliestIncompleteStep", () => {
     ).toBe(4);
   });
 
-  it("returns 5 when the attestation is missing", () => {
+  // JOB-310: step 4 no longer collects salaryExpectation, so it must not be
+  // the signal step routing reads. A profile that answered the clearance
+  // gate but left every other JOB-134 field null (the normal shape after
+  // this ticket) still has to advance past step 4.
+  it("returns 5 once the clearance gate is answered, even with every other JOB-134 field null", () => {
     expect(
       earliestIncompleteStep(
         profile({
           citizenshipStatus: "f1",
           currentCity: "Austin",
-          salaryExpectation: "negotiable",
+          clearanceEligibility: "no",
         }),
         resume(),
       ),
@@ -73,7 +77,7 @@ describe("earliestIncompleteStep", () => {
         profile({
           citizenshipStatus: "f1",
           currentCity: "Austin",
-          salaryExpectation: "negotiable",
+          clearanceEligibility: "no",
           attestedAt: new Date("2026-08-31"),
         }),
         resume(),
@@ -90,7 +94,7 @@ describe("earliestIncompleteStep", () => {
     const profileRow = {
       citizenship_status: null,
       current_city: null,
-      salary_expectation: null,
+      clearance_eligibility: null,
       attested_at: null,
     };
     const resumeRow = {
@@ -100,7 +104,7 @@ describe("earliestIncompleteStep", () => {
       {
         citizenshipStatus: profileRow.citizenship_status,
         currentCity: profileRow.current_city,
-        salaryExpectation: profileRow.salary_expectation,
+        clearanceEligibility: profileRow.clearance_eligibility,
         attestedAt: profileRow.attested_at,
       },
       resumeRow ? { storagePath: resumeRow.storage_path } : null,
@@ -112,7 +116,7 @@ describe("earliestIncompleteStep", () => {
     const profileRow = {
       citizenship_status: null,
       current_city: null,
-      salary_expectation: null,
+      clearance_eligibility: null,
       attested_at: null,
     };
     const resumeRow = null;
@@ -120,7 +124,7 @@ describe("earliestIncompleteStep", () => {
       {
         citizenshipStatus: profileRow.citizenship_status,
         currentCity: profileRow.current_city,
-        salaryExpectation: profileRow.salary_expectation,
+        clearanceEligibility: profileRow.clearance_eligibility,
         attestedAt: profileRow.attested_at,
       },
       resumeRow,

@@ -507,16 +507,36 @@ export async function saveIntakeDraft(
       break;
 
     case 4:
-      update.salary_expectation = validated.salaryExpectation;
-      update.subject_to_restrictive_covenant =
-        validated.subjectToRestrictiveCovenant;
-      update.relatives_at_target_employers =
-        validated.relativesAtTargetEmployers;
-      update.previously_employed_at_target_employers =
-        validated.previouslyEmployedAtTargetEmployers;
+      // JOB-310: step 4's form no longer collects these six, so `validated`
+      // now defaults every one of them to null on this path regardless of
+      // whether a person answered one already, either here before this
+      // change or later through the needs_attestation resolution flow.
+      // Writing that null straight through would erase a real answer every
+      // time the one remaining field (clearance) gets resaved. A null here
+      // means "this draft says nothing about it", not "clear it", so each
+      // one is only written when the draft actually carries a value.
+      if (validated.salaryExpectation !== null) {
+        update.salary_expectation = validated.salaryExpectation;
+      }
+      if (validated.subjectToRestrictiveCovenant !== null) {
+        update.subject_to_restrictive_covenant =
+          validated.subjectToRestrictiveCovenant;
+      }
+      if (validated.relativesAtTargetEmployers !== null) {
+        update.relatives_at_target_employers =
+          validated.relativesAtTargetEmployers;
+      }
+      if (validated.previouslyEmployedAtTargetEmployers !== null) {
+        update.previously_employed_at_target_employers =
+          validated.previouslyEmployedAtTargetEmployers;
+      }
+      if (validated.highSchoolName !== null) {
+        update.high_school_name = validated.highSchoolName;
+      }
+      if (validated.highSchoolGradYear !== null) {
+        update.high_school_grad_year = validated.highSchoolGradYear;
+      }
       update.clearance_eligibility = validated.clearanceEligibility;
-      update.high_school_name = validated.highSchoolName;
-      update.high_school_grad_year = validated.highSchoolGradYear;
       // Derive clearanceLevelHeld: forced to "never_held" when clearance
       // eligibility is "no".
       //
