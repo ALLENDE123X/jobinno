@@ -232,6 +232,20 @@
       "when": 1788304201000,
       "tag": "0032_profiles_re_engagement_send_failures_privileges",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1788307200000,
+      "tag": "0033_profiles_recap_email_last_sent_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1788307201000,
+      "tag": "0034_profiles_recap_email_last_sent_at_privileges",
+      "breakpoints": true
     }
   ]
 }

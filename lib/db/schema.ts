@@ -724,6 +724,28 @@ export const profiles = pgTable(
      */
     reEngagementSendFailures: integer("re_engagement_send_failures").notNull().default(0),
 
+    /**
+     * JOB-329. When the morning recap email last went out to this person, or
+     * null if it never has. `inngest/recap-cron.ts` reads this to gate a
+     * second send within a 20 hour window and stamps it right after a send
+     * succeeds, so a person whose overnight applications keep landing across
+     * two cron ticks is never emailed twice in the same morning.
+     *
+     * Ours, not the person's, so it stays out of every grant list the same
+     * way `re_engagement_sent_at` above does: no `authenticated` UPDATE,
+     * granted only to `service_role` in
+     * `drizzle/0034_profiles_recap_email_last_sent_at_privileges.sql`,
+     * following the rule `drizzle/0003_profiles_column_privileges.sql`
+     * states.
+     *
+     * A timestamp rather than a boolean because the eligibility check is
+     * "at least 20 hours since the last send or never" rather than "ever
+     * sent", so a person whose earliest overnight burst was on Monday can
+     * still receive Tuesday's recap: the column is a rolling anti double
+     * send guard, not a lifetime flag.
+     */
+    recapEmailLastSentAt: timestamp("recap_email_last_sent_at", { withTimezone: true }),
+
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

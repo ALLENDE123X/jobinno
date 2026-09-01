@@ -1,0 +1,36 @@
+-- Grants `recap_email_last_sent_at` to `service_role` only. JOB-329.
+--
+-- A second file rather than folding this into 0033, for the reason 0033's
+-- own header gives: `drizzle-kit push`, which CI uses to build its throwaway
+-- database, applies the ALTER TABLE in that file on its own by diffing
+-- `lib/db/schema.ts`, but cannot see a GRANT at all, so
+-- `.github/workflows/ci.yml` needs to apply this file by explicit name the
+-- same way it already does for
+-- `0016_profiles_github_url_privileges.sql`,
+-- `0020_profiles_intake_fields_privileges.sql`,
+-- `0021_resumes_column_privileges.sql`,
+-- `0023_profiles_answer_memory_privileges.sql`,
+-- `0026_profiles_gmail_refresh_token_privileges.sql` and
+-- `0030_profiles_re_engagement_sent_at_privileges.sql`.
+--
+-- Hand written rather than generated, same as the six above: the Drizzle
+-- schema DSL has no way to express GRANT, so this was created with
+-- `drizzle-kit generate --custom` to stay journalled in
+-- `drizzle.__drizzle_migrations` and then filled in by hand.
+--
+-- Not granted to `authenticated`, on purpose. `recap_email_last_sent_at` is
+-- not something a person owns or types in; it is our record of when we last
+-- emailed them, on the same side of the line as `stripe_customer_id`,
+-- `browserbase_context_id`, `gmail_refresh_token` and
+-- `re_engagement_sent_at` above it in `lib/db/schema.ts`, all likewise
+-- granted to nobody but the service role. It also stays absent from the
+-- GRANT SELECT list in `0027_profiles_column_select_lockdown.sql` for the
+-- same reason those four are: nothing on the browser side reads it.
+--
+-- `service_role` already holds a table wide UPDATE and bypasses row level
+-- security besides, so the grant below is redundant in practice, the same
+-- redundancy `0003_profiles_column_privileges.sql` notes for the four
+-- columns it grants back to `service_role` by name. Written down anyway so
+-- a reader can see who the one writer is without checking Supabase's role
+-- defaults.
+GRANT UPDATE (recap_email_last_sent_at) ON public.profiles TO service_role;
