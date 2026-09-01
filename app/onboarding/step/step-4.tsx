@@ -12,12 +12,15 @@
  * clearance question with no way to decline is one of the few things that
  * stops a run outright. The other six now go unasked here and are answered
  * once, the first time a real employer's form actually asks, through the
- * `needs_attestation` path in `lib/fill-application-form.ts`. See
+ * runtime fabrication policy in `lib/fill-application-form.ts`. See
  * `lib/onboarding/intake-schema.ts` for why loosening the requirement there
  * needed no change on that side.
  *
  * clearanceLevelHeld is shown only when clearanceEligibility is not "no";
  * otherwise it is auto-derived to "never_held".
+ *
+ * JOB-314. StepFooter provides Back / Save and finish later / Next. The
+ * form's onSubmit still handles Next (validates strict, routes to step 5).
  *
  * No prose hyphens or em dashes per HARD STOP 8.
  */
@@ -25,7 +28,6 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-import { Button } from "@/components/ui/button";
 import {
   Select,
   SelectContent,
@@ -42,7 +44,7 @@ import {
 import { clearanceLevelIsRelevant } from "@/lib/onboarding/intake-derivation";
 
 import { saveIntakeDraft } from "../actions";
-import { Field } from "./_shared";
+import { Field, StepFooter } from "./_shared";
 
 type ClearanceValue = (typeof CLEARANCE_ELIGIBILITY_OPTIONS)[number]["value"];
 type ClearanceLevelValue = (typeof CLEARANCE_LEVEL_OPTIONS)[number]["value"];
@@ -176,18 +178,15 @@ export function Step4Form({
         </p>
       ) : null}
 
-      <div className="flex gap-3">
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => router.push("/onboarding/step/3")}
-        >
-          Back
-        </Button>
-        <Button type="submit" disabled={busy}>
-          {busy ? "Saving" : "Next"}
-        </Button>
-      </div>
+      <StepFooter
+        step={4}
+        backHref="/onboarding/step/3"
+        busy={busy}
+        draftPayload={{
+          clearanceEligibility,
+          clearanceLevelHeld: showClearanceLevel ? clearanceLevelHeld : null,
+        }}
+      />
     </form>
   );
 }

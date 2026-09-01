@@ -30,6 +30,7 @@ const TOTAL_STEPS = 5;
  * need to pre-fill. The full row is not passed to the client.
  */
 type ProfileData = {
+  email: string | null;
   resume_path: string | null;
   linkedin_pdf_path: string | null;
   github_url: string | null;
@@ -122,6 +123,7 @@ export default async function OnboardingStepPage({
   );
 
   const profileData: ProfileData = {
+    email: profile.email ?? null,
     resume_path: resumeObjectPath,
     linkedin_pdf_path: linkedinObjectPath,
     github_url: profile.github_url ?? null,

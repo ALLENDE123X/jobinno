@@ -63,3 +63,21 @@ export function earliestIncompleteStep(
   if (!profile.attestedAt) return 5;
   return 6;
 }
+
+/**
+ * Where a person lands once earliestIncompleteStep has been computed for
+ * them, immediately after auth and on every later visit to /onboarding or
+ * /onboarding/preview (JOB-309).
+ *
+ * The preview page is not one of the five onboarding steps and is
+ * deliberately not folded into earliestIncompleteStep above: it is a pre
+ * step landing page, shown only to someone who has not started step 1 yet.
+ * Once a resumes row exists, earliestIncompleteStep never returns 1 again
+ * for that person, so this function naturally stops sending them back to
+ * it, without a second stored flag anywhere.
+ */
+export function postAuthOnboardingPath(step: number): string {
+  if (step === 1) return "/onboarding/preview";
+  if (step === 6) return "/dashboard";
+  return `/onboarding/step/${step}`;
+}
