@@ -1,0 +1,28 @@
+-- Grants `re_engagement_send_failures` to `service_role` only. JOB-321.
+--
+-- A second file rather than folding this into 0031, for the reason 0031's
+-- own header gives: `drizzle-kit push`, which CI uses to build its
+-- throwaway database, applies the ALTER TABLE in that file on its own by
+-- diffing `lib/db/schema.ts`, but cannot see a GRANT at all, so
+-- `.github/workflows/ci.yml` needs to apply this file by explicit name the
+-- same way it already does for
+-- `0030_profiles_re_engagement_sent_at_privileges.sql` and every hand
+-- written privilege migration above it.
+--
+-- Hand written rather than generated, same as those files: the Drizzle
+-- schema DSL has no way to express GRANT, so this was created with
+-- `drizzle-kit generate --custom` to stay journalled in
+-- `drizzle.__drizzle_migrations` and then filled in by hand.
+--
+-- ── Not granted to `authenticated`, on purpose ───────────────────────────
+-- `re_engagement_send_failures` is a bookkeeping counter our cron writes,
+-- not something a person types in or reads about themselves. It sits on
+-- the same side of the line as `re_engagement_sent_at` above it in
+-- `lib/db/schema.ts`, likewise granted to nobody but the service role.
+--
+-- `service_role` already holds a table wide UPDATE and bypasses row level
+-- security besides, so the grant below is redundant in practice — the
+-- same redundancy `0030_profiles_re_engagement_sent_at_privileges.sql`
+-- notes for its own column. Written down anyway so a reader can see who
+-- the one writer is without checking Supabase's role defaults.
+GRANT UPDATE (re_engagement_send_failures) ON public.profiles TO service_role;

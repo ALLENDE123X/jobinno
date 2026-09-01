@@ -700,6 +700,30 @@ export const profiles = pgTable(
      */
     reEngagementSentAt: timestamp("re_engagement_sent_at", { withTimezone: true }),
 
+    /**
+     * JOB-321. How many times Resend has refused this candidate's re
+     * engagement email after `inngest/reengagement-cron.ts` claimed their
+     * row. Written by `releaseReEngagementSlot` in the same statement that
+     * unstamps `re_engagement_sent_at`, so the cron can pick the row up
+     * again the next hour, up to `REENGAGEMENT_MAX_SEND_FAILURES`.
+     *
+     * NOT NULL with a default of zero, on the same reasoning
+     * `applicationsUsed` uses two blocks up: an unset counter has to mean
+     * "no failures yet" and not "unknown", so that the release path can
+     * increment it without a null check every time. Zero for every row
+     * that predates JOB-321.
+     *
+     * Ours, not the person's, so it stays out of every grant list the
+     * same way `re_engagement_sent_at` above does: no `authenticated`
+     * UPDATE, granted only to `service_role` in
+     * `drizzle/0032_profiles_re_engagement_send_failures_privileges.sql`.
+     * A candidate that has hit the retry cap has this column at
+     * `REENGAGEMENT_MAX_SEND_FAILURES` or higher and
+     * `re_engagement_sent_at` still stamped — the "give up" terminal
+     * state a human is expected to look at.
+     */
+    reEngagementSendFailures: integer("re_engagement_send_failures").notNull().default(0),
+
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

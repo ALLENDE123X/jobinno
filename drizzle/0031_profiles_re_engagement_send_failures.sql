@@ -1,0 +1,35 @@
+-- profiles.re_engagement_send_failures (JOB-321): how many times Resend has
+-- refused to accept the founder personal re engagement email for this
+-- candidate. `inngest/reengagement-cron.ts` reads and writes it through
+-- `releaseReEngagementSlot`, which increments it every time a send fails
+-- after a successful atomic claim, and unstamps `re_engagement_sent_at` on
+-- the same statement so the cron picks the row up again the next hour, up
+-- to `REENGAGEMENT_MAX_SEND_FAILURES`. After that the stamp stays and this
+-- counter records why: three failed sends is where the cron gives up and a
+-- human is expected to look.
+--
+-- ── Why this is a counter and not a status enum ──────────────────────────
+-- Option B in the ticket named a `re_engagement_status` enum column and a
+-- separate retry cron. A counter costs one column and lets the primary
+-- cron do the work of both, with the same terminal state semantics: a row
+-- at three or more failures with `re_engagement_sent_at` still stamped is
+-- the "give up" state, and the primary cron's `IS NULL` filter on
+-- `re_engagement_sent_at` already refuses to pick it up again. An enum
+-- would have added a whole vocabulary the schema does not otherwise
+-- carry, for no observable difference in behaviour.
+--
+-- NOT NULL with a default of zero, so every existing row means "no
+-- failures yet" without any backfill statement here. A row that was
+-- previously send-stamped by the pre-JOB-321 cron is treated as having
+-- zero failures, which is honest: the pre-JOB-321 code would not have
+-- reached this branch at all, and re-classifying its outcome after the
+-- fact would be a guess.
+--
+-- The grant this column needs is
+-- `0032_profiles_re_engagement_send_failures_privileges.sql`, a separate
+-- file for the same reason 0029 and 0030 above are two files:
+-- `drizzle-kit push`, which CI uses to build its throwaway database,
+-- applies a plain ALTER TABLE like this one on its own by diffing
+-- `lib/db/schema.ts`, but cannot see a GRANT at all because the Drizzle
+-- schema DSL has no way to express one.
+ALTER TABLE "profiles" ADD COLUMN "re_engagement_send_failures" integer NOT NULL DEFAULT 0;
