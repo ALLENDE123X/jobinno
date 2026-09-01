@@ -691,11 +691,12 @@ export const profiles = pgTable(
      * `drizzle/0030_profiles_re_engagement_sent_at_privileges.sql`, following
      * the rule `drizzle/0003_profiles_column_privileges.sql` states.
      *
-     * Null on every existing row, which is exactly what "never sent" should
-     * read as. The one exception on record is aryareed's row, backfilled in
-     * the same migration to the real timestamp of the manual send that
-     * preceded this cron, so the cron does not repeat a nudge that already
-     * went out.
+     * Null on every row that has not been nudged. A pre existing row for a
+     * candidate who received the founder personal manual send before this
+     * cron shipped was backfilled directly in production via an out of band
+     * ops action (see the JOB-311 backfill runbook and
+     * drizzle/0029_profiles_re_engagement_sent_at.sql's header comment), so
+     * the cron does not repeat a nudge that already went out.
      */
     reEngagementSentAt: timestamp("re_engagement_sent_at", { withTimezone: true }),
 
