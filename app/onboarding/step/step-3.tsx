@@ -13,7 +13,6 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   intakeFieldErrors,
@@ -22,7 +21,7 @@ import {
 import { needsSponsorshipNonUsIsRelevant } from "@/lib/onboarding/intake-derivation";
 
 import { saveIntakeDraft } from "../actions";
-import { Field, YesNoField, toBoolean, type YesNo } from "./_shared";
+import { Field, StepFooter, YesNoField, toBoolean, type YesNo } from "./_shared";
 
 type ProfileData = {
   street_address: string | null;
@@ -99,6 +98,16 @@ export function Step3Form({
         currentCountry,
         targetLocations: parsedTargets,
         willingToRelocate: toBoolean(willingToRelocate),
+        // false, not null, on this path: onSubmit only runs from the
+        // strict Next button, which means step3Schema is about to require
+        // every field including this one. The question was either shown
+        // (showSponsorshipNonUs true, so the user's own yes or no goes on
+        // the payload) or genuinely not relevant to what they already
+        // answered (targetLocations and willingToRelocate are both real
+        // answers at this point, not drafts), so false here is a value
+        // the user's other answers already imply, not a fabrication. Do
+        // not change this to null to match draftPayload below; that would
+        // make a complete step fail step3Schema's required boolean check.
         needsSponsorshipNonUs: showSponsorshipNonUs
           ? toBoolean(needsSponsorshipNonUs)
           : false,
@@ -259,18 +268,43 @@ export function Step3Form({
         </p>
       ) : null}
 
-      <div className="flex gap-3">
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => router.push("/onboarding/step/2")}
-        >
-          Back
-        </Button>
-        <Button type="submit" disabled={busy}>
-          {busy ? "Saving" : "Next"}
-        </Button>
-      </div>
+      <StepFooter
+        step={3}
+        backHref="/onboarding/step/2"
+        busy={busy}
+        draftPayload={{
+          streetAddress,
+          currentCity,
+          postalCode,
+          currentCountry,
+          targetLocations: parsedTargets,
+          willingToRelocate: toBoolean(willingToRelocate),
+          // null, not false, on this path, and deliberately different
+          // from the onSubmit payload above. step3DraftSchema accepts
+          // null for every field, which is the honest value here: Save
+          // and finish later can fire before the user has named a target
+          // location or answered willingToRelocate, and showSponsorshipNonUs
+          // being false in that state means "not shown yet", not "shown
+          // and answered no". saveIntakeDraft's partial branch
+          // (app/onboarding/actions.ts) does not actually trust this
+          // field when the question is not relevant; it recomputes
+          // relevance itself from the saved targetLocations and
+          // willingToRelocate and stores null in that case regardless of
+          // what is sent here. This field still matters, and null is
+          // still the right value, for the case that recompute does not
+          // cover: the question was relevant and shown, but the person
+          // had not picked yes or no yet when they clicked Save and
+          // finish later. onSubmit cannot send null here at all, because
+          // step3Schema requires a real boolean; a step is only allowed
+          // to reach onSubmit once every field on it, including this one,
+          // has an actual answer.
+          needsSponsorshipNonUs: showSponsorshipNonUs
+            ? toBoolean(needsSponsorshipNonUs)
+            : null,
+          gradDate,
+          earliestStart,
+        }}
+      />
     </form>
   );
 }
