@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   earliestIncompleteStep,
+  postAuthOnboardingPath,
   type ProfileForRouting,
   type ResumeForRouting,
 } from "@/lib/onboarding/step-routing";
@@ -12,7 +13,7 @@ function profile(
   return {
     citizenshipStatus: null,
     currentCity: null,
-    salaryExpectation: null,
+    clearanceEligibility: null,
     attestedAt: null,
     ...overrides,
   };
@@ -44,7 +45,7 @@ describe("earliestIncompleteStep", () => {
     ).toBe(3);
   });
 
-  it("returns 4 when compliance and comp are missing", () => {
+  it("returns 4 when the clearance gate is missing", () => {
     expect(
       earliestIncompleteStep(
         profile({ citizenshipStatus: "f1", currentCity: "Austin" }),
@@ -53,13 +54,17 @@ describe("earliestIncompleteStep", () => {
     ).toBe(4);
   });
 
-  it("returns 5 when the attestation is missing", () => {
+  // JOB-310: step 4 no longer collects salaryExpectation, so it must not be
+  // the signal step routing reads. A profile that answered the clearance
+  // gate but left every other JOB-134 field null (the normal shape after
+  // this ticket) still has to advance past step 4.
+  it("returns 5 once the clearance gate is answered, even with every other JOB-134 field null", () => {
     expect(
       earliestIncompleteStep(
         profile({
           citizenshipStatus: "f1",
           currentCity: "Austin",
-          salaryExpectation: "negotiable",
+          clearanceEligibility: "no",
         }),
         resume(),
       ),
@@ -72,7 +77,7 @@ describe("earliestIncompleteStep", () => {
         profile({
           citizenshipStatus: "f1",
           currentCity: "Austin",
-          salaryExpectation: "negotiable",
+          clearanceEligibility: "no",
           attestedAt: new Date("2026-08-31"),
         }),
         resume(),
@@ -89,7 +94,7 @@ describe("earliestIncompleteStep", () => {
     const profileRow = {
       citizenship_status: null,
       current_city: null,
-      salary_expectation: null,
+      clearance_eligibility: null,
       attested_at: null,
     };
     const resumeRow = {
@@ -99,7 +104,7 @@ describe("earliestIncompleteStep", () => {
       {
         citizenshipStatus: profileRow.citizenship_status,
         currentCity: profileRow.current_city,
-        salaryExpectation: profileRow.salary_expectation,
+        clearanceEligibility: profileRow.clearance_eligibility,
         attestedAt: profileRow.attested_at,
       },
       resumeRow ? { storagePath: resumeRow.storage_path } : null,
@@ -111,7 +116,7 @@ describe("earliestIncompleteStep", () => {
     const profileRow = {
       citizenship_status: null,
       current_city: null,
-      salary_expectation: null,
+      clearance_eligibility: null,
       attested_at: null,
     };
     const resumeRow = null;
@@ -119,11 +124,32 @@ describe("earliestIncompleteStep", () => {
       {
         citizenshipStatus: profileRow.citizenship_status,
         currentCity: profileRow.current_city,
-        salaryExpectation: profileRow.salary_expectation,
+        clearanceEligibility: profileRow.clearance_eligibility,
         attestedAt: profileRow.attested_at,
       },
       resumeRow,
     );
     expect(result).toBe(1);
+  });
+});
+
+// JOB-309. postAuthOnboardingPath is what actually decides where a signed in
+// user lands: app/onboarding/page.tsx (the real post-auth destination) and
+// app/onboarding/preview/page.tsx both redirect through it rather than each
+// hardcoding their own view of what step 1 or step 6 means.
+describe("postAuthOnboardingPath", () => {
+  it("sends someone who has not started step 1 to the preview page, not straight to step 1", () => {
+    expect(postAuthOnboardingPath(1)).toBe("/onboarding/preview");
+  });
+
+  it("sends an already attested profile to the dashboard", () => {
+    expect(postAuthOnboardingPath(6)).toBe("/dashboard");
+  });
+
+  it("sends anyone mid intake to their own numbered step", () => {
+    expect(postAuthOnboardingPath(2)).toBe("/onboarding/step/2");
+    expect(postAuthOnboardingPath(3)).toBe("/onboarding/step/3");
+    expect(postAuthOnboardingPath(4)).toBe("/onboarding/step/4");
+    expect(postAuthOnboardingPath(5)).toBe("/onboarding/step/5");
   });
 });

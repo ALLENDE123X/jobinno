@@ -93,6 +93,53 @@ const requiredText = (field: string, max = 120) =>
     .max(max, `${field} is too long.`);
 
 /**
+ * ── JOB-310: lazy loaded out of intake ────────────────────────────────────
+ *
+ * Salary expectation, high school name and year, non compete, relatives at a
+ * target employer and previous employment at a target employer used to be
+ * required on step 4, all seven of that step's questions gating everyone who
+ * signed up. A one person diagnosis found the whole of step two through four
+ * behind a 100% pre attestation drop off, and of those seven only clearance
+ * eligibility genuinely has to be known before a search can start: the other
+ * six are answered here if a person wants to get ahead of them, and answered
+ * later, once, the first time a real employer's form actually asks, through
+ * the existing `needs_attestation` path in `lib/fill-application-form.ts`.
+ *
+ * Nothing about the columns or the write paths changed, only the requirement.
+ * `blockedForAnswers` and `buildFactCatalog` in that file already read a null
+ * value on one of these columns as "not yet answered" rather than "answered
+ * no", which is what makes loosening the requirement here safe without a
+ * change on that side.
+ *
+ * The empty string collapse mirrors `githubUrl` below: a step 4 a person
+ * skipped and a step 4 a person typed into and then cleared should parse to
+ * the same null, not to two different states nothing downstream expects.
+ */
+const optionalText = (field: string, max = 120) =>
+  z.preprocess((raw) => {
+    const trimmed = typeof raw === "string" ? raw.trim() : raw;
+    return trimmed === "" ? null : trimmed;
+  }, z.string().max(max, `${field} is too long.`).nullable());
+
+const salaryExpectationField = optionalText("Salary expectation", 200).default(
+  null
+);
+const highSchoolNameField = optionalText("High school name").default(null);
+const highSchoolGradYearField = z
+  .number()
+  .int("High school graduation year must be a year.")
+  .min(1900, "High school graduation year must be a real year.")
+  .max(2100, "High school graduation year must be a real year.")
+  .nullable()
+  .default(null);
+const subjectToRestrictiveCovenantField = z.boolean().nullable().default(null);
+const relativesAtTargetEmployersField = z.boolean().nullable().default(null);
+const previouslyEmployedAtTargetEmployersField = z
+  .boolean()
+  .nullable()
+  .default(null);
+
+/**
  * JOB-230. Matches `github.com/handle`, with or without a leading `https://`
  * or `www.`, and with or without a trailing slash. Anything that names a
  * different domain fails this, on purpose: a candidate who pastes their
@@ -189,22 +236,24 @@ export function intakeSchema(userId: string) {
       clearanceLevelHeld,
 
       /**
-       * ── JOB-134: the questions the pipeline kept having to ask ────────────
+       * ── JOB-134, loosened by JOB-310 ───────────────────────────────────────
        *
        * Every one of these was a real screening question on a real board that
        * no stored answer covered, so the run stopped and the person answered it
        * on a terminal. They are here because a question answered at intake once
-       * is a question the second user never sees at all.
+       * is a question the second user never sees at all. JOB-310 made all four
+       * optional at intake time: see the `optionalText` comment above for why.
        *
        * Whether a previous employer's contract still binds them: a non-compete,
-       * a non-solicitation clause, or another restrictive covenant. Required
-       * and a plain boolean, because the form's version is a plain yes or no
-       * and a blank is a stopped application. A "yes" is not a dead end, it is
-       * a true answer to the question every employer asks; any follow up asking
-       * which agreement and on what terms is free text only the person can
-       * write, so that one still reaches them.
+       * a non-solicitation clause, or another restrictive covenant. A plain
+       * boolean, because the form's version is a plain yes or no. A "yes" is
+       * not a dead end, it is a true answer to the question every employer
+       * asks; any follow up asking which agreement and on what terms is free
+       * text only the person can write, so that one still reaches them. A null
+       * means nobody has answered this yet, which stays a question a real
+       * form's `needs_attestation` escalation puts to the candidate.
        */
-      subjectToRestrictiveCovenant: z.boolean(),
+      subjectToRestrictiveCovenant: subjectToRestrictiveCovenantField,
       /**
        * Read this one carefully, because it is deliberately not the question
        * the form asks. A form asks about one named employer; this asks about
@@ -218,20 +267,22 @@ export function intakeSchema(userId: string) {
        * in as many words, because a question that quietly means something wider
        * than it appears to is a question somebody answers wrongly.
        */
-      relativesAtTargetEmployers: z.boolean(),
+      relativesAtTargetEmployers: relativesAtTargetEmployersField,
       /** The same shape and the same asymmetry, for prior employment. */
-      previouslyEmployedAtTargetEmployers: z.boolean(),
+      previouslyEmployedAtTargetEmployers:
+        previouslyEmployedAtTargetEmployersField,
       /**
        * What they expect to be paid, in their own words.
        *
-       * Free text rather than a number, and required rather than optional.
-       * HARD STOP 9 names salary expectations outright as something no model
-       * may compose, so the only answer this system can ever put on a form is
-       * one the person wrote. "$120,000", "market rate for a new grad" and
-       * "negotiable" are all real answers, and a number field would accept
-       * neither of the last two.
+       * Free text rather than a number. HARD STOP 9 names salary expectations
+       * outright as something no model may compose, so the only answer this
+       * system can ever put on a form is one the person wrote. "$120,000",
+       * "market rate for a new grad" and "negotiable" are all real answers, and
+       * a number field would accept neither of the last two. Optional since
+       * JOB-310: a null here is not a guess at "negotiable", it is "not asked
+       * yet", and stays that way until a real form asks and escalates.
        */
-      salaryExpectation: requiredText("Salary expectation", 200),
+      salaryExpectation: salaryExpectationField,
 
       currentCity: requiredText("Current city"),
       currentCountry: requiredText("Current country"),
@@ -248,19 +299,18 @@ export function intakeSchema(userId: string) {
 
       /**
        * High school, which every one of Palantir's 128 Lever listings asks for
-       * by name and nothing in a resume reliably carries.
+       * by name and nothing in a resume reliably carries. Optional since
+       * JOB-310, for the same reason as `salaryExpectation` above.
        *
        * The year is an integer rather than a date because that is what the
        * question asks for, and it is bounded here rather than only by the CHECK
        * on the column so that a mistyped year comes back as a sentence the
-       * person can act on instead of a constraint violation.
+       * person can act on instead of a constraint violation. The bound still
+       * applies to a year that is actually given; only its presence is
+       * optional now.
        */
-      highSchoolName: requiredText("High school name"),
-      highSchoolGradYear: z
-        .number()
-        .int("High school graduation year must be a year.")
-        .min(1900, "High school graduation year must be a real year.")
-        .max(2100, "High school graduation year must be a real year."),
+      highSchoolName: highSchoolNameField,
+      highSchoolGradYear: highSchoolGradYearField,
 
       resumePath: ownedObjectPath,
       /**
@@ -477,23 +527,26 @@ export const step3Schema = z.object({
 });
 
 /**
- * Step 4: Compliance + compensation. Includes the clearance cross-field
- * check: active_clearance with never_held is a contradiction.
+ * Step 4: Compliance + compensation.
+ *
+ * JOB-310 slimmed this to one required gate, clearance eligibility, with its
+ * conditional level. Salary, non compete, relatives and previous employment
+ * at a target employer, and high school name and year are all optional now:
+ * see the `optionalText` comment further up for why. Still includes the
+ * clearance cross-field check: active_clearance with never_held is a
+ * contradiction.
  */
 export const step4Schema = z
   .object({
-    salaryExpectation: requiredText("Salary expectation", 200),
-    subjectToRestrictiveCovenant: z.boolean(),
-    relativesAtTargetEmployers: z.boolean(),
-    previouslyEmployedAtTargetEmployers: z.boolean(),
+    salaryExpectation: salaryExpectationField,
+    subjectToRestrictiveCovenant: subjectToRestrictiveCovenantField,
+    relativesAtTargetEmployers: relativesAtTargetEmployersField,
+    previouslyEmployedAtTargetEmployers:
+      previouslyEmployedAtTargetEmployersField,
     clearanceEligibility,
     clearanceLevelHeld,
-    highSchoolName: requiredText("High school name"),
-    highSchoolGradYear: z
-      .number()
-      .int("High school graduation year must be a year.")
-      .min(1900, "High school graduation year must be a real year.")
-      .max(2100, "High school graduation year must be a real year."),
+    highSchoolName: highSchoolNameField,
+    highSchoolGradYear: highSchoolGradYearField,
   })
   .check((ctx) => {
     const value = ctx.value;
@@ -510,6 +563,106 @@ export const step4Schema = z
       });
     }
   });
+
+/**
+ * ── Draft schemas for Save and finish later (JOB-314) ───────────────────────
+ *
+ * step2Schema through step4Schema above enforce required means required, on
+ * purpose: those are the schemas that gate the `Next` button, and the header
+ * comment at the top of this file explains why a blank cannot reach the
+ * pipeline. `Save and finish later` is a different action with a different
+ * contract. It exists so a person can pause mid step without losing what
+ * they already typed, so it must never reject a payload for being
+ * incomplete, only for being the wrong shape.
+ *
+ * Every field below is optional. An empty string, a missing key, an out of
+ * range number or an unrecognized enum value all resolve to null rather than
+ * a validation error, so `saveIntakeDraft` can always persist whatever was
+ * filled in and never blocks a save on a field the person has not reached
+ * yet. The cross field checks (F1 status required for F1 citizenship, the
+ * clearance contradiction) are dropped entirely here for the same reason:
+ * they describe what a complete answer looks like, and a draft is not one.
+ */
+
+const draftEmptyToNull = (raw: unknown) =>
+  typeof raw === "string" && raw.trim() === "" ? null : raw;
+
+const draftText = (max: number) =>
+  z.preprocess(draftEmptyToNull, z.string().trim().max(max).nullable()).catch(null);
+
+const draftEnum = <T extends readonly [string, ...string[]]>(values: T) =>
+  z.preprocess(draftEmptyToNull, z.enum(values).nullable()).catch(null);
+
+const draftBoolean = () => z.boolean().nullable().catch(null);
+
+const draftDate = () =>
+  z.preprocess(draftEmptyToNull, z.iso.date().nullable()).catch(null);
+
+const draftStringArray = (max: number) =>
+  z
+    .array(z.string().trim().max(120))
+    .max(max)
+    .catch([]);
+
+const draftYear = () =>
+  z
+    .preprocess((raw) => {
+      if (typeof raw === "number") return raw;
+      if (typeof raw === "string" && /^\d+$/.test(raw.trim())) {
+        return Number(raw.trim());
+      }
+      return null;
+    }, z.number().int().min(1900).max(2100).nullable())
+    .catch(null);
+
+const citizenshipValues = CITIZENSHIP_OPTIONS.map((option) => option.value) as [
+  string,
+  ...string[],
+];
+const f1StatusValues = F1_STATUS_OPTIONS.map((option) => option.value) as [
+  string,
+  ...string[],
+];
+const clearanceEligibilityValues = CLEARANCE_ELIGIBILITY_OPTIONS.map(
+  (option) => option.value,
+) as [string, ...string[]];
+const clearanceLevelValues = CLEARANCE_LEVEL_OPTIONS.map(
+  (option) => option.value,
+) as [string, ...string[]];
+
+/** Step 2 draft: work authorization, with nothing required. */
+export const step2DraftSchema = z.object({
+  citizenshipStatus: draftEnum(citizenshipValues),
+  f1Status: draftEnum(f1StatusValues),
+  visaStatus: draftText(200),
+  workAuthorizedUs: draftBoolean(),
+  requiresSponsorship: draftBoolean(),
+});
+
+/** Step 3 draft: location and timing, with nothing required. */
+export const step3DraftSchema = z.object({
+  streetAddress: draftText(200),
+  currentCity: draftText(120),
+  currentCountry: draftText(120),
+  postalCode: draftText(20),
+  targetLocations: draftStringArray(20),
+  willingToRelocate: draftBoolean(),
+  needsSponsorshipNonUs: draftBoolean(),
+  gradDate: draftDate(),
+  earliestStart: draftDate(),
+});
+
+/** Step 4 draft: compliance and compensation, with nothing required. */
+export const step4DraftSchema = z.object({
+  salaryExpectation: draftText(200),
+  subjectToRestrictiveCovenant: draftBoolean(),
+  relativesAtTargetEmployers: draftBoolean(),
+  previouslyEmployedAtTargetEmployers: draftBoolean(),
+  clearanceEligibility: draftEnum(clearanceEligibilityValues),
+  clearanceLevelHeld: draftEnum(clearanceLevelValues),
+  highSchoolName: draftText(120),
+  highSchoolGradYear: draftYear(),
+});
 
 /** Step 5: Attestation checkbox. */
 export const step5Schema = z.object({

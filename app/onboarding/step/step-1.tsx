@@ -15,12 +15,11 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { RESUMES_BUCKET, createClient } from "@/lib/supabase/client";
 
 import { saveIntakeDraft } from "../actions";
-import { Field } from "./_shared";
+import { Field, StepFooter } from "./_shared";
 
 type ProfileData = {
   github_url: string | null;
@@ -168,9 +167,20 @@ export function Step1Form({
         </p>
       ) : null}
 
-      <Button type="submit" disabled={busy}>
-        {busy ? "Saving" : "Next"}
-      </Button>
+      {/*
+        Save and finish later on step 1 saves the GitHub URL field only.
+        The resume and LinkedIn PDF are local File objects at this point,
+        not yet uploaded, and uploading them is an async storage write this
+        button is not meant to trigger silently. A person who pauses here
+        without clicking Next keeps their typed GitHub URL and re-selects
+        the file when they come back, the same as they would if they had
+        simply closed the tab before choosing a file at all.
+      */}
+      <StepFooter
+        step={1}
+        draftPayload={{ githubUrl: githubUrl || null }}
+        busy={busy}
+      />
     </form>
   );
 }

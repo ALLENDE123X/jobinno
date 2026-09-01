@@ -1,10 +1,26 @@
 "use client";
 
 /**
- * Step 4: Compliance + compensation.
+ * Step 4: Security clearance.
+ *
+ * JOB-310. This step used to ask seven questions: clearance eligibility,
+ * non compete, relatives at a target employer, previous employment at a
+ * target employer, salary expectation, and high school name and year. A one
+ * person diagnosis found the whole of step two through four behind a 100%
+ * pre attestation drop off, and of the seven only clearance eligibility
+ * genuinely has to be known before a search can start, because a required
+ * clearance question with no way to decline is one of the few things that
+ * stops a run outright. The other six now go unasked here and are answered
+ * once, the first time a real employer's form actually asks, through the
+ * runtime fabrication policy in `lib/fill-application-form.ts`. See
+ * `lib/onboarding/intake-schema.ts` for why loosening the requirement there
+ * needed no change on that side.
  *
  * clearanceLevelHeld is shown only when clearanceEligibility is not "no";
  * otherwise it is auto-derived to "never_held".
+ *
+ * JOB-314. StepFooter provides Back / Save and finish later / Next. The
+ * form's onSubmit still handles Next (validates strict, routes to step 5).
  *
  * No prose hyphens or em dashes per HARD STOP 8.
  */
@@ -12,8 +28,6 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -30,20 +44,14 @@ import {
 import { clearanceLevelIsRelevant } from "@/lib/onboarding/intake-derivation";
 
 import { saveIntakeDraft } from "../actions";
-import { Field, YesNoField, toBoolean, type YesNo } from "./_shared";
+import { Field, StepFooter } from "./_shared";
 
 type ClearanceValue = (typeof CLEARANCE_ELIGIBILITY_OPTIONS)[number]["value"];
 type ClearanceLevelValue = (typeof CLEARANCE_LEVEL_OPTIONS)[number]["value"];
 
 type ProfileData = {
-  salary_expectation: string | null;
-  subject_to_restrictive_covenant: boolean | null;
-  relatives_at_target_employers: boolean | null;
-  previously_employed_at_target_employers: boolean | null;
   clearance_eligibility: string | null;
   clearance_level_held: string | null;
-  high_school_name: string | null;
-  high_school_grad_year: number | null;
 };
 
 export function Step4Form({
@@ -52,47 +60,12 @@ export function Step4Form({
   profile: ProfileData;
 }) {
   const router = useRouter();
-  const [salaryExpectation, setSalaryExpectation] = useState(
-    profile.salary_expectation ?? "",
-  );
-  const [subjectToRestrictiveCovenant, setSubjectToRestrictiveCovenant] =
-    useState<YesNo>(
-      profile.subject_to_restrictive_covenant === true
-        ? "yes"
-        : profile.subject_to_restrictive_covenant === false
-          ? "no"
-          : "",
-    );
-  const [relativesAtTargetEmployers, setRelativesAtTargetEmployers] =
-    useState<YesNo>(
-      profile.relatives_at_target_employers === true
-        ? "yes"
-        : profile.relatives_at_target_employers === false
-          ? "no"
-          : "",
-    );
-  const [
-    previouslyEmployedAtTargetEmployers,
-    setPreviouslyEmployedAtTargetEmployers,
-  ] = useState<YesNo>(
-    profile.previously_employed_at_target_employers === true
-      ? "yes"
-      : profile.previously_employed_at_target_employers === false
-        ? "no"
-        : "",
-  );
   const [clearanceEligibility, setClearanceEligibility] = useState<
     ClearanceValue | ""
   >((profile.clearance_eligibility as ClearanceValue) ?? "");
   const [clearanceLevelHeld, setClearanceLevelHeld] = useState<
     ClearanceLevelValue | ""
   >((profile.clearance_level_held as ClearanceLevelValue) ?? "");
-  const [highSchoolName, setHighSchoolName] = useState(
-    profile.high_school_name ?? "",
-  );
-  const [highSchoolGradYear, setHighSchoolGradYear] = useState(
-    profile.high_school_grad_year?.toString() ?? "",
-  );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -106,23 +79,11 @@ export function Step4Form({
     setErrors({});
 
     try {
-      const parsedYear = /^\d+$/.test(highSchoolGradYear.trim())
-        ? Number(highSchoolGradYear.trim())
-        : highSchoolGradYear;
-
       const payload = {
-        salaryExpectation,
-        subjectToRestrictiveCovenant: toBoolean(subjectToRestrictiveCovenant),
-        relativesAtTargetEmployers: toBoolean(relativesAtTargetEmployers),
-        previouslyEmployedAtTargetEmployers: toBoolean(
-          previouslyEmployedAtTargetEmployers,
-        ),
         clearanceEligibility,
         clearanceLevelHeld: showClearanceLevel
           ? clearanceLevelHeld
           : "never_held",
-        highSchoolName,
-        highSchoolGradYear: parsedYear,
       };
 
       const parsed = step4Schema.safeParse(payload);
@@ -155,7 +116,9 @@ export function Step4Form({
         <h2 className="text-lg font-medium">Security clearance</h2>
         <p className="text-muted-foreground text-sm">
           Defence and aerospace employers ask this on every listing, and most of
-          them will not let an application through without an answer.
+          them will not let an application through without an answer. Everything
+          else a form might ask, we will ask you the first time a real listing
+          needs it, so this is the only question here.
         </p>
 
         <Field
@@ -209,108 +172,21 @@ export function Step4Form({
         ) : null}
       </section>
 
-      <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
-        <h2 className="text-lg font-medium">Screening questions</h2>
-        <p className="text-muted-foreground text-sm">
-          Almost every employer asks these somewhere in the application. Answer
-          them once here and we will not stop to ask you again.
-        </p>
-
-        <YesNoField
-          label="Are you under a non compete or non solicitation agreement"
-          htmlFor="restrictive-covenant"
-          value={subjectToRestrictiveCovenant}
-          onChange={setSubjectToRestrictiveCovenant}
-          error={errors.subjectToRestrictiveCovenant}
-          hint="This is about an agreement with a previous employer. If you are under one, say yes. We will still come back to you if a form asks for the details."
-        />
-
-        <YesNoField
-          label="Do you have relatives working at any company you might apply to"
-          htmlFor="relatives-at-target"
-          value={relativesAtTargetEmployers}
-          onChange={setRelativesAtTargetEmployers}
-          error={errors.relativesAtTargetEmployers}
-          hint="Forms ask this about themselves, one company at a time. A no here answers all of them. A yes means we ask you about the specific company when it comes up."
-        />
-
-        <YesNoField
-          label="Have you ever worked at any company you might apply to"
-          htmlFor="previously-employed-at-target"
-          value={previouslyEmployedAtTargetEmployers}
-          onChange={setPreviouslyEmployedAtTargetEmployers}
-          error={errors.previouslyEmployedAtTargetEmployers}
-          hint="Same as above. A no answers every version of this question, and a yes means we ask you which company when a form wants to know."
-        />
-
-        <Field
-          label="What you expect to be paid"
-          htmlFor="salary"
-          error={errors.salaryExpectation}
-          hint="In your own words. A number, a range, or something like negotiable. We never make one up for you."
-        >
-          <Input
-            id="salary"
-            value={salaryExpectation}
-            onChange={(event) => setSalaryExpectation(event.target.value)}
-            placeholder="$120,000, or negotiable"
-          />
-        </Field>
-      </section>
-
-      <section className="space-y-4 rounded-2xl border bg-card/40 p-6 sm:p-8">
-        <h2 className="text-lg font-medium">High school</h2>
-        <p className="text-muted-foreground text-sm">
-          A surprising number of forms ask for this by name, and a resume almost
-          never carries it.
-        </p>
-
-        <Field
-          label="High school name"
-          htmlFor="highschool"
-          error={errors.highSchoolName}
-        >
-          <Input
-            id="highschool"
-            value={highSchoolName}
-            onChange={(event) => setHighSchoolName(event.target.value)}
-            placeholder="Lincoln High School"
-          />
-        </Field>
-
-        <Field
-          label="Year you graduated high school"
-          htmlFor="highschoolyear"
-          error={errors.highSchoolGradYear}
-        >
-          <Input
-            id="highschoolyear"
-            inputMode="numeric"
-            value={highSchoolGradYear}
-            onChange={(event) => setHighSchoolGradYear(event.target.value)}
-            placeholder="2022"
-          />
-        </Field>
-      </section>
-
       {message ? (
         <p className="text-destructive text-sm" role="alert">
           {message}
         </p>
       ) : null}
 
-      <div className="flex gap-3">
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => router.push("/onboarding/step/3")}
-        >
-          Back
-        </Button>
-        <Button type="submit" disabled={busy}>
-          {busy ? "Saving" : "Next"}
-        </Button>
-      </div>
+      <StepFooter
+        step={4}
+        backHref="/onboarding/step/3"
+        busy={busy}
+        draftPayload={{
+          clearanceEligibility,
+          clearanceLevelHeld: showClearanceLevel ? clearanceLevelHeld : null,
+        }}
+      />
     </form>
   );
 }

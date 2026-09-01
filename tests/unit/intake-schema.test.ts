@@ -84,6 +84,13 @@ describe("intakeSchema", () => {
     // No f1Status and no linkedinPdfPath in this list, and that is correct.
     // Both default to null, so an empty submission is not missing them; the F1
     // sub status only becomes required once the citizenship answer asks for it.
+    //
+    // JOB-310 lazy loads six of these out of intake: highSchoolGradYear,
+    // highSchoolName, previouslyEmployedAtTargetEmployers,
+    // relativesAtTargetEmployers, salaryExpectation and
+    // subjectToRestrictiveCovenant all default to null now, the same way
+    // f1Status and linkedinPdfPath already did, so none of them belongs in
+    // this list any more either.
     expect(failedFields({})).toEqual([
       "attestation",
       "citizenshipStatus",
@@ -93,17 +100,11 @@ describe("intakeSchema", () => {
       "currentCountry",
       "earliestStart",
       "gradDate",
-      "highSchoolGradYear",
-      "highSchoolName",
       "needsSponsorshipNonUs",
       "postalCode",
-      "previouslyEmployedAtTargetEmployers",
-      "relativesAtTargetEmployers",
       "requiresSponsorship",
       "resumePath",
-      "salaryExpectation",
       "streetAddress",
-      "subjectToRestrictiveCovenant",
       "targetLocations",
       "visaStatus",
       "willingToRelocate",
@@ -127,12 +128,6 @@ describe("intakeSchema", () => {
     "targetLocations",
     "gradDate",
     "earliestStart",
-    "highSchoolName",
-    "highSchoolGradYear",
-    "subjectToRestrictiveCovenant",
-    "relativesAtTargetEmployers",
-    "previouslyEmployedAtTargetEmployers",
-    "salaryExpectation",
     "resumePath",
     "attestation",
   ])("rejects a submission missing %s", (field) => {
@@ -140,6 +135,49 @@ describe("intakeSchema", () => {
     delete input[field];
 
     expect(failedFields(input)).toContain(field);
+  });
+
+  // JOB-310: the mirror of the six-field removal above. Deleting any one of
+  // these from an otherwise complete submission must not fail it, which is
+  // the acceptance bar the ticket names: skipping them still lets intake
+  // complete and attested_at stamp.
+  describe("JOB-310: lazy loaded compliance fields", () => {
+    it.each([
+      "salaryExpectation",
+      "highSchoolName",
+      "highSchoolGradYear",
+      "subjectToRestrictiveCovenant",
+      "relativesAtTargetEmployers",
+      "previouslyEmployedAtTargetEmployers",
+    ])("accepts a submission missing %s", (field) => {
+      const input: Record<string, unknown> = validIntake();
+      delete input[field];
+
+      const result = schema.safeParse(input);
+      expect(result.success, `field ${field}`).toBe(true);
+    });
+
+    it("accepts a minimum viable submission with none of the six answered", () => {
+      const input = validIntake() as Record<string, unknown>;
+      delete input.salaryExpectation;
+      delete input.highSchoolName;
+      delete input.highSchoolGradYear;
+      delete input.subjectToRestrictiveCovenant;
+      delete input.relativesAtTargetEmployers;
+      delete input.previouslyEmployedAtTargetEmployers;
+
+      const result = schema.safeParse(input);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.salaryExpectation).toBeNull();
+      expect(result.data.highSchoolName).toBeNull();
+      expect(result.data.highSchoolGradYear).toBeNull();
+      expect(result.data.subjectToRestrictiveCovenant).toBeNull();
+      expect(result.data.relativesAtTargetEmployers).toBeNull();
+      expect(result.data.previouslyEmployedAtTargetEmployers).toBeNull();
+      // The attestation itself still requires the one field JOB-310 kept.
+      expect(result.data.clearanceEligibility).toBe("no");
+    });
   });
 
   it("rejects blank and whitespace only text", () => {
