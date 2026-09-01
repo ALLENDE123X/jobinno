@@ -46,6 +46,7 @@ import {
   deriveRequiresSponsorship,
   deriveWorkAuthorizedUs,
   needsSponsorshipNonUsIsRelevant,
+  prefillVisaStatus,
 } from "@/lib/onboarding/intake-derivation";
 import {
   intakeFieldErrors,
@@ -406,18 +407,29 @@ export async function saveIntakeDraft(
       }
       break;
 
-    case 2:
-      update.citizenship_status = validated.citizenshipStatus;
+    case 2: {
+      // JOB-312: US citizens and permanent residents have a fixed visa
+      // status ("None, US citizen" / "Permanent resident") by definition,
+      // so the server is the sole author and the client field is hidden
+      // (see Step2Form). Anyone else's visa status is a fact only they
+      // can state, so their own answer is used as is.
+      //
+      // JOB-314 partial branch: a half filled draft may not have a
+      // citizenship yet, and deriveWorkAuthorizedUs /
+      // deriveRequiresSponsorship both collapse "not answered" to false,
+      // which would store a "no" nobody gave. Force true / false only
+      // once citizenship is actually known to be US citizen or permanent
+      // resident; otherwise pass the explicit answer through as is,
+      // including null for "not answered yet".
+      const citizenship = validated.citizenshipStatus as string | null;
+      const isUsOrPr =
+        citizenship === "us_citizen" || citizenship === "permanent_resident";
+      update.citizenship_status = citizenship;
       update.f1_status = validated.f1Status;
-      update.visa_status = validated.visaStatus;
+      update.visa_status = isUsOrPr
+        ? prefillVisaStatus(citizenship as "us_citizen" | "permanent_resident", null)
+        : validated.visaStatus;
       if (partial) {
-        // See the "options.partial" header above: a half filled draft may
-        // not have a citizenship yet, and deriveWorkAuthorizedUs /
-        // deriveRequiresSponsorship both collapse "not answered" to false,
-        // which would store a "no" nobody gave. Force true / false only
-        // once citizenship is actually known to be US citizen or permanent
-        // resident; otherwise pass the explicit answer through as is,
-        // including null for "not answered yet".
         // lib/onboarding/intake-derivation.ts's INHERENTLY_AUTHORIZED list
         // is not exported (it is a private module constant), so it cannot
         // be imported directly here without changing that file, which is
@@ -427,7 +439,6 @@ export async function saveIntakeDraft(
         // passed in, so calling it here with an explicit answer of null
         // is exactly an "is this citizenship inherently authorized" check,
         // with no second list to keep in sync.
-        const citizenship = validated.citizenshipStatus as string | null;
         const inherentlyAuthorized = citizenship
           ? deriveWorkAuthorizedUs(citizenship, null)
           : false;
@@ -438,19 +449,20 @@ export async function saveIntakeDraft(
           ? false
           : (validated.requiresSponsorship as boolean | null);
       } else {
-        // Derive workAuthorizedUs and requiresSponsorship: for US citizens
-        // and permanent residents these are forced; for others the explicit
-        // answer is used.
+        // Strict Next path: for US citizens and permanent residents work
+        // auth and requires_sponsorship are forced; for others the
+        // explicit answer is used.
         update.work_authorized_us = deriveWorkAuthorizedUs(
-          validated.citizenshipStatus as string,
+          citizenship as string,
           validated.workAuthorizedUs as boolean | null,
         );
         update.requires_sponsorship = deriveRequiresSponsorship(
-          validated.citizenshipStatus as string,
+          citizenship as string,
           validated.requiresSponsorship as boolean | null,
         );
       }
       break;
+    }
 
     case 3:
       update.street_address = validated.streetAddress;

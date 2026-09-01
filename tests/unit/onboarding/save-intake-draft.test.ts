@@ -1,7 +1,7 @@
 // @vitest-environment node
 /**
- * JOB-308 round two BLOCKING 1 and BLOCKING 2, and JOB-314 red team round
- * two BLOCKING 1 and MAJOR 2.
+ * JOB-308 round two BLOCKING 1 and BLOCKING 2, JOB-312 visa autofill,
+ * and JOB-314 red team round two BLOCKING 1 and MAJOR 2.
  *
  * saveIntakeDraft is a server action, so it is tested with a fake Supabase
  * client the way analytics-instrumentation.test.ts fakes it. The behaviors
@@ -14,7 +14,12 @@
  *     workAuthorizedUs and requiresSponsorship from the payload; the
  *     server derives them, so no answer we submit is one the user did
  *     not choose (HARD STOP 9).
- *  3. The `partial: true` path (Save and finish later) for steps 2, 3 and
+ *  3. Step 2 for a US citizen or permanent resident also omits
+ *     visaStatus; the server derives the correct string via
+ *     prefillVisaStatus regardless of what, if anything, the client
+ *     sent, and an F1's own visaStatus answer is written through as is.
+ *
+ *  4. The `partial: true` path (Save and finish later) for steps 2, 3 and
  *     4 never turns an unanswered question into a stored true or false.
  *     Step 3 in particular: a JOB-314 red team round found that the
  *     original partial branch called deriveNeedsSponsorshipNonUs
@@ -132,11 +137,10 @@ describe("saveIntakeDraft step 1", () => {
 });
 
 describe("saveIntakeDraft step 2", () => {
-  it("accepts a US citizen payload that omits workAuthorizedUs and requiresSponsorship", async () => {
+  it("accepts a US citizen payload that omits workAuthorizedUs, requiresSponsorship and visaStatus", async () => {
     const result = await saveIntakeDraft(
       {
         citizenshipStatus: "us_citizen",
-        visaStatus: "None, US citizen",
       },
       2,
     );
@@ -149,9 +153,47 @@ describe("saveIntakeDraft step 2", () => {
     // even though the client did not send those fields.
     expect(profileUpdate?.values?.work_authorized_us).toBe(true);
     expect(profileUpdate?.values?.requires_sponsorship).toBe(false);
+    // JOB-312: visa_status is server-derived via prefillVisaStatus too.
+    expect(profileUpdate?.values?.visa_status).toBe("None, US citizen");
   });
 
-  it("accepts an F1 with an explicit workAuthorizedUs=false answer", async () => {
+  it("derives the permanent resident visa string when visaStatus is omitted", async () => {
+    const result = await saveIntakeDraft(
+      {
+        citizenshipStatus: "permanent_resident",
+      },
+      2,
+    );
+
+    expect(result.ok).toBe(true);
+    const profileUpdate = writes.find(
+      (w) => w.table === "profiles" && w.kind === "update",
+    );
+    expect(profileUpdate?.values?.visa_status).toBe("Permanent resident");
+    expect(profileUpdate?.values?.work_authorized_us).toBe(true);
+    expect(profileUpdate?.values?.requires_sponsorship).toBe(false);
+  });
+
+  it("overrides a client supplied visaStatus for a US citizen with the derived value", async () => {
+    // Defense in depth: even if a payload names an arbitrary visaStatus for
+    // a US citizen, the server is the sole author of that value, exactly
+    // like it already is for workAuthorizedUs and requiresSponsorship.
+    const result = await saveIntakeDraft(
+      {
+        citizenshipStatus: "us_citizen",
+        visaStatus: "something else entirely",
+      },
+      2,
+    );
+
+    expect(result.ok).toBe(true);
+    const profileUpdate = writes.find(
+      (w) => w.table === "profiles" && w.kind === "update",
+    );
+    expect(profileUpdate?.values?.visa_status).toBe("None, US citizen");
+  });
+
+  it("accepts an F1 with an explicit workAuthorizedUs=false answer and writes their own visaStatus", async () => {
     const result = await saveIntakeDraft(
       {
         citizenshipStatus: "f1",
@@ -170,6 +212,8 @@ describe("saveIntakeDraft step 2", () => {
     // The user's own answer, not a fabricated true.
     expect(profileUpdate?.values?.work_authorized_us).toBe(false);
     expect(profileUpdate?.values?.requires_sponsorship).toBe(true);
+    // The user's own words, written through unchanged.
+    expect(profileUpdate?.values?.visa_status).toBe("F-1");
   });
 
   it("rejects an F1 who omits workAuthorizedUs", async () => {
@@ -185,6 +229,21 @@ describe("saveIntakeDraft step 2", () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.errors?.workAuthorizedUs).toBeDefined();
+  });
+
+  it("rejects an F1 who omits visaStatus", async () => {
+    const result = await saveIntakeDraft(
+      {
+        citizenshipStatus: "f1",
+        f1Status: "opt",
+        workAuthorizedUs: true,
+        requiresSponsorship: false,
+      },
+      2,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors?.visaStatus).toBeDefined();
   });
 });
 

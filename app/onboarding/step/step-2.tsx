@@ -17,6 +17,13 @@
  * directly serves HARD STOP 9: no answer we submit on a person's behalf
  * is one they did not enter themselves.
  *
+ * The visa status field follows the same rule as of JOB-312: for US
+ * citizens and permanent residents it is not rendered at all and the
+ * client omits it from the payload, since the server derives the exact
+ * same value via `prefillVisaStatus`. For every other citizenship the
+ * field is rendered and required, since visa status is a fact only the
+ * person themselves can state.
+ *
  * No prose hyphens or em dashes per HARD STOP 8.
  */
 
@@ -103,16 +110,17 @@ export function Step2Form({
     setErrors({});
 
     try {
-      // For US citizens and permanent residents, workAuthorizedUs and
-      // requiresSponsorship are auto-derived server-side; the payload
-      // omits them so the server is the sole author. For every other
-      // citizenship the explicit answer is required.
+      // For US citizens and permanent residents, visaStatus,
+      // workAuthorizedUs and requiresSponsorship are all auto-derived
+      // server-side; the payload omits them so the server is the sole
+      // author. For every other citizenship the explicit answer is
+      // required.
       const payload: Record<string, unknown> = {
         citizenshipStatus,
         f1Status: isF1 ? (f1Status === "" ? null : f1Status) : null,
-        visaStatus,
       };
       if (!isUsOrPr) {
+        payload.visaStatus = visaStatus;
         payload.workAuthorizedUs = toBoolean(workAuthorizedUs);
         payload.requiresSponsorship = toBoolean(requiresSponsorship);
       }
@@ -194,19 +202,21 @@ export function Step2Form({
           </Field>
         ) : null}
 
-        <Field
-          label="Your current visa status"
-          htmlFor="visa"
-          error={errors.visaStatus}
-          hint="In your own words. If you are not on a visa, say so, for example: not applicable, US citizen."
-        >
-          <Input
-            id="visa"
-            value={visaStatus}
-            onChange={(event) => setVisaStatus(event.target.value)}
-            placeholder="Not applicable, US citizen"
-          />
-        </Field>
+        {isUsOrPr ? null : (
+          <Field
+            label="Your current visa status"
+            htmlFor="visa"
+            error={errors.visaStatus}
+            hint="In your own words. If you are not on a visa, say so, for example: not applicable, US citizen."
+          >
+            <Input
+              id="visa"
+              value={visaStatus}
+              onChange={(event) => setVisaStatus(event.target.value)}
+              placeholder="Not applicable, US citizen"
+            />
+          </Field>
+        )}
 
         {isUsOrPr ? (
           <p className="text-muted-foreground text-xs">
