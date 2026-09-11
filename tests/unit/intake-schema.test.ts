@@ -91,6 +91,14 @@ describe("intakeSchema", () => {
     // subjectToRestrictiveCovenant all default to null now, the same way
     // f1Status and linkedinPdfPath already did, so none of them belongs in
     // this list any more either.
+    //
+    // JOB-361 does the same to streetAddress and postalCode: both default to
+    // null now, so neither belongs in this list either. currentCountry,
+    // willingToRelocate and earliestStart stay in this list on purpose. This
+    // schema is the final submit, reached only after step3Schema has already
+    // required a real value for each of the three (defaulted or typed), so
+    // an empty submission straight to intakeSchema is still missing all
+    // three and should still fail on them.
     expect(failedFields({})).toEqual([
       "attestation",
       "citizenshipStatus",
@@ -101,10 +109,8 @@ describe("intakeSchema", () => {
       "earliestStart",
       "gradDate",
       "needsSponsorshipNonUs",
-      "postalCode",
       "requiresSponsorship",
       "resumePath",
-      "streetAddress",
       "targetLocations",
       "visaStatus",
       "willingToRelocate",
@@ -120,9 +126,7 @@ describe("intakeSchema", () => {
     "visaStatus",
     "clearanceEligibility",
     "clearanceLevelHeld",
-    "streetAddress",
     "currentCity",
-    "postalCode",
     "currentCountry",
     "willingToRelocate",
     "targetLocations",
@@ -135,6 +139,43 @@ describe("intakeSchema", () => {
     delete input[field];
 
     expect(failedFields(input)).toContain(field);
+  });
+
+  // JOB-361: the mirror of the JOB-310 removal above, for the two fields
+  // this ticket lazy loads out of step 3. Deleting either from an otherwise
+  // complete submission must not fail it.
+  describe("JOB-361: optional address fields", () => {
+    it.each(["streetAddress", "postalCode"])(
+      "accepts a submission missing %s",
+      (field) => {
+        const input: Record<string, unknown> = validIntake();
+        delete input[field];
+
+        const result = schema.safeParse(input);
+        expect(result.success, `field ${field}`).toBe(true);
+      },
+    );
+
+    it("accepts a minimum viable submission with neither answered", () => {
+      const input = validIntake() as Record<string, unknown>;
+      delete input.streetAddress;
+      delete input.postalCode;
+
+      const result = schema.safeParse(input);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.streetAddress).toBeNull();
+      expect(result.data.postalCode).toBeNull();
+      // The rest of the location block is still required.
+      expect(result.data.currentCountry).toBe("United States");
+    });
+
+    it("treats a blank street address the same as none given", () => {
+      const result = schema.safeParse({ ...validIntake(), streetAddress: "" });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.streetAddress).toBeNull();
+    });
   });
 
   // JOB-310: the mirror of the six-field removal above. Deleting any one of

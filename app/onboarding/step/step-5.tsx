@@ -101,11 +101,34 @@ function SummarySection({
   );
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+/**
+ * `muted` is JOB-361's marker for a row that names an optional field the
+ * person skipped: street_address and postal_code no longer gate this step,
+ * so "Not provided" here means "left for the runtime pipeline to ask about",
+ * not "something is wrong". Grayed out rather than dropped entirely, so
+ * editing this step still shows the person the field exists.
+ */
+function Row({
+  label,
+  value,
+  muted,
+}: {
+  label: string;
+  value: string;
+  muted?: boolean;
+}) {
   return (
     <div className="flex justify-between gap-4">
       <dt className="text-muted-foreground shrink-0">{label}</dt>
-      <dd className="text-right font-medium">{value}</dd>
+      <dd
+        className={
+          muted
+            ? "text-muted-foreground text-right font-normal"
+            : "text-right font-medium"
+        }
+      >
+        {value}
+      </dd>
     </div>
   );
 }
@@ -249,6 +272,7 @@ export function Step5Form({
               .filter(Boolean)
               .join(", ") || "Not provided"
           }
+          muted={!profile.street_address && !profile.postal_code}
         />
         <Row
           label="City"

@@ -124,6 +124,29 @@ const optionalText = (field: string, max = 120) =>
 const salaryExpectationField = optionalText("Salary expectation", 200).default(
   null
 );
+
+/**
+ * ── JOB-361: lazy loaded out of step 3 ────────────────────────────────────
+ *
+ * Street address and postal code used to be required on step 3 alongside
+ * current country, willing to relocate and earliest start, and those five
+ * fields blocked everyone regardless of which of Ashby, Workable, Greenhouse,
+ * SmartRecruiters or Lever the person's first application actually landed on.
+ * Only two of the five gate a first submission on every one of those boards:
+ * target_locations and grad_date. Street address and postal code are asked
+ * by some boards and not others, so they are optional here and left to the
+ * runtime pipeline's HARD STOP 9 carve out
+ * (`lib/candidate-answers.ts`, `lib/fill-application-form.ts`) to fill in, or
+ * to ask about, the first time a real form actually needs one.
+ *
+ * The other three (`currentCountry`, `willingToRelocate`, `earliestStart`
+ * below) stay required in shape, but `step3Schema` now derives a value for
+ * each of them from another field a person already answered rather than
+ * leaving them blank. See that schema's own comment for the reasoning behind
+ * each default.
+ */
+const streetAddressField = optionalText("Street address", 200).default(null);
+const postalCodeField = optionalText("Postal code", 20).default(null);
 const highSchoolNameField = optionalText("High school name").default(null);
 const highSchoolGradYearField = z
   .number()
@@ -286,8 +309,14 @@ export function intakeSchema(userId: string) {
 
       currentCity: requiredText("Current city"),
       currentCountry: requiredText("Current country"),
-      streetAddress: requiredText("Street address", 200),
-      postalCode: requiredText("Postal code", 20),
+      /**
+       * JOB-361: optional. See the field comment above for why, and
+       * `lib/ashby-direct-submit.ts`'s `candidateValueForField` (and its
+       * equivalents on the other solvers) for how a null here already reads
+       * as "not answered" rather than a value composed for the board.
+       */
+      streetAddress: streetAddressField,
+      postalCode: postalCodeField,
       willingToRelocate: z.boolean(),
       targetLocations: z
         .array(requiredText("Target location"))
@@ -523,23 +552,146 @@ export const step2Schema = z
   });
 
 /**
+ * JOB-361: the default `currentCountry` takes when citizenship is
+ * `us_citizen` and nothing has been typed. Null for every other citizenship,
+ * which means "still ask" to the check in `step3Schema` below: guessing a
+ * country for an F1, H1B or permanent resident answer is a country that
+ * could be wrong on a real application, where a US citizen's is not.
+ */
+export function defaultCurrentCountry(
+  citizenshipStatus: string | null,
+): string | null {
+  return citizenshipStatus === "us_citizen" ? "United States" : null;
+}
+
+/**
+ * JOB-361: the default `willingToRelocate` takes once at least one target
+ * location has been picked. Picking a target is already the person saying
+ * where they want to work, so this reads that answer rather than asking the
+ * same question a second time. Null when nothing has been picked yet, which
+ * means "still ask" the same way `defaultCurrentCountry` does above.
+ */
+export function defaultWillingToRelocate(
+  targetLocations: readonly string[],
+): boolean | null {
+  return targetLocations.length > 0 ? true : null;
+}
+
+/**
+ * JOB-361: `gradDate` plus 30 days, the ordinary new grad runway, in the
+ * same `YYYY-MM-DD` shape `z.iso.date` validates. Computed in UTC so a date
+ * typed near midnight does not roll onto a different calendar day than the
+ * one the person actually typed.
+ */
+export function defaultEarliestStart(gradDate: string): string {
+  const parsed = new Date(`${gradDate}T00:00:00Z`);
+  parsed.setUTCDate(parsed.getUTCDate() + 30);
+  return parsed.toISOString().slice(0, 10);
+}
+
+/**
  * Step 3: Location + timing. targetLocations is validated as a comma
  * separated string that becomes an array (min 1 entry).
+ *
+ * ── JOB-361: down to the fields a first submission actually needs ──────────
+ *
+ * Only `targetLocations` and `gradDate` gate every one of Ashby, Workable,
+ * Greenhouse, SmartRecruiters and Lever. The other four kept from blocking
+ * as follows:
+ *
+ *   streetAddress, postalCode
+ *     Optional now (`streetAddressField` / `postalCodeField` above). Asked
+ *     by some boards and not others, and left to the runtime pipeline's
+ *     HARD STOP 9 carve out to fill in the first time a real form needs one.
+ *
+ *   currentCountry
+ *     Still required in shape, but defaulted to "United States" once
+ *     `citizenshipStatus` is known to be `us_citizen`, via
+ *     `defaultCurrentCountry` above. Every other citizenship still has to
+ *     answer outright: `citizenshipStatus` rides along in this payload only
+ *     so that check has something to read, and is not written anywhere by
+ *     this step (step 2 already owns that column).
+ *
+ *   willingToRelocate
+ *     Still required in shape, defaulted to true once a target location has
+ *     been picked, via `defaultWillingToRelocate` above. An explicit answer,
+ *     yes or no, is never overwritten by this default.
+ *
+ *   earliestStart
+ *     Still required in shape, defaulted to `gradDate` plus 30 days via
+ *     `defaultEarliestStart` above whenever nothing has been typed.
+ *
+ * The three defaults run in a `.transform()` after the object's own field
+ * level checks pass, and the `.check()` after that transform is what still
+ * rejects a `currentCountry` or `willingToRelocate` that came out of the
+ * transform null: the default filled it in or it did not, and either way the
+ * field is still required to have a real answer by the time this schema
+ * accepts the payload.
  */
-export const step3Schema = z.object({
-  streetAddress: requiredText("Street address", 200),
-  currentCity: requiredText("Current city"),
-  currentCountry: requiredText("Current country"),
-  postalCode: requiredText("Postal code", 20),
-  targetLocations: z
-    .array(requiredText("Target location"))
-    .min(1, "Add at least one place you want to work.")
-    .max(20, "That is more target locations than a search can use."),
-  willingToRelocate: z.boolean(),
-  needsSponsorshipNonUs: z.boolean(),
-  gradDate: z.iso.date("Graduation date must be a real date."),
-  earliestStart: z.iso.date("Earliest start date must be a real date."),
-});
+export const step3Schema = z
+  .object({
+    streetAddress: streetAddressField,
+    currentCity: requiredText("Current city"),
+    currentCountry: z
+      .string()
+      .trim()
+      .max(120, "Current country is too long.")
+      .nullable()
+      .default(null),
+    postalCode: postalCodeField,
+    targetLocations: z
+      .array(requiredText("Target location"))
+      .min(1, "Add at least one place you want to work.")
+      .max(20, "That is more target locations than a search can use."),
+    willingToRelocate: z.boolean().nullable().default(null),
+    needsSponsorshipNonUs: z.boolean(),
+    /**
+     * Not a step 3 answer and not written to `profiles` by this step; see
+     * the header comment above. Optional because a draft that has not
+     * reached step 2 yet, or a caller validating this schema in isolation,
+     * has nothing to send here.
+     */
+    citizenshipStatus: citizenshipStatus.nullable().default(null),
+    gradDate: z.iso.date("Graduation date must be a real date."),
+    earliestStart: z.iso
+      .date("Earliest start date must be a real date.")
+      .nullable()
+      .default(null),
+  })
+  .transform((value) => {
+    const currentCountry =
+      value.currentCountry && value.currentCountry.length > 0
+        ? value.currentCountry
+        : defaultCurrentCountry(value.citizenshipStatus);
+
+    const willingToRelocate =
+      value.willingToRelocate !== null
+        ? value.willingToRelocate
+        : defaultWillingToRelocate(value.targetLocations);
+
+    const earliestStart =
+      value.earliestStart ?? defaultEarliestStart(value.gradDate);
+
+    return { ...value, currentCountry, willingToRelocate, earliestStart };
+  })
+  .check((ctx) => {
+    const value = ctx.value;
+
+    // willingToRelocate needs no matching check here: targetLocations is
+    // already required to hold at least one entry above, so
+    // defaultWillingToRelocate always resolves it to true by the time this
+    // runs. The only field the transform can still leave null is
+    // currentCountry, for a citizenship other than us_citizen with nothing
+    // typed.
+    if (!value.currentCountry) {
+      ctx.issues.push({
+        code: "custom",
+        input: value.currentCountry,
+        path: ["currentCountry"],
+        message: "Current country is required.",
+      });
+    }
+  });
 
 /**
  * Step 4: Compliance + compensation.
