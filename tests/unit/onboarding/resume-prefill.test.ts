@@ -104,6 +104,36 @@ describe("detectCitizenshipFromResumeText", () => {
       ).toBeNull();
     });
   });
+
+  // Round two red team's regression: round two's own word boundary fix
+  // rejected "US citizenship" as a match for the "US citizen" phrase
+  // (correctly), but never added "US citizenship" as its own phrase, so a
+  // resume that plainly states it read as nothing at all. Round two's
+  // disqualifier list also included generic English words ("apply", "help")
+  // that fire on ordinary resume prose unrelated to visa status.
+  describe("round two red team false positives", () => {
+    it("reads a direct citizenship statement using the noun form", () => {
+      expect(detectCitizenshipFromResumeText("I hold US citizenship")).toBe("us_citizen");
+    });
+
+    it("reads a direct citizenship statement with trailing confirmation wording", () => {
+      expect(detectCitizenshipFromResumeText("US citizenship confirmed")).toBe("us_citizen");
+    });
+
+    it("does not treat the generic word 'apply' as a disqualifier", () => {
+      expect(
+        detectCitizenshipFromResumeText(
+          "US citizen, quick to apply lessons learned across projects",
+        ),
+      ).toBe("us_citizen");
+    });
+
+    it("does not treat the generic word 'help' as a disqualifier", () => {
+      expect(
+        detectCitizenshipFromResumeText("US citizen helping with community outreach"),
+      ).toBe("us_citizen");
+    });
+  });
 });
 
 describe("parseGradDateToIso", () => {

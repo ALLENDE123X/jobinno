@@ -25,10 +25,22 @@
  * bare `indexOf` let "US Citizenship" match "US Citizen", and the negation
  * scan only looked backward, so a trailing disqualifier such as "needed"
  * or "sponsorship" slipped through. The matcher is now word boundary only
- * (a regex, never a substring test) and scans a window both before and
- * after every match; see `hasUnnegatedPhrase` for the exact rule and
+ * (a regex, never a substring test) and rejects a match with either a
+ * negation word just before it or a disqualifying word anywhere in the same
+ * sentence; see `hasUnnegatedPhrase` for the exact rule and
  * `tests/unit/onboarding/resume-prefill.test.ts` for the full set of
  * exploits it now rejects.
+ *
+ * Round two's own fix then regressed the opposite direction: it added
+ * "US citizen" as a phrase but never "US citizenship" itself, so a resume
+ * that plainly says "I hold US citizenship" matched nothing at all, and its
+ * disqualifier list included generic English words ("apply", "help",
+ * "assist", "future", "services", "cases") that fired on ordinary resume
+ * prose that never mentioned a visa or an employer at all. Round three adds
+ * the missing phrasings and prunes the disqualifier list to words specific
+ * to a visa or immigration context, or to a company or organisation suffix;
+ * see the comment above `DISQUALIFIER_WORDS` for the two immigration
+ * specific words added in their place.
  *
  * current_city and grad_date go through the model, because
  * `buildResumeProfile` already extracts, sanitises and ships them to the
@@ -76,6 +88,11 @@ const US_CITIZEN_PHRASES = [
   "united states citizen",
   "american citizen",
   "citizen of the united states",
+  "u.s. citizenship",
+  "us citizenship",
+  "united states citizenship",
+  "u.s. national",
+  "us national",
 ];
 
 const PERMANENT_RESIDENT_PHRASES = [
@@ -87,21 +104,35 @@ const PERMANENT_RESIDENT_PHRASES = [
 
 /** How far back from a match to look for a negating word. */
 const NEGATION_WINDOW = 20;
-/** How far forward from a match to look for a disqualifying word. */
-const DISQUALIFIER_WINDOW = 40;
 
 const NEGATION_WORDS = ["not", "no", "non", "without"];
 
 /**
- * Words that, appearing shortly after an otherwise matching phrase, mean the
- * sentence is not a first person status claim at all: someone else's company
- * or program name ("US Citizen Corp", "US Citizen Advocacy Network"), a
- * service performed for other people ("citizen naturalization cases for
- * clients", "Citizenship & Immigration Services"), or a future or
- * conditional need rather than a current status ("green card sponsorship
- * needed", "will require ... green card ... in the future"). This list is
- * verified against every false positive round one red team found on this
- * ticket; see the exploit list in the test file before trimming it.
+ * Words that, appearing anywhere in the same sentence as an otherwise
+ * matching phrase, mean the sentence is not a first person status claim at
+ * all: someone else's company or program name ("US Citizen Corp", "US
+ * Citizen Advocacy Network"), a visa or immigration process performed for
+ * other people ("citizen naturalization cases for clients", "Citizenship &
+ * Immigration Services"), or a future or conditional need rather than a
+ * current status ("green card sponsorship needed", "will require
+ * sponsorship ... green card ... in the future").
+ *
+ * Round two red team's regression: this list used to include generic
+ * English words that recur in ordinary resume prose unrelated to visa
+ * status ("apply", "help", "assist", "future", "services", "cases"), which
+ * fired on sentences that never mentioned sponsorship or immigration at
+ * all. Round three prunes it to words that are specific to a visa or
+ * immigration context, or to a company or organisation suffix, and adds two
+ * immigration specific terms ("immigration", "naturalization") in their
+ * place so the phrases newly added to `US_CITIZEN_PHRASES` this round
+ * ("US citizenship", "US national") still reject a mention of the US
+ * Citizenship and Immigration Services agency rather than reading it as a
+ * personal claim. The check also moved from a fixed character window
+ * forward of the match to the whole sentence containing it (see
+ * `isSentenceDisqualified`), since "will require sponsorship ... in the
+ * future" only kept "sponsorship" ahead of the match once "future" was
+ * dropped, and a fixed forward window would have missed it. See the exploit
+ * list in the test file before trimming this list further.
  */
 const DISQUALIFIER_WORDS = [
   "sponsorship",
@@ -110,21 +141,70 @@ const DISQUALIFIER_WORDS = [
   "requires",
   "needed",
   "pending",
-  "help",
-  "assist",
-  "apply",
-  "cases",
-  "services",
   "corp",
   "inc",
   "llc",
   "network",
   "advocacy",
-  "future",
+  "immigration",
+  "naturalization",
 ];
 
 const NEGATION_PATTERN = new RegExp(`\\b(?:${NEGATION_WORDS.join("|")})\\b[^.]*$`, "i");
-const DISQUALIFIER_PATTERN = new RegExp(`^[^.]*\\b(?:${DISQUALIFIER_WORDS.join("|")})\\b`, "i");
+const DISQUALIFIER_PATTERN = new RegExp(`\\b(?:${DISQUALIFIER_WORDS.join("|")})\\b`, "i");
+
+/**
+ * A period at `index` counts as ending an abbreviation, not a sentence,
+ * when exactly one letter or digit sits immediately before it ("e.g.",
+ * "i.e.", "u.s.", "a.m."). Two or more (a real word, or a suffix like
+ * "corp." or "inc.") or zero (the period stands alone) both count as a real
+ * sentence end. This only has to be good enough to stop an abbreviation's
+ * internal punctuation from truncating the sentence a disqualifier search
+ * runs over; it is not a general purpose sentence splitter.
+ */
+function isAbbreviationPeriod(haystack: string, index: number): boolean {
+  let i = index - 1;
+  let letters = 0;
+  while (i >= 0 && /[a-z0-9]/i.test(haystack[i])) {
+    letters++;
+    i--;
+  }
+  return letters === 1;
+}
+
+/**
+ * True if the sentence containing the match at `[start, end)` in `haystack`
+ * carries a disqualifying word anywhere in it, before or after the match.
+ * A sentence boundary is the nearest real (non abbreviation) period on each
+ * side, or the start or end of the string when there is none. Scoped to
+ * the sentence rather than a fixed size window so a disqualifier is caught
+ * regardless of which side of the match it falls on.
+ */
+function isSentenceDisqualified(haystack: string, start: number, end: number): boolean {
+  let sentenceStart = 0;
+  for (let searchEnd = start; ; ) {
+    const periodIndex = haystack.lastIndexOf(".", searchEnd - 1);
+    if (periodIndex === -1) break;
+    if (!isAbbreviationPeriod(haystack, periodIndex)) {
+      sentenceStart = periodIndex + 1;
+      break;
+    }
+    searchEnd = periodIndex;
+  }
+
+  let sentenceEnd = haystack.length;
+  for (let searchStart = end; ; ) {
+    const periodIndex = haystack.indexOf(".", searchStart);
+    if (periodIndex === -1) break;
+    if (!isAbbreviationPeriod(haystack, periodIndex)) {
+      sentenceEnd = periodIndex;
+      break;
+    }
+    searchStart = periodIndex + 1;
+  }
+
+  return DISQUALIFIER_PATTERN.test(haystack.slice(sentenceStart, sentenceEnd));
+}
 
 /** Escapes a plain phrase (spaces and periods only, no other regex metacharacters) for use inside a `RegExp`. */
 function escapePhraseForRegExp(phrase: string): string {
@@ -134,13 +214,15 @@ function escapePhraseForRegExp(phrase: string): string {
 /**
  * True if `phrase` appears in `haystack` as a whole phrase, matched on word
  * boundaries rather than as a bare substring, so "US Citizenship" can never
- * match "US Citizen". A match is rejected if a negation word ("not", "no",
- * "non", "without") sits in the `NEGATION_WINDOW` characters before it, or a
- * disqualifying word sits in the `DISQUALIFIER_WINDOW` characters after it,
- * neither check crossing a sentence boundary. A resume that says "not a US
- * citizen" must never be read as one, and neither must one that names a
- * company, describes work done for other people, or states a future or
- * conditional need rather than a current status.
+ * match "US Citizen" alone (though "US citizenship" is now its own listed
+ * phrase; see `US_CITIZEN_PHRASES`). A match is rejected if a negation word
+ * ("not", "no", "non", "without") sits in the `NEGATION_WINDOW` characters
+ * before it, never crossing a sentence boundary, or if a disqualifying word
+ * sits anywhere in the same sentence (see `isSentenceDisqualified`). A
+ * resume that says "not a US citizen" must never be read as one, and
+ * neither must one that names a company, describes work done for other
+ * people, or states a future or conditional need rather than a current
+ * status.
  */
 function hasUnnegatedPhrase(haystack: string, phrase: string): boolean {
   const pattern = new RegExp(`\\b${escapePhraseForRegExp(phrase)}\\b`, "g");
@@ -149,8 +231,7 @@ function hasUnnegatedPhrase(haystack: string, phrase: string): boolean {
     const start = match.index;
     const end = start + match[0].length;
     const before = haystack.slice(Math.max(0, start - NEGATION_WINDOW), start);
-    const after = haystack.slice(end, Math.min(haystack.length, end + DISQUALIFIER_WINDOW));
-    if (!NEGATION_PATTERN.test(before) && !DISQUALIFIER_PATTERN.test(after)) {
+    if (!NEGATION_PATTERN.test(before) && !isSentenceDisqualified(haystack, start, end)) {
       return true;
     }
   }
@@ -288,9 +369,11 @@ export type ResumePrefillParseResult =
  * `LLM_TIMEOUT_MS` in `lib/resume-parser.ts`, burning a full call nobody
  * was waiting on any more. `lib/resume-parser.ts` stays untouched per this
  * ticket's scope, so the parse work below is raced against this timer
- * rather than the timeout being threaded into `extractResume` itself; the
- * in flight model call is not cancelled, but this function stops waiting
- * on it and reports a failure back to the caller in 30 seconds either way.
+ * rather than the timeout being threaded into `extractResume` itself. This
+ * bounds how long the caller waits, which fixes the hang, but it does not
+ * cancel the in flight model call itself; that half of MAJOR 2 (the burned
+ * credit on an abandoned parse) is tracked as JOB-364, see the comment on
+ * the `Promise.race` call below.
  */
 const SERVER_PARSE_TIMEOUT_MS = 30_000;
 
@@ -338,6 +421,13 @@ export async function runResumeParseForPrefill(
   work.catch(() => {});
 
   try {
+    // JOB-364: this race bounds the caller wait but does NOT cancel the
+    // underlying LLM fetch. The in flight model call still runs to
+    // completion server side after this returns via timeout, burning a
+    // full call nobody is waiting on any more. Full cancellation needs an
+    // AbortSignal threaded through `extractResume` and `callTextOnlyModel`
+    // in `lib/resume-parser.ts`, out of scope for this ticket; see the
+    // follow up issue.
     const { extracted, defaults } = await Promise.race([
       work,
       rejectAfter(SERVER_PARSE_TIMEOUT_MS),
