@@ -163,10 +163,18 @@ export default async function OnboardingStepPage({
   // unmodified `profile.*` columns, so a resume derived default can never
   // make routing think a step is complete that the user has not actually
   // saved. Step 4 gets none of this: the ticket's scope is steps 2 and 3
-  // only, since clearance is not something a resume states.
-  const resumeDefaults = resumeRow
-    ? await readResumePrefillDefaults(supabase, resumeRow.id)
-    : null;
+  // only, since clearance is not something a resume states. The read only
+  // runs for steps 2 and 3 themselves, not for every step a resume happens
+  // to exist for.
+  //
+  // There is no `target_locations` prefill: a resume's home address is
+  // where someone lives, not a stated job search preference, so step 3's
+  // location field is always left for the person to answer themselves. See
+  // `lib/onboarding/resume-prefill.ts` for the rest of that reasoning.
+  const resumeDefaults =
+    resumeRow && (step === 2 || step === 3)
+      ? await readResumePrefillDefaults(supabase, resumeRow.id)
+      : null;
   if (resumeDefaults) {
     if (profileData.citizenship_status === null && resumeDefaults.citizenshipStatus) {
       profileData.citizenship_status = resumeDefaults.citizenshipStatus;
@@ -179,13 +187,6 @@ export default async function OnboardingStepPage({
     }
     if (profileData.current_city === null && resumeDefaults.currentCity) {
       profileData.current_city = resumeDefaults.currentCity;
-    }
-    if (
-      (profileData.target_locations === null ||
-        profileData.target_locations.length === 0) &&
-      resumeDefaults.targetLocations
-    ) {
-      profileData.target_locations = resumeDefaults.targetLocations;
     }
     if (profileData.grad_date === null && resumeDefaults.gradDate) {
       profileData.grad_date = resumeDefaults.gradDate;

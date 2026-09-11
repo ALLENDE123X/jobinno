@@ -31,7 +31,6 @@ const validDefaults = {
   citizenshipStatus: null,
   workAuthorizedUs: null,
   currentCity: "London, UK",
-  targetLocations: ["London, UK"],
   gradDate: null,
 };
 

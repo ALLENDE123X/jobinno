@@ -59,6 +59,51 @@ describe("detectCitizenshipFromResumeText", () => {
       detectCitizenshipFromResumeText("H1B sponsorship required for this role"),
     ).toBeNull();
   });
+
+  // Round one red team's BLOCKING 1: a bare substring match let "US
+  // Citizenship" match "US Citizen", and the negation scan never looked
+  // forward, so a trailing disqualifier slipped through. Every exploit red
+  // team verified is its own case here rather than folded together, so a
+  // regression in any one of them fails loudly and by name.
+  describe("round one red team false positives", () => {
+    it("does not read a mention of USCIS as a personal citizenship claim", () => {
+      expect(
+        detectCitizenshipFromResumeText(
+          "I helped clients apply for US Citizenship & Immigration Services (USCIS) grants",
+        ),
+      ).toBeNull();
+    });
+
+    it("does not read a company name in a bullet as a personal citizenship claim", () => {
+      expect(detectCitizenshipFromResumeText("US Citizen Corp (client)")).toBeNull();
+    });
+
+    it("does not read work performed for other people as a personal citizenship claim", () => {
+      expect(
+        detectCitizenshipFromResumeText(
+          "Immigration paralegal handling US citizen naturalization cases for clients",
+        ),
+      ).toBeNull();
+    });
+
+    it("does not read a volunteer organization's name as a personal citizenship claim", () => {
+      expect(
+        detectCitizenshipFromResumeText("Volunteer at US Citizen Advocacy Network"),
+      ).toBeNull();
+    });
+
+    it("does not read a stated need for a green card as already holding one", () => {
+      expect(detectCitizenshipFromResumeText("Green card sponsorship needed")).toBeNull();
+    });
+
+    it("does not read a future sponsorship need mentioning a green card as holding one", () => {
+      expect(
+        detectCitizenshipFromResumeText(
+          "Will require sponsorship for an employment visa (e.g., green card) in the future",
+        ),
+      ).toBeNull();
+    });
+  });
 });
 
 describe("parseGradDateToIso", () => {
@@ -104,7 +149,7 @@ describe("deriveResumePrefillDefaults", () => {
     expect(defaults.workAuthorizedUs).toBeNull();
   });
 
-  it("mirrors location into targetLocations and reads the most recent grad date", () => {
+  it("reads current city and the most recent grad date, never target locations", () => {
     const profile = emptyProfile({
       location: "Boston, MA",
       education: [
@@ -113,8 +158,8 @@ describe("deriveResumePrefillDefaults", () => {
     });
     const defaults = deriveResumePrefillDefaults("no citizenship claim here", profile);
     expect(defaults.currentCity).toBe("Boston, MA");
-    expect(defaults.targetLocations).toEqual(["Boston, MA"]);
     expect(defaults.gradDate).toBe("2026-05-01");
+    expect(defaults).not.toHaveProperty("targetLocations");
   });
 
   it("leaves every field null when the resume carries nothing usable", () => {
@@ -123,7 +168,6 @@ describe("deriveResumePrefillDefaults", () => {
       citizenshipStatus: null,
       workAuthorizedUs: null,
       currentCity: null,
-      targetLocations: null,
       gradDate: null,
     });
   });
@@ -135,7 +179,6 @@ describe("ResumePrefillDefaultsSchema", () => {
       citizenshipStatus: null,
       workAuthorizedUs: null,
       currentCity: null,
-      targetLocations: null,
       gradDate: null,
     });
     expect(result.success).toBe(true);
@@ -146,7 +189,6 @@ describe("ResumePrefillDefaultsSchema", () => {
       citizenshipStatus: "f1",
       workAuthorizedUs: null,
       currentCity: null,
-      targetLocations: null,
       gradDate: null,
     });
     expect(result.success).toBe(false);
@@ -197,7 +239,6 @@ describe("readResumePrefillDefaults", () => {
           citizenshipStatus: "us_citizen",
           workAuthorizedUs: true,
           currentCity: "Denver, CO",
-          targetLocations: ["Denver, CO"],
           gradDate: "2026-05-01",
         },
       }),
@@ -207,7 +248,6 @@ describe("readResumePrefillDefaults", () => {
       citizenshipStatus: "us_citizen",
       workAuthorizedUs: true,
       currentCity: "Denver, CO",
-      targetLocations: ["Denver, CO"],
       gradDate: "2026-05-01",
     });
   });

@@ -235,6 +235,15 @@ export async function readStoredParse(
  * A write failure is logged and swallowed. The profile has already been derived
  * by the time this runs, so failing here would throw away a good parse and a
  * good application over a cache write.
+ *
+ * This is a full replacement, not a merge: any sibling key written onto
+ * `resumes.parsed` by something other than this module is dropped, not
+ * preserved. `lib/onboarding/resume-prefill.ts` writes one such sibling,
+ * `onboardingDefaults`. As of JOB-360 that is not exploitable, since this
+ * function only runs during the fill pipeline, well after onboarding has
+ * already read `onboardingDefaults` back and finished with it, but a future
+ * caller that expects this write to be additive would be wrong. Splice the
+ * existing row's other keys in first if that ever needs to change.
  */
 export async function writeStoredParse(
   supabase: SupabaseClient,
