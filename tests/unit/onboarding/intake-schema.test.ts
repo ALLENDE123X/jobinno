@@ -209,6 +209,155 @@ describe("step3Schema", () => {
     const result = step3Schema.safeParse({ ...base, currentCity: "" });
     expect(result.success).toBe(false);
   });
+
+  // JOB-361: streetAddress and postalCode are optional now.
+  describe("optional address fields", () => {
+    it("accepts a payload missing both streetAddress and postalCode", () => {
+      const input: Record<string, unknown> = { ...base };
+      delete input.streetAddress;
+      delete input.postalCode;
+
+      const result = step3Schema.safeParse(input);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.streetAddress).toBeNull();
+      expect(result.data.postalCode).toBeNull();
+    });
+
+    it("treats a blank streetAddress the same as none given", () => {
+      const result = step3Schema.safeParse({ ...base, streetAddress: "" });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.streetAddress).toBeNull();
+    });
+  });
+
+  // JOB-361: currentCountry defaults to "United States" for a US citizen,
+  // and still has to be answered outright for anyone else.
+  describe("currentCountry default", () => {
+    it("defaults to United States for a US citizen who leaves it blank", () => {
+      const input: Record<string, unknown> = { ...base };
+      delete input.currentCountry;
+      input.citizenshipStatus = "us_citizen";
+
+      const result = step3Schema.safeParse(input);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.currentCountry).toBe("United States");
+    });
+
+    it("still requires an explicit answer for a non US citizenship", () => {
+      const input: Record<string, unknown> = { ...base };
+      delete input.currentCountry;
+      input.citizenshipStatus = "h1b";
+
+      const result = step3Schema.safeParse(input);
+      expect(result.success).toBe(false);
+      if (!result.success)
+        expect(
+          result.error.issues.map((issue) => issue.path[0]),
+        ).toContain("currentCountry");
+    });
+
+    it("still requires an explicit answer when citizenship is unknown", () => {
+      const input: Record<string, unknown> = { ...base };
+      delete input.currentCountry;
+
+      const result = step3Schema.safeParse(input);
+      expect(result.success).toBe(false);
+    });
+
+    it("keeps a real answer even for a US citizen rather than overwriting it", () => {
+      const result = step3Schema.safeParse({
+        ...base,
+        currentCountry: "Puerto Rico",
+        citizenshipStatus: "us_citizen",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.currentCountry).toBe("Puerto Rico");
+    });
+  });
+
+  // JOB-361: willingToRelocate defaults to true once a target location has
+  // been picked, since targetLocations is already required to be non-empty.
+  describe("willingToRelocate default", () => {
+    it("defaults to true when left unanswered", () => {
+      const input: Record<string, unknown> = { ...base };
+      delete input.willingToRelocate;
+
+      const result = step3Schema.safeParse(input);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.willingToRelocate).toBe(true);
+    });
+
+    it("keeps an explicit no rather than overwriting it", () => {
+      const result = step3Schema.safeParse({
+        ...base,
+        willingToRelocate: false,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.willingToRelocate).toBe(false);
+    });
+  });
+
+  // JOB-361: earliestStart defaults to gradDate plus 30 days.
+  describe("earliestStart default", () => {
+    it("defaults to 30 days after gradDate when left unanswered", () => {
+      const input: Record<string, unknown> = { ...base, gradDate: "2027-05-01" };
+      delete input.earliestStart;
+
+      const result = step3Schema.safeParse(input);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.earliestStart).toBe("2027-05-31");
+    });
+
+    it("keeps an explicit earliestStart rather than overwriting it", () => {
+      const result = step3Schema.safeParse({
+        ...base,
+        gradDate: "2027-05-01",
+        earliestStart: "2027-08-15",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.earliestStart).toBe("2027-08-15");
+    });
+
+    it("rolls a month boundary correctly", () => {
+      const input: Record<string, unknown> = { ...base, gradDate: "2027-12-15" };
+      delete input.earliestStart;
+
+      const result = step3Schema.safeParse(input);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.earliestStart).toBe("2028-01-14");
+    });
+  });
+
+  it("matches JOB-361's success criterion: a US citizen with a target location picked needs no other new answers", () => {
+    // streetAddress and postalCode omitted (optional), currentCountry and
+    // willingToRelocate omitted (defaulted), earliestStart omitted
+    // (defaulted). currentCity, targetLocations and gradDate are outside
+    // this ticket's scope and stay required and typed, the same as before.
+    const result = step3Schema.safeParse({
+      currentCity: "Austin",
+      citizenshipStatus: "us_citizen",
+      targetLocations: ["Austin, US"],
+      needsSponsorshipNonUs: false,
+      gradDate: "2027-05-01",
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.currentCountry).toBe("United States");
+    expect(result.data.willingToRelocate).toBe(true);
+    expect(result.data.earliestStart).toBe("2027-05-31");
+    expect(result.data.streetAddress).toBeNull();
+    expect(result.data.postalCode).toBeNull();
+  });
 });
 
 describe("step4Schema", () => {
