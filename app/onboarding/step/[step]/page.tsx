@@ -13,6 +13,7 @@
 import { redirect } from "next/navigation";
 
 import { PageShell } from "@/components/page-shell";
+import { readResumePrefillDefaults } from "@/lib/onboarding/resume-prefill";
 import { earliestIncompleteStep } from "@/lib/onboarding/step-routing";
 import { createServerClient } from "@/lib/supabase/server";
 
@@ -86,7 +87,7 @@ export default async function OnboardingStepPage({
     supabase.from("profiles").select("*").eq("id", user.id).maybeSingle(),
     supabase
       .from("resumes")
-      .select("storage_path, linkedin_pdf_path")
+      .select("id, storage_path, linkedin_pdf_path")
       .eq("user_id", user.id)
       .order("created_at", { ascending: false })
       .limit(1)
@@ -154,6 +155,42 @@ export default async function OnboardingStepPage({
     high_school_grad_year: profile.high_school_grad_year ?? null,
     attested_at: profile.attested_at ?? null,
   };
+
+  // JOB-360: pre fill whatever step 2 and step 3 still show blank from the
+  // resume parsed on step 1, read back off `resumes.parsed` instead of
+  // parsed again here. This only ever fills a field that is currently null,
+  // and `earliestIncompleteStep` above already ran against the real,
+  // unmodified `profile.*` columns, so a resume derived default can never
+  // make routing think a step is complete that the user has not actually
+  // saved. Step 4 gets none of this: the ticket's scope is steps 2 and 3
+  // only, since clearance is not something a resume states.
+  const resumeDefaults = resumeRow
+    ? await readResumePrefillDefaults(supabase, resumeRow.id)
+    : null;
+  if (resumeDefaults) {
+    if (profileData.citizenship_status === null && resumeDefaults.citizenshipStatus) {
+      profileData.citizenship_status = resumeDefaults.citizenshipStatus;
+    }
+    if (
+      profileData.work_authorized_us === null &&
+      resumeDefaults.workAuthorizedUs !== null
+    ) {
+      profileData.work_authorized_us = resumeDefaults.workAuthorizedUs;
+    }
+    if (profileData.current_city === null && resumeDefaults.currentCity) {
+      profileData.current_city = resumeDefaults.currentCity;
+    }
+    if (
+      (profileData.target_locations === null ||
+        profileData.target_locations.length === 0) &&
+      resumeDefaults.targetLocations
+    ) {
+      profileData.target_locations = resumeDefaults.targetLocations;
+    }
+    if (profileData.grad_date === null && resumeDefaults.gradDate) {
+      profileData.grad_date = resumeDefaults.gradDate;
+    }
+  }
 
   return (
     <PageShell>

@@ -65,6 +65,13 @@ import {
   step4Schema,
   step5Schema,
 } from "@/lib/onboarding/intake-schema";
+import {
+  ResumePrefillDefaultsSchema,
+  persistResumePrefillParse,
+  runResumeParseForPrefill,
+  type ResumePrefillParseResult,
+} from "@/lib/onboarding/resume-prefill";
+import { ExtractedResumeSchema } from "@/lib/resume-parser";
 import { RESUMES_BUCKET, createServerClient } from "@/lib/supabase/server";
 
 export type IntakeResult =
@@ -311,6 +318,37 @@ export async function submitIntake(payload: unknown): Promise<IntakeResult> {
 
   revalidatePath("/onboarding");
   return { ok: true };
+}
+
+// ── JOB-360: parse the resume right after upload, before step 2 ────────────
+// Called from step 1's upload handler, synchronously, with a client side
+// 30 second cap. See `lib/onboarding/resume-prefill.ts` for why this is a
+// narrower, resume only parse. Does not persist anything: there is no
+// `resumes` row yet at the moment a file is chosen, so the result travels
+// back through the browser to `saveIntakeDraft` below, which persists it
+// once the row exists.
+export async function parseResumeForPrefill(
+  resumeObjectPath: string,
+): Promise<ResumePrefillParseResult> {
+  const supabase = await createServerClient();
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return { ok: false, reason: "Your session has expired." };
+  }
+
+  if (!resumeObjectPath.startsWith(`${user.id}/`)) {
+    return { ok: false, reason: "That file belongs to a different account." };
+  }
+
+  return runResumeParseForPrefill(supabase, {
+    userId: user.id,
+    userEmail: user.email ?? "",
+    resumeObjectPath,
+  });
 }
 
 // ── Save as you go ────────────────────────────────────────────────────────
@@ -642,18 +680,50 @@ export async function saveIntakeDraft(
     if (resumePath) {
       // Bucket qualified, matching the convention `submitIntake` and
       // `lib/candidate-intake.ts` write it under.
-      const { error: resumeError } = await supabase.from("resumes").insert({
-        user_id: user.id,
-        storage_path: `${RESUMES_BUCKET}/${resumePath}`,
-        linkedin_pdf_path: linkedinPdfPath
-          ? `${RESUMES_BUCKET}/${linkedinPdfPath}`
-          : null,
-      });
+      const bucketQualifiedResumePath = `${RESUMES_BUCKET}/${resumePath}`;
+      const { data: insertedResume, error: resumeError } = await supabase
+        .from("resumes")
+        .insert({
+          user_id: user.id,
+          storage_path: bucketQualifiedResumePath,
+          linkedin_pdf_path: linkedinPdfPath
+            ? `${RESUMES_BUCKET}/${linkedinPdfPath}`
+            : null,
+        })
+        .select("id")
+        .single();
       if (resumeError) {
         return {
           ok: false,
           message: `Could not save your resume: ${resumeError.message}`,
         };
+      }
+
+      // JOB-360: the row now exists, so this is the first point the parse
+      // `parseResumeForPrefill` already ran can be written down. Read off
+      // the raw `payload` rather than `validated`, since step1Schema
+      // strips fields it does not declare, and validated again here
+      // regardless of what the client claims. A malformed or absent
+      // payload is not an error; it just means no pre fill cache, same as
+      // a client side parse failure or timeout.
+      const rawPayload = (payload ?? {}) as Record<string, unknown>;
+      const extractedResult = ExtractedResumeSchema.safeParse(
+        rawPayload.resumeExtracted,
+      );
+      const defaultsResult = ResumePrefillDefaultsSchema.safeParse(
+        rawPayload.resumeDefaults,
+      );
+      if (
+        insertedResume?.id &&
+        extractedResult.success &&
+        defaultsResult.success
+      ) {
+        await persistResumePrefillParse(
+          insertedResume.id,
+          bucketQualifiedResumePath,
+          extractedResult.data,
+          defaultsResult.data,
+        );
       }
     }
   }

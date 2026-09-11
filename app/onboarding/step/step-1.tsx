@@ -16,10 +16,35 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import { Input } from "@/components/ui/input";
+import type { ResumePrefillDefaults } from "@/lib/onboarding/resume-prefill";
+import type { ExtractedResume } from "@/lib/resume-parser";
 import { RESUMES_BUCKET, createClient } from "@/lib/supabase/client";
 
-import { saveIntakeDraft } from "../actions";
+import { parseResumeForPrefill, saveIntakeDraft } from "../actions";
 import { Field, StepFooter } from "./_shared";
+
+/**
+ * JOB-360. The parse this awaits has no guaranteed upper bound of its own,
+ * so past 30 seconds the person continues without pre fill rather than
+ * staring at a spinner. Not cancelled, just no longer waited on.
+ */
+const PREFILL_PARSE_TIMEOUT_MS = 30_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
+}
 
 type ProfileData = {
   github_url: string | null;
@@ -43,6 +68,7 @@ export function Step1Form({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [parsingResume, setParsingResume] = useState(false);
 
   const hasExistingResume = Boolean(profile.resume_path);
 
@@ -73,6 +99,8 @@ export function Step1Form({
 
       let resumePath: string | null = null;
       let linkedinPdfPath: string | null = null;
+      let resumeExtracted: ExtractedResume | null = null;
+      let resumeDefaults: ResumePrefillDefaults | null = null;
 
       if (resumeFile) {
         resumePath = await upload(resumeFile);
@@ -81,11 +109,40 @@ export function Step1Form({
         linkedinPdfPath = await upload(linkedinFile);
       }
 
+      // JOB-360. Parse the just uploaded resume before advancing to step 2.
+      // A parse that fails, times out, or comes back malformed falls
+      // through to a normal Continue with nothing pre filled.
+      if (resumePath) {
+        setParsingResume(true);
+        const parsed = await withTimeout(
+          parseResumeForPrefill(resumePath),
+          PREFILL_PARSE_TIMEOUT_MS,
+        );
+        setParsingResume(false);
+
+        if (parsed && parsed.ok) {
+          resumeExtracted = parsed.extracted;
+          resumeDefaults = parsed.defaults;
+        } else if (parsed) {
+          console.warn(
+            "[onboarding] resume prefill parse failed:",
+            parsed.reason,
+          );
+        } else {
+          console.warn(
+            "[onboarding] resume prefill parse timed out after " +
+              `${PREFILL_PARSE_TIMEOUT_MS / 1000} seconds`,
+          );
+        }
+      }
+
       const result = await saveIntakeDraft(
         {
           githubUrl: githubUrl || null,
           resumePath,
           linkedinPdfPath,
+          resumeExtracted,
+          resumeDefaults,
         },
         1,
       );
@@ -103,6 +160,7 @@ export function Step1Form({
       );
     } finally {
       setBusy(false);
+      setParsingResume(false);
     }
   }
 
@@ -160,6 +218,13 @@ export function Step1Form({
           />
         </Field>
       </section>
+
+      {parsingResume ? (
+        <p className="text-muted-foreground text-sm" role="status">
+          Reading your resume to pre fill the next few steps. This takes
+          about ten to fifteen seconds.
+        </p>
+      ) : null}
 
       {message ? (
         <p className="text-destructive text-sm" role="alert">
