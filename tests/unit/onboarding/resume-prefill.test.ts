@@ -134,6 +134,75 @@ describe("detectCitizenshipFromResumeText", () => {
       ).toBe("us_citizen");
     });
   });
+
+  // Round three red team's BLOCKING regression: round three added "us
+  // national" and "u.s. national" to `US_CITIZEN_PHRASES`, reasoning that a
+  // national is a citizenship style status. But "national" as a noun is
+  // overwhelmingly institutional on a resume (National Guard, National
+  // Merit, National Science Foundation, National Honor Society, National
+  // Security), and none of those carry a disqualifying word this scanner
+  // would catch. Round four removes both phrases entirely; each case below
+  // must now return null.
+  describe("round three red team false positives (US national removed)", () => {
+    it("does not read a National Guard service mention as a citizenship claim", () => {
+      expect(detectCitizenshipFromResumeText("US National Guard veteran")).toBeNull();
+    });
+
+    it("does not read a National Guard service record as a citizenship claim", () => {
+      expect(
+        detectCitizenshipFromResumeText("US National Guard, Sergeant, 6 years of service"),
+      ).toBeNull();
+    });
+
+    it("does not read a National Debt research topic as a citizenship claim", () => {
+      expect(detectCitizenshipFromResumeText("US National Debt research")).toBeNull();
+    });
+
+    it("does not read a national security clearance mention as a citizenship claim", () => {
+      expect(detectCitizenshipFromResumeText("US national security clearance")).toBeNull();
+    });
+
+    it("does not read a national security policy course as a citizenship claim", () => {
+      expect(
+        detectCitizenshipFromResumeText("Studied US national security policy at Georgetown"),
+      ).toBeNull();
+    });
+
+    it("does not read a National Security Council internship as a citizenship claim", () => {
+      expect(
+        detectCitizenshipFromResumeText("Held a US National Security Council internship"),
+      ).toBeNull();
+    });
+
+    it("does not read a National Merit Scholar award as a citizenship claim", () => {
+      expect(detectCitizenshipFromResumeText("US National Merit Scholar")).toBeNull();
+    });
+
+    it("does not read a National Forest Service mention as a citizenship claim", () => {
+      expect(
+        detectCitizenshipFromResumeText("Volunteer firefighter, US National Forest Service"),
+      ).toBeNull();
+    });
+
+    it("does not read a National Honor Society membership as a citizenship claim", () => {
+      expect(detectCitizenshipFromResumeText("US National Honor Society member")).toBeNull();
+    });
+
+    it("does not read a National Science Foundation grant as a citizenship claim", () => {
+      expect(
+        detectCitizenshipFromResumeText("US National Science Foundation grant recipient"),
+      ).toBeNull();
+    });
+
+    // Acceptable false negative: "US national" is rarely stated on resumes
+    // as a bare self attestation, and when it is, it is ambiguous enough
+    // that fabricating citizenship_status is worse than leaving it blank.
+    // See PR #363 Round 3 red team finding for the institutional
+    // false positive surface that motivated dropping the phrase.
+    it("no longer reads a bare 'US national' self attestation as a citizenship claim", () => {
+      expect(detectCitizenshipFromResumeText("I am a US national")).toBeNull();
+    });
+  });
 });
 
 describe("parseGradDateToIso", () => {

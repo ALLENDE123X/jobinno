@@ -42,6 +42,26 @@
  * see the comment above `DISQUALIFIER_WORDS` for the two immigration
  * specific words added in their place.
  *
+ * Round three also added "US national" and "U.S. national" as phrases,
+ * reasoning that a national is a citizenship style status. Round three's own
+ * red team found ten distinct institutional false positives from that pair:
+ * "national" as a noun is overwhelmingly used on resumes for an
+ * organisation's name rather than a person's status ("US National Guard
+ * veteran", "US National Merit Scholar", "US National Science Foundation
+ * grant recipient", "Studied US national security policy at Georgetown"),
+ * and none of those carry a disqualifying word this scanner would catch.
+ * Round four drops both phrases from `US_CITIZEN_PHRASES` entirely rather
+ * than trying to patch the disqualifier list again: "national" the noun is
+ * too close to "National Guard" and "National Merit" and the rest to be
+ * fixed by adding more disqualifying words without an unbounded chase for
+ * the next institutional name that also contains it. A resume that states
+ * "I am a US national" as a bare self attestation now returns null instead
+ * of `us_citizen`; that is an accepted false negative, since a blank field
+ * is worse than nothing but a fabricated one is worse still. See
+ * `tests/unit/onboarding/resume-prefill.test.ts` for the institutional false
+ * positive set this removal fixes and the one accepted false negative it
+ * introduces.
+ *
  * current_city and grad_date go through the model, because
  * `buildResumeProfile` already extracts, sanitises and ships them to the
  * fill pipeline today; this reuses that reviewed path. A resume's home
@@ -91,8 +111,6 @@ const US_CITIZEN_PHRASES = [
   "u.s. citizenship",
   "us citizenship",
   "united states citizenship",
-  "u.s. national",
-  "us national",
 ];
 
 const PERMANENT_RESIDENT_PHRASES = [
@@ -124,10 +142,13 @@ const NEGATION_WORDS = ["not", "no", "non", "without"];
  * all. Round three prunes it to words that are specific to a visa or
  * immigration context, or to a company or organisation suffix, and adds two
  * immigration specific terms ("immigration", "naturalization") in their
- * place so the phrases newly added to `US_CITIZEN_PHRASES` this round
- * ("US citizenship", "US national") still reject a mention of the US
- * Citizenship and Immigration Services agency rather than reading it as a
- * personal claim. The check also moved from a fixed character window
+ * place so "US citizenship", newly added to `US_CITIZEN_PHRASES` this round,
+ * still rejects a mention of the US Citizenship and Immigration Services
+ * agency rather than reading it as a personal claim. Round three also added
+ * "US national" to `US_CITIZEN_PHRASES` alongside "US citizenship"; round
+ * four removed it again after its own institutional false positives (see the
+ * file header comment), so these two disqualifiers now only guard "US
+ * citizenship". The check also moved from a fixed character window
  * forward of the match to the whole sentence containing it (see
  * `isSentenceDisqualified`), since "will require sponsorship ... in the
  * future" only kept "sponsorship" ahead of the match once "future" was
