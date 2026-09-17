@@ -27,9 +27,11 @@
  * once the walk reached the surrounding `<form>` the query returned every
  * hidden input and every `<select>` in the form, so the commit was
  * silently overwriting sibling screening dropdowns and CSRF tokens. The
- * current commit script instead scopes to `closest('[data-field], .sr-
- * field, fieldset')` with a fallback to the widget's direct parent's
- * direct children only; see `commitScript` below for the exact rules.
+ * current commit script instead scopes to explicit per question wrappers
+ * (`[data-field]` or `.sr-field`) with a fallback to the widget's direct
+ * parent's direct children only; see the block comment above `commitScript`
+ * below for the exact rules and for why `<fieldset>` is deliberately not
+ * in that list.
  *
  * What this module deliberately does NOT do:
  *
@@ -204,6 +206,21 @@ function jsLiteral(value: string): string {
  * never see the event; the fallback sibling scope would also be
  * anchored at the descendant's parent rather than at the widget's, so a
  * hidden `<select>` a level up from the descendant could be missed.
+ *
+ * The descendant fallback requires EXACTLY ONE widget match (JOB-293
+ * MINOR-1 follow up). Prior revision returned the first match from
+ * `querySelector`, so a caller that passed an outer wrapper selector
+ * naming two sibling comboboxes (for example an `.sr-field-group`
+ * containing two screening questions) would silently pick one at random
+ * and dispatch events on the wrong screening question. The new rule
+ * collects every match under the start element and returns the sole
+ * element only when there is exactly one; on ambiguity the resolver
+ * returns null, which lets `commit` surface `adapter_failed` instead
+ * of quietly writing to an arbitrary widget. Every current caller
+ * (see `selectDropdown` in `lib/agent/tools.ts`) passes a per field
+ * selector where at most one widget is in scope, so the tightened
+ * rule keeps the single widget case working and only fires on the
+ * ambiguous case no caller is meant to hit.
  */
 function widgetResolverSource(): string {
   return `
@@ -214,9 +231,9 @@ function widgetResolverSource(): string {
         if (r === "combobox" || r === "listbox") return scope;
         scope = scope.parentElement;
       }
-      if (start && start.querySelector) {
-        const nested = start.querySelector('[role="combobox"], [role="listbox"]');
-        if (nested) return nested;
+      if (start && start.querySelectorAll) {
+        const nested = start.querySelectorAll('[role="combobox"], [role="listbox"]');
+        if (nested.length === 1) return nested[0];
       }
       return null;
     };
@@ -370,11 +387,21 @@ function commitScript(fieldSelector: string, optionValue: string): string {
     // uses, so a descendant selector (for example an id on the listbox or
     // a class on a label inside the widget) still fires events on the
     // widget and still anchors the fallback sibling scope at the widget's
-    // parent rather than the descendant's. When no widget is found the
-    // raw element is the anchor, which preserves the prior behavior for
-    // non widget callers.
+    // parent rather than the descendant's.
+    //
+    // JOB-293 MINOR-1 follow up: when the selector names an outer wrapper
+    // that contains more than one widget, or names something with no
+    // widget at all, resolveWidget returns null. Fail closed here rather
+    // than falling back to the raw element as anchor: firing events on a
+    // wrapper and blindly writing to whatever hidden controls happen to
+    // sit under it is exactly the arbitrary widget shape the ticket
+    // exists to prevent. The caller sees adapter_failed and the visible
+    // click path stays in charge.
     const widget = resolveWidget(el);
-    const anchor = widget || el;
+    if (!widget) {
+      return { ok: false, reason: "no unique widget resolved from selector", fired: [] };
+    }
+    const anchor = widget;
     const controls = [anchor];
     const seen = new Set([anchor]);
 
