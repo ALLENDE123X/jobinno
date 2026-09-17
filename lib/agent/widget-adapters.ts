@@ -70,6 +70,16 @@ export interface CommitResult {
   status: AdapterCommitStatus;
   adapterName: string | null;
   detail: string | null;
+  /**
+   * JOB-317: set by adapters that can prove, by reading the widget's own
+   * state back after the commit, whether the framework actually accepted
+   * the value. `true` means the readback showed the committed value in the
+   * widget's reactive state; `false` means the commit ran but the state
+   * readback did not show it; absent means the adapter has no state
+   * readback to offer (the JOB-281 event dispatch adapter, for example,
+   * can only prove events fired, not that anything listened).
+   */
+  stateVerified?: boolean;
 }
 
 /**
@@ -103,12 +113,12 @@ export interface WidgetAdapter {
  * real `Page` shape, kept structural so the module never imports Stagehand
  * and so tests can pass any object that satisfies the two methods.
  */
-interface PageLike {
+export interface PageLike {
   url?: () => string | Promise<string>;
   evaluate: (fn: string, ...args: unknown[]) => Promise<unknown>;
 }
 
-function isPageLike(value: unknown): value is PageLike {
+export function isPageLike(value: unknown): value is PageLike {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -170,7 +180,7 @@ function isSmartRecruitersUrl(url: string): boolean {
  * `lib/form-fields.ts`'s helpers so this module has no dependency edge back
  * into the ported code.
  */
-function jsLiteral(value: string): string {
+export function jsLiteral(value: string): string {
   const escaped = value
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
@@ -531,13 +541,414 @@ export class SRScreeningDropdownAdapter implements WidgetAdapter {
 }
 
 /**
+ * JOB-317: shared in page source that resolves the actual `spl-` component
+ * host from whatever element a field selector lands on, by feature
+ * detecting the component's own commit surface rather than by tag name.
+ *
+ * Why feature detection. The 2026-08-31 recon against the live OneClick
+ * bundle (Wabtec publication, real production JS) decompiled the
+ * `spl-multiselect-autocomplete` component JOB-266 fought and found its
+ * commit pipeline is a set of public prototype methods:
+ *
+ *   handleOptionSelect(event)  reads event.detail.value (an option id) and
+ *                              event.detail.selected, flips
+ *                              selectedOptionsDictionary, then calls
+ *                              handleChange(getValue())
+ *   handleChange(value)        assigns the reactive `value` property
+ *                              (which writes the `__value` backing field
+ *                              JOB-266 inspected), runs validate(), and
+ *                              dispatches the `spl-change` CustomEvent
+ *   markAsTouched()            dispatches the `spl-touched` event
+ *
+ * Zone.js listener bookkeeping on the same live page shows Angular
+ * subscribes to exactly `spl-change` and `spl-touched` on every mounted
+ * `spl-` control (own properties named `__zone_symbol__spl-changefalse`
+ * and so on, plus `__ngContext__` on the host). So the reactive form
+ * validator that blocks submit with "Value is required" is fed by the
+ * event this pipeline dispatches, and calling the pipeline directly is the
+ * layer ABOVE the click plumbing that all six JOB-266 mechanisms (and both
+ * pivot spike models) failed to penetrate from below.
+ *
+ * Tag names are minified build artifacts and component variants exist
+ * (`spl-select`, `spl-checkbox` share the same base class), so the
+ * resolver asks each candidate whether it exposes the commit surface
+ * instead of matching names: `handleOptionSelect` plus `updateSelection`
+ * marks the multiselect shape, `handleChange` plus `emitChangeEvent`
+ * marks the base field shape. That is the per instance decision this
+ * ticket exists to make.
+ */
+function splHostResolverSource(): string {
+  return `
+    const isMultiselectHost = (n) => !!n && typeof n.handleOptionSelect === "function" && typeof n.updateSelection === "function";
+    const isBaseFieldHost = (n) => !!n && typeof n.handleChange === "function" && typeof n.emitChangeEvent === "function";
+    const isSplHost = (n) => isMultiselectHost(n) || isBaseFieldHost(n);
+    const resolveSplHost = (start) => {
+      let scope = start;
+      for (let depth = 0; depth < 8 && scope; depth++) {
+        if (isSplHost(scope)) return scope;
+        scope = scope.parentElement;
+      }
+      if (start && start.querySelectorAll) {
+        const all = start.querySelectorAll("*");
+        const budget = Math.min(all.length, 400);
+        for (let i = 0; i < budget; i++) {
+          const n = all[i];
+          if (n.tagName && n.tagName.indexOf("-") >= 0 && isSplHost(n)) return n;
+        }
+      }
+      return null;
+    };
+  `;
+}
+
+function splMatchScript(fieldSelector: string): string {
+  return `(() => {
+    try {
+      ${splHostResolverSource()}
+      const sel = ${jsLiteral(fieldSelector)};
+      const el = document.querySelector(sel);
+      if (!el) return false;
+      return resolveSplHost(el) !== null;
+    } catch (e) {
+      return false;
+    }
+  })()`;
+}
+
+/**
+ * The in page IIFE the spl state adapter's `commit` runs. Probes THIS
+ * widget instance, picks the commit path its shape supports, applies it,
+ * and reads the widget's own reactive state back so the caller gets a
+ * verified yes or no rather than a hopeful event dispatch.
+ *
+ * Multiselect shape, in order:
+ *
+ *   1. Find the option whose label or value equals the target (trimmed,
+ *      case insensitive) across every option store the instance exposes:
+ *      `options`, `optionsDictionary`, `_optionsToRender`, and
+ *      `dynamicOptions`. The instance decides which of those are
+ *      populated; the adapter does not assume.
+ *   2. If none match and the instance allows custom values and carries an
+ *      `optionFactory`, build the option through the factory. This is the
+ *      component's own custom value path, not an invention: the factory is
+ *      supplied by SR's Angular wrapper and is what a typed in custom
+ *      value goes through on a real interaction.
+ *   3. Seed `optionsDictionary[id]` when absent. The live recon showed
+ *      `getValue()` maps selected ids through `optionsDictionary`, and an
+ *      option the dropdown never rendered may not be registered there yet;
+ *      without the seed the commit computes an empty value and the
+ *      component's own value watcher then wipes the selection.
+ *   4. Call `handleOptionSelect` with a CustomEvent shaped exactly like
+ *      the one the component's own option rows dispatch:
+ *      `detail: { value: optionId, selected: false }` (`selected` is the
+ *      option's state BEFORE the interaction, so `false` means select).
+ *   5. `markAsTouched()` when exposed, mirroring the blur a real
+ *      interaction ends with, so touched gated validators run.
+ *
+ * Base field shape (single selects, checkboxes, anything on the shared
+ * form field base class): `handleChange(target)` then `markAsTouched()`.
+ *
+ * Never invents a value: the only value that can land is the target the
+ * caller chose, and when no option store entry (and no custom value
+ * factory) matches it, the script reports failure with what it searched
+ * rather than picking something close. HARD STOP 9 applies to widget
+ * plumbing too.
+ *
+ * Verification: `handleChange` assigns `value` synchronously, so the
+ * script reads `host.value` right after the call and reports whether the
+ * target (or the matched option's value) is present. That readback is the
+ * `stateVerified` field on the CommitResult.
+ */
+function splCommitScript(fieldSelector: string, optionValue: string): string {
+  return `(() => {
+    ${splHostResolverSource()}
+    const sel = ${jsLiteral(fieldSelector)};
+    const target = ${jsLiteral(optionValue)};
+    const el = document.querySelector(sel);
+    if (!el) {
+      return { ok: false, reason: "selector did not resolve", stateVerified: false };
+    }
+    const host = resolveSplHost(el);
+    if (!host) {
+      return { ok: false, reason: "no spl component host found", stateVerified: false };
+    }
+    const norm = (v) => String(v == null ? "" : v).trim().toLowerCase();
+    const safeJson = (v) => {
+      try {
+        const s = JSON.stringify(v);
+        return s === undefined ? "undefined" : s;
+      } catch (e) {
+        return "[unserializable]";
+      }
+    };
+    const zoneEvents = [];
+    try {
+      for (const p of Object.getOwnPropertyNames(host)) {
+        const m = p.match(/^__zone_symbol__(.+?)(?:true|false)$/);
+        if (m) zoneEvents.push(m[1]);
+      }
+    } catch (e) {}
+    const probe = {
+      tag: host.tagName ? host.tagName.toLowerCase() : "unknown",
+      shape: isMultiselectHost(host) ? "multiselect" : "baseField",
+      ngContext: "__ngContext__" in host,
+      zoneEvents: zoneEvents,
+    };
+    const before = safeJson(host.value);
+    const valueContains = (v) => {
+      const current = host.value;
+      if (Array.isArray(current)) return current.some((x) => norm(x) === norm(v));
+      return norm(current) === norm(v);
+    };
+    let path = "";
+    let reason = "";
+    let matched = null;
+    try {
+      if (probe.shape === "multiselect") {
+        const stores = [];
+        if (Array.isArray(host.options)) stores.push(["options", host.options]);
+        if (host.optionsDictionary && typeof host.optionsDictionary === "object") {
+          stores.push(["optionsDictionary", Object.values(host.optionsDictionary)]);
+        }
+        if (Array.isArray(host._optionsToRender)) stores.push(["_optionsToRender", host._optionsToRender]);
+        if (Array.isArray(host.dynamicOptions)) stores.push(["dynamicOptions", host.dynamicOptions]);
+        const searched = [];
+        for (const [storeName, entries] of stores) {
+          searched.push(storeName + "(" + entries.length + ")");
+          for (const opt of entries) {
+            if (!opt) continue;
+            if (norm(opt.label) === norm(target) || norm(opt.value) === norm(target)) {
+              matched = opt;
+              path = "handleOptionSelect via " + storeName;
+              break;
+            }
+          }
+          if (matched) break;
+        }
+        if (!matched && host.allowCustomValues && typeof host.optionFactory === "function") {
+          try {
+            const custom = host.optionFactory(target);
+            if (custom && (custom.id !== undefined || custom.label !== undefined)) {
+              matched = custom;
+              path = "handleOptionSelect via optionFactory custom value";
+            }
+          } catch (e) {
+            reason = "optionFactory threw: " + String(e && e.message ? e.message : e);
+          }
+        }
+        if (!matched) {
+          return {
+            ok: false,
+            stateVerified: false,
+            probe: probe,
+            before: before,
+            reason: reason || ("no option matched the target across " + (searched.join(", ") || "no populated option stores")),
+          };
+        }
+        if (matched.id === undefined || matched.id === null) {
+          // The option factory contract allows a label only option with no
+          // id. The dictionary keyed pipeline cannot address that, so use
+          // the component's value array path instead: handleChange assigns
+          // the reactive value, validates, and emits, and the component's
+          // own value watcher re derives the tags.
+          const nextValue = Array.isArray(host.value) ? host.value.slice() : [];
+          const v = matched.value !== undefined ? matched.value : target;
+          if (!nextValue.some((x) => norm(x) === norm(v))) nextValue.push(v);
+          path = path + " then handleChange with value array (option had no id)";
+          host.handleChange(nextValue);
+        } else {
+          if (!host.optionsDictionary || typeof host.optionsDictionary !== "object") {
+            host.optionsDictionary = {};
+          }
+          if (!host.optionsDictionary[matched.id]) {
+            host.optionsDictionary[matched.id] = matched;
+          }
+          const alreadySelected =
+            !!host.selectedOptionsDictionary && host.selectedOptionsDictionary[matched.id] === true;
+          if (!alreadySelected) {
+            host.handleOptionSelect(
+              new CustomEvent("agent-state-commit", {
+                detail: { value: matched.id, selected: false },
+              })
+            );
+          } else {
+            path = path + " (already selected)";
+          }
+        }
+      } else {
+        path = "handleChange";
+        host.handleChange(target);
+      }
+      if (typeof host.markAsTouched === "function") {
+        try { host.markAsTouched(); } catch (e) {}
+      }
+    } catch (e) {
+      return {
+        ok: false,
+        stateVerified: false,
+        probe: probe,
+        before: before,
+        reason: "commit path threw: " + String(e && e.message ? e.message : e),
+      };
+    }
+    const verified =
+      valueContains(target) || (matched !== null && valueContains(matched.value));
+    return {
+      ok: true,
+      stateVerified: verified,
+      probe: probe,
+      path: path,
+      before: before,
+      after: safeJson(host.value),
+    };
+  })()`;
+}
+
+interface SplCommitScriptResult {
+  ok: boolean;
+  stateVerified: boolean;
+  reason?: string;
+  path?: string;
+  before?: string;
+  after?: string;
+  probe?: {
+    tag?: string;
+    shape?: string;
+    ngContext?: boolean;
+    zoneEvents?: string[];
+  };
+}
+
+function coerceSplCommitScriptResult(
+  value: unknown
+): SplCommitScriptResult | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  return {
+    ok: record.ok === true,
+    stateVerified: record.stateVerified === true,
+    reason: typeof record.reason === "string" ? record.reason : undefined,
+    path: typeof record.path === "string" ? record.path : undefined,
+    before: typeof record.before === "string" ? record.before : undefined,
+    after: typeof record.after === "string" ? record.after : undefined,
+    probe:
+      typeof record.probe === "object" && record.probe !== null
+        ? (record.probe as SplCommitScriptResult["probe"])
+        : undefined,
+  };
+}
+
+function describeProbe(probe: SplCommitScriptResult["probe"]): string {
+  if (!probe) return "no probe data";
+  const zone =
+    probe.zoneEvents && probe.zoneEvents.length > 0
+      ? probe.zoneEvents.join("+")
+      : "none";
+  return `${probe.tag ?? "unknown"} shape=${probe.shape ?? "unknown"} ngContext=${
+    probe.ngContext === true
+  } zoneListeners=${zone}`;
+}
+
+/**
+ * JOB-317: the second SR adapter. Commits a screening dropdown by driving
+ * the `spl-` component's own public commit pipeline (see the block comment
+ * on `splHostResolverSource` for the decompiled pipeline and the live
+ * evidence) instead of dispatching events at the click plumbing below it.
+ *
+ * Registered AHEAD of `SRScreeningDropdownAdapter` because its `matches`
+ * is strictly narrower: it requires an actual component instance exposing
+ * the commit surface, which no plain ARIA fixture and no non SR widget
+ * satisfies. When the state paths fail on a matched instance, `commit`
+ * falls back to the JOB-281 event dispatch adapter so the production
+ * behavior that shipped before this ticket is preserved on exactly the
+ * inputs it used to receive.
+ */
+export class SRSplStateCommitAdapter implements WidgetAdapter {
+  readonly name = "SRSplStateCommitAdapter";
+
+  async matches(page: unknown, fieldSelector: string): Promise<boolean> {
+    if (!isPageLike(page)) return false;
+    const url = await readPageUrl(page);
+    if (!isSmartRecruitersUrl(url)) return false;
+    try {
+      const result = await page.evaluate(splMatchScript(fieldSelector));
+      return result === true;
+    } catch {
+      return false;
+    }
+  }
+
+  async commit(
+    page: unknown,
+    fieldSelector: string,
+    optionValue: string
+  ): Promise<CommitResult> {
+    if (!isPageLike(page)) {
+      return {
+        status: "adapter_failed",
+        adapterName: this.name,
+        detail: "page handle did not expose an evaluate method",
+        stateVerified: false,
+      };
+    }
+    let parsed: SplCommitScriptResult | null = null;
+    let failureDetail: string;
+    try {
+      const raw = await page.evaluate(
+        splCommitScript(fieldSelector, optionValue)
+      );
+      parsed = coerceSplCommitScriptResult(raw);
+      if (parsed && parsed.ok) {
+        return {
+          status: "committed",
+          adapterName: this.name,
+          stateVerified: parsed.stateVerified,
+          detail:
+            `${parsed.path ?? "unknown path"}; ${describeProbe(parsed.probe)}; ` +
+            `value before=${parsed.before ?? "?"} after=${parsed.after ?? "?"}; ` +
+            `stateVerified=${parsed.stateVerified}`,
+        };
+      }
+      failureDetail = parsed
+        ? `${parsed.reason ?? "state commit reported failure"}; ${describeProbe(parsed.probe)}`
+        : "commit script returned an unexpected shape";
+    } catch (error) {
+      failureDetail = error instanceof Error ? error.message : String(error);
+    }
+    // The state paths could not commit this instance. Fall back to the
+    // JOB-281 event dispatch adapter so a widget this adapter matched but
+    // could not drive still gets the behavior production shipped before
+    // this ticket, and record both halves in the detail so the trace
+    // shows exactly what was tried.
+    const fallback = await new SRScreeningDropdownAdapter().commit(
+      page,
+      fieldSelector,
+      optionValue
+    );
+    return {
+      status: fallback.status,
+      adapterName: this.name,
+      stateVerified: false,
+      detail:
+        `state commit failed (${failureDetail}); ` +
+        `fell back to event dispatch: ${fallback.detail ?? "no detail"}`,
+    };
+  }
+}
+
+/**
  * The registered adapters, in the order the registry consults them. Kept
  * as a factory rather than a constant so tests can instantiate a fresh
  * adapter per call and so a future ticket can plug a config or a runtime
  * override in without churning every call site.
+ *
+ * JOB-317 ordering: the state commit adapter runs first because its match
+ * is strictly narrower (a real component instance exposing the commit
+ * surface); the JOB-281 event dispatch adapter keeps serving every ARIA
+ * shaped widget the narrower match declines, unchanged.
  */
 export function getRegisteredAdapters(): readonly WidgetAdapter[] {
-  return [new SRScreeningDropdownAdapter()];
+  return [new SRSplStateCommitAdapter(), new SRScreeningDropdownAdapter()];
 }
 
 /**
