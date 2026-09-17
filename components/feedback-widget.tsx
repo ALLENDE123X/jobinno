@@ -21,10 +21,17 @@
  * to be. Jobinno's session lives in a cookie, and the private client this file
  * used to reach for kept its own in `localStorage`, so it never found a session
  * and stamped every report `user_id: null`. See the header of `lib/feedback.ts`.
+ *
+ * JOB-365: hidden under `/internal/visuals`. Those 15 routes render a fixed
+ * 1920x1080 frame meant to be screenshotted for a reel, and this button's own
+ * `fixed right-4 bottom-4` position would sit on top of every one of them.
+ * Checking the path here, rather than making the mock pages themselves aware
+ * of this widget, keeps the fix in the one file that owns the positioning.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MessageSquarePlus } from "lucide-react";
+import { usePathname } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -55,6 +62,7 @@ import { createClient } from "@/lib/supabase/client";
 type Phase = "editing" | "sending" | "sent";
 
 export function FeedbackWidget() {
+  const pathname = usePathname();
   const [open, setOpen] = useState(false);
   const [category, setCategory] = useState<FeedbackCategory>("bug");
   const [body, setBody] = useState("");
@@ -123,6 +131,12 @@ export function FeedbackWidget() {
       setError(null);
     }
   }, []);
+
+  // After every hook above, so this stays a conditional return rather than a
+  // conditional hook call.
+  if (pathname === "/internal/visuals" || pathname?.startsWith("/internal/visuals/")) {
+    return null;
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
