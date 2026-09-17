@@ -26,7 +26,8 @@
     "skip-rollup": "tsx lib/skip-rollup-cli.ts",
     "analyze-failures": "tsx lib/failure-recordings-cli.ts",
     "measure:reap-lag": "tsx scripts/browserbase-reap-lag.ts",
-    "test:ashby": "tsx scripts/test-ashby-api.ts"
+    "test:ashby": "tsx scripts/test-ashby-api.ts",
+    "capture:visuals": "tsx scripts/capture-visuals.ts"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "^3.0.39",
