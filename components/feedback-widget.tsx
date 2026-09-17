@@ -134,7 +134,7 @@ export function FeedbackWidget() {
 
   // After every hook above, so this stays a conditional return rather than a
   // conditional hook call.
-  if (pathname?.startsWith("/internal/visuals")) {
+  if (pathname === "/internal/visuals" || pathname?.startsWith("/internal/visuals/")) {
     return null;
   }
 

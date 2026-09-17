@@ -36,16 +36,24 @@ const OUTPUT_DIR = "/tmp/jobinno-visuals";
 const VIEWPORT = { width: 1920, height: 1080 };
 const READY_TIMEOUT_MS = 60_000;
 const READY_POLL_INTERVAL_MS = 1_000;
-// Lets the number tickers on a couple of pages (dashboard-counter-climbing,
-// money-time-saved-counter) finish their spring animation before the
-// screenshot, so the captured PNG shows the settled final value rather than
-// a mid animation frame. `networkidle` alone does not wait for this: no
-// network activity is involved in a CSS/JS spring running client side.
-// `components/ui/number-ticker.tsx`'s spring (damping 60, stiffness 100) is
-// overdamped, and its slow pole settles within roughly 4 seconds; measured
-// against a real run, 2 seconds left the ticker visibly short of its final
-// value, so this is set well past the slow pole rather than trimmed close to it.
-const ANIMATION_SETTLE_MS = 4_500;
+// JOB-365 followup: this used to be a 4.5 second wait for the number ticker
+// pages (dashboard-counter-climbing, money-time-saved-counter) to let their
+// spring animation settle before the screenshot. That approach had a real
+// bug: `components/ui/number-ticker.tsx`'s spring (damping 60, stiffness
+// 100) has a slow pole whose settle time depends on the target value, and
+// for value={3375} it had not always finished by 4.5 seconds, producing a
+// captured PNG that read $3,374 instead of $3,375.
+//
+// The fix removes the race instead of chasing it with a longer wait: both
+// pages now render through `CaptureTicker`
+// (app/internal/visuals/_components/capture-ticker.tsx), which skips the
+// spring and renders the final value directly whenever this script's
+// `?capture=1` query param is present (see
+// app/internal/visuals/_lib/capture-context.tsx). Any future page with its
+// own animation should do the same rather than relying on a fixed wait
+// here. This constant is kept small only as a general settle buffer for
+// ordinary CSS transitions, not for anything spring driven.
+const ANIMATION_SETTLE_MS = 500;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
@@ -99,7 +107,11 @@ async function captureAll(): Promise<void> {
     const page = await context.newPage();
 
     for (const slug of VISUAL_SLUGS) {
-      const url = `${BASE_URL}/internal/visuals/${slug}`;
+      // `?capture=1` tells `CaptureProvider` (app/internal/visuals/_lib/capture-context.tsx)
+      // this is a screenshot run, so `CaptureTicker` renders its settled
+      // final value directly instead of animating into it. See the
+      // ANIMATION_SETTLE_MS comment above for why this replaced a fixed wait.
+      const url = `${BASE_URL}/internal/visuals/${slug}?capture=1`;
       console.log(`Capturing ${slug}...`);
       await page.goto(url, { waitUntil: "networkidle" });
       // `next dev` renders its own dev tools indicator (a `<nextjs-portal>`

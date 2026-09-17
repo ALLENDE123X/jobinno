@@ -1,9 +1,15 @@
 // JOB-365. Beat 4 visual: the overnight run animating from 0 to 47 while the
 // viewer was asleep. `NumberTicker` already ships in components/ui, so this
 // page only supplies the copy and the layout around it.
+//
+// JOB-365 followup: uses `CaptureTicker` instead of `NumberTicker` directly,
+// so a `scripts/capture-visuals.ts` run renders 47 immediately rather than
+// hoping the spring animation has settled by screenshot time. See
+// `_components/capture-ticker.tsx`.
 import { Logo } from "@/components/logo";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { NumberTicker } from "@/components/ui/number-ticker";
+
+import { CaptureTicker } from "../_components/capture-ticker";
 
 const RECENT = [
   { company: "Anthropic", time: "8:47am" },
@@ -22,7 +28,7 @@ export function DashboardCounterClimbing() {
           Jobinno
         </div>
         <p className="text-muted-foreground text-2xl">While you slept</p>
-        <NumberTicker value={47} className="text-[220px] leading-none font-semibold" />
+        <CaptureTicker value={47} className="text-[220px] leading-none font-semibold" />
         <p className="text-muted-foreground text-2xl">applications submitted overnight</p>
       </div>
 
