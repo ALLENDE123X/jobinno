@@ -41,7 +41,11 @@ const READY_POLL_INTERVAL_MS = 1_000;
 // screenshot, so the captured PNG shows the settled final value rather than
 // a mid animation frame. `networkidle` alone does not wait for this: no
 // network activity is involved in a CSS/JS spring running client side.
-const ANIMATION_SETTLE_MS = 2_000;
+// `components/ui/number-ticker.tsx`'s spring (damping 60, stiffness 100) is
+// overdamped, and its slow pole settles within roughly 4 seconds; measured
+// against a real run, 2 seconds left the ticker visibly short of its final
+// value, so this is set well past the slow pole rather than trimmed close to it.
+const ANIMATION_SETTLE_MS = 4_500;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
@@ -98,6 +102,14 @@ async function captureAll(): Promise<void> {
       const url = `${BASE_URL}/internal/visuals/${slug}`;
       console.log(`Capturing ${slug}...`);
       await page.goto(url, { waitUntil: "networkidle" });
+      // `next dev` renders its own dev tools indicator (a `<nextjs-portal>`
+      // custom element pinned to a screen corner) on every page. Real users
+      // never see it, since it does not exist in a production build, but the
+      // capture server here is always `next dev` (see startDevServer), so
+      // without this it would sit on top of every screenshot. Scoped to this
+      // script rather than to `next.config.ts`, so it does not change what
+      // any other developer sees while running the app locally.
+      await page.addStyleTag({ content: "nextjs-portal { display: none !important; }" });
       await page.waitForTimeout(ANIMATION_SETTLE_MS);
       await page.screenshot({
         path: `${OUTPUT_DIR}/${slug}.png`,
